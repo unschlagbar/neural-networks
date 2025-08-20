@@ -2,7 +2,7 @@ use std::f32::consts::PI;
 
 use rand::{Rng, rng, seq::SliceRandom};
 
-use crate::layer::{ActivationFn, LearningLayer};
+use crate::layer::{Activation, LearningLayer};
 
 #[derive(Debug)]
 pub struct LearningMLP {
@@ -13,10 +13,10 @@ impl LearningMLP {
     pub fn random(layout: &[usize]) -> Self {
         let mut layers: Box<[LearningLayer]> = layout
             .windows(2)
-            .map(|window| LearningLayer::random(window[0], window[1], ActivationFn::Sigmoid))
+            .map(|window| LearningLayer::random(window[0], window[1], Activation::Sigmoid))
             .collect();
 
-        layers[layers.len() - 1].activation_fn = ActivationFn::Sigmoid;
+        layers[layers.len() - 1].activation_fn = Activation::Sigmoid;
 
         Self { layers }
     }
@@ -37,7 +37,8 @@ impl LearningMLP {
         let output_layer_idx = n_layers - 1;
 
         let output_fn = self.layers[output_layer_idx].activation_fn;
-        let output_z = output_fn.derivative(self.layers[output_layer_idx].last_z.clone());
+        let mut output_z = self.layers[output_layer_idx].last_z.clone();
+        output_fn.derivative(&mut output_z);
 
         let mut delta: Box<[f32]> = (0..output.len())
             .map(|j| (output[j] - target[j]) * output_z[j])
@@ -62,19 +63,22 @@ impl LearningMLP {
             if l > 0 {
                 let prev_idx = l - 1;
                 let prev_fn = self.layers[prev_idx].activation_fn;
-                let prev_z = &self.layers[prev_idx].last_z;
+                let mut prev_z = self.layers[prev_idx].last_z.clone();
                 let prev_size = self.layers[l].weights.rows();
-                let mut prev_delta = vec![0.0; prev_size];
-                for k in 0..prev_size {
-                    let mut sum = 0.0;
-                    for (j, delta) in delta.iter().enumerate() {
-                        sum += self.layers[l].weights[k][j] * delta;
-                    }
-                    prev_delta[k] = sum;
-                }
+                let prev_delta: Box<[f32]> = (0..prev_size)
+                    .map(|k| {
+                        let mut sum = 0.0;
+                        for (j, delta) in delta.iter().enumerate() {
+                            sum += self.layers[l].weights[k][j] * delta;
+                        }
+                        sum
+                    })
+                    .collect();
+                prev_fn.derivative(&mut prev_z);
+
                 delta = prev_delta
                     .into_iter()
-                    .zip(prev_fn.derivative(prev_z.clone()))
+                    .zip(&prev_z)
                     .map(|(p, d)| p * d)
                     .collect();
             }

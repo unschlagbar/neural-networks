@@ -5,13 +5,13 @@ use rand::{Rng, rng};
 pub struct LearningLayer {
     pub weights: Matrix,
     pub biases: Box<[f32]>,
-    pub activation_fn: ActivationFn,
+    pub activation_fn: Activation,
     pub last_input: Box<[f32]>,
     pub last_z: Box<[f32]>,
 }
 
 impl LearningLayer {
-    pub fn random(inputs: usize, size: usize, activation_fn: ActivationFn) -> Self {
+    pub fn random(inputs: usize, size: usize, activation_fn: Activation) -> Self {
         let mut rng = rng();
 
         let weights: Vec<f32> = (0..inputs * size)
@@ -43,7 +43,8 @@ impl LearningLayer {
         }
         self.last_z.copy_from_slice(&z);
 
-        self.activation_fn.activate(z)
+        self.activation_fn.activate(&mut z);
+        z
     }
 
     pub fn forward_no_activation(&mut self, input: &[f32]) -> Box<[f32]> {
@@ -58,8 +59,6 @@ impl LearningLayer {
         }
         self.last_z.copy_from_slice(&z);
         z
-
-        //self.activation_fn.activate(z)
     }
 
     pub const fn input_size(&self) -> usize {
@@ -72,7 +71,7 @@ impl LearningLayer {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ActivationFn {
+pub enum Activation {
     Relu,
     Sigmoid,
     Tanh,
@@ -80,32 +79,42 @@ pub enum ActivationFn {
     Linear,
 }
 
-impl ActivationFn {
-    pub fn activate(&self, x: Box<[f32]>) -> Box<[f32]> {
+impl Activation {
+    pub fn activate(&self, x: &mut [f32]) {
         match self {
-            Self::Relu => x.into_iter().map(|x| x.max(0.0)).collect(),
-            Self::Sigmoid => x.into_iter().map(|x| sigmoid(x)).collect(),
-            Self::Tanh => x.into_iter().map(|x| x.tanh()).collect(),
-            Self::Softmax => softmax(&x),
-            Self::Linear => x,
+            Self::Relu => x.iter_mut().for_each(|x| *x = x.max(0.0)),
+            Self::Sigmoid => x.iter_mut().for_each(|x| *x = sigmoid(*x)),
+            Self::Tanh => x.iter_mut().for_each(|x| *x = x.tanh()),
+            Self::Softmax => x.copy_from_slice(&softmax(x)),
+            Self::Linear => (),
         }
     }
 
-    pub fn derivative(&self, x: Box<[f32]>) -> Box<[f32]> {
+    pub fn derivative(&self, x: &mut [f32]) {
+        match self {
+            Self::Relu => x
+                .iter_mut()
+                .for_each(|x| *x = if *x > 0.0 { 1.0 } else { 0.0 }),
+            Self::Sigmoid => {
+                self.activate(x);
+                x.iter_mut().for_each(|x| *x = *x * (1.0 - *x));
+            }
+            Self::Tanh => unimplemented!(),
+            Self::Softmax => unimplemented!(),
+            Self::Linear => (),
+        }
+    }
+
+    pub fn derivative_active(&self, x: Box<[f32]>) -> Box<[f32]> {
         match self {
             Self::Relu => x
                 .into_iter()
                 .map(|x| if x > 0.0 { 1.0 } else { 0.0 })
                 .collect(),
-            Self::Sigmoid => self
-                .activate(x)
-                .into_iter()
-                .map(|x| x * (1.0 - x))
-                .collect(),
+            Self::Sigmoid => x.into_iter().map(|x| x * (1.0 - x)).collect(),
             Self::Tanh => unimplemented!(),
             Self::Softmax => unimplemented!(),
             Self::Linear => x,
-
         }
     }
 }

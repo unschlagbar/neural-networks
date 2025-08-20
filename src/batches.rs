@@ -29,20 +29,19 @@ impl<'a, T> Iterator for Batches<'a, T> {
             return None;
         }
 
-        let size: usize;
-        if self.size.end == usize::MAX {
-            size = max_possible_size;
+        let size = if self.size.end == usize::MAX {
+            max_possible_size
         } else {
             let choose_end = self.size.end.min(max_possible_size + 1);
             if self.size.start >= choose_end {
                 return None;
             }
-            size = if self.size.start == self.size.end {
+            if self.size.start == self.size.end {
                 self.size.start
             } else {
                 rand::random_range(self.size.start..choose_end)
-            };
-        }
+            }
+        };
 
         let first = &self.data[self.index..self.index + size];
         let second = &self.data[self.index + 1..self.index + size + 1];
