@@ -18,15 +18,13 @@ fn main() {
     #[allow(unused)]
     let (stoi, itos, vocab_size) = {
         // 1. Trainingsdaten laden (z.B. aus alice.txt)
-        let text = get_all_text();
-        let chars: Vec<char> = text.chars().collect();
+        let chars = fs::read_to_string("charset.txt").expect("Charset konnte nicht gelesen werden");
+        let mut vocab: Vec<char> = chars.chars().collect();
 
-        // 2. Alphabet bauen
-        let mut vocab: Vec<char> = chars.clone();
         vocab.sort();
         vocab.dedup();
+        
         let vocab_size = vocab.len();
-
         println!("Vocab size: {vocab_size}");
 
         // Mappings char->id und id->char
@@ -46,8 +44,9 @@ fn main() {
     } else {
         LSTM::new(&[vocab_size, 512, 512], vocab_size)
     };
+    model.save("Jarvis").unwrap();
 
-    //test(&mut model, &stoi, &itos);
+    test(&mut model, &stoi, &itos);
 
     let mut files: Vec<PathBuf> = fs::read_dir("training_files/")
         .unwrap()
@@ -63,7 +62,7 @@ fn main() {
             .filter_map(|ch| stoi.get(&ch).copied())
             .collect();
 
-        model.train(&data, 1..usize::MAX, 1);
+        model.train(&data, 400..800, 1);
         println!("completed data {i}")
     }
 
@@ -117,37 +116,6 @@ fn build_trainings_set2() {
         fs::write(format!("training_files2/{i}",), &content).unwrap();
         i += 1;
     }
-}
-
-fn get_all_text() -> String {
-    // Datei einlesen
-    let xml = fs::read_to_string("input.xml").expect("Datei konnte nicht gelesen werden");
-
-    let mut search_start = 0;
-
-    let start_tag = "<rohtext>";
-    let end_tag = "</rohtext>";
-
-    let mut i = 0;
-    let mut contents = String::new();
-
-    while let Some(start) = xml[search_start..].find(start_tag) {
-        let start_index = search_start + start + start_tag.len() + 2;
-
-        if let Some(end) = xml[start_index..].find(end_tag) {
-            let end_index = start_index + end - 2;
-            let content = &xml[start_index..end_index];
-            fs::write(format!("training_files/{i}",), content).unwrap();
-            contents.push_str(content);
-
-            search_start = end_index + end_tag.len();
-        } else {
-            break; // kein schließendes Tag mehr gefunden
-        }
-        i += 1;
-    }
-
-    contents
 }
 
 pub fn test(model: &mut LSTM, stoi: &HashMap<char, u16>, itos: &[char]) {

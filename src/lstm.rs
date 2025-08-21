@@ -52,63 +52,47 @@ impl LSTMLayer {
         }
     }
 
-    pub fn forward(&mut self, input: Vec<f32>) -> LSTMCache {
+    pub fn forward(&mut self, input: &[f32]) -> LSTMCache {
         let states_prev = self.d.clone();
 
-        let mut xh = input;
+        // Combine input + previous hidden state
+        let mut xh = Vec::with_capacity(self.input_size + self.hidden_size);
+        xh.extend_from_slice(input);
         xh.extend_from_slice(&states_prev[DH]);
-        let xh = xh.into_boxed_slice();
 
-        let ft: Box<[f32]> = self
-            .wf
-            .row_mul(&xh)
-            .into_iter()
-            .zip(&self.b[F])
-            .map(|(x, b)| sigmoid(x + b))
-            .collect();
-        let it: Box<[f32]> = self
-            .wi
-            .row_mul(&xh)
-            .into_iter()
-            .zip(&self.b[I])
-            .map(|(x, b)| sigmoid(x + b))
-            .collect();
-        let ct: Box<[f32]> = self
-            .wc
-            .row_mul(&xh)
-            .into_iter()
-            .zip(&self.b[C])
-            .map(|(x, b)| (x + b).tanh())
-            .collect();
-        self.d[DC].copy_from_slice(&add_vec(
-            &mul_vec(&ft, &states_prev[DC]),
-            &mul_vec(&it, &ct),
-        ));
-        let ot: Box<[f32]> = self
-            .wo
-            .row_mul(&xh)
-            .into_iter()
-            .zip(&self.b[O])
-            .map(|(x, b)| sigmoid(x + b))
-            .collect();
+        // Compute gates with minimal allocations
+        let mut ft = self.wf.row_mul(&xh);
+        let mut it = self.wi.row_mul(&xh);
+        let mut ct = self.wc.row_mul(&xh);
+        let mut ot = self.wo.row_mul(&xh);
 
-        let new_dh = mul_vec(
-            &ot,
-            &self.d[DC]
-                .iter()
-                .copied()
-                .map(|x| x.tanh())
-                .collect::<Box<[f32]>>(),
-        );
+        let h = self.hidden_size;
 
-        self.d[DH].copy_from_slice(&new_dh);
+        for j in 0..h {
+            ft[j] = sigmoid(ft[j] + self.b[F][j]);
+            it[j] = sigmoid(it[j] + self.b[I][j]);
+            ct[j] = (ct[j] + self.b[C][j]).tanh();
+            ot[j] = sigmoid(ot[j] + self.b[O][j]);
+        }
+
+        // Update cell state: c_t = f_t * c_{t-1} + i_t * c~_t
+        let prev_c = &states_prev[DC];
+        for j in 0..h {
+            self.d[DC][j] = ft[j] * prev_c[j] + it[j] * ct[j];
+        }
+
+        // Compute hidden state: h_t = o_t * tanh(c_t)
+        for j in 0..h {
+            self.d[DH][j] = ot[j] * self.d[DC][j].tanh();
+        }
+
         LSTMCache {
-            xh,
+            xh: xh.into_boxed_slice(),
             states_prev,
-            ft,
-            it,
-            ct,
-            ot,
+            ft: ft.into_boxed_slice(),
+            it: it.into_boxed_slice(),
+            ct: ct.into_boxed_slice(),
+            ot: ot.into_boxed_slice(),
             states: self.d.clone(),
         }
     }
@@ -200,11 +184,7 @@ impl LSTMLayer {
         let dx = dconcat;
 
         // dc_prev (for previous time-step) = dc ⊙ f_t
-        let dc_prev: Vec<f32> = dc
-            .iter()
-            .zip(&cache.ft)
-            .map(|(a, b)| a * b)
-            .collect();
+        let dc_prev: Vec<f32> = dc.iter().zip(&cache.ft).map(|(a, b)| a * b).collect();
 
         (dh_prev, dc_prev, dx)
     }
@@ -230,7 +210,6 @@ impl LSTM {
             layers: Vec::with_capacity(layers.len()),
             wy: Matrix::zeros(output_layer.weights.rows(), output_layer.weights.cols()),
             by: vec![0.0; output_layer.biases.len()].into(),
-            d_prev: Vec::with_capacity(layers.len()),
         };
 
         for layer in &layers {
@@ -243,7 +222,6 @@ impl LSTM {
 
                 b: Matrix::zeros(4, layer.hidden_size),
             });
-            grads.d_prev.push(Matrix::zeros(2, layer.hidden_size));
         }
 
         Self {
@@ -296,7 +274,7 @@ impl LSTM {
             println!("forward time: {:?}", forward_time / steps.max(1));
             println!("backward time: {:?}", backwards_time / steps.max(1));
         }
-        self.clear_grads();
+        self.scale_grads(0.5);
     }
 
     pub fn forward_sequence(&mut self, input: &[u16]) -> (Vec<Vec<LSTMCache>>, Matrix) {
@@ -306,11 +284,11 @@ impl LSTM {
 
         for t in 0..t {
             caches.push(Vec::with_capacity(self.layers.len()));
-            let mut input_vec = one_hot(input[t] as _, self.layers.first().unwrap().input_size);
+            let mut input_vec: &[f32] = &one_hot(input[t] as _, self.layers.first().unwrap().input_size);
 
             for layer in &mut self.layers {
                 caches[t].push(layer.forward(input_vec));
-                input_vec = layer.d[DH].to_vec();
+                input_vec = &layer.d[DH];
             }
 
             props_list[t].copy_from_slice(&self.output_layer.forward(&input_vec));
@@ -323,12 +301,11 @@ impl LSTM {
         let mut logits_list = Matrix::uninit(t, self.output_layer.weights.cols());
 
         for t in 0..t {
-            let mut input_vec =
-                one_hot(input[t] as _, self.layers.first().unwrap().input_size);
+            let mut input_vec: &[f32] = &one_hot(input[t] as _, self.layers.first().unwrap().input_size);
 
             for layer in &mut self.layers {
                 layer.forward(input_vec);
-                input_vec = layer.d[DH].to_vec();
+                input_vec = &layer.d[DH];
             }
 
             logits_list[t].copy_from_slice(&self.output_layer.forward_no_activation(&input_vec));
@@ -385,10 +362,6 @@ impl LSTM {
                     &mut dc_next[l],
                     &mut self.grads.layers[l],
                 );
-
-                // store dh/dc for previous time-step usage
-                self.grads.d_prev[l][DH].copy_from_slice(&dh_prev);
-                self.grads.d_prev[l][DC].copy_from_slice(&dc_prev);
 
                 // prepare dh_layer for next (lower) layer: combine dh_next from same time-step and dx
                 if l > 0 {
@@ -596,7 +569,6 @@ pub struct LSTMGrads {
     pub layers: Vec<LSTMLayerGrads>,
     pub wy: Matrix,
     pub by: Box<[f32]>,
-    pub d_prev: Vec<Matrix>,
 }
 
 pub struct LSTMLayerGrads {
@@ -612,16 +584,6 @@ fn one_hot(index: usize, size: usize) -> Vec<f32> {
     let mut out = vec![0.0; size];
     out[index] = 1.0;
     out
-}
-
-fn mul_vec(x: &[f32], y: &[f32]) -> Vec<f32> {
-    assert_eq!(x.len(), y.len());
-    x.iter().zip(y).map(|(x, y)| x * y).collect()
-}
-
-fn add_vec(x: &[f32], y: &[f32]) -> Vec<f32> {
-    assert_eq!(x.len(), y.len());
-    x.iter().zip(y).map(|(x, y)| x + y).collect()
 }
 
 fn add_vec_in_place(x: &mut [f32], y: &[f32]) {
