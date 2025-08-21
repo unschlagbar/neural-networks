@@ -46,7 +46,7 @@ fn main() {
     };
     model.save("Jarvis").unwrap();
 
-    test(&mut model, &stoi, &itos);
+    //test(&mut model, &stoi, &itos);
 
     let mut files: Vec<PathBuf> = fs::read_dir("training_files/")
         .unwrap()
