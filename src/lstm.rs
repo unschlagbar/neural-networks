@@ -100,8 +100,8 @@ impl LSTMLayer {
     pub fn backwards(
         &mut self,
         mut cache: LSTMCache,
-        dh: &mut [f32],
-        dc_next: &mut [f32],
+        dh: &[f32],
+        dc_next: &[f32],
         grads: &mut LSTMLayerGrads,
     ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let h = self.hidden_size;
@@ -111,22 +111,23 @@ impl LSTMLayer {
         // Note: caller already used Activation::Tanh.activate in original; keep same order:
         Activation::Tanh.activate(&mut cache.states[DC]);
 
+        let mut ds = vec![0.0; h * 4];
+        let (do_, split) = ds.split_at_mut(h);
+        let (df, split) = split.split_at_mut(h);
+        let (di, dct) = split.split_at_mut(h);
+
         // 2) do = dh ⊙ tanh(c) * σ'(o)
-        let mut do_ = vec![0.0f32; h];
         for i in 0..h {
             do_[i] = dh[i] * cache.states[DC][i] * dsigmoid_from_y(cache.ot[i]);
         }
 
         // 3) dc = dh ⊙ o * (1 - tanh(c)^2) + dc_next
-        let mut dc = dc_next.to_vec(); // small allocation: size = hidden_size
+        let mut dc = dc_next.to_vec();
         for i in 0..h {
             dc[i] += dh[i] * cache.ot[i] * dtanh_from_y(cache.states[DC][i]);
         }
 
         // 4) gate grads: df, di, dct
-        let mut df = vec![0.0f32; h];
-        let mut di = vec![0.0f32; h];
-        let mut dct = vec![0.0f32; h];
         for i in 0..h {
             df[i] = dc[i] * cache.states_prev[DC][i] * dsigmoid_from_y(cache.ft[i]);
             di[i] = dc[i] * cache.ct[i] * dsigmoid_from_y(cache.it[i]);
@@ -162,13 +163,13 @@ impl LSTMLayer {
 
         // 6) backprop to inputs+prev-hidden: dconcat = Wf^T * df + Wi^T * di + ...
         // compute row-wise accumulation to keep contiguous memory access on W rows
-        let mut dconcat = vec![0.0f32; rows];
+        let mut dconcat = vec![0.0; rows];
         for i in 0..rows {
             let wf_row = &self.wf[i];
             let wi_row = &self.wi[i];
             let wc_row = &self.wc[i];
             let wo_row = &self.wo[i];
-            let mut s = 0.0f32;
+            let mut s = 0.0;
             // sum over columns (hidden units)
             for j in 0..h {
                 s += wf_row[j] * df[j];
@@ -231,7 +232,7 @@ impl LSTM {
         }
     }
 
-    pub fn train(&mut self, input: &[u16], seq_len: Range<usize>, epochs: usize) {
+    pub fn train(&mut self, input: &[u16], size: Range<usize>, separators: &[u16], epochs: usize) {
         for layer in &mut self.layers {
             layer.d.clear();
         }
@@ -242,7 +243,7 @@ impl LSTM {
             let mut total_loss = 0.0;
             let mut steps = 0;
 
-            for (inputs, targets) in Batches::new(input, seq_len.clone()) {
+            for (inputs, targets) in Batches::new(input, separators, size.clone()) {
                 let forward_start_time = Instant::now();
                 let (caches, probs_list) = self.forward_sequence(inputs);
                 forward_time += forward_start_time.elapsed();
@@ -257,7 +258,7 @@ impl LSTM {
                 backwards_time += backwards_start_time.elapsed();
 
                 self.sgd_step(0.001);
-                self.scale_grads(0.7);
+                self.scale_grads(0.5);
             }
 
             println!(
@@ -274,7 +275,8 @@ impl LSTM {
             println!("forward time: {:?}", forward_time / steps.max(1));
             println!("backward time: {:?}", backwards_time / steps.max(1));
         }
-        self.scale_grads(0.5);
+        self.sgd_step(0.001);
+        self.scale_grads(0.25);
     }
 
     pub fn forward_sequence(&mut self, input: &[u16]) -> (Vec<Vec<LSTMCache>>, Matrix) {
@@ -284,7 +286,8 @@ impl LSTM {
 
         for t in 0..t {
             caches.push(Vec::with_capacity(self.layers.len()));
-            let mut input_vec: &[f32] = &one_hot(input[t] as _, self.layers.first().unwrap().input_size);
+            let mut input_vec: &[f32] =
+                &one_hot(input[t] as _, self.layers.first().unwrap().input_size);
 
             for layer in &mut self.layers {
                 caches[t].push(layer.forward(input_vec));
@@ -301,7 +304,8 @@ impl LSTM {
         let mut logits_list = Matrix::uninit(t, self.output_layer.weights.cols());
 
         for t in 0..t {
-            let mut input_vec: &[f32] = &one_hot(input[t] as _, self.layers.first().unwrap().input_size);
+            let mut input_vec: &[f32] =
+                &one_hot(input[t] as _, self.layers.first().unwrap().input_size);
 
             for layer in &mut self.layers {
                 layer.forward(input_vec);
@@ -356,12 +360,8 @@ impl LSTM {
 
                 // call the new per-layer backward that returns dh_prev, dc_prev, dx
                 // note: pass mutable refs to dh_layer and dc_next[l] so function can read them
-                let (dh_prev, dc_prev, dx) = layer.backwards(
-                    cache,
-                    &mut dh_layer,
-                    &mut dc_next[l],
-                    &mut self.grads.layers[l],
-                );
+                let (dh_prev, dc_prev, dx) =
+                    layer.backwards(cache, &dh_layer, &dc_next[l], &mut self.grads.layers[l]);
 
                 // prepare dh_layer for next (lower) layer: combine dh_next from same time-step and dx
                 if l > 0 {

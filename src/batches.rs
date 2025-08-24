@@ -1,52 +1,85 @@
+use rand::random_range;
 use std::ops::Range;
 
 pub struct Batches<'a, T> {
     data: &'a [T],
+    separators: &'a [T],
     size: Range<usize>,
     index: usize,
 }
 
-impl<'a, T> Batches<'a, T> {
-    pub fn new(data: &'a [T], size: Range<usize>) -> Self {
+impl<'a, T: PartialEq> Batches<'a, T> {
+    pub fn new(data: &'a [T], separators: &'a [T], size: Range<usize>) -> Self {
         Self {
             data,
+            separators,
             size,
             index: 0,
         }
     }
 }
 
-impl<'a, T> Iterator for Batches<'a, T> {
+impl<'a, T: PartialEq> Iterator for Batches<'a, T> {
     type Item = (&'a [T], &'a [T]);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let remaining = self.data.len() - self.index;
-        if remaining < 1 {
-            return None;
-        }
-        let max_possible_size = remaining - 1;
-        if max_possible_size < self.size.start {
-            return None;
-        }
+        let len = self.data.len();
 
-        let size = if self.size.end == usize::MAX {
-            max_possible_size
-        } else {
-            let choose_end = self.size.end.min(max_possible_size + 1);
-            if self.size.start >= choose_end {
+        while self.index < len {
+            let start = self.index;
+
+            // ---- Modus 1: Separator ----
+            if !self.separators.is_empty() {
+                while self.index < len && !self.separators.contains(&self.data[self.index]) {
+                    self.index += 1;
+                }
+
+                if self.index < len {
+                    let end = self.index;
+                    self.index += 1; // Separator konsumieren
+
+                    let sentence = &self.data[start..=end]; // inkl. Separator
+
+                    // Nur zurückgeben, wenn Satz > 2 Tokens
+                    if sentence.len() > 2 {
+                        let input = &sentence[..sentence.len() - 1];
+                        let target = &sentence[1..];
+                        return Some((input, target));
+                    } else {
+                        continue; // zu kurz → nächste Iteration
+                    }
+                }
+            }
+
+            // ---- Modus 2: Random-Länge oder Reststück ----
+            let remaining = len - start;
+
+            // Wenn zu kurz → überspringen
+            if remaining <= 2 {
+                self.index = len; // fertig
                 return None;
             }
-            if self.size.start == self.size.end {
-                self.size.start
+
+            let min_len = self.size.start.max(3); // mindestens 3
+            let max_len = self.size.end.min(remaining);
+
+            let length = if remaining <= min_len {
+                remaining // Reststück, >2 hier gesichert
+            } else if min_len >= max_len {
+                min_len
             } else {
-                rand::random_range(self.size.start..choose_end)
-            }
-        };
+                random_range(min_len..=max_len)
+            };
 
-        let first = &self.data[self.index..self.index + size];
-        let second = &self.data[self.index + 1..self.index + size + 1];
+            let input_end = start + length - 1;
+            let input = &self.data[start..input_end];
+            let target = &self.data[start + 1..start + length];
 
-        self.index += size;
-        Some((first, second))
+            self.index = start + length;
+
+            return Some((input, target));
+        }
+
+        None
     }
 }

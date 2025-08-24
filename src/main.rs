@@ -23,7 +23,7 @@ fn main() {
 
         vocab.sort();
         vocab.dedup();
-        
+
         let vocab_size = vocab.len();
         println!("Vocab size: {vocab_size}");
 
@@ -42,11 +42,11 @@ fn main() {
     let mut model = if let Ok(model) = LSTM::load("Jarvis") {
         model
     } else {
-        LSTM::new(&[vocab_size, 512, 512], vocab_size)
+        LSTM::new(&[vocab_size, 128, 128], vocab_size)
     };
     model.save("Jarvis").unwrap();
 
-    //test(&mut model, &stoi, &itos);
+    test(&mut model, &stoi, &itos);
 
     let mut files: Vec<PathBuf> = fs::read_dir("training_files/")
         .unwrap()
@@ -62,7 +62,7 @@ fn main() {
             .filter_map(|ch| stoi.get(&ch).copied())
             .collect();
 
-        model.train(&data, 400..800, 1);
+        model.train(&data, 0..0, &[stoi[&'.'], stoi[&'!'], stoi[&'?']], 1);
         println!("completed data {i}")
     }
 
@@ -91,6 +91,9 @@ fn build_trainings_set() {
             let mut content = xml[start_index..end_index].to_string();
             content = content.replace("&quot;", "");
             content = content.replace('\u{00A0}', "");
+            content = content.replace('\u{00AD}', "");
+            content = content.replace('\u{2013}', "\u{002d}");
+            content = content.replace('\u{2018}', "\u{0060}");
             fs::write(format!("training_files/{i}",), &content).unwrap();
 
             search_start = end_index + end_tag.len();
