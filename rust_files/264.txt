@@ -1,0 +1,63 @@
+pub mod axe;
+pub mod bucket;
+pub mod dye;
+pub mod egg;
+pub mod ender_eye;
+pub mod glowing_ink_sac;
+pub mod hoe;
+pub mod honeycomb;
+pub mod ignite;
+pub mod ink_sac;
+pub mod mace;
+pub mod minecart;
+pub mod shovel;
+pub mod snowball;
+pub mod swords;
+pub mod trident;
+
+use crate::item::items::minecart::MinecartItem;
+
+use super::registry::ItemRegistry;
+use axe::AxeItem;
+use bucket::{EmptyBucketItem, FilledBucketItem};
+use dye::DyeItem;
+use egg::EggItem;
+use ender_eye::EnderEyeItem;
+use glowing_ink_sac::GlowingInkSacItem;
+use hoe::HoeItem;
+use honeycomb::HoneyCombItem;
+use ignite::fire_charge::FireChargeItem;
+use ignite::flint_and_steel::FlintAndSteelItem;
+use ink_sac::InkSacItem;
+use mace::MaceItem;
+use shovel::ShovelItem;
+use snowball::SnowBallItem;
+use std::sync::Arc;
+use swords::SwordItem;
+use trident::TridentItem;
+
+#[must_use]
+pub fn default_registry() -> Arc<ItemRegistry> {
+    let mut manager = ItemRegistry::default();
+
+    manager.register(SnowBallItem);
+    manager.register(HoeItem);
+    manager.register(EggItem);
+    manager.register(FlintAndSteelItem);
+    manager.register(SwordItem);
+    manager.register(MaceItem);
+    manager.register(TridentItem);
+    manager.register(EmptyBucketItem);
+    manager.register(FilledBucketItem);
+    manager.register(ShovelItem);
+    manager.register(AxeItem);
+    manager.register(MinecartItem);
+    manager.register(HoneyCombItem);
+    manager.register(EnderEyeItem);
+    manager.register(FireChargeItem);
+    manager.register(DyeItem);
+    manager.register(InkSacItem);
+    manager.register(GlowingInkSacItem);
+
+    Arc::new(manager)
+}

@@ -232,7 +232,7 @@ impl LSTM {
         }
     }
 
-    pub fn train(&mut self, input: &[u16], size: Range<usize>, separators: &[u16], epochs: usize) {
+    pub fn train(&mut self, input: &[u16], size: Range<usize>, separators: &[u16], epochs: usize, lr: f32) {
         for layer in &mut self.layers {
             layer.d.clear();
         }
@@ -257,7 +257,7 @@ impl LSTM {
                 self.backwards_sequence(inputs, targets, caches, probs_list);
                 backwards_time += backwards_start_time.elapsed();
 
-                self.sgd_step(0.001);
+                self.sgd_step(lr);
                 self.scale_grads(0.5);
             }
 

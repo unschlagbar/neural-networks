@@ -1,0 +1,11 @@
+#[must_use]
+pub const fn get_recipe_remainder_id(item_id: u16) -> Option<u16> {
+    match item_id {
+        968u16 => Some(967u16),
+        969u16 => Some(967u16),
+        973u16 => Some(967u16),
+        1238u16 => Some(1075u16),
+        1308u16 => Some(1075u16),
+        _ => None,
+    }
+}

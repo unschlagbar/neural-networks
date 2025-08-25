@@ -1,0 +1,528 @@
+use crate::tag::{Item, RegistryKey, Tag, Taggable};
+use std::hash::{Hash, Hasher};
+#[derive(Debug)]
+pub struct Enchantment {
+    pub id: u8,
+    pub name: &'static str,
+    pub registry_key: &'static str,
+    pub anvil_cost: u32,
+    pub supported_items: &'static Tag,
+    pub max_level: i32,
+    pub slots: &'static [AttributeModifierSlot],
+}
+impl Taggable for Enchantment {
+    #[inline]
+    fn tag_key() -> RegistryKey {
+        RegistryKey::Enchantment
+    }
+    #[inline]
+    fn registry_key(&self) -> &str {
+        self.registry_key
+    }
+    #[inline]
+    fn registry_id(&self) -> u16 {
+        self.id as u16
+    }
+}
+impl PartialEq for Enchantment {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for Enchantment {}
+impl Hash for Enchantment {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+#[derive(Debug, Clone, Hash, PartialEq)]
+pub enum AttributeModifierSlot {
+    Any,
+    MainHand,
+    OffHand,
+    Hand,
+    Feet,
+    Legs,
+    Chest,
+    Head,
+    Armor,
+    Body,
+    Saddle,
+}
+impl Enchantment {
+    pub const AQUA_AFFINITY: Enchantment = Enchantment {
+        id: 0u8,
+        name: "minecraft:aqua_affinity",
+        registry_key: "aqua_affinity",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_HEAD_ARMOR,
+        max_level: 1i32,
+        slots: &[AttributeModifierSlot::Head],
+    };
+    pub const BANE_OF_ARTHROPODS: Enchantment = Enchantment {
+        id: 1u8,
+        name: "minecraft:bane_of_arthropods",
+        registry_key: "bane_of_arthropods",
+        anvil_cost: 2u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_WEAPON,
+        max_level: 5i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const BINDING_CURSE: Enchantment = Enchantment {
+        id: 2u8,
+        name: "minecraft:binding_curse",
+        registry_key: "binding_curse",
+        anvil_cost: 8u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_EQUIPPABLE,
+        max_level: 1i32,
+        slots: &[AttributeModifierSlot::Armor],
+    };
+    pub const BLAST_PROTECTION: Enchantment = Enchantment {
+        id: 3u8,
+        name: "minecraft:blast_protection",
+        registry_key: "blast_protection",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_ARMOR,
+        max_level: 4i32,
+        slots: &[AttributeModifierSlot::Armor],
+    };
+    pub const BREACH: Enchantment = Enchantment {
+        id: 4u8,
+        name: "minecraft:breach",
+        registry_key: "breach",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_MACE,
+        max_level: 4i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const CHANNELING: Enchantment = Enchantment {
+        id: 5u8,
+        name: "minecraft:channeling",
+        registry_key: "channeling",
+        anvil_cost: 8u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_TRIDENT,
+        max_level: 1i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const DENSITY: Enchantment = Enchantment {
+        id: 6u8,
+        name: "minecraft:density",
+        registry_key: "density",
+        anvil_cost: 2u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_MACE,
+        max_level: 5i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const DEPTH_STRIDER: Enchantment = Enchantment {
+        id: 7u8,
+        name: "minecraft:depth_strider",
+        registry_key: "depth_strider",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_FOOT_ARMOR,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::Feet],
+    };
+    pub const EFFICIENCY: Enchantment = Enchantment {
+        id: 8u8,
+        name: "minecraft:efficiency",
+        registry_key: "efficiency",
+        anvil_cost: 1u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_MINING,
+        max_level: 5i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const FEATHER_FALLING: Enchantment = Enchantment {
+        id: 9u8,
+        name: "minecraft:feather_falling",
+        registry_key: "feather_falling",
+        anvil_cost: 2u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_FOOT_ARMOR,
+        max_level: 4i32,
+        slots: &[AttributeModifierSlot::Armor],
+    };
+    pub const FIRE_ASPECT: Enchantment = Enchantment {
+        id: 10u8,
+        name: "minecraft:fire_aspect",
+        registry_key: "fire_aspect",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_FIRE_ASPECT,
+        max_level: 2i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const FIRE_PROTECTION: Enchantment = Enchantment {
+        id: 11u8,
+        name: "minecraft:fire_protection",
+        registry_key: "fire_protection",
+        anvil_cost: 2u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_ARMOR,
+        max_level: 4i32,
+        slots: &[AttributeModifierSlot::Armor],
+    };
+    pub const FLAME: Enchantment = Enchantment {
+        id: 12u8,
+        name: "minecraft:flame",
+        registry_key: "flame",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_BOW,
+        max_level: 1i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const FORTUNE: Enchantment = Enchantment {
+        id: 13u8,
+        name: "minecraft:fortune",
+        registry_key: "fortune",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_MINING_LOOT,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const FROST_WALKER: Enchantment = Enchantment {
+        id: 14u8,
+        name: "minecraft:frost_walker",
+        registry_key: "frost_walker",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_FOOT_ARMOR,
+        max_level: 2i32,
+        slots: &[AttributeModifierSlot::Feet],
+    };
+    pub const IMPALING: Enchantment = Enchantment {
+        id: 15u8,
+        name: "minecraft:impaling",
+        registry_key: "impaling",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_TRIDENT,
+        max_level: 5i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const INFINITY: Enchantment = Enchantment {
+        id: 16u8,
+        name: "minecraft:infinity",
+        registry_key: "infinity",
+        anvil_cost: 8u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_BOW,
+        max_level: 1i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const KNOCKBACK: Enchantment = Enchantment {
+        id: 17u8,
+        name: "minecraft:knockback",
+        registry_key: "knockback",
+        anvil_cost: 2u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_SWORD,
+        max_level: 2i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const LOOTING: Enchantment = Enchantment {
+        id: 18u8,
+        name: "minecraft:looting",
+        registry_key: "looting",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_SWORD,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const LOYALTY: Enchantment = Enchantment {
+        id: 19u8,
+        name: "minecraft:loyalty",
+        registry_key: "loyalty",
+        anvil_cost: 2u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_TRIDENT,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const LUCK_OF_THE_SEA: Enchantment = Enchantment {
+        id: 20u8,
+        name: "minecraft:luck_of_the_sea",
+        registry_key: "luck_of_the_sea",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_FISHING,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const LURE: Enchantment = Enchantment {
+        id: 21u8,
+        name: "minecraft:lure",
+        registry_key: "lure",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_FISHING,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const MENDING: Enchantment = Enchantment {
+        id: 22u8,
+        name: "minecraft:mending",
+        registry_key: "mending",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_DURABILITY,
+        max_level: 1i32,
+        slots: &[AttributeModifierSlot::Any],
+    };
+    pub const MULTISHOT: Enchantment = Enchantment {
+        id: 23u8,
+        name: "minecraft:multishot",
+        registry_key: "multishot",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_CROSSBOW,
+        max_level: 1i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const PIERCING: Enchantment = Enchantment {
+        id: 24u8,
+        name: "minecraft:piercing",
+        registry_key: "piercing",
+        anvil_cost: 1u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_CROSSBOW,
+        max_level: 4i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const POWER: Enchantment = Enchantment {
+        id: 25u8,
+        name: "minecraft:power",
+        registry_key: "power",
+        anvil_cost: 1u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_BOW,
+        max_level: 5i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const PROJECTILE_PROTECTION: Enchantment = Enchantment {
+        id: 26u8,
+        name: "minecraft:projectile_protection",
+        registry_key: "projectile_protection",
+        anvil_cost: 2u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_ARMOR,
+        max_level: 4i32,
+        slots: &[AttributeModifierSlot::Armor],
+    };
+    pub const PROTECTION: Enchantment = Enchantment {
+        id: 27u8,
+        name: "minecraft:protection",
+        registry_key: "protection",
+        anvil_cost: 1u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_ARMOR,
+        max_level: 4i32,
+        slots: &[AttributeModifierSlot::Armor],
+    };
+    pub const PUNCH: Enchantment = Enchantment {
+        id: 28u8,
+        name: "minecraft:punch",
+        registry_key: "punch",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_BOW,
+        max_level: 2i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const QUICK_CHARGE: Enchantment = Enchantment {
+        id: 29u8,
+        name: "minecraft:quick_charge",
+        registry_key: "quick_charge",
+        anvil_cost: 2u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_CROSSBOW,
+        max_level: 3i32,
+        slots: &[
+            AttributeModifierSlot::MainHand,
+            AttributeModifierSlot::OffHand,
+        ],
+    };
+    pub const RESPIRATION: Enchantment = Enchantment {
+        id: 30u8,
+        name: "minecraft:respiration",
+        registry_key: "respiration",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_HEAD_ARMOR,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::Head],
+    };
+    pub const RIPTIDE: Enchantment = Enchantment {
+        id: 31u8,
+        name: "minecraft:riptide",
+        registry_key: "riptide",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_TRIDENT,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::Hand],
+    };
+    pub const SHARPNESS: Enchantment = Enchantment {
+        id: 32u8,
+        name: "minecraft:sharpness",
+        registry_key: "sharpness",
+        anvil_cost: 1u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_SHARP_WEAPON,
+        max_level: 5i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const SILK_TOUCH: Enchantment = Enchantment {
+        id: 33u8,
+        name: "minecraft:silk_touch",
+        registry_key: "silk_touch",
+        anvil_cost: 8u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_MINING_LOOT,
+        max_level: 1i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const SMITE: Enchantment = Enchantment {
+        id: 34u8,
+        name: "minecraft:smite",
+        registry_key: "smite",
+        anvil_cost: 2u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_WEAPON,
+        max_level: 5i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const SOUL_SPEED: Enchantment = Enchantment {
+        id: 35u8,
+        name: "minecraft:soul_speed",
+        registry_key: "soul_speed",
+        anvil_cost: 8u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_FOOT_ARMOR,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::Feet],
+    };
+    pub const SWEEPING_EDGE: Enchantment = Enchantment {
+        id: 36u8,
+        name: "minecraft:sweeping_edge",
+        registry_key: "sweeping_edge",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_SWORD,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub const SWIFT_SNEAK: Enchantment = Enchantment {
+        id: 37u8,
+        name: "minecraft:swift_sneak",
+        registry_key: "swift_sneak",
+        anvil_cost: 8u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_LEG_ARMOR,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::Legs],
+    };
+    pub const THORNS: Enchantment = Enchantment {
+        id: 38u8,
+        name: "minecraft:thorns",
+        registry_key: "thorns",
+        anvil_cost: 8u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_ARMOR,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::Any],
+    };
+    pub const UNBREAKING: Enchantment = Enchantment {
+        id: 39u8,
+        name: "minecraft:unbreaking",
+        registry_key: "unbreaking",
+        anvil_cost: 2u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_DURABILITY,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::Any],
+    };
+    pub const VANISHING_CURSE: Enchantment = Enchantment {
+        id: 40u8,
+        name: "minecraft:vanishing_curse",
+        registry_key: "vanishing_curse",
+        anvil_cost: 8u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_VANISHING,
+        max_level: 1i32,
+        slots: &[AttributeModifierSlot::Any],
+    };
+    pub const WIND_BURST: Enchantment = Enchantment {
+        id: 41u8,
+        name: "minecraft:wind_burst",
+        registry_key: "wind_burst",
+        anvil_cost: 4u32,
+        supported_items: &Item::MINECRAFT_ENCHANTABLE_MACE,
+        max_level: 3i32,
+        slots: &[AttributeModifierSlot::MainHand],
+    };
+    pub fn from_name(name: &str) -> Option<&'static Self> {
+        match name {
+            "minecraft:aqua_affinity" => Some(&Self::AQUA_AFFINITY),
+            "minecraft:bane_of_arthropods" => Some(&Self::BANE_OF_ARTHROPODS),
+            "minecraft:binding_curse" => Some(&Self::BINDING_CURSE),
+            "minecraft:blast_protection" => Some(&Self::BLAST_PROTECTION),
+            "minecraft:breach" => Some(&Self::BREACH),
+            "minecraft:channeling" => Some(&Self::CHANNELING),
+            "minecraft:density" => Some(&Self::DENSITY),
+            "minecraft:depth_strider" => Some(&Self::DEPTH_STRIDER),
+            "minecraft:efficiency" => Some(&Self::EFFICIENCY),
+            "minecraft:feather_falling" => Some(&Self::FEATHER_FALLING),
+            "minecraft:fire_aspect" => Some(&Self::FIRE_ASPECT),
+            "minecraft:fire_protection" => Some(&Self::FIRE_PROTECTION),
+            "minecraft:flame" => Some(&Self::FLAME),
+            "minecraft:fortune" => Some(&Self::FORTUNE),
+            "minecraft:frost_walker" => Some(&Self::FROST_WALKER),
+            "minecraft:impaling" => Some(&Self::IMPALING),
+            "minecraft:infinity" => Some(&Self::INFINITY),
+            "minecraft:knockback" => Some(&Self::KNOCKBACK),
+            "minecraft:looting" => Some(&Self::LOOTING),
+            "minecraft:loyalty" => Some(&Self::LOYALTY),
+            "minecraft:luck_of_the_sea" => Some(&Self::LUCK_OF_THE_SEA),
+            "minecraft:lure" => Some(&Self::LURE),
+            "minecraft:mending" => Some(&Self::MENDING),
+            "minecraft:multishot" => Some(&Self::MULTISHOT),
+            "minecraft:piercing" => Some(&Self::PIERCING),
+            "minecraft:power" => Some(&Self::POWER),
+            "minecraft:projectile_protection" => Some(&Self::PROJECTILE_PROTECTION),
+            "minecraft:protection" => Some(&Self::PROTECTION),
+            "minecraft:punch" => Some(&Self::PUNCH),
+            "minecraft:quick_charge" => Some(&Self::QUICK_CHARGE),
+            "minecraft:respiration" => Some(&Self::RESPIRATION),
+            "minecraft:riptide" => Some(&Self::RIPTIDE),
+            "minecraft:sharpness" => Some(&Self::SHARPNESS),
+            "minecraft:silk_touch" => Some(&Self::SILK_TOUCH),
+            "minecraft:smite" => Some(&Self::SMITE),
+            "minecraft:soul_speed" => Some(&Self::SOUL_SPEED),
+            "minecraft:sweeping_edge" => Some(&Self::SWEEPING_EDGE),
+            "minecraft:swift_sneak" => Some(&Self::SWIFT_SNEAK),
+            "minecraft:thorns" => Some(&Self::THORNS),
+            "minecraft:unbreaking" => Some(&Self::UNBREAKING),
+            "minecraft:vanishing_curse" => Some(&Self::VANISHING_CURSE),
+            "minecraft:wind_burst" => Some(&Self::WIND_BURST),
+            _ => None,
+        }
+    }
+    pub fn from_id(id: u8) -> Option<&'static Self> {
+        match id {
+            0u8 => Some(&Self::AQUA_AFFINITY),
+            1u8 => Some(&Self::BANE_OF_ARTHROPODS),
+            2u8 => Some(&Self::BINDING_CURSE),
+            3u8 => Some(&Self::BLAST_PROTECTION),
+            4u8 => Some(&Self::BREACH),
+            5u8 => Some(&Self::CHANNELING),
+            6u8 => Some(&Self::DENSITY),
+            7u8 => Some(&Self::DEPTH_STRIDER),
+            8u8 => Some(&Self::EFFICIENCY),
+            9u8 => Some(&Self::FEATHER_FALLING),
+            10u8 => Some(&Self::FIRE_ASPECT),
+            11u8 => Some(&Self::FIRE_PROTECTION),
+            12u8 => Some(&Self::FLAME),
+            13u8 => Some(&Self::FORTUNE),
+            14u8 => Some(&Self::FROST_WALKER),
+            15u8 => Some(&Self::IMPALING),
+            16u8 => Some(&Self::INFINITY),
+            17u8 => Some(&Self::KNOCKBACK),
+            18u8 => Some(&Self::LOOTING),
+            19u8 => Some(&Self::LOYALTY),
+            20u8 => Some(&Self::LUCK_OF_THE_SEA),
+            21u8 => Some(&Self::LURE),
+            22u8 => Some(&Self::MENDING),
+            23u8 => Some(&Self::MULTISHOT),
+            24u8 => Some(&Self::PIERCING),
+            25u8 => Some(&Self::POWER),
+            26u8 => Some(&Self::PROJECTILE_PROTECTION),
+            27u8 => Some(&Self::PROTECTION),
+            28u8 => Some(&Self::PUNCH),
+            29u8 => Some(&Self::QUICK_CHARGE),
+            30u8 => Some(&Self::RESPIRATION),
+            31u8 => Some(&Self::RIPTIDE),
+            32u8 => Some(&Self::SHARPNESS),
+            33u8 => Some(&Self::SILK_TOUCH),
+            34u8 => Some(&Self::SMITE),
+            35u8 => Some(&Self::SOUL_SPEED),
+            36u8 => Some(&Self::SWEEPING_EDGE),
+            37u8 => Some(&Self::SWIFT_SNEAK),
+            38u8 => Some(&Self::THORNS),
+            39u8 => Some(&Self::UNBREAKING),
+            40u8 => Some(&Self::VANISHING_CURSE),
+            41u8 => Some(&Self::WIND_BURST),
+            _ => None,
+        }
+    }
+}

@@ -2,67 +2,51 @@ use rand::rng;
 use rand::seq::SliceRandom;
 
 use crate::lstm::LSTM;
+use crate::tokenizer::Tokenizer;
 
 pub mod batches;
 pub mod jarvis;
 pub mod layer;
 pub mod lstm;
 pub mod mlp;
+pub mod tokenizer;
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::stdin;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     #[allow(unused)]
-    let (stoi, itos, vocab_size) = {
-        // 1. Trainingsdaten laden (z.B. aus alice.txt)
-        let chars = fs::read_to_string("charset.txt").expect("Charset konnte nicht gelesen werden");
-        let mut vocab: Vec<char> = chars.chars().collect();
+    let tokenizer = Tokenizer::new("charset.txt");
 
-        vocab.sort();
-        vocab.dedup();
-
-        let vocab_size = vocab.len();
-        println!("Vocab size: {vocab_size}");
-
-        // Mappings char->id und id->char
-        let mut stoi = HashMap::with_capacity(vocab.len());
-        let mut itos = Vec::with_capacity(vocab.len());
-        for (i, c) in vocab.iter().enumerate() {
-            stoi.insert(*c, i as u16);
-            itos.push(*c);
-        }
-
-        (stoi, itos, vocab_size)
-    };
+    //println!("{:?}", tokenizer.itos);
 
     // 5. Model initialisieren
     let mut model = if let Ok(model) = LSTM::load("Jarvis") {
         model
     } else {
-        LSTM::new(&[vocab_size, 128, 128], vocab_size)
+        let model = LSTM::new(&[tokenizer.vocab_size(), 512, 512], tokenizer.vocab_size());
+        model.save("Jarvis").unwrap();
+        model
     };
-    model.save("Jarvis").unwrap();
 
-    test(&mut model, &stoi, &itos);
+    //test(&mut model, &tokenizer);
 
-    let mut files: Vec<PathBuf> = fs::read_dir("training_files/")
+    let mut files: Vec<PathBuf> = fs::read_dir("rust_files/")
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();
+
+    files.shuffle(&mut rng());
+    files.shuffle(&mut rng());
     files.shuffle(&mut rng());
 
     for (i, entry) in files.iter().enumerate() {
         let content = fs::read_to_string(entry).unwrap();
 
-        let data: Vec<u16> = content
-            .chars()
-            .filter_map(|ch| stoi.get(&ch).copied())
-            .collect();
+        let data: Vec<u16> = tokenizer.to_tokens(&content);
+        model.train(&data, 200..250, &[], 1, 0.001);
 
-        model.train(&data, 0..0, &[stoi[&'.'], stoi[&'!'], stoi[&'?']], 1);
         println!("completed data {i}")
     }
 
@@ -107,32 +91,46 @@ fn build_trainings_set() {
 #[test]
 fn build_trainings_set2() {
     // Datei einlesen
-    let xml = fs::read_to_string("deu_mixed-typical_2011_10K-sentences.txt")
-        .expect("Datei konnte nicht gelesen werden");
+    let mut files = Vec::new();
+    collect_files_recursively(Path::new("C:/Users/e7438/Desktop/Pumpkin"), &mut files);
 
-    fs::create_dir("training_files2").unwrap();
+    let target = "rust_files";
 
-    let mut i = 0;
+    fs::create_dir(target).unwrap();
 
-    for sent in xml.lines() {
-        let content = sent.split_once(' ').unwrap().1;
-        fs::write(format!("training_files2/{i}",), &content).unwrap();
-        i += 1;
+    for (i, content) in files.iter().enumerate() {
+        fs::write(format!("{target}/{i}.txt",), content.trim()).unwrap();
     }
 }
 
-pub fn test(model: &mut LSTM, stoi: &HashMap<char, u16>, itos: &[char]) {
+pub fn test(model: &mut LSTM, tokenizer: &Tokenizer) {
     loop {
         let mut input = String::new();
         stdin().read_line(&mut input).unwrap();
-        let prefix: Box<[u16]> = input
-            .trim()
-            .chars()
-            .filter_map(|ch| stoi.get(&ch).copied())
-            .collect();
+        let prefix = tokenizer.to_tokens(&input.trim());
 
         let output = model.sample(&prefix, 1000, 0.4);
-        let output: String = output.into_iter().map(|i| itos[i as usize]).collect();
+        let output = tokenizer.to_text(&output);
         println!("response: {output}");
+    }
+}
+
+pub fn collect_files_recursively(dir: &Path, files: &mut Vec<String>) {
+    if dir.is_dir() {
+        let entries =
+            fs::read_dir(dir).unwrap_or_else(|_| panic!("Kann Verzeichnis {:?} nicht lesen", dir));
+
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Rekursiver Aufruf für Unterverzeichnisse
+                    collect_files_recursively(&path, files);
+                } else if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rs")
+                {
+                    files.push(fs::read_to_string(path).unwrap());
+                }
+            }
+        }
     }
 }

@@ -46,7 +46,7 @@ impl<'a, T: PartialEq> Iterator for Batches<'a, T> {
                         let target = &sentence[1..];
                         return Some((input, target));
                     } else {
-                        continue; // zu kurz → nächste Iteration
+                        continue; // zu kurz -> nächste Iteration
                     }
                 }
             }
@@ -54,7 +54,7 @@ impl<'a, T: PartialEq> Iterator for Batches<'a, T> {
             // ---- Modus 2: Random-Länge oder Reststück ----
             let remaining = len - start;
 
-            // Wenn zu kurz → überspringen
+            // Wenn zu kurz -> überspringen
             if remaining <= 2 {
                 self.index = len; // fertig
                 return None;

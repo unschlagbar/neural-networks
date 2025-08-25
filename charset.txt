@@ -1,1 +1,1 @@
-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZäöüÄÖÜß0123456789.,;:!?'"„“‘’…–—()[]{}+-*/%=&|^~<>_#@$\€`\\/\t\n 
+abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZäöüÄÖÜß0123456789 .,:;(){}[]+-*/=<>!?&|^%#@~"'`\_$
