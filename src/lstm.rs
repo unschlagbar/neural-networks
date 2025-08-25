@@ -1,7 +1,6 @@
 use std::{
     fs::File,
     io::{self, BufReader, BufWriter, Read, Write},
-    ops::Range,
     time::{Duration, Instant},
 };
 
@@ -232,51 +231,53 @@ impl LSTM {
         }
     }
 
-    pub fn train(&mut self, input: &[u16], size: Range<usize>, separators: &[u16], epochs: usize, lr: f32) {
+    pub fn train(&mut self, data: Batches<u16>, lr: f32, iteration: &mut usize, batch_size: usize) {
         for layer in &mut self.layers {
             layer.d.clear();
         }
-        for epoch in 0..epochs {
-            let mut forward_time = Duration::new(0, 0);
-            let mut backwards_time = Duration::new(0, 0);
 
-            let mut total_loss = 0.0;
-            let mut steps = 0;
+        let mut forward_time = Duration::new(0, 0);
+        let mut backwards_time = Duration::new(0, 0);
 
-            for (inputs, targets) in Batches::new(input, separators, size.clone()) {
-                let forward_start_time = Instant::now();
-                let (caches, probs_list) = self.forward_sequence(inputs);
-                forward_time += forward_start_time.elapsed();
+        let mut total_loss = 0.0;
+        let mut steps = 0;
 
-                let l = seq_loss(&probs_list, targets);
+        for (inputs, targets) in data {
+            let forward_start_time = Instant::now();
+            let (caches, probs_list) = self.forward_sequence(inputs);
+            forward_time += forward_start_time.elapsed();
 
-                total_loss += l;
-                steps += 1;
+            let l = seq_loss(&probs_list, targets);
 
-                let backwards_start_time = Instant::now();
-                self.backwards_sequence(inputs, targets, caches, probs_list);
-                backwards_time += backwards_start_time.elapsed();
+            total_loss += l;
+            steps += 1;
 
+            let backwards_start_time = Instant::now();
+            self.backwards_sequence(inputs, targets, caches, probs_list);
+            backwards_time += backwards_start_time.elapsed();
+            
+            *iteration += 1;
+            
+            if *iteration % batch_size == 0 {
                 self.sgd_step(lr);
-                self.scale_grads(0.5);
+                self.scale_grads(0.6);
+                *iteration = 1;
             }
-
-            println!(
-                "Epoch {epoch} average loss = {:.4}",
-                total_loss / steps.max(1) as f32
-            );
-
-            if total_loss.is_nan() {
-                *self = Self::load("Jarvis").unwrap();
-            } else {
-                self.save("Jarvis").unwrap();
-            }
-
-            println!("forward time: {:?}", forward_time / steps.max(1));
-            println!("backward time: {:?}", backwards_time / steps.max(1));
         }
-        self.sgd_step(0.001);
-        self.scale_grads(0.25);
+
+        println!(
+            "{iteration} Average loss = {:.4}",
+            total_loss / steps.max(1) as f32
+        );
+
+        if total_loss.is_nan() {
+            *self = Self::load("Jarvis").unwrap();
+        } else {
+            self.save("Jarvis").unwrap();
+        }
+
+        println!("forward time: {:?}", forward_time / steps.max(1));
+        println!("backward time: {:?}", backwards_time / steps.max(1));
     }
 
     pub fn forward_sequence(&mut self, input: &[u16]) -> (Vec<Vec<LSTMCache>>, Matrix) {

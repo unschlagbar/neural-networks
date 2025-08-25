@@ -31,6 +31,8 @@ impl Tokenizer {
             itos.push(token.to_string());
         }
 
+        println!("Vokabulargröße: {}", itos.len());
+
         Tokenizer { stoi, itos }
     }
 

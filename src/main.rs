@@ -1,6 +1,7 @@
 use rand::rng;
 use rand::seq::SliceRandom;
 
+use crate::batches::Batches;
 use crate::lstm::LSTM;
 use crate::tokenizer::Tokenizer;
 
@@ -41,11 +42,13 @@ fn main() {
     files.shuffle(&mut rng());
     files.shuffle(&mut rng());
 
+    let mut iteration = 1;
+
     for (i, entry) in files.iter().enumerate() {
         let content = fs::read_to_string(entry).unwrap();
 
         let data: Vec<u16> = tokenizer.to_tokens(&content);
-        model.train(&data, 200..250, &[], 1, 0.001);
+        model.train(Batches::new(&data, &[], 200..250), 0.001, &mut iteration, 3);
 
         println!("completed data {i}")
     }
