@@ -43,12 +43,13 @@ fn main() {
     files.shuffle(&mut rng());
 
     let mut iteration = 1;
+    let mut j = 1;
 
     for (i, entry) in files.iter().enumerate() {
         let content = fs::read_to_string(entry).unwrap();
 
         let data: Vec<u16> = tokenizer.to_tokens(&content);
-        model.train(Batches::new(&data, &[], 200..250), 0.001, &mut iteration, 3);
+        model.train(Batches::new(&data, &[], 200..250), 0.001, &mut iteration, &mut j, 3);
 
         println!("completed data {i}")
     }

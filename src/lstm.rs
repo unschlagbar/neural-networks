@@ -231,7 +231,7 @@ impl LSTM {
         }
     }
 
-    pub fn train(&mut self, data: Batches<u16>, lr: f32, iteration: &mut usize, batch_size: usize) {
+    pub fn train(&mut self, data: Batches<u16>, lr: f32, iteration: &mut usize, j: &mut usize, batch_size: usize) {
         for layer in &mut self.layers {
             layer.d.clear();
         }
@@ -262,11 +262,12 @@ impl LSTM {
                 self.sgd_step(lr);
                 self.scale_grads(0.6);
                 *iteration = 1;
+                *j += 1;
             }
         }
 
         println!(
-            "{iteration} Average loss = {:.4}",
+            "{j} Average loss = {:.4}",
             total_loss / steps.max(1) as f32
         );
 
