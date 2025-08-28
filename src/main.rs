@@ -13,14 +13,11 @@ pub mod mlp;
 pub mod tokenizer;
 
 use std::fs;
-use std::io::stdin;
+use std::io::{Write, stdin, stdout};
 use std::path::{Path, PathBuf};
 
 fn main() {
-    #[allow(unused)]
     let tokenizer = Tokenizer::new("charset.txt");
-
-    //println!("{:?}", tokenizer.itos);
 
     // 5. Model initialisieren
     let mut model = if let Ok(model) = LSTM::load("Jarvis") {
@@ -31,7 +28,7 @@ fn main() {
         model
     };
 
-    //test(&mut model, &tokenizer);
+    test(&mut model, &tokenizer);
 
     let mut files: Vec<PathBuf> = fs::read_dir("rust_files/")
         .unwrap()
@@ -49,7 +46,13 @@ fn main() {
         let content = fs::read_to_string(entry).unwrap();
 
         let data: Vec<u16> = tokenizer.to_tokens(&content);
-        model.train(Batches::new(&data, &[], 200..250), 0.001, &mut iteration, &mut j, 3);
+        model.train(
+            Batches::new(&data, &[], 200..250),
+            0.0001,
+            &mut iteration,
+            &mut j,
+            1,
+        );
 
         println!("completed data {i}")
     }
@@ -113,9 +116,11 @@ pub fn test(model: &mut LSTM, tokenizer: &Tokenizer) {
         stdin().read_line(&mut input).unwrap();
         let prefix = tokenizer.to_tokens(&input.trim());
 
-        let output = model.sample(&prefix, 1000, 0.4);
-        let output = tokenizer.to_text(&output);
-        println!("response: {output}");
+        println!("response: ");
+        let _ = model.sample(&prefix, 2000, 0.4, |token| {
+            print!("{}", tokenizer.to_char(token));
+            stdout().flush().unwrap();
+        });
     }
 }
 

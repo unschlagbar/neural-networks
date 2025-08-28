@@ -21,6 +21,8 @@ const O: usize = 3;
 const DH: usize = 0;
 const DC: usize = 1;
 
+const SCALE: f32 = 1.0;
+
 pub struct LSTMLayer {
     pub input_size: usize,
     pub hidden_size: usize,
@@ -82,16 +84,16 @@ impl LSTMLayer {
 
         // Compute hidden state: h_t = o_t * tanh(c_t)
         for j in 0..h {
-            self.d[DH][j] = ot[j] * self.d[DC][j].tanh();
+            self.d[DH][j] = ot[j] * self.d[DC][j].tanh() * SCALE;
         }
 
         LSTMCache {
-            xh: xh.into_boxed_slice(),
+            xh,
             states_prev,
-            ft: ft.into_boxed_slice(),
-            it: it.into_boxed_slice(),
-            ct: ct.into_boxed_slice(),
-            ot: ot.into_boxed_slice(),
+            ft,
+            it,
+            ct,
+            ot,
             states: self.d.clone(),
         }
     }
@@ -117,13 +119,13 @@ impl LSTMLayer {
 
         // 2) do = dh ⊙ tanh(c) * σ'(o)
         for i in 0..h {
-            do_[i] = dh[i] * cache.states[DC][i] * dsigmoid_from_y(cache.ot[i]);
+            do_[i] = dh[i] * cache.states[DC][i] * dsigmoid_from_y(cache.ot[i]) * SCALE;
         }
 
         // 3) dc = dh ⊙ o * (1 - tanh(c)^2) + dc_next
         let mut dc = dc_next.to_vec();
         for i in 0..h {
-            dc[i] += dh[i] * cache.ot[i] * dtanh_from_y(cache.states[DC][i]);
+            dc[i] += dh[i] * cache.ot[i] * dtanh_from_y(cache.states[DC][i]) * SCALE;
         }
 
         // 4) gate grads: df, di, dct
@@ -231,7 +233,14 @@ impl LSTM {
         }
     }
 
-    pub fn train(&mut self, data: Batches<u16>, lr: f32, iteration: &mut usize, j: &mut usize, batch_size: usize) {
+    pub fn train(
+        &mut self,
+        data: Batches<u16>,
+        lr: f32,
+        iteration: &mut usize,
+        j: &mut usize,
+        batch_size: usize,
+    ) {
         for layer in &mut self.layers {
             layer.d.clear();
         }
@@ -255,21 +264,18 @@ impl LSTM {
             let backwards_start_time = Instant::now();
             self.backwards_sequence(inputs, targets, caches, probs_list);
             backwards_time += backwards_start_time.elapsed();
-            
+
             *iteration += 1;
-            
+
             if *iteration % batch_size == 0 {
-                self.sgd_step(lr);
+                self.sgd_step(lr / batch_size as f32);
                 self.scale_grads(0.6);
                 *iteration = 1;
                 *j += 1;
             }
         }
 
-        println!(
-            "{j} Average loss = {:.4}",
-            total_loss / steps.max(1) as f32
-        );
+        println!("{j} Average loss = {:.4}", total_loss / steps.max(1) as f32);
 
         if total_loss.is_nan() {
             *self = Self::load("Jarvis").unwrap();
@@ -444,7 +450,13 @@ impl LSTM {
         grads.by.iter_mut().for_each(|x| *x *= scale);
     }
 
-    pub fn sample(&mut self, prefix: &[u16], max_len: usize, temperature: f32) -> Vec<u16> {
+    pub fn sample(
+        &mut self,
+        prefix: &[u16],
+        max_len: usize,
+        temperature: f32,
+        mut callback: impl FnMut(u16),
+    ) -> Vec<u16> {
         for layer in &mut self.layers {
             layer.d.clear();
         }
@@ -480,6 +492,7 @@ impl LSTM {
                 }
             }
             out.push(next);
+            callback(next);
             last_token = next;
         }
 
@@ -555,14 +568,14 @@ impl LSTM {
 }
 
 pub struct LSTMCache {
-    pub xh: Box<[f32]>,
+    pub xh: Vec<f32>,
 
     pub states_prev: Matrix,
 
-    pub ft: Box<[f32]>,
-    pub it: Box<[f32]>,
-    pub ct: Box<[f32]>,
-    pub ot: Box<[f32]>,
+    pub ft: Vec<f32>,
+    pub it: Vec<f32>,
+    pub ct: Vec<f32>,
+    pub ot: Vec<f32>,
 
     pub states: Matrix,
 }

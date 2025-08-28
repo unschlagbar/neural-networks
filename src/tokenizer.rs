@@ -123,6 +123,18 @@ impl Tokenizer {
         result
     }
 
+    pub fn to_char(&self, token: u16) -> &str {
+        if let Some(symbol) = self.itos.get(token as usize) {
+            match symbol.as_str() {
+                "<SPACE2>" => "  ",
+                "<SPACE4>" => "    ",
+                _ => symbol,
+            }
+        } else {
+            panic!("Token {} nicht im Vokabular gefunden", token);
+        }
+    }
+
     pub const fn vocab_size(&self) -> usize {
         self.itos.len()
     }
