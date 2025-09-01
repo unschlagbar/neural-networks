@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
 
+#[derive(Clone)]
 pub struct Tokenizer {
     pub stoi: HashMap<String, u16>,
     pub itos: Vec<String>,
+    pub non_token_indexes: usize,
 }
 
 impl Tokenizer {
@@ -24,7 +26,7 @@ impl Tokenizer {
         }
 
         // Spezielle Tokens für Mehrfach-Leerzeichen
-        let specials = vec!["<SPACE2>", "<SPACE4>"];
+        let specials = vec!["<SPACE2>", "<SPACE4>", "<END>", "<QSTART>", "<QEND>"];
         for (i, token) in specials.iter().enumerate() {
             let index = vocab.len() + i;
             stoi.insert(token.to_string(), index as u16);
@@ -33,7 +35,11 @@ impl Tokenizer {
 
         println!("Vokabulargröße: {}", itos.len());
 
-        Tokenizer { stoi, itos }
+        Tokenizer {
+            stoi,
+            itos,
+            non_token_indexes: 1,
+        }
     }
 
     pub fn to_tokens(&self, text: &str) -> Vec<u16> {
@@ -113,6 +119,9 @@ impl Tokenizer {
                 match symbol.as_str() {
                     "<SPACE2>" => result.push_str("  "),
                     "<SPACE4>" => result.push_str("    "),
+                    "<END>" => result.push_str("<END>"),
+                    "<QSTART>" => result.push_str("<QSTART>"),
+                    "<QEND>" => result.push_str("<QEND>"),
                     _ => result.push_str(symbol),
                 }
             } else {
@@ -123,11 +132,14 @@ impl Tokenizer {
         result
     }
 
-    pub fn to_char(&self, token: u16) -> &str {
+    pub fn get_char(&self, token: u16) -> &str {
         if let Some(symbol) = self.itos.get(token as usize) {
             match symbol.as_str() {
                 "<SPACE2>" => "  ",
                 "<SPACE4>" => "    ",
+                "<END>" => "<END>",
+                "<QSTART>" => "<QSTART>",
+                "<QEND>" => "<QEND>",
                 _ => symbol,
             }
         } else {
@@ -135,7 +147,33 @@ impl Tokenizer {
         }
     }
 
+    pub fn get_token(&self, char: &str) -> u16 {
+        if let Some(symbol) = self.stoi.get(char) {
+            *symbol
+        } else {
+            panic!("Char {} nicht im Vokabular gefunden", char);
+        }
+    }
+
+    pub fn get_token_space<'a>(&self, output: &'a [f32]) -> &'a [f32] {
+        assert_eq!(output.len(), self.vocab_size() + self.non_token_indexes);
+        &output[0..self.vocab_size()]
+    }
+
     pub const fn vocab_size(&self) -> usize {
         self.itos.len()
+    }
+
+    pub const fn size(&self) -> usize {
+        self.itos.len() + self.non_token_indexes
+    }
+
+    pub fn build_input(&self, index: usize, non_token_data: &[f32]) -> Vec<f32> {
+        assert!(index < self.vocab_size());
+        assert_eq!(non_token_data.len(), self.non_token_indexes);
+        let mut input = vec![0.0; self.size()];
+        input[index] = 1.0;
+        input[self.vocab_size()..].copy_from_slice(non_token_data);
+        input
     }
 }

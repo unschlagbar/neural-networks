@@ -9,7 +9,7 @@ use rand::random_range;
 
 use crate::{
     batches::Batches,
-    layer::{Activation, LearningLayer, sigmoid, softmax},
+    layer::{sigmoid, softmax, Activation, LearningLayer}, MODEL_LOC,
 };
 
 const CLIP: f32 = 1.0;
@@ -241,8 +241,10 @@ impl LSTM {
         j: &mut usize,
         batch_size: usize,
     ) {
-        for layer in &mut self.layers {
-            layer.d.clear();
+        if random_range(0..5) == 0 {
+            for layer in &mut self.layers {
+                layer.d.clear();
+            }
         }
 
         let mut forward_time = Duration::new(0, 0);
@@ -278,9 +280,9 @@ impl LSTM {
         println!("{j} Average loss = {:.4}", total_loss / steps.max(1) as f32);
 
         if total_loss.is_nan() {
-            *self = Self::load("Jarvis").unwrap();
+            *self = Self::load(MODEL_LOC).unwrap();
         } else {
-            self.save("Jarvis").unwrap();
+            self.save(MODEL_LOC).unwrap();
         }
 
         println!("forward time: {:?}", forward_time / steps.max(1));
@@ -455,7 +457,7 @@ impl LSTM {
         prefix: &[u16],
         max_len: usize,
         temperature: f32,
-        mut callback: impl FnMut(u16),
+        mut callback: impl FnMut(u16) -> bool,
     ) -> Vec<u16> {
         for layer in &mut self.layers {
             layer.d.clear();
@@ -492,7 +494,9 @@ impl LSTM {
                 }
             }
             out.push(next);
-            callback(next);
+            if !callback(next) {
+                break;
+            }
             last_token = next;
         }
 
