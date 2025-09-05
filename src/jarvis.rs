@@ -1,5 +1,5 @@
-use crate::layer::LearningLayer;
+use crate::layer::DenseLayer;
 
 pub struct Jarvis {
-    pub embeding: LearningLayer,
+    pub embeding: DenseLayer,
 }

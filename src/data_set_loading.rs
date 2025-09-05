@@ -23,6 +23,13 @@ impl DataSet {
             tokenizer: tokenizer.clone(),
         }
     }
+
+    pub fn load_file(tokenizer: &Tokenizer, path: &str) -> Self {
+        Self {
+            files: vec![path.into()],
+            tokenizer: tokenizer.clone(),
+        }
+    }
 }
 
 pub struct DataSetIter {

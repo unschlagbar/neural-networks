@@ -26,7 +26,7 @@ impl Tokenizer {
         }
 
         // Spezielle Tokens für Mehrfach-Leerzeichen
-        let specials = vec!["<SPACE2>", "<SPACE4>", "<END>", "<QSTART>", "<QEND>"];
+        let specials = ["<SPACE2>", "<SPACE4>", "<END>", "<QSTART>", "<QEND>"];
         for (i, token) in specials.iter().enumerate() {
             let index = vocab.len() + i;
             stoi.insert(token.to_string(), index as u16);

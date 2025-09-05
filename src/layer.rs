@@ -1,41 +1,41 @@
 use iron_oxide::collections::Matrix;
 use rand::{Rng, rng};
 
+use crate::{
+    lstm::{add_vec_in_place, outer},
+    mlp::DenseLayerGrads,
+};
+
 #[derive(Debug)]
-pub struct LearningLayer {
+pub struct DenseLayer {
     pub weights: Matrix,
-    pub biases: Box<[f32]>,
-    pub activation_fn: Activation,
-    pub last_input: Box<[f32]>,
-    pub last_z: Box<[f32]>,
+    pub biases: Vec<f32>,
+    pub activation: Activation,
+    pub last_z: Vec<f32>,
 }
 
-impl LearningLayer {
-    pub fn random(inputs: usize, size: usize, activation_fn: Activation) -> Self {
+impl DenseLayer {
+    pub fn random(input_size: usize, hidden_size: usize, activation: Activation) -> Self {
         let mut rng = rng();
 
-        let weights: Vec<f32> = (0..inputs * size)
+        let weights = Matrix::random(input_size, hidden_size, 1.0);
+        let biases = (0..hidden_size)
             .map(|_| rng.random_range(-1.0..1.0))
             .collect();
-
-        let weights = Matrix::from_vec(weights, inputs, size);
-
-        let biases = (0..size).map(|_| rng.random_range(-1.0..1.0)).collect();
 
         Self {
             weights,
             biases,
-            activation_fn,
-            last_input: vec![0.0; inputs].into_boxed_slice(),
-            last_z: vec![0.0; size].into_boxed_slice(),
+            activation,
+            last_z: vec![0.0; hidden_size],
         }
     }
 
-    pub fn forward(&mut self, input: &[f32]) -> Box<[f32]> {
+    pub fn forward(&mut self, input: &[f32]) -> (Vec<f32>, Vec<f32>) {
         assert_eq!(input.len(), self.weights.rows());
-        self.last_input.copy_from_slice(input);
+        let last_input = input.to_vec();
 
-        let mut z = self.biases.clone();
+        let mut z = self.biases.to_vec();
         for (i, &x) in input.iter().enumerate() {
             for (j, &w) in self.weights[i].iter().enumerate() {
                 z[j] += x * w;
@@ -43,13 +43,13 @@ impl LearningLayer {
         }
         self.last_z.copy_from_slice(&z);
 
-        self.activation_fn.activate(&mut z);
-        z
+        self.activation.activate(&mut z);
+        (last_input, z)
     }
 
-    pub fn forward_no_activation(&mut self, input: &[f32]) -> Box<[f32]> {
+    pub fn forward_no_activation(&mut self, input: &[f32]) -> &[f32] {
         assert_eq!(input.len(), self.weights.rows());
-        self.last_input.copy_from_slice(input);
+        //self.last_input.copy_from_slice(input);
 
         let mut z = self.biases.clone();
         for (i, &x) in input.iter().enumerate() {
@@ -57,8 +57,30 @@ impl LearningLayer {
                 z[j] += x * w;
             }
         }
-        self.last_z.copy_from_slice(&z);
-        z
+        self.last_z = z;
+        &self.last_z
+    }
+
+    pub fn backwards(
+        &mut self,
+        input: &[f32],
+        delta: &[f32],
+        grads: &mut DenseLayerGrads,
+        delta_next: Option<&mut [f32]>,
+    ) {
+        grads.weights.add_inplace(&outer(input, delta));
+        add_vec_in_place(&mut grads.biases, delta);
+
+        if let Some(delta_next) = delta_next {
+            // dh for top layer receives Wy^T * dy plus dhNext from future
+            for i in 0..self.input_size() {
+                let mut s = 0.0;
+                for (&dy, &weight) in delta.iter().zip(&self.weights[i]) {
+                    s += dy * weight;
+                }
+                delta_next[i] += s;
+            }
+        }
     }
 
     pub const fn input_size(&self) -> usize {

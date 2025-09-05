@@ -1,30 +1,31 @@
 use std::f32::consts::PI;
 
+use iron_oxide::collections::Matrix;
 use rand::{Rng, rng, seq::SliceRandom};
 
-use crate::layer::{Activation, LearningLayer};
+use crate::layer::{Activation, DenseLayer};
 
 #[derive(Debug)]
 pub struct LearningMLP {
-    pub layers: Box<[LearningLayer]>,
+    pub layers: Box<[DenseLayer]>,
 }
 
 impl LearningMLP {
     pub fn random(layout: &[usize]) -> Self {
-        let mut layers: Box<[LearningLayer]> = layout
+        let mut layers: Box<[DenseLayer]> = layout
             .windows(2)
-            .map(|window| LearningLayer::random(window[0], window[1], Activation::Sigmoid))
+            .map(|window| DenseLayer::random(window[0], window[1], Activation::Sigmoid))
             .collect();
 
-        layers[layers.len() - 1].activation_fn = Activation::Sigmoid;
+        layers[layers.len() - 1].activation = Activation::Sigmoid;
 
         Self { layers }
     }
 
-    pub fn forward(&mut self, input: &[f32]) -> Box<[f32]> {
-        let mut input = self.layers[0].forward(input);
+    pub fn forward(&mut self, input: &[f32]) -> Vec<f32> {
+        let mut input = self.layers[0].forward(input).1;
         for layer in &mut self.layers[1..] {
-            input = layer.forward(&input);
+            input = layer.forward(&input).1;
         }
         input
     }
@@ -36,7 +37,7 @@ impl LearningMLP {
         let n_layers = self.layers.len();
         let output_layer_idx = n_layers - 1;
 
-        let output_fn = self.layers[output_layer_idx].activation_fn;
+        let output_fn = self.layers[output_layer_idx].activation;
         let mut output_z = self.layers[output_layer_idx].last_z.clone();
         output_fn.derivative(&mut output_z);
 
@@ -45,7 +46,9 @@ impl LearningMLP {
             .collect();
 
         for l in (0..n_layers).rev() {
-            let curr_input: &[f32] = &self.layers[l].last_input;
+            // fix
+            //let curr_input: &[f32] = &self.layers[l].last_input;
+            let curr_input: &[f32] = &vec![0.0; self.layers[l].input_size()];
 
             // Update weights
             for (i, input) in curr_input.iter().enumerate() {
@@ -62,7 +65,7 @@ impl LearningMLP {
             // If not the first layer, compute delta for the previous layer
             if l > 0 {
                 let prev_idx = l - 1;
-                let prev_fn = self.layers[prev_idx].activation_fn;
+                let prev_fn = self.layers[prev_idx].activation;
                 let mut prev_z = self.layers[prev_idx].last_z.clone();
                 let prev_size = self.layers[l].weights.rows();
                 let prev_delta: Box<[f32]> = (0..prev_size)
@@ -162,4 +165,9 @@ impl LearningMLP {
             );
         }
     }
+}
+
+pub struct DenseLayerGrads {
+    pub weights: Matrix,
+    pub biases: Vec<f32>,
 }
