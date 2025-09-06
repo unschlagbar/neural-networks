@@ -73,12 +73,12 @@ impl DenseLayer {
 
         if let Some(delta_next) = delta_next {
             // dh for top layer receives Wy^T * dy plus dhNext from future
-            for i in 0..self.input_size() {
+            for (i, d) in delta_next.iter_mut().enumerate() {
                 let mut s = 0.0;
                 for (&dy, &weight) in delta.iter().zip(&self.weights[i]) {
                     s += dy * weight;
                 }
-                delta_next[i] += s;
+                *d += s;
             }
         }
     }

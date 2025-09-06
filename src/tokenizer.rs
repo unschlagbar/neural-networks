@@ -46,10 +46,12 @@ impl Tokenizer {
         let mut tokens = Vec::new();
         let mut space_counter = 0;
 
-        for c in text.chars() {
+        for mut c in text.chars() {
             if c == ' ' {
                 space_counter += 1;
                 continue;
+            } else if c == '—' {
+                c = '-'
             }
 
             // Wenn vorher Leerzeichen waren, verarbeite sie
@@ -151,7 +153,17 @@ impl Tokenizer {
         if let Some(symbol) = self.stoi.get(char) {
             *symbol
         } else {
-            panic!("Char {} nicht im Vokabular gefunden", char);
+            let mut char = char.chars().next().unwrap();
+            if char == '—' {
+                char = '-'
+            }
+            let char = char.to_string();
+
+            if let Some(symbol) = self.stoi.get(&char) {
+                *symbol
+            } else {
+                panic!("Char {} nicht im Vokabular gefunden", char);
+            }
         }
     }
 

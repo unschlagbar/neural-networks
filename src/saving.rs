@@ -121,7 +121,24 @@ impl Sequential {
         // Grads passend zu den geladenen Layern initialisieren
         let grads = layers.iter().map(LayerGrads::from_layer).collect();
 
-        Ok(Sequential { layers, grads })
+        let mut dh_next = Vec::with_capacity(layers.len());
+        let mut dc_next = Vec::with_capacity(layers.len());
+
+        for lay in &layers {
+            dh_next.push(vec![0.0; lay.hidden_size()]);
+            if lay.is_recurrent() {
+                dc_next.push(vec![0.0; lay.hidden_size()]);
+            } else {
+                dc_next.push(Vec::with_capacity(0));
+            }
+        }
+
+        Ok(Sequential {
+            layers,
+            grads,
+            dh_next,
+            dc_next,
+        })
     }
 }
 

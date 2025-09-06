@@ -81,8 +81,8 @@ impl LSTMLayer {
         }
 
         // Compute hidden state: h_t = o_t * tanh(c_t)
-        for j in 0..h {
-            self.d[DH][j] = ot[j] * self.d[DC][j].tanh();
+        for (j, &ot) in ot.iter().enumerate() {
+            self.d[DH][j] = ot * self.d[DC][j].tanh();
         }
 
         LSTMCache {
@@ -100,9 +100,9 @@ impl LSTMLayer {
         &mut self,
         mut cache: LSTMCache,
         delta_h: &[f32],
-        dc_next: &[f32],
+        dc_next: &mut [f32],
         grads: &mut LSTMLayerGrads,
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    ) -> (Vec<f32>, Vec<f32>) {
         let h = self.hidden_size;
         let rows = self.input_size + self.hidden_size;
 
@@ -121,7 +121,7 @@ impl LSTMLayer {
         }
 
         // 3) dc = dh ⊙ o * (1 - tanh(c)^2) + dc_next
-        let mut dc = dc_next.to_vec();
+        let dc = dc_next;
         for i in 0..h {
             dc[i] += delta_h[i] * cache.ot[i] * dtanh_from_y(cache.states[DC][i]);
         }
@@ -163,7 +163,7 @@ impl LSTMLayer {
         // 6) backprop to inputs+prev-hidden: dconcat = Wf^T * df + Wi^T * di + ...
         // compute row-wise accumulation to keep contiguous memory access on W rows
         let mut dconcat = vec![0.0; rows];
-        for i in 0..rows {
+        for (i, dconcat) in dconcat.iter_mut().enumerate() {
             let wf_row = &self.wf[i];
             let wi_row = &self.wi[i];
             let wc_row = &self.wc[i];
@@ -176,7 +176,7 @@ impl LSTMLayer {
                 s += wc_row[j] * dct[j];
                 s += wo_row[j] * do_[j];
             }
-            dconcat[i] = s;
+            *dconcat = s;
         }
 
         // split dx and dh_prev
@@ -184,9 +184,9 @@ impl LSTMLayer {
         let dx = dconcat;
 
         // dc_prev (for previous time-step) = dc ⊙ f_t
-        let dc_prev = dc.iter().zip(&cache.ft).map(|(a, b)| a * b).collect();
+        dc.iter_mut().zip(&cache.ft).for_each(|(a, b)| *a *= b);
 
-        (dh_prev, dc_prev, dx)
+        (dh_prev, dx)
     }
 
     // This is the fn for my new dynamic system
@@ -257,7 +257,7 @@ impl LSTMLayer {
         // 6) backprop to inputs+prev-hidden: dconcat = Wf^T * df + Wi^T * di + ...
         // compute row-wise accumulation to keep contiguous memory access on W rows
         let mut dconcat = vec![0.0; rows];
-        for i in 0..rows {
+        for (i, dconcat) in dconcat.iter_mut().enumerate() {
             let wf_row = &self.wf[i];
             let wi_row = &self.wi[i];
             let wc_row = &self.wc[i];
@@ -270,7 +270,7 @@ impl LSTMLayer {
                 s += wc_row[j] * dct[j];
                 s += wo_row[j] * do_[j];
             }
-            dconcat[i] = s;
+            *dconcat = s;
         }
 
         // split dx and dh_prev
@@ -404,7 +404,7 @@ impl LSTM {
                 input_vec = &layer.d[DH];
             }
 
-            logits_list[t].copy_from_slice(&self.output_layer.forward_no_activation(input_vec));
+            logits_list[t].copy_from_slice(self.output_layer.forward_no_activation(input_vec));
         }
         logits_list
     }
@@ -436,12 +436,12 @@ impl LSTM {
 
             // dh for top layer receives Wy^T * dy plus dhNext from future
             let mut dh_top = dh_next.last().unwrap().clone();
-            for i in 0..self.output_layer.input_size() {
+            for (i, dh_top) in dh_top.iter_mut().enumerate() {
                 let mut s = 0.0;
                 for (&dy, &weight) in dy.iter().zip(&self.output_layer.weights[i]) {
                     s += dy * weight;
                 }
-                dh_top[i] += s;
+                *dh_top += s;
             }
 
             // Propagate through layers top->bottom at this time step
@@ -452,8 +452,8 @@ impl LSTM {
 
                 // call the new per-layer backward that returns dh_prev, dc_prev, dx
                 // note: pass mutable refs to dh_layer and dc_next[l] so function can read them
-                let (dh_prev, dc_prev, dx) =
-                    layer.backwards(cache, &dh_layer, &dc_next[l], &mut self.grads.layers[l]);
+                let (dh_prev, dx) =
+                    layer.backwards(cache, &dh_layer, &mut dc_next[l], &mut self.grads.layers[l]);
 
                 // prepare dh_layer for next (lower) layer: combine dh_next from same time-step and dx
                 if l > 0 {
@@ -464,8 +464,6 @@ impl LSTM {
                     }
                 }
 
-                // set dc_next for previous time-step: dc_prev
-                dc_next[l] = dc_prev;
                 // set dh_next for this layer (to be used when processing previous t)
                 dh_next[l] = dh_prev;
             }
@@ -783,9 +781,9 @@ fn write_vec<W: Write>(writer: &mut W, vec: &[f32]) -> io::Result<()> {
 fn read_vec<R: Read>(reader: &mut R, len: usize) -> io::Result<Vec<f32>> {
     let mut vec = vec![0.0; len];
     let mut buf = [0u8; 4];
-    for i in 0..vec.len() {
+    for i in &mut vec {
         reader.read_exact(&mut buf)?;
-        vec[i] = f32::from_le_bytes(buf);
+        *i = f32::from_le_bytes(buf);
     }
     Ok(vec)
 }

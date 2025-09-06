@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, rc::Rc};
 
 use rand::{rng, seq::SliceRandom};
 
@@ -6,35 +6,36 @@ use crate::tokenizer::Tokenizer;
 
 pub struct DataSet {
     files: Vec<PathBuf>,
-    tokenizer: Tokenizer,
+    tokenizer: Rc<Tokenizer>,
 }
 
 impl DataSet {
-    pub fn load_rust_files(tokenizer: &Tokenizer) -> Self {
+    pub fn load_rust_files(tokenizer: Rc<Tokenizer>) -> Self {
         let mut files: Vec<PathBuf> = fs::read_dir("cargo_rust_files/")
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect();
 
         files.shuffle(&mut rng());
+        files.shuffle(&mut rng());
+        files.shuffle(&mut rng());
+        files.shuffle(&mut rng());
+        files.shuffle(&mut rng());
 
-        Self {
-            files,
-            tokenizer: tokenizer.clone(),
-        }
+        Self { files, tokenizer }
     }
 
-    pub fn load_file(tokenizer: &Tokenizer, path: &str) -> Self {
+    pub fn load_file(tokenizer: Rc<Tokenizer>, path: &str) -> Self {
         Self {
             files: vec![path.into()],
-            tokenizer: tokenizer.clone(),
+            tokenizer,
         }
     }
 }
 
 pub struct DataSetIter {
     files: Vec<PathBuf>,
-    tokenizer: Tokenizer,
+    tokenizer: Rc<Tokenizer>,
     idx: usize,
 }
 

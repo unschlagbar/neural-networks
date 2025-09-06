@@ -1,4 +1,4 @@
-use std::{collections::HashMap, mem};
+use std::mem;
 
 use iron_oxide::collections::Matrix;
 use rand::random_range;
@@ -15,12 +15,31 @@ use crate::{
 pub struct Sequential {
     pub layers: Vec<Layer>,
     pub grads: Vec<LayerGrads>,
+    pub dh_next: Vec<Vec<f32>>,
+    pub dc_next: Vec<Vec<f32>>,
 }
 
 impl Sequential {
     pub fn new(layers: Vec<Layer>) -> Self {
         let grads = layers.iter().map(LayerGrads::from_layer).collect();
-        Self { layers, grads }
+
+        let mut dh_next = Vec::with_capacity(layers.len());
+        let mut dc_next = Vec::with_capacity(layers.len());
+
+        for lay in &layers {
+            dh_next.push(vec![0.0; lay.hidden_size()]);
+            if lay.is_recurrent() {
+                dc_next.push(vec![0.0; lay.hidden_size()]);
+            } else {
+                dc_next.push(Vec::with_capacity(0));
+            }
+        }
+        Self {
+            layers,
+            grads,
+            dh_next,
+            dc_next,
+        }
     }
 
     pub fn forward_over(&mut self, input: &[u16]) -> Vec<Vec<Cache>> {
@@ -67,18 +86,13 @@ impl Sequential {
     }
 
     fn backwards_sequence(&mut self, seq: &[u16], targets: &[u16], mut caches: Vec<Vec<Cache>>) {
-        let mut dh_next = Vec::with_capacity(self.layers.len());
-        let mut dc_next = Vec::with_capacity(self.layers.len());
-        let mut idx_map = HashMap::with_capacity(self.layers.len());
-
-        for (i, lay) in self.layers.iter().enumerate() {
-            dh_next.push(vec![0.0; lay.hidden_size()]);
-            if lay.is_recurrent() {
-                idx_map.insert(i, dc_next.len());
-                dc_next.push(vec![0.0; lay.hidden_size()]);
-            }
+        for layer in &mut self.dh_next {
+            layer.fill(0.0);
         }
-
+        
+        for layer in &mut self.dc_next {
+            layer.fill(0.0);
+        }
         for t in (0..seq.len()).rev() {
             let mut delta = caches[t].last().unwrap().output().to_vec();
             delta[targets[t] as usize] -= 1.0;
@@ -94,26 +108,24 @@ impl Sequential {
                 // note: pass mutable refs to dh_layer and dc_next[l] so function can read them
                 match layer {
                     Layer::Lstm(layer) => {
-                        let (dh_prev, dc_prev, dx) = layer.backwards(
+                        let (dh_prev, dx) = layer.backwards(
                             cache.lstm(),
                             &dh_layer,
-                            &dc_next[idx_map[&l]],
+                            &mut self.dc_next[l],
                             self.grads[l].lstm(),
                         );
 
                         // prepare dh_layer for next (lower) layer: combine dh_next from same time-step and dx
                         if l > 0 {
                             // dh_next[l-1] already contains dh coming from future time-step for layer l-1
-                            dh_layer = dh_next[l - 1].clone();
+                            dh_layer = self.dh_next[l - 1].clone();
                             for i in 0..layer.input_size {
                                 dh_layer[i] += dx[i];
                             }
                         }
 
-                        // set dc_next for previous time-step: dc_prev
-                        dc_next[idx_map[&l]] = dc_prev;
                         // set dh_next for this layer (to be used when processing previous t)
-                        dh_next[l] = dh_prev;
+                        self.dh_next[l] = dh_prev;
                     }
                     Layer::Dense(layer) => {
                         let cache_dense = cache.dense();
@@ -144,32 +156,30 @@ impl Sequential {
         j: &mut usize,
         batch_size: usize,
     ) {
-        if 0 == 0 {
-            for layer in &mut self.layers {
-                layer.clear_mem();
-            }
+        for layer in &mut self.layers {
+            layer.clear_mem();
         }
-
+        
         let mut total_loss = 0.0;
         let mut steps = 0;
-
+        
         for (inputs, targets) in data {
             let caches = self.forward_over(inputs);
-
+            
             let probs_list: Vec<&[f32]> = caches
-                .iter()
-                .map(|cache| cache.last().unwrap().output())
-                .collect();
+            .iter()
+            .map(|cache| cache.last().unwrap().output())
+            .collect();
+        
+        let l = seq_loss(&probs_list, targets);
+        
+        total_loss += l;
+        steps += 1;
+        
+        self.backwards_sequence(inputs, targets, caches);
 
-            let l = seq_loss(&probs_list, targets);
-
-            total_loss += l;
-            steps += 1;
-
-            self.backwards_sequence(inputs, targets, caches);
-
-            *iteration += 1;
-
+        *iteration += 1;
+        
             if *iteration % batch_size == 0 {
                 self.sgd_step(lr / batch_size as f32);
                 self.scale_grads(0.6);
@@ -201,7 +211,7 @@ impl Sequential {
             last_token = prefix[prefix.len() - 1];
         }
 
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(max_len);
         for _ in 0..max_len {
             let logits = self.forward_sample(&[last_token]);
             let p = &logits[0];
@@ -233,11 +243,8 @@ impl Sequential {
     }
 
     fn sgd_step(&mut self, lr: f32) {
-        for g in &mut self.grads {
-            g.clip();
-        }
-
         for (layer, grads) in self.layers.iter_mut().zip(&mut self.grads) {
+            grads.clip();
             layer.apply_grads(grads, lr);
         }
     }
@@ -296,24 +303,6 @@ impl Layer {
             Self::Lstm(lstm) => Cache::Lstm(lstm.forward(input)),
             Self::Dense(dense) => Cache::Dense(dense.forward(input)),
         }
-    }
-
-    pub fn backward(
-        &mut self,
-        delta: &[f32],
-        grads: &mut LayerGrads,
-        delta_next: Option<&mut [f32]>,
-        cache: Cache,
-    ) {
-        match self {
-            Self::Lstm(lstm) => {
-                let cache = cache.lstm();
-                lstm.backwards(cache, delta, delta, grads.lstm());
-            }
-            Self::Dense(dense) => {
-                dense.backwards(&cache.dense().0, delta, grads.dense(), delta_next)
-            }
-        };
     }
 
     pub fn is_recurrent(&self) -> bool {
