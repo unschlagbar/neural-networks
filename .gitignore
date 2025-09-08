@@ -1,6 +1,7 @@
 /target
 /cargo_rust_files
 /rust_files
+/training_files
 Jarvis
 rust_rnn
 rust_rnn2

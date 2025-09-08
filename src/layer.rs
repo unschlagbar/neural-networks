@@ -41,15 +41,15 @@ impl DenseLayer {
                 z[j] += x * w;
             }
         }
-        self.last_z.copy_from_slice(&z);
 
+        
         self.activation.activate(&mut z);
+        //self.last_z.copy_from_slice(&z);
         (last_input, z)
     }
 
     pub fn forward_no_activation(&mut self, input: &[f32]) -> &[f32] {
         assert_eq!(input.len(), self.weights.rows());
-        //self.last_input.copy_from_slice(input);
 
         let mut z = self.biases.clone();
         for (i, &x) in input.iter().enumerate() {
@@ -63,12 +63,18 @@ impl DenseLayer {
 
     pub fn backwards(
         &mut self,
-        input: &[f32],
-        delta: &[f32],
+        mut cache: (Vec<f32>, Vec<f32>),
+        delta: &mut [f32],
         grads: &mut DenseLayerGrads,
         delta_next: Option<&mut [f32]>,
     ) {
-        grads.weights.add_inplace(&outer(input, delta));
+        if !matches!(self.activation, Activation::Softmax) {
+            self.activation.derivative_active(&mut cache.1);
+    
+            delta.iter_mut().zip(cache.1).for_each(|(d, o)| *d *= o);
+        }
+
+        grads.weights.add_inplace(&outer(&cache.0, delta));
         add_vec_in_place(&mut grads.biases, delta);
 
         if let Some(delta_next) = delta_next {
@@ -127,16 +133,17 @@ impl Activation {
         }
     }
 
-    pub fn derivative_active(&self, x: Box<[f32]>) -> Box<[f32]> {
+    pub fn derivative_active(&self, x: &mut [f32]) {
         match self {
             Self::Relu => x
-                .into_iter()
-                .map(|x| if x > 0.0 { 1.0 } else { 0.0 })
-                .collect(),
-            Self::Sigmoid => x.into_iter().map(|x| x * (1.0 - x)).collect(),
+                .iter_mut()
+                .for_each(|x| *x = if *x == 0.0 { 0.0 } else { 1.0 }),
+            Self::Sigmoid => {
+                x.iter_mut().for_each(|x| *x = *x * (1.0 - *x));
+            }
             Self::Tanh => unimplemented!(),
             Self::Softmax => unimplemented!(),
-            Self::Linear => x,
+            Self::Linear => (),
         }
     }
 }

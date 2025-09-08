@@ -20,7 +20,15 @@ pub struct Sequential {
 }
 
 impl Sequential {
-    pub fn new(layers: Vec<Layer>) -> Self {
+    pub fn new(layout: Vec<LayerBuilder>, mut input_size: usize) -> Self {
+        let mut layers = Vec::with_capacity(layout.len());
+
+        for layout in layout {
+            layers.push(
+                layout.layer_random_init(&mut input_size)
+            );
+        }
+
         let grads = layers.iter().map(LayerGrads::from_layer).collect();
 
         let mut dh_next = Vec::with_capacity(layers.len());
@@ -134,8 +142,8 @@ impl Sequential {
                         // Prepare delta_next as temp for dx
                         let mut dx_temp = vec![0.0; layer.input_size()];
                         layer.backwards(
-                            &cache_dense.0,
-                            &dh_layer,
+                            cache_dense,
+                            &mut dh_layer,
                             self.grads[l].dense(),
                             Some(&mut dx_temp),
                         );
@@ -475,4 +483,26 @@ fn seq_loss(probs_list: &[&[f32]], targets: &[u16]) -> f32 {
         l += -p.ln();
     }
     l / targets.len() as f32
+}
+
+pub enum LayerBuilder {
+    LSTM(usize),
+    Dense(usize, Activation),
+}
+
+impl LayerBuilder {
+    pub fn layer_random_init(self, input_size: &mut usize) -> Layer {
+        match self {
+            LayerBuilder::LSTM(hidden_size) => {
+                let l = Layer::Lstm(LSTMLayer::random(*input_size, hidden_size));
+                *input_size = hidden_size;
+                l
+            },
+            LayerBuilder::Dense(hidden_size, activation) => {
+                let l = Layer::Dense(DenseLayer::random(*input_size, hidden_size, activation));
+                *input_size = hidden_size;
+                l 
+            },
+        }
+    }
 }

@@ -1,7 +1,13 @@
+use std::ops::Range;
+use std::rc::Rc;
+use std::{
+    io::{Write, stdin, stdout},
+    time::{Duration, Instant},
+};
+
 use crate::data_set_loading::DataSet;
-use crate::layer::{Activation, DenseLayer};
-use crate::lstm::LSTMLayer;
-use crate::sequential::Layer;
+use crate::layer::Activation;
+use crate::sequential::LayerBuilder::*;
 use crate::tokenizer::Tokenizer;
 use crate::{batches::Batches, sequential::Sequential};
 
@@ -17,18 +23,11 @@ pub mod saving;
 pub mod sequential;
 pub mod tokenizer;
 
-use std::ops::Range;
-use std::rc::Rc;
-use std::{
-    io::{Write, stdin, stdout},
-    time::{Duration, Instant},
-};
-
 const MODEL_LOC: &str = "rust_rnn";
-const SEQ_LEN: Range<usize> = 100..100;
+const SEQ_LEN: Range<usize> = 300..300;
 const LR: f32 = 0.00001;
 const BATCH_SIZE: usize = 1;
-const EPOCHS: usize = 200;
+const EPOCHS: usize = 2000;
 
 const MAX_LEN: usize = 2000;
 const TEMPERATURE: f32 = 0.4;
@@ -47,21 +46,26 @@ pub fn train() {
     let tokenizer = Rc::new(Tokenizer::new("charset.txt"));
 
     let mut model = if let Ok(model) = Sequential::load(MODEL_LOC) {
-        println!("loading modell");
+        println!("loaded model");
         model
     } else {
         let vocab = tokenizer.vocab_size();
         let activation = Activation::Relu;
 
-        let model = Sequential::new(vec![
-            Layer::Dense(DenseLayer::random(vocab, 256, activation)),
-            Layer::Lstm(LSTMLayer::random(256, 256)),
-            Layer::Dense(DenseLayer::random(256, 256, activation)),
-            Layer::Lstm(LSTMLayer::random(256, 256)),
-            Layer::Dense(DenseLayer::random(256, 256, activation)),
-            Layer::Lstm(LSTMLayer::random(256, 256)),
-            Layer::Dense(DenseLayer::random(256, vocab, Activation::Softmax)),
-        ]);
+        let layout = vec![
+            Dense(256, activation),
+            LSTM(256),
+            Dense(256, activation),
+            LSTM(256),
+            Dense(256, activation),
+            LSTM(256),
+            Dense(256, activation),
+            LSTM(256),
+            Dense(256, activation),
+            Dense(vocab, Activation::Softmax),
+        ];
+
+        let model = Sequential::new(layout, vocab);
         model.save(MODEL_LOC).unwrap();
         model
     };

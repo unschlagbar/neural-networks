@@ -14,7 +14,7 @@ impl LearningMLP {
     pub fn random(layout: &[usize]) -> Self {
         let mut layers: Box<[DenseLayer]> = layout
             .windows(2)
-            .map(|window| DenseLayer::random(window[0], window[1], Activation::Sigmoid))
+            .map(|window| DenseLayer::random(window[0], window[1], Activation::Relu))
             .collect();
 
         layers[layers.len() - 1].activation = Activation::Sigmoid;
@@ -39,7 +39,7 @@ impl LearningMLP {
 
         let output_fn = self.layers[output_layer_idx].activation;
         let mut output_z = self.layers[output_layer_idx].last_z.clone();
-        output_fn.derivative(&mut output_z);
+        output_fn.derivative_active(&mut output_z);
 
         let mut delta: Box<[f32]> = (0..output.len())
             .map(|j| (output[j] - target[j]) * output_z[j])
@@ -77,7 +77,7 @@ impl LearningMLP {
                         sum
                     })
                     .collect();
-                prev_fn.derivative(&mut prev_z);
+                prev_fn.derivative_active(&mut prev_z);
 
                 delta = prev_delta
                     .into_iter()
@@ -121,9 +121,9 @@ impl LearningMLP {
             }
         }
 
-        let mut mlp = LearningMLP::random(&[2, 32, 32, 32, 32, 1]);
+        let mut mlp = LearningMLP::random(&[2, 128, 1]);
 
-        let learning_rate = 0.005;
+        let learning_rate = 0.0051;
         let epochs = 50000;
 
         for epoch in 0..epochs {
