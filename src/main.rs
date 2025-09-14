@@ -60,8 +60,6 @@ pub fn train() {
             Dense(256, activation),
             LSTM(256),
             Dense(256, activation),
-            LSTM(256),
-            Dense(256, activation),
             Dense(vocab, Activation::Softmax),
         ];
 
@@ -78,7 +76,7 @@ pub fn train() {
     let mut divider = 0;
 
     for _ in 0..EPOCHS {
-        for data in DataSet::load_file(tokenizer.clone(), "alice.txt") {
+        for data in DataSet::load_pumpkin_files(tokenizer.clone(), r"C:\Users\e7438\Desktop\Pumpkin".into()) {
             let start_time = Instant::now();
             model.train(
                 Batches::new(&data, &[], SEQ_LEN),

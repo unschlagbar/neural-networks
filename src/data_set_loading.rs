@@ -25,6 +25,18 @@ impl DataSet {
         Self { files, tokenizer }
     }
 
+    pub fn load_pumpkin_files(tokenizer: Rc<Tokenizer>, root: PathBuf) -> Self {
+        let mut files: Vec<PathBuf> = collect_files_with_extension(root, "rs", 110_000);
+
+        files.shuffle(&mut rng());
+        files.shuffle(&mut rng());
+        files.shuffle(&mut rng());
+        files.shuffle(&mut rng());
+        files.shuffle(&mut rng());
+
+        Self { files, tokenizer }
+    }
+
     pub fn load_file(tokenizer: Rc<Tokenizer>, path: &str) -> Self {
         Self {
             files: vec![path.into()],
@@ -64,5 +76,41 @@ impl Iterator for DataSetIter {
         let content = fs::read_to_string(path).ok()?;
         let data: Vec<u16> = self.tokenizer.to_tokens(&content);
         Some(data)
+    }
+}
+
+pub fn collect_files_with_extension(
+    root: PathBuf,
+    extension: &str,
+    max_size: u64,
+) -> Vec<PathBuf> {
+    let mut collected = Vec::new();
+    if root.is_dir() {
+        collect_recursively(root, extension, max_size, &mut collected);
+    }
+    collected
+}
+
+fn collect_recursively(
+    dir: PathBuf,
+    extension: &str,
+    max_size: u64,
+    collected: &mut Vec<PathBuf>,
+) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_recursively(path, extension, max_size, collected);
+            } else if let Some(ext) = path.extension() {
+                if ext == extension {
+                    if let Ok(metadata) = fs::metadata(&path) {
+                        if metadata.len() <= max_size {
+                            collected.push(path);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
