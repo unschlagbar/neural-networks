@@ -88,6 +88,9 @@ pub fn collect_files_with_extension(
     if root.is_dir() {
         collect_recursively(root, extension, max_size, &mut collected);
     }
+    if collected.is_empty() {
+        panic!("invalid dir!");
+    }
     collected
 }
 
