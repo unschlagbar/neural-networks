@@ -22,12 +22,14 @@ impl LearningMLP {
         Self { layers }
     }
 
-    pub fn forward(&mut self, input: &[f32]) -> Vec<f32> {
-        let mut input = self.layers[0].forward(input).1;
-        for layer in &mut self.layers[1..] {
-            input = layer.forward(&input).1;
-        }
-        input
+    pub fn forward(&mut self, _input: &[f32]) -> Vec<f32> {
+        //let gg = (vec![0.0; input.len()], vec![0.0; self])
+        //let mut input = self.layers[0].forward(input).1;
+        //for layer in &mut self.layers[1..] {
+        //    input = layer.forward(&input).1;
+        //}
+        //input
+        todo!()
     }
 
     pub fn train(&mut self, input: &[f32], target: &[f32], learning_rate: f32) {

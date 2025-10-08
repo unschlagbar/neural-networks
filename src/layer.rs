@@ -31,21 +31,20 @@ impl DenseLayer {
         }
     }
 
-    pub fn forward(&mut self, input: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    pub fn forward(&mut self, input: &[f32], cache: &mut (Vec<f32>, Vec<f32>)) {
         assert_eq!(input.len(), self.weights.rows());
-        let last_input = input.to_vec();
 
-        let mut z = self.biases.to_vec();
+        cache.1.copy_from_slice(&self.biases);
+        let mut z = &mut cache.1;
         for (i, &x) in input.iter().enumerate() {
             for (j, &w) in self.weights[i].iter().enumerate() {
                 z[j] += x * w;
             }
         }
 
-        
+        cache.0.copy_from_slice(input);
+
         self.activation.activate(&mut z);
-        //self.last_z.copy_from_slice(&z);
-        (last_input, z)
     }
 
     pub fn forward_no_activation(&mut self, input: &[f32]) -> &[f32] {
@@ -63,15 +62,15 @@ impl DenseLayer {
 
     pub fn backwards(
         &mut self,
-        mut cache: (Vec<f32>, Vec<f32>),
+        cache: &mut (Vec<f32>, Vec<f32>),
         delta: &mut [f32],
         grads: &mut DenseLayerGrads,
         delta_next: Option<&mut [f32]>,
     ) {
         if !matches!(self.activation, Activation::Softmax) {
             self.activation.derivative_active(&mut cache.1);
-    
-            delta.iter_mut().zip(cache.1).for_each(|(d, o)| *d *= o);
+
+            delta.iter_mut().zip(&cache.1).for_each(|(d, o)| *d *= o);
         }
 
         grads.weights.add_inplace(&outer(&cache.0, delta));

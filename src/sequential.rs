@@ -17,6 +17,7 @@ pub struct Sequential {
     pub grads: Vec<LayerGrads>,
     pub dh_next: Vec<Vec<f32>>,
     pub dc_next: Vec<Vec<f32>>,
+    pub cache: Vec<Vec<Cache>>,
 }
 
 impl Sequential {
@@ -24,9 +25,7 @@ impl Sequential {
         let mut layers = Vec::with_capacity(layout.len());
 
         for layout in layout {
-            layers.push(
-                layout.layer_random_init(&mut input_size)
-            );
+            layers.push(layout.layer_random_init(&mut input_size));
         }
 
         let grads = layers.iter().map(LayerGrads::from_layer).collect();
@@ -47,25 +46,39 @@ impl Sequential {
             grads,
             dh_next,
             dc_next,
+            cache: Vec::new(),
         }
     }
 
-    pub fn forward_over(&mut self, input: &[u16]) -> Vec<Vec<Cache>> {
-        let t = input.len();
-        let mut caches = Vec::with_capacity(t);
+    pub fn make_cache(&mut self, len: usize) {
+        let mut caches = Vec::with_capacity(len);
 
-        for t in 0..t {
+        for i in 0..len {
             caches.push(Vec::with_capacity(self.layers.len()));
-            let mut input_vec: &[f32] =
-                &one_hot(input[t] as _, self.layers.first().unwrap().input_size());
 
             for layer in &mut self.layers {
-                let cache = layer.forward(input_vec);
-                caches[t].push(cache);
-                input_vec = caches[t].last().unwrap().output();
+                caches[i].push(layer.make_cache());
             }
         }
-        caches
+        self.cache = caches;
+    }
+
+    pub fn forward_over(&mut self, input: &[u16]) {
+        let t = input.len();
+
+        for t in 0..t {
+            let input_vec: &[f32] = &one_hot(input[t] as _, self.layers[0].input_size());
+
+            for (l, layer) in self.layers.iter_mut().enumerate() {
+                let (input, cache) = if l == 0 {
+                    (input_vec, &mut self.cache[t][l])
+                } else {
+                    let (left, right) = self.cache[t].split_at_mut(l);
+                    (left[l - 1].output(), &mut right[0])
+                };
+                layer.forward(input, cache);
+            }
+        }
     }
 
     pub fn forward_sample(&mut self, input: &[u16]) -> Matrix {
@@ -76,11 +89,12 @@ impl Sequential {
         for t in 0..t {
             let mut input_vec = one_hot(input[t] as _, self.in_size());
 
-            for layer in &mut self.layers[..end] {
-                let cache = layer.forward(&input_vec);
+            for (l, layer) in self.layers[..end].iter_mut().enumerate() {
+                let cache = &mut self.cache[0][l];
+                layer.forward(&input_vec, cache);
                 input_vec = match cache {
                     Cache::Lstm(cache) => cache.states[DH].to_vec(),
-                    Cache::Dense(mut cache) => mem::take(&mut cache.1),
+                    Cache::Dense(cache) => mem::take(&mut cache.1),
                 };
             }
             let last_layer = self.layers.last_mut().unwrap();
@@ -93,16 +107,16 @@ impl Sequential {
         logist
     }
 
-    fn backwards_sequence(&mut self, seq: &[u16], targets: &[u16], mut caches: Vec<Vec<Cache>>) {
+    fn backwards_sequence(&mut self, seq: &[u16], targets: &[u16]) {
         for layer in &mut self.dh_next {
             layer.fill(0.0);
         }
-        
+
         for layer in &mut self.dc_next {
             layer.fill(0.0);
         }
         for t in (0..seq.len()).rev() {
-            let mut delta = caches[t].last().unwrap().output().to_vec();
+            let mut delta = self.cache[t].last().unwrap().output().to_vec();
             delta[targets[t] as usize] -= 1.0;
 
             let mut dh_layer = delta; // dh entering top layer at time t (including future contribution)
@@ -110,7 +124,7 @@ impl Sequential {
             // Propagate through layers top->bottom at this time step
             for l in (0..self.layers.len()).rev() {
                 let layer = &mut self.layers[l];
-                let cache = caches[t].pop().unwrap(); // ownership moved into call
+                let cache = &mut self.cache[t][l];
 
                 // call the new per-layer backward that returns dh_prev, dc_prev, dx
                 // note: pass mutable refs to dh_layer and dc_next[l] so function can read them
@@ -167,27 +181,22 @@ impl Sequential {
         for layer in &mut self.layers {
             layer.clear_mem();
         }
-        
+
         let mut total_loss = 0.0;
         let mut steps = 0;
-        
-        for (inputs, targets) in data {
-            let caches = self.forward_over(inputs);
-            
-            let probs_list: Vec<&[f32]> = caches
-            .iter()
-            .map(|cache| cache.last().unwrap().output())
-            .collect();
-        
-        let l = seq_loss(&probs_list, targets);
-        
-        total_loss += l;
-        steps += 1;
-        
-        self.backwards_sequence(inputs, targets, caches);
 
-        *iteration += 1;
-        
+        for (inputs, targets) in data {
+            self.forward_over(inputs);
+
+            let l = self.seq_loss(targets);
+
+            total_loss += l;
+            steps += 1;
+
+            self.backwards_sequence(inputs, targets);
+
+            *iteration += 1;
+
             if *iteration % batch_size == 0 {
                 self.sgd_step(lr / batch_size as f32);
                 self.scale_grads(0.6);
@@ -276,6 +285,15 @@ impl Sequential {
     pub fn in_size(&self) -> usize {
         self.layers.first().unwrap().input_size()
     }
+
+        fn seq_loss(&self, targets: &[u16]) -> f32 {
+    let mut l = 0.0;
+    for t in 0..targets.len() {
+        let p = self.cache[t][self.layers.len() - 1].output()[targets[t] as usize] + 1e-12;
+        l += -p.ln();
+    }
+    l / targets.len() as f32
+}
 }
 
 pub enum Layer {
@@ -306,10 +324,22 @@ impl Layer {
         }
     }
 
-    pub fn forward(&mut self, input: &[f32]) -> Cache {
+    pub fn forward(&mut self, input: &[f32], cache: &mut Cache) {
         match self {
-            Self::Lstm(lstm) => Cache::Lstm(lstm.forward(input)),
-            Self::Dense(dense) => Cache::Dense(dense.forward(input)),
+            Self::Lstm(lstm) => {
+                if let Cache::Lstm(cache) = cache {
+                    lstm.forward(input, cache);
+                } else {
+                    panic!();
+                }
+            }
+            Self::Dense(dense) => {
+                if let Cache::Dense(cache) = cache {
+                    dense.forward(input, cache);
+                } else {
+                    panic!();
+                }
+            }
         }
     }
 
@@ -346,6 +376,16 @@ impl Layer {
             }
         }
     }
+
+    pub fn make_cache(&self) -> Cache {
+        match self {
+            Layer::Lstm(lstm_layer) => Cache::Lstm(lstm_layer.make_cache()),
+            Layer::Dense(dense_layer) => Cache::Dense((
+                vec![0.0; dense_layer.input_size()],
+                vec![0.0; dense_layer.hidden_size()],
+            )),
+        }
+    }
 }
 
 pub enum Cache {
@@ -361,7 +401,7 @@ impl Cache {
         }
     }
 
-    pub fn lstm(self) -> LSTMCache {
+    pub fn lstm(&mut self) -> &mut LSTMCache {
         if let Self::Lstm(lstm) = self {
             lstm
         } else {
@@ -369,7 +409,7 @@ impl Cache {
         }
     }
 
-    pub fn dense(self) -> (Vec<f32>, Vec<f32>) {
+    pub fn dense(&mut self) -> &mut (Vec<f32>, Vec<f32>) {
         if let Self::Dense(dense) = self {
             dense
         } else {
@@ -476,15 +516,6 @@ impl LayerGrads {
     }
 }
 
-fn seq_loss(probs_list: &[&[f32]], targets: &[u16]) -> f32 {
-    let mut l = 0.0;
-    for t in 0..targets.len() {
-        let p = probs_list[t][targets[t] as usize] + 1e-12;
-        l += -p.ln();
-    }
-    l / targets.len() as f32
-}
-
 pub enum LayerBuilder {
     LSTM(usize),
     Dense(usize, Activation),
@@ -497,12 +528,12 @@ impl LayerBuilder {
                 let l = Layer::Lstm(LSTMLayer::random(*input_size, hidden_size));
                 *input_size = hidden_size;
                 l
-            },
+            }
             LayerBuilder::Dense(hidden_size, activation) => {
                 let l = Layer::Dense(DenseLayer::random(*input_size, hidden_size, activation));
                 *input_size = hidden_size;
-                l 
-            },
+                l
+            }
         }
     }
 }

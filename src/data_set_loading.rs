@@ -79,11 +79,7 @@ impl Iterator for DataSetIter {
     }
 }
 
-pub fn collect_files_with_extension(
-    root: PathBuf,
-    extension: &str,
-    max_size: u64,
-) -> Vec<PathBuf> {
+pub fn collect_files_with_extension(root: PathBuf, extension: &str, max_size: u64) -> Vec<PathBuf> {
     let mut collected = Vec::new();
     if root.is_dir() {
         collect_recursively(root, extension, max_size, &mut collected);
@@ -94,12 +90,7 @@ pub fn collect_files_with_extension(
     collected
 }
 
-fn collect_recursively(
-    dir: PathBuf,
-    extension: &str,
-    max_size: u64,
-    collected: &mut Vec<PathBuf>,
-) {
+fn collect_recursively(dir: PathBuf, extension: &str, max_size: u64, collected: &mut Vec<PathBuf>) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();

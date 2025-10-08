@@ -11,7 +11,6 @@ use crate::sequential::LayerBuilder::*;
 use crate::tokenizer::Tokenizer;
 use crate::{batches::Batches, sequential::Sequential};
 
-pub mod aud_text;
 pub mod batches;
 pub mod data_set_loading;
 pub mod jarvis;
@@ -24,10 +23,10 @@ pub mod sequential;
 pub mod tokenizer;
 
 const MODEL_LOC: &str = "rust_rnn";
-const SEQ_LEN: Range<usize> = 300..300;
-const LR: f32 = 0.00001;
+const SEQ_LEN: Range<usize> = 100..100;
+const LR: f32 = 0.00005;
 const BATCH_SIZE: usize = 1;
-const EPOCHS: usize = 2000;
+const EPOCHS: usize = 25;
 
 const MAX_LEN: usize = 2000;
 const TEMPERATURE: f32 = 0.4;
@@ -55,11 +54,7 @@ pub fn train() {
         let layout = vec![
             Dense(256, activation),
             LSTM(256),
-            Dense(256, activation),
             LSTM(256),
-            Dense(256, activation),
-            LSTM(256),
-            Dense(256, activation),
             Dense(vocab, Activation::Softmax),
         ];
 
@@ -68,15 +63,16 @@ pub fn train() {
         model
     };
 
+    model.make_cache(SEQ_LEN.end);
+
     let mut iteration = 1;
     let mut j = 1;
     let mut i = 1;
 
     let mut total_time = Duration::from_secs(0);
-    let mut divider = 0;
 
     for _ in 0..EPOCHS {
-        for data in DataSet::load_pumpkin_files(tokenizer.clone(), r"C:\Users\e7438\Desktop\Pumpkin".into()) {
+        for data in DataSet::load_file(tokenizer.clone(), "alice.txt") {
             let start_time = Instant::now();
             model.train(
                 Batches::new(&data, &[], SEQ_LEN),
@@ -86,13 +82,12 @@ pub fn train() {
                 BATCH_SIZE,
             );
             model.save(MODEL_LOC).unwrap();
-            divider += 1;
             total_time += start_time.elapsed();
-            println!("completed data {i}, in: {:?}", total_time / divider);
+
+            println!("completed data {i}, in: {:?}", total_time / i);
             i += 1;
         }
     }
-
 }
 
 pub fn sample() {

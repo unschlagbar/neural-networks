@@ -4,12 +4,11 @@ use std::{
 };
 
 use iron_oxide::collections::Matrix;
-use rand::random_range;
 
 use crate::{
     MODEL_LOC,
     batches::Batches,
-    layer::{Activation, DenseLayer, sigmoid, softmax},
+    layer::{Activation, DenseLayer, sigmoid},
 };
 
 pub const CLIP: f32 = 1.0;
@@ -51,19 +50,42 @@ impl LSTMLayer {
         }
     }
 
-    pub fn forward(&mut self, input: &[f32]) -> LSTMCache {
-        let states_prev = self.d.clone();
+    pub fn validate_cache(&mut self, cache: &LSTMCache) {
+        let input_size = self.input_size;
+        let hidden_size = self.hidden_size;
+        let rows = input_size + hidden_size;
+
+        assert_eq!(cache.states.cols(), hidden_size);
+        assert_eq!(cache.states_prev.cols(), hidden_size);
+        assert_eq!(cache.xh.len(), rows);
+        assert_eq!(cache.ct.len(), hidden_size);
+        assert_eq!(cache.ft.len(), hidden_size);
+        assert_eq!(cache.it.len(), hidden_size);
+        assert_eq!(cache.ot.len(), hidden_size);
+    }
+
+    pub fn forward(&mut self, input: &[f32], cache: &mut LSTMCache) {
+        #[cfg(debug_assertions)]
+        self.validate_cache(cache);
+
+        cache.states_prev.copy_from(&self.d);
+        let states_prev = &cache.states_prev;
 
         // Combine input + previous hidden state
-        let mut xh = Vec::with_capacity(self.input_size + self.hidden_size);
-        xh.extend_from_slice(input);
-        xh.extend_from_slice(&states_prev[DH]);
+        let xh = &mut cache.xh;
+        xh[..input.len()].copy_from_slice(input);
+        xh[input.len()..].copy_from_slice(&states_prev[DH]);
 
-        // Compute gates with minimal allocations
-        let mut ft = self.wf.row_mul(&xh);
-        let mut it = self.wi.row_mul(&xh);
-        let mut ct = self.wc.row_mul(&xh);
-        let mut ot = self.wo.row_mul(&xh);
+        // Compute gates
+        self.wf.row_mul(&xh, &mut cache.ft);
+        self.wi.row_mul(&xh, &mut cache.it);
+        self.wc.row_mul(&xh, &mut cache.ct);
+        self.wo.row_mul(&xh, &mut cache.ot);
+
+        let ft = &mut cache.ft;
+        let it = &mut cache.it;
+        let ct = &mut cache.ct;
+        let ot = &mut cache.ot;
 
         let h = self.hidden_size;
 
@@ -81,24 +103,17 @@ impl LSTMLayer {
         }
 
         // Compute hidden state: h_t = o_t * tanh(c_t)
+        assert_eq!(ot.len(), self.d[DC].len());
         for (j, &ot) in ot.iter().enumerate() {
             self.d[DH][j] = ot * self.d[DC][j].tanh();
         }
 
-        LSTMCache {
-            xh,
-            states_prev,
-            ft,
-            it,
-            ct,
-            ot,
-            states: self.d.clone(),
-        }
+        cache.states.copy_from(&self.d);
     }
 
     pub fn backwards(
         &mut self,
-        mut cache: LSTMCache,
+        cache: &mut LSTMCache,
         delta_h: &[f32],
         dc_next: &mut [f32],
         grads: &mut LSTMLayerGrads,
@@ -282,12 +297,29 @@ impl LSTMLayer {
 
         (dh_prev, dc_prev, dx)
     }
+
+    pub fn make_cache(&self) -> LSTMCache {
+        let hidden_size = self.hidden_size;
+        let input_size = self.input_size;
+        let rows = input_size + hidden_size;
+
+        LSTMCache {
+            xh: vec![0.0; rows],
+            states_prev: Matrix::zeros(2, hidden_size),
+            ft: vec![0.0; hidden_size],
+            it: vec![0.0; hidden_size],
+            ct: vec![0.0; hidden_size],
+            ot: vec![0.0; hidden_size],
+            states: Matrix::zeros(2, hidden_size),
+        }
+    }
 }
 
 pub struct LSTM {
     pub layers: Box<[LSTMLayer]>,
     pub output_layer: DenseLayer,
     pub grads: LSTMGrads,
+    pub cache: Vec<Vec<LSTMCache>>,
 }
 
 impl LSTM {
@@ -322,6 +354,7 @@ impl LSTM {
             layers,
             output_layer,
             grads,
+            cache: Vec::new(),
         }
     }
 
@@ -343,14 +376,14 @@ impl LSTM {
         let mut steps = 0;
 
         for (inputs, targets) in data {
-            let (caches, probs_list) = self.forward_over(inputs);
+            let probs_list = self.forward_over(inputs);
 
             let l = seq_loss(&probs_list, targets);
 
             total_loss += l;
             steps += 1;
 
-            self.backwards_sequence(inputs, targets, caches, probs_list);
+            self.backwards_sequence(inputs, targets, probs_list);
 
             *iteration += 1;
 
@@ -371,9 +404,9 @@ impl LSTM {
         }
     }
 
-    pub fn forward_over(&mut self, input: &[u16]) -> (Vec<Vec<LSTMCache>>, Matrix) {
+    pub fn forward_over(&mut self, input: &[u16]) -> Matrix {
         let t = input.len();
-        let mut caches = Vec::with_capacity(t);
+        let caches = &mut self.cache;
         let mut props_list = Matrix::uninit(t, self.output_layer.hidden_size());
 
         for t in 0..t {
@@ -381,43 +414,26 @@ impl LSTM {
             let mut input_vec: &[f32] =
                 &one_hot(input[t] as _, self.layers.first().unwrap().input_size);
 
-            for layer in &mut self.layers {
-                caches[t].push(layer.forward(input_vec));
+            for (l, layer) in self.layers.iter_mut().enumerate() {
+                layer.forward(input_vec, &mut caches[t][l]);
                 input_vec = &layer.d[DH];
             }
 
-            props_list[t].copy_from_slice(&self.output_layer.forward(input_vec).1);
+            let mut cache = (
+                vec![0.0; self.output_layer.input_size()],
+                vec![0.0; self.output_layer.hidden_size()],
+            );
+            self.output_layer.forward(input_vec, &mut cache);
+
+            props_list[t].copy_from_slice(&cache.1);
         }
-        (caches, props_list)
+        props_list
     }
 
-    pub fn forward_sample(&mut self, input: &[u16]) -> Matrix {
-        let t = input.len();
-        let mut logits_list = Matrix::uninit(t, self.output_layer.hidden_size());
-
-        for t in 0..t {
-            let mut input_vec: &[f32] =
-                &one_hot(input[t] as _, self.layers.first().unwrap().input_size);
-
-            for layer in &mut self.layers {
-                layer.forward(input_vec);
-                input_vec = &layer.d[DH];
-            }
-
-            logits_list[t].copy_from_slice(self.output_layer.forward_no_activation(input_vec));
-        }
-        logits_list
-    }
-
-    fn backwards_sequence(
-        &mut self,
-        seq: &[u16],
-        targets: &[u16],
-        mut caches: Vec<Vec<LSTMCache>>,
-        mut probs_list: Matrix,
-    ) {
+    fn backwards_sequence(&mut self, seq: &[u16], targets: &[u16], mut probs_list: Matrix) {
         let mut dh_next = Vec::with_capacity(self.layers.len());
         let mut dc_next = Vec::with_capacity(self.layers.len());
+        let caches = &mut self.cache;
 
         for lay in &self.layers {
             dh_next.push(vec![0.0; lay.hidden_size]);
@@ -448,7 +464,7 @@ impl LSTM {
             let mut dh_layer = dh_top; // dh entering top layer at time t (including future contribution)
             for l in (0..self.layers.len()).rev() {
                 let layer = &mut self.layers[l];
-                let cache = caches[t].pop().unwrap(); // ownership moved into call
+                let cache = &mut caches[t][l]; // ownership moved into call
 
                 // call the new per-layer backward that returns dh_prev, dc_prev, dx
                 // note: pass mutable refs to dh_layer and dc_next[l] so function can read them
@@ -528,57 +544,6 @@ impl LSTM {
 
         grads.wy.scale(scale);
         grads.by.iter_mut().for_each(|x| *x *= scale);
-    }
-
-    pub fn sample(
-        &mut self,
-        prefix: &[u16],
-        max_len: usize,
-        temperature: f32,
-        mut callback: impl FnMut(u16) -> bool,
-    ) -> Vec<u16> {
-        for layer in &mut self.layers {
-            layer.d.clear();
-        }
-
-        let mut last_token;
-
-        if prefix.is_empty() {
-            last_token = random_range(0..self.output_layer.hidden_size()) as u16;
-        } else {
-            let _ = self.forward_sample(&prefix[0..prefix.len() - 1]);
-            last_token = prefix[prefix.len() - 1];
-        }
-
-        let mut out = Vec::new();
-        for _ in 0..max_len {
-            let logits = self.forward_sample(&[last_token]);
-            let p = &logits[0];
-
-            let logits: Vec<f32> = p.iter().map(|&p| p / temperature.max(1e-8)).collect();
-            let q = softmax(&logits);
-
-            let mut idx: Vec<usize> = (0..logits.len()).collect();
-            idx.sort_unstable_by(|&a, &b| p[b].partial_cmp(&p[a]).unwrap());
-
-            let r = random_range(0.0..1.0);
-            let mut cum = 0.0;
-            let mut next = 0;
-            for i in idx {
-                cum += q[i];
-                if cum >= r {
-                    next = i as u16;
-                    break;
-                }
-            }
-            out.push(next);
-            if !callback(next) {
-                break;
-            }
-            last_token = next;
-        }
-
-        out
     }
 
     pub fn save(&self, path: &str) -> io::Result<()> {

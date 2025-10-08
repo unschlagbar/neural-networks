@@ -138,6 +138,7 @@ impl Sequential {
             grads,
             dh_next,
             dc_next,
+            cache: Vec::new(),
         })
     }
 }

@@ -1,34 +1,11 @@
 use std::{
-    io::{stdin, stdout, Write}, rc::Rc, time::{Duration, Instant}
+    rc::Rc,
+    time::{Duration, Instant},
 };
 
 use crate::{batches::Batches, data_set_loading::DataSet, lstm::LSTM, tokenizer::Tokenizer};
 
 pub const MODEL_LOC: &str = "rust_rnn_old";
-
-pub fn test_response_old(model: &mut LSTM, tokenizer: &Tokenizer) {
-    loop {
-        let mut input = String::new();
-        stdin().read_line(&mut input).unwrap();
-
-        let prefix = if !input.trim().is_empty() {
-            tokenizer.to_tokens(input.trim())
-        } else {
-            Vec::new()
-        };
-
-        print!("response: ");
-        let _ = model.sample(&prefix, 2000, 0.3, |token| {
-            if tokenizer.get_char(token) == "<END>" {
-                false
-            } else {
-                print!("{}", tokenizer.get_char(token));
-                stdout().flush().unwrap();
-                true
-            }
-        });
-    }
-}
 
 pub fn run_old() {
     let tokenizer = Rc::new(Tokenizer::new("charset.txt"));
