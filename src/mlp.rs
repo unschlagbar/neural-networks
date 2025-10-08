@@ -168,8 +168,3 @@ impl LearningMLP {
         }
     }
 }
-
-pub struct DenseLayerGrads {
-    pub weights: Matrix,
-    pub biases: Vec<f32>,
-}

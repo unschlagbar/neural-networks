@@ -3,7 +3,6 @@ use rand::{Rng, rng};
 
 use crate::{
     lstm::{add_vec_in_place, outer},
-    mlp::DenseLayerGrads,
 };
 
 #[derive(Debug)]
@@ -11,7 +10,6 @@ pub struct DenseLayer {
     pub weights: Matrix,
     pub biases: Vec<f32>,
     pub activation: Activation,
-    pub last_z: Vec<f32>,
 }
 
 impl DenseLayer {
@@ -27,15 +25,24 @@ impl DenseLayer {
             weights,
             biases,
             activation,
-            last_z: vec![0.0; hidden_size],
         }
+    }
+
+    pub fn validate_cache(&mut self, cache: &(Vec<f32>, Vec<f32>)) {
+        let input_size = self.input_size();
+        let hidden_size = self.hidden_size();
+
+        assert_eq!(cache.0.len(), input_size);
+        assert_eq!(cache.1.len(), hidden_size);
     }
 
     pub fn forward(&mut self, input: &[f32], cache: &mut (Vec<f32>, Vec<f32>)) {
         assert_eq!(input.len(), self.weights.rows());
+        #[cfg(debug_assertions)]
+        self.validate_cache(cache);
 
         cache.1.copy_from_slice(&self.biases);
-        let mut z = &mut cache.1;
+        let z = &mut cache.1;
         for (i, &x) in input.iter().enumerate() {
             for (j, &w) in self.weights[i].iter().enumerate() {
                 z[j] += x * w;
@@ -44,20 +51,19 @@ impl DenseLayer {
 
         cache.0.copy_from_slice(input);
 
-        self.activation.activate(&mut z);
+        self.activation.activate(z);
     }
 
-    pub fn forward_no_activation(&mut self, input: &[f32]) -> &[f32] {
+    pub fn forward_no_activation(&mut self, input: &[f32], cache: &mut (Vec<f32>, Vec<f32>)) {
         assert_eq!(input.len(), self.weights.rows());
 
-        let mut z = self.biases.clone();
+        cache.1.copy_from_slice(&self.biases);
+        let z = &mut cache.1;
         for (i, &x) in input.iter().enumerate() {
             for (j, &w) in self.weights[i].iter().enumerate() {
                 z[j] += x * w;
             }
         }
-        self.last_z = z;
-        &self.last_z
     }
 
     pub fn backwards(
@@ -95,6 +101,11 @@ impl DenseLayer {
     pub const fn hidden_size(&self) -> usize {
         self.weights.cols()
     }
+}
+
+pub struct DenseLayerGrads {
+    pub weights: Matrix,
+    pub biases: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]

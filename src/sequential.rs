@@ -1,15 +1,12 @@
-use std::mem;
-
 use iron_oxide::collections::Matrix;
 use rand::random_range;
 
 use crate::{
     batches::Batches,
-    layer::{Activation, DenseLayer, softmax},
+    layer::{softmax, Activation, DenseLayer, DenseLayerGrads},
     lstm::{
-        CLIP, DH, LSTMCache, LSTMLayer, LSTMLayerGrads, one_hot, sub_in_place, sub_vec_in_place,
+        one_hot, sub_in_place, sub_vec_in_place, LSTMCache, LSTMLayer, LSTMLayerGrads, CLIP, DH
     },
-    mlp::DenseLayerGrads,
 };
 
 pub struct Sequential {
@@ -87,22 +84,36 @@ impl Sequential {
         let end = self.layers.len() - 1;
 
         for t in 0..t {
-            let mut input_vec = one_hot(input[t] as _, self.in_size());
+            let input_vec: &[f32] = &one_hot(input[t] as _, self.in_size());
 
             for (l, layer) in self.layers[..end].iter_mut().enumerate() {
-                let cache = &mut self.cache[0][l];
-                layer.forward(&input_vec, cache);
-                input_vec = match cache {
-                    Cache::Lstm(cache) => cache.states[DH].to_vec(),
-                    Cache::Dense(cache) => mem::take(&mut cache.1),
+                let (input, cache) = if l == 0 {
+                    (input_vec, &mut self.cache[0][l])
+                } else {
+                    let (left, right) = self.cache[0].split_at_mut(l);
+                    (left[l - 1].output(), &mut right[0])
                 };
+                layer.forward(input, cache);
             }
             let last_layer = self.layers.last_mut().unwrap();
+            let (left, right) = self.cache[0].split_at_mut(end);
 
-            logist[t].copy_from_slice(match last_layer {
+            let cache = if let Cache::Dense(cache) = &mut right[0] {
+                cache
+            } else {
+                panic!()
+            };
+
+            let input = match &mut left[end - 1] {
+                Cache::Lstm(cache) => &cache.states[DH],
+                Cache::Dense(cache) => &cache.0,
+            };
+            match last_layer {
                 Layer::Lstm(_) => panic!("not supported output layer"),
-                Layer::Dense(layer) => layer.forward_no_activation(&input_vec),
-            });
+                Layer::Dense(layer) => layer.forward_no_activation(input, cache),
+            }
+
+            logist[t].copy_from_slice(&cache.1);
         }
         logist
     }
@@ -388,6 +399,7 @@ impl Layer {
     }
 }
 
+#[derive(Debug)]
 pub enum Cache {
     Lstm(LSTMCache),
     Dense((Vec<f32>, Vec<f32>)),

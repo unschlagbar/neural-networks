@@ -104,8 +104,6 @@ impl Sequential {
                         weights,
                         biases,
                         activation,
-                        // Forward-Cache leer initialisieren
-                        last_z: vec![0.0; hidden_size],
                     };
                     layers.push(Layer::Dense(layer));
                 }

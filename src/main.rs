@@ -16,7 +16,6 @@ pub mod data_set_loading;
 pub mod jarvis;
 pub mod layer;
 pub mod lstm;
-pub mod mlp;
 pub mod old;
 pub mod saving;
 pub mod sequential;
@@ -31,7 +30,7 @@ const EPOCHS: usize = 25;
 const MAX_LEN: usize = 2000;
 const TEMPERATURE: f32 = 0.4;
 
-const TRAIN: bool = true;
+const TRAIN: bool = !true;
 
 fn main() {
     if TRAIN {
@@ -93,6 +92,7 @@ pub fn train() {
 pub fn sample() {
     let tokenizer = Tokenizer::new("charset.txt");
     let mut model = Sequential::load(MODEL_LOC).unwrap();
+    model.make_cache(1);
 
     loop {
         let mut input = String::new();

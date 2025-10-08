@@ -614,6 +614,7 @@ impl LSTM {
     }
 }
 
+#[derive(Debug)]
 pub struct LSTMCache {
     pub xh: Vec<f32>,
 
