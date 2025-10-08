@@ -22,7 +22,7 @@ pub mod sequential;
 pub mod tokenizer;
 
 const MODEL_LOC: &str = "rust_rnn";
-const SEQ_LEN: Range<usize> = 100..100;
+const SEQ_LEN: Range<usize> = 300..300;
 const LR: f32 = 0.00005;
 const BATCH_SIZE: usize = 1;
 const EPOCHS: usize = 25;
