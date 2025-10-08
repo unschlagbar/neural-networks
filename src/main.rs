@@ -30,7 +30,7 @@ const EPOCHS: usize = 25;
 const MAX_LEN: usize = 2000;
 const TEMPERATURE: f32 = 0.4;
 
-const TRAIN: bool = !true;
+const TRAIN: bool = true;
 
 fn main() {
     if TRAIN {
@@ -71,7 +71,7 @@ pub fn train() {
     let mut total_time = Duration::from_secs(0);
 
     for _ in 0..EPOCHS {
-        for data in DataSet::load_file(tokenizer.clone(), "alice.txt") {
+        for data in DataSet::load_pumpkin_files(tokenizer.clone(), "../Pumpkin") {
             let start_time = Instant::now();
             model.train(
                 Batches::new(&data, &[], SEQ_LEN),

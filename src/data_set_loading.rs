@@ -25,8 +25,8 @@ impl DataSet {
         Self { files, tokenizer }
     }
 
-    pub fn load_pumpkin_files(tokenizer: Rc<Tokenizer>, root: PathBuf) -> Self {
-        let mut files: Vec<PathBuf> = collect_files_with_extension(root, "rs", 110_000);
+    pub fn load_pumpkin_files(tokenizer: Rc<Tokenizer>, root: &str) -> Self {
+        let mut files: Vec<PathBuf> = collect_files_with_extension(root.into(), "rs", 110_000);
 
         files.shuffle(&mut rng());
         files.shuffle(&mut rng());
@@ -83,6 +83,8 @@ pub fn collect_files_with_extension(root: PathBuf, extension: &str, max_size: u6
     let mut collected = Vec::new();
     if root.is_dir() {
         collect_recursively(root, extension, max_size, &mut collected);
+    } else {
+        panic!("not a dir!");
     }
     if collected.is_empty() {
         panic!("invalid dir!");
