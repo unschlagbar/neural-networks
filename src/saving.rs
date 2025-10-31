@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::usize;
 
 use iron_oxide::collections::Matrix;
 
@@ -61,6 +62,8 @@ impl Sequential {
         let n_layers = read_u32(&mut r)? as usize;
         let mut layers = Vec::with_capacity(n_layers);
 
+        let mut net_input_size = usize::MAX;
+
         for _ in 0..n_layers {
             let tag = read_u8(&mut r)?;
             match tag {
@@ -68,6 +71,10 @@ impl Sequential {
                     // LSTM
                     let input_size = read_u32(&mut r)? as usize;
                     let hidden_size = read_u32(&mut r)? as usize;
+
+                    if net_input_size == usize::MAX {
+                        net_input_size = input_size
+                    }
 
                     let wf = read_matrix(&mut r)?;
                     let wi = read_matrix(&mut r)?;
@@ -94,6 +101,10 @@ impl Sequential {
                     let activation = read_activation(&mut r)?;
                     let weights = read_matrix(&mut r)?;
                     let biases = read_f32_vec(&mut r)?;
+
+                    if net_input_size == usize::MAX {
+                        net_input_size = input_size
+                    }
 
                     // defensive checks (optional)
                     debug_assert_eq!(weights.rows(), input_size);
@@ -132,6 +143,7 @@ impl Sequential {
         }
 
         Ok(Sequential {
+            input_size: net_input_size,
             layers,
             grads,
             dh_next,

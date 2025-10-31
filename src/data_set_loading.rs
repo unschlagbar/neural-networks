@@ -25,6 +25,21 @@ impl DataSet {
         Self { files, tokenizer }
     }
 
+    pub fn load_from_dir(tokenizer: Rc<Tokenizer>, path: &str) -> Self {
+        let mut files: Vec<PathBuf> = fs::read_dir(path)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+
+        files.shuffle(&mut rng());
+        files.shuffle(&mut rng());
+        files.shuffle(&mut rng());
+        files.shuffle(&mut rng());
+        files.shuffle(&mut rng());
+
+        Self { files, tokenizer }
+    }
+
     pub fn load_pumpkin_files(tokenizer: Rc<Tokenizer>, root: &str) -> Self {
         let mut files: Vec<PathBuf> = collect_files_with_extension(root.into(), "rs", 110_000);
 
@@ -43,8 +58,15 @@ impl DataSet {
             tokenizer,
         }
     }
+
+    pub fn to_raw_data(self) -> Vec<Vec<u16>> {
+        let mut raw_data: Vec<Vec<u16>> = self.into_iter().collect();
+        raw_data.shuffle(&mut rng());
+        raw_data
+    }
 }
 
+#[derive(Clone)]
 pub struct DataSetIter {
     files: Vec<PathBuf>,
     tokenizer: Rc<Tokenizer>,

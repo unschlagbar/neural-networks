@@ -1,15 +1,15 @@
-use std::ops::Range;
 use std::rc::Rc;
 use std::{
     io::{Write, stdin, stdout},
     time::{Duration, Instant},
 };
 
+use crate::batches::RandomBatches;
 use crate::data_set_loading::DataSet;
 use crate::layer::Activation;
 use crate::sequential::LayerBuilder::*;
 use crate::tokenizer::Tokenizer;
-use crate::{batches::Batches, sequential::Sequential};
+use crate::sequential::Sequential;
 
 pub mod batches;
 pub mod data_set_loading;
@@ -20,15 +20,16 @@ pub mod old;
 pub mod saving;
 pub mod sequential;
 pub mod tokenizer;
+pub mod prepare_set;
 
-const MODEL_LOC: &str = "rust_rnn";
-const SEQ_LEN: Range<usize> = 60..60;
-const LR: f32 = 0.002;
-const BATCH_SIZE: usize = 2;
-const EPOCHS: usize = 25;
+const MODEL_LOC: &str = "test";
+const SEQ_LEN: usize = 100;
+const LR: f32 = 0.0007;
+const BATCH_SIZE: usize = 5;
+const EPOCHS: usize = 1;
 
 const MAX_LEN: usize = 2000;
-const TEMPERATURE: f32 = 0.3;
+const TEMPERATURE: f32 = 0.4;
 
 const TRAIN: bool = true;
 
@@ -57,29 +58,25 @@ pub fn train() {
             Dense(vocab, Activation::Softmax),
         ];
 
-        let model = Sequential::new(layout, vocab);
-        model.save(MODEL_LOC).unwrap();
-        model
+        println!("init model");
+
+        Sequential::new(layout, vocab)
     };
 
-    model.make_cache(SEQ_LEN.end);
+    model.make_cache(SEQ_LEN);
 
-    let mut iteration = 1;
-    let mut j = 1;
+    let mut iteration = 0;
+    let mut j = 0;
     let mut i = 1;
 
     let mut total_time = Duration::from_secs(0);
 
+    let data_set = DataSet::load_from_dir(tokenizer.clone(), "political_speeches/").to_raw_data();
+
     for _ in 0..EPOCHS {
-        for data in DataSet::load_file(tokenizer.clone(), "alice.txt") {
+        for data in RandomBatches::new(SEQ_LEN, &data_set) {
             let start_time = Instant::now();
-            model.train(
-                Batches::new(&data, SEQ_LEN),
-                LR,
-                &mut iteration,
-                &mut j,
-                BATCH_SIZE,
-            );
+            model.train(data.into_iter(), LR, &mut iteration, &mut j, BATCH_SIZE);
             model.save(MODEL_LOC).unwrap();
             total_time += start_time.elapsed();
 
@@ -95,6 +92,7 @@ pub fn sample() {
     model.make_cache(1);
 
     loop {
+        println!("Sample mode. Type the seq start!");
         let mut input = String::new();
         stdin().read_line(&mut input).unwrap();
 

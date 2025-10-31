@@ -82,7 +82,7 @@ impl Tokenizer {
             if let Some(&token) = self.stoi.get(&s) {
                 tokens.push(token);
             } else {
-                println!("Unbekanntes Zeichen: {:04}", c);
+                //println!("Unbekanntes Zeichen: {:04}", c);
             }
         }
 

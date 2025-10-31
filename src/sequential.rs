@@ -2,14 +2,14 @@ use iron_oxide::collections::Matrix;
 use rand::random_range;
 
 use crate::{
-    batches::Batches,
-    layer::{softmax, Activation, DenseLayer, DenseLayerGrads},
+    layer::{Activation, DenseLayer, DenseLayerGrads, softmax},
     lstm::{
-        one_hot, sub_in_place, sub_vec_in_place, LSTMCache, LSTMLayer, LSTMLayerGrads, CLIP, DH
+        CLIP, DH, LSTMCache, LSTMLayer, LSTMLayerGrads, one_hot, sub_in_place, sub_vec_in_place,
     },
 };
 
 pub struct Sequential {
+    pub input_size: usize,
     pub layers: Vec<Layer>,
     pub grads: Vec<LayerGrads>,
     pub dh_next: Vec<Vec<f32>>,
@@ -18,11 +18,13 @@ pub struct Sequential {
 }
 
 impl Sequential {
-    pub fn new(layout: Vec<LayerBuilder>, mut input_size: usize) -> Self {
+    pub fn new(layout: Vec<LayerBuilder>, input_size: usize) -> Self {
         let mut layers = Vec::with_capacity(layout.len());
 
+        let mut layer_size = input_size;
+
         for layout in layout {
-            layers.push(layout.layer_random_init(&mut input_size));
+            layers.push(layout.layer_random_init(&mut layer_size));
         }
 
         let grads = layers.iter().map(LayerGrads::from_layer).collect();
@@ -39,6 +41,7 @@ impl Sequential {
             }
         }
         Self {
+            input_size,
             layers,
             grads,
             dh_next,
@@ -64,7 +67,7 @@ impl Sequential {
         let t = input.len();
 
         for t in 0..t {
-            let input_vec: &[f32] = &one_hot(input[t] as _, self.layers[0].input_size());
+            let input_vec: &[f32] = &one_hot(input[t] as _, self.input_size);
 
             for (l, layer) in self.layers.iter_mut().enumerate() {
                 let (input, cache) = if l == 0 {
@@ -84,7 +87,7 @@ impl Sequential {
         let end = self.layers.len() - 1;
 
         for t in 0..t {
-            let input_vec: &[f32] = &one_hot(input[t] as _, self.in_size());
+            let input_vec: &[f32] = &one_hot(input[t] as _, self.input_size);
 
             for (l, layer) in self.layers[..end].iter_mut().enumerate() {
                 let (input, cache) = if l == 0 {
@@ -119,13 +122,6 @@ impl Sequential {
     }
 
     fn backwards_sequence(&mut self, seq: &[u16], targets: &[u16]) {
-        for layer in &mut self.dh_next {
-            layer.fill(0.0);
-        }
-
-        for layer in &mut self.dc_next {
-            layer.fill(0.0);
-        }
         for t in (0..seq.len()).rev() {
             let mut delta = self.cache[t].last().unwrap().output().to_vec();
             delta[targets[t] as usize] -= 1.0;
@@ -181,22 +177,29 @@ impl Sequential {
         }
     }
 
-    pub fn train(
+    pub fn train<'a, I: Iterator<Item = (&'a [u16], &'a [u16])>>(
         &mut self,
-        data: Batches<u16>,
+        data: I,
         lr: f32,
         iteration: &mut usize,
         j: &mut usize,
         batch_size: usize,
     ) {
-        for layer in &mut self.layers {
-            layer.clear_mem();
-        }
-
         let mut total_loss = 0.0;
         let mut steps = 0;
 
         for (inputs, targets) in data {
+            for layer in &mut self.dh_next {
+                layer.fill(0.0);
+            }
+
+            for layer in &mut self.dc_next {
+                layer.fill(0.0);
+            }
+
+            for layer in &mut self.layers {
+                layer.clear_mem();
+            }
             self.forward_over(inputs);
 
             let l = self.seq_loss(targets);
@@ -211,7 +214,7 @@ impl Sequential {
             if *iteration % batch_size == 0 {
                 self.sgd_step(lr / batch_size as f32);
                 self.scale_grads(0.6);
-                *iteration = 1;
+                *iteration = 0;
                 *j += 1;
             }
         }
@@ -233,7 +236,7 @@ impl Sequential {
         let mut last_token;
 
         if prefix.is_empty() {
-            last_token = random_range(0..self.layers.last().unwrap().hidden_size()) as u16;
+            last_token = random_range(0..self.input_size) as u16;
         } else {
             let _ = self.forward_sample(&prefix[0..prefix.len() - 1]);
             last_token = prefix[prefix.len() - 1];
@@ -293,18 +296,14 @@ impl Sequential {
         self.layers.last().unwrap().hidden_size()
     }
 
-    pub fn in_size(&self) -> usize {
-        self.layers.first().unwrap().input_size()
+    fn seq_loss(&self, targets: &[u16]) -> f32 {
+        let mut l = 0.0;
+        for t in 0..targets.len() {
+            let p = self.cache[t][self.layers.len() - 1].output()[targets[t] as usize] + 1e-12;
+            l += -p.ln();
+        }
+        l / targets.len() as f32
     }
-
-        fn seq_loss(&self, targets: &[u16]) -> f32 {
-    let mut l = 0.0;
-    for t in 0..targets.len() {
-        let p = self.cache[t][self.layers.len() - 1].output()[targets[t] as usize] + 1e-12;
-        l += -p.ln();
-    }
-    l / targets.len() as f32
-}
 }
 
 pub enum Layer {

@@ -1,9 +1,8 @@
+#![allow(unused)]
 use iron_oxide::collections::Matrix;
 use rand::{Rng, rng};
 
-use crate::{
-    lstm::{add_vec_in_place, outer},
-};
+use crate::lstm::{add_vec_in_place, outer};
 
 #[derive(Debug)]
 pub struct DenseLayer {
@@ -188,9 +187,7 @@ pub trait Cache {}
 
 pub trait Grads {}
 
-
 pub trait Layer<C: Cache, G: Grads> {
-
     fn forward(&self, input: &[f32], cache: &mut C);
     fn backwards(
         &mut self,
