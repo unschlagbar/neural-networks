@@ -3,16 +3,14 @@ use std::ops::Range;
 
 pub struct Batches<'a, T> {
     data: &'a [T],
-    separators: &'a [T],
     size: Range<usize>,
     index: usize,
 }
 
 impl<'a, T: PartialEq> Batches<'a, T> {
-    pub fn new(data: &'a [T], separators: &'a [T], size: Range<usize>) -> Self {
+    pub fn new(data: &'a [T], size: Range<usize>) -> Self {
         Self {
             data,
-            separators,
             size,
             index: 0,
         }
@@ -26,33 +24,9 @@ impl<'a, T: PartialEq> Iterator for Batches<'a, T> {
         let len = self.data.len();
 
         while self.index < len {
-            let start = self.index;
-
-            // ---- Modus 1: Separator ----
-            if !self.separators.is_empty() {
-                while self.index < len && !self.separators.contains(&self.data[self.index]) {
-                    self.index += 1;
-                }
-
-                if self.index < len {
-                    let end = self.index;
-                    self.index += 1; // Separator konsumieren
-
-                    let sentence = &self.data[start..=end]; // inkl. Separator
-
-                    // Nur zurückgeben, wenn Satz > 2 Tokens
-                    if sentence.len() > 2 {
-                        let input = &sentence[..sentence.len() - 1];
-                        let target = &sentence[1..];
-                        return Some((input, target));
-                    } else {
-                        continue; // zu kurz -> nächste Iteration
-                    }
-                }
-            }
 
             // ---- Modus 2: Random-Länge oder Reststück ----
-            let remaining = len - start;
+            let remaining = len - self.index;
 
             // Wenn zu kurz -> überspringen
             if remaining <= 2 {
@@ -71,11 +45,11 @@ impl<'a, T: PartialEq> Iterator for Batches<'a, T> {
                 random_range(min_len..=max_len)
             };
 
-            let input_end = start + length - 1;
-            let input = &self.data[start..input_end];
-            let target = &self.data[start + 1..start + length];
+            let input_end = self.index + length;
+            let input = &self.data[self.index..input_end - 1];
+            let target = &self.data[self.index + 1..input_end];
 
-            self.index = start + length;
+            self.index += length;
 
             return Some((input, target));
         }

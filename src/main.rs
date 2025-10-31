@@ -22,13 +22,13 @@ pub mod sequential;
 pub mod tokenizer;
 
 const MODEL_LOC: &str = "rust_rnn";
-const SEQ_LEN: Range<usize> = 300..300;
-const LR: f32 = 0.00005;
-const BATCH_SIZE: usize = 1;
+const SEQ_LEN: Range<usize> = 60..60;
+const LR: f32 = 0.002;
+const BATCH_SIZE: usize = 2;
 const EPOCHS: usize = 25;
 
 const MAX_LEN: usize = 2000;
-const TEMPERATURE: f32 = 0.4;
+const TEMPERATURE: f32 = 0.3;
 
 const TRAIN: bool = true;
 
@@ -71,10 +71,10 @@ pub fn train() {
     let mut total_time = Duration::from_secs(0);
 
     for _ in 0..EPOCHS {
-        for data in DataSet::load_pumpkin_files(tokenizer.clone(), "../Pumpkin") {
+        for data in DataSet::load_file(tokenizer.clone(), "alice.txt") {
             let start_time = Instant::now();
             model.train(
-                Batches::new(&data, &[], SEQ_LEN),
+                Batches::new(&data, SEQ_LEN),
                 LR,
                 &mut iteration,
                 &mut j,

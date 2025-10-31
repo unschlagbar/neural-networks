@@ -33,7 +33,7 @@ pub fn run_old() {
         {
             let start_time = Instant::now();
             model.train(
-                Batches::new(&data, &[], 100..100),
+                Batches::new(&data, 100..100),
                 0.001,
                 &mut iteration,
                 &mut j,

@@ -183,3 +183,39 @@ pub fn softmax(vec: &[f32]) -> Box<[f32]> {
 pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
+
+pub trait Cache {}
+
+pub trait Grads {}
+
+
+pub trait Layer<C: Cache, G: Grads> {
+
+    fn forward(&self, input: &[f32], cache: &mut C);
+    fn backwards(
+        &mut self,
+        cache: &mut C,
+        delta: &mut [f32],
+        grads: &mut G,
+        delta_next: Option<&mut [f32]>,
+    );
+}
+
+impl Grads for DenseLayerGrads {}
+impl Cache for Vec<f32> {}
+
+impl Layer<Vec<f32>, DenseLayerGrads> for DenseLayer {
+    fn forward(&self, input: &[f32], cache: &mut Vec<f32>) {
+        todo!()
+    }
+
+    fn backwards(
+        &mut self,
+        cache: &mut Vec<f32>,
+        delta: &mut [f32],
+        grads: &mut DenseLayerGrads,
+        delta_next: Option<&mut [f32]>,
+    ) {
+        todo!()
+    }
+}

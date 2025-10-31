@@ -1,1 +1,180 @@
-Alice lebt in Berlin und arbeitet als Ingenieurin. Sie ist 29 Jahre alt. Ihr Freund Bob ist Lehrer in Hamburg und 34 Jahre alt. Clara ist eine Ärztin aus München und 27 Jahre alt. David ist Architekt in Köln und 45 Jahre alt. Eva arbeitet als Designerin in Frankfurt und ist 31 Jahre alt. Sie alle sind gute Freunde und treffen sich oft, um gemeinsam Zeit zu verbringen.
+In the last three stories we discussed a lot about RNNs and LSTMs from a theoretical perspective. In this story, we will bridge the gap to practice by implementing an English language model using LSTMs in PyTorch.
+What is a language model?
+
+A language model is a model that has learnt to estimate the probability of a sequence of tokens. It can use such fact to perform sequence generation. That is, given any initial set of tokens it can predict what token, out of all the possible ones, is most likely to follow. This means that we can give the model one word and have it generate an entire sequence by letting it repeatedly generate the next word given the previous words so far.
+
+Given initial tokens of “This is”, the model would carry on inference in the following way:
+Press enter or click to view image in full size
+This and all other images are by the author
+
+Notice that we stop feeding the model the previous token once it produces a special end of sentence token <eos>. This assumes that the model was trained on sequences that all end with this token so it has a sense of when it’s time to output it. An alternative way is to only stop the model after it has generated a number of tokens.
+
+As you might have guessed already, an applications of language models is autocompletion. They can learn to help you write emails, code, Shakespeare books, just whatever you train them on.
+How do we build a language model?
+
+Any language model is associated with a vocabulary from which it draws tokens. For English word-level language modeling, if such vocabulary has 100K words, then given any initial set of words the model has to make a choice of which one (among the 100K) to predict as the next word.
+
+We can thus build a language model by using an LSTM network with a classification head. That is, the output layer should be a Softmax that assigns a probability to each word in the vocabulary. Choosing the best prediction for the next word can be then done by taking the one associated with the highest probability or more often just randomly sampling the Softmax output distribution.
+
+To train the model all we need is a large body of text with many sequences to act as our dataset. Suppose “This smells really good.” was one of the sequences, then the model could be trained on that in the following fashion
+Press enter or click to view image in full size
+
+In each time step, we see if the predicted token is indeed the next token and calculate the loss accordingly. Notice how the training labels are derived from the corpus as well; for any sequence of length T in the corpus, the first T-1 words make the input sequence and the last T-1 words make the target sequence (labels). In this sense, training a language model is said to be self-supervised.
+
+Now that you understand what is a language model, let’s start building one! We will use the WikiText-2 dataset which is derived from many good featured articles on Wikipedia.
+Let’s code!
+
+This will be our pipeline. We will go over and explain each step in it using notebook code snapshots. You can also view it in notebook format here.
+Press enter or click to view image in full size
+
+We will use the datasets library from HuggingFace to load and map over the dataset, Torchtext to tokenize the dataset and construct the vocabulary and PyTorch to define, train and evaluate the model. The purpose of tqdm is just to show progress bars during training and evaluation.
+
+Besides of the imports, we set a device variable that we will use later in functions to ensure that computation takes place on the GPU if possible and we set a seed value so that we can reproduce the results whenever we need to.
+
+Loading the Dataset
+Press enter or click to view image in full size
+Cell Output
+
+To load the dataset, we use the load_dataset() function from datasets. There are two WikiText datasets, an older version: WikiText-103 and a newer version: WikiText-2. For each there is a raw version and a slightly-preprocessed version. We have chosen the raw version of the newer dataset because we will take care of preprocessing by ourselves later.
+
+The output from load_datasets has the train, test and validation sets already split for us. To print an example we first choose one of the three sets, then the row that corresponds to the example and then the name of the feature (column) that we would like to print. Here, the dataset always has one column ‘text’ which corresponds to a paragraph/piece of text from Wiki. If you try to change the index you might notice that sometimes there is no paragraph and rather an empty string so we will have to care of that later.
+
+Tokenizing the Dataset
+
+The next step is to tokenize every sequence in the dataset. To do this we get a tokenizer from torchtext as in line 1, we then define a function that given an example with feature ‘text’ returns an example with feature ‘tokens’ that contains the tokenization of the text.
+
+So if the text was “It makes sense.” then the function will return [“it”, “makes”, “sense”, “.”]
+
+We didn’t implement our own tokenizer because built-in ones like this are usually more carefully designed to deal with special cases.
+
+In the third line, we use the map function from the datasets library to apply the tokenize_data function on each example. map will need to pass the example along with the tokenizer to tokenize_data so we pass the tokenizer in fn_kwargs as well. At this point, we no longer need the text column so we drop it.
+
+This step is essential because the LSTM/RNN considers the sequence token by token. So it has to be broken down into tokens that we can iterate over.
+
+Constructing the Vocabulary
+Press enter or click to view image in full size
+Cell Output
+
+In the first line we tell torchtext to add any word that has occurred at least three times in the dataset to the vocabulary because otherwise it would be too big (remember its length will be the number of neurons in the output classification layer) and some words only rarely occur. We then manually add an <unk> token and set is as the default index so that whenever we request from the vocabulary the index of a word that it doesn’t have we get <unk>.
+
+In line 4, we also insert an <eos> token. We will later insert it at the end of each sequence so the model learns to produce it when the sequence it’s generating should end.
+
+As shown in the cell output, the vocabulary length is about 30K and we notice that indeed <unk> and <eos> are in the vocabulary by printing the first 10 elements in it. ‘itos’ refers to ‘index to string’.
+
+Implementing the Dataloaders
+
+A dataloader in PyTorch is a function that given a dataset gives you a way to iterate over batches of it. In a batch, all the examples are processed in parallel.
+
+Here we define a function that does 4 things:
+
+1- It appends each sequence of tokenized text with an <eos> token to mark its end. (line 5)
+
+2- It encodes each token to a numerical value equal to its index in the vocabulary. Note that those that occurred less than thrice in the dataset will map to the unknown token. (line 6)
+
+3- It combines all the numerical sequences into a list (1D Tensor). (line 2, line 8)
+
+4- It reshapes it into a 2D tensor of dimensions [batch_size, num_batches] (line 10, line 11)
+
+To clarify further, suppose the dataset involved only three pieces of text from Wiki that are
+
+    “the more you read, the more things you will know and understand”
+
+    “curiosity is the wick in the candle of learning”
+
+    “eventually things start making sense”
+
+then this function given a batch size of 5 returns a 2D tensor data of the form
+Press enter or click to view image in full size
+
+But with much more columns and as numbers instead of words. We will see in a little bit how we will use this to train our model. For now let’s apply the function on the train, test and validation sets.
+
+Defining the Model
+Press enter or click to view image in full size
+
+The model we’ll build will correspond to the diagram above. The three key components are an embedding layer, the LSTM layers, and the classification layer. We already know the purpose of the LSTM and classification layers. The purpose of the embedding layer is to map each word (given as an index) into a vector of E dimensions that further layers can learn from. Indecies or equivalently one-hot vectors are considered poor representations because they assume words have no relations between each other. This mapping is also learnt during training.
+Get Essam Wisam’s stories in your inbox
+
+Join Medium for free to get updates from this writer.
+
+As a form of regularization, we will use a dropout layer before each of the embedding, LSTM, and output layers.
+
+There a few things to highlight about the implementation of the model above:
+
+    The tie_weights argument. The purpose of this is to make the embedding layer share weights with the output layer. This helps reduce the number of parameters because it has been shown that the output weights also learn word embeddings in some sense. Note that for this to work the hidden and embedding layers must be of the same size.
+    The self.init_weights() call. We will initialize the weights as in this paper. They state to initialize the embedding weights uniformly in the range [-0.1, 0.1] and all other layers uniformly in the range [-1/sqrt(H), 1/sqrt(H)]. To apply this to the LSTM, we have to iterate through each of its layers to initialize its hidden to hidden and hidden to next layer weights.
+
+We also implement a function to set the LSTM’s hidden and cell state to zero.
+
+Finally, the last function we will to implement under the LSTM class is detach_hidden
+
+We will need this function while training to explicitly tell PyTorch that hidden states due to different sequences are independent. Don’t worry about it for now.
+
+Hyperparameter Tuning & Model Initialization
+
+Notice that we set the embedding and hidden dimensions as the same value because we will use weight tying.
+
+Here we initialize the model, optimizer and loss criterion. We also calculate the no. of parameters to be at 47M.
+
+Now we are ready to start training. But before we do let’s go back and remember the structure of our data.
+
+Recall, we had a [batch_size=128, num_batches=16214] tensor that looks something like
+Press enter or click to view image in full size
+Here [batch_size=4, num_batches=24]
+
+Recall as well that the LSTM takes as input a tensor of shape [N, L, E] where N is the batch_size and L is the sequence length, E is the length of each element in the sequence (embedding length). Thus, we need to decide on a sequence length (L) and we need to break the dataset into chunks of that sequence then feed them one by one. If we decide to take L=4 for the table above then then a model is trained on all the data in 6 iterations because each color corresponds to a “batch of sequences” which is one feedforward pass to the model.
+Press enter or click to view image in full size
+
+Yes, this means that some of the sequences that will be fed to the model may involve parts from different sequences in the original dataset or be a subset of one (depending on the sequence length L). For this reason we will later only reset the hidden state every epoch, this is like assuming that the next batch of sequences is probably always a follow up on the previous in the original dataset.
+
+What we did is called “using a fixed backpropagation through time window” and it’s just one of the ways to deal with the problem that we can’t have a batch of sequences with unequal lengths.
+
+Now because we haven’t performed this step of breaking the dataset into “batches of L-sequences” we will define a function that given the index of the first batch of tokens in the batch returns the corresponding batch of sequences.
+
+The function takes the dataset in [batch_size, num_batches] format, the sequence length and the index and returns the batch of sequences that corresponds to the input and targets of the LSTM.
+
+Training & Evaluation the Model
+
+Here, line 4 sets the model to training mode to train mode (so dropout is not disabled). Lines 6 through 8 ensure that the dataset can be broken down into batches of length seq_len (L).
+
+In the for loop, we consider the dataset at indecies [0, seq_len, 2*seq_len,..] each of these will be given to the get_batch function so it returns the corresponding sequence of batches for the input (src) and the labels (trg) as in line 16. Both have dimensions [batch size, seq_len].
+
+In the first two lines of the for loop we zero the gradients due to the previous batch and detach its hidden state.
+
+The prediction we get in line 20 has dimensions [batch size, seq_len, vocab size], we reshape that into [batch_size*seq_len, vocab] and flatten the target to [batch size * seq_len]. The loss function expects targets and predictions in this case.
+
+In line 25 we compute the gradients in the network, we then clip all those that exceed ‘clip’ to sidestep exploding gradient. In line 27 we update the weights and in line 28 we compute the loss. Loss.item() has the total loss divided by the batch_size and sequence_length, we multiply by seq_len so we can calculate the average loss per sequence (instead of per token) in the end.
+
+If you get a Nvidia T4 on Google Colab, training would take about 2 hours and a half under the hyperparamer setting above.
+
+The evaluation loop is similar to the training loop except that we no longer need to backprop or keep track of gradients.
+
+Now we need to call the two functions
+
+Here we use ReduceLROnPlateu to reduce the learning rate by a factor of 2 after every epoch associated with no improvement. We are probably oscillating near the minimum in this case, so it’s time to slow down.
+
+We also save the model with the highest validation loss and return the perplexity which an increasing function of the loss that measures how confident the model is.
+
+Inference
+
+This is the last step in our pipeline!
+
+Here we take the prompt, tokenize, encode and feed it into the model to get the predictions (which are logits, remember the Softmax is applied in the loss function). Thus, we then apply Softmax while specifying that we want the output due to the last word in the sequence which represents the prediction for the next word.
+
+We divide the logits by a temperature value to alter the model’s confidence by adjusting the Softmax probability distribution. I recommend checking this to understand more about the effect.
+
+Once we have the Softmax distribution, we randomly sample it to make our prediction on the next word. If we get <unk> then we give that another try.
+
+Once we get <eos> we stop predicting.
+
+We decode the prediction back to strings in lines 24 and 25.
+Press enter or click to view image in full size
+Output
+
+That’s it! Congratulations for making it to the end of the story. Before you go, let’s recap on the key takeaways from this story
+
+    A language model is just an RNN with a classification head that is trained to predict the next token in large corpus of text (tokens in general).
+    Once trained, the model has a sense of the probability of different sequences. Thus, given an initial set of tokens the model can generate subsequent tokens so that the sequence in the end makes sense.
+    Given a large corpus of text, we need to tokenize it, encode it and put it in the right shape before we start training.
+    The rest follows from your ordinary experience of implementing deep learning models on PyTorch
+
+This will bring our story to an end. If you’ve found this useful then remember you can help it reach others by leaving some claps. Till next time, au revoir.
