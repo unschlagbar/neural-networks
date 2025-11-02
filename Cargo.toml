@@ -12,7 +12,7 @@ name = "lstm_training"
 harness = false
 
 [dev-dependencies]
-criterion = "0.4"
+criterion = "0.7.0"
 
 [dependencies]
 iron_oxide = { path = "../iron_oxide" }

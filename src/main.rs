@@ -22,13 +22,13 @@ pub mod sequential;
 pub mod tokenizer;
 
 const MODEL_LOC: &str = "test";
-const SEQ_LEN: usize = 100;
+const SEQ_LEN: usize = 50;
 const LR: f32 = 0.00005;
-const BATCH_SIZE: usize = 2;
+const BATCH_SIZE: usize = 1;
 const EPOCHS: usize = 1;
 
 const MAX_LEN: usize = 2000;
-const TEMPERATURE: f32 = 0.1;
+const TEMPERATURE: f32 = 0.4;
 
 const TRAIN: bool = true;
 

@@ -90,7 +90,9 @@ impl Sequential {
                         wc,
                         wo,
                         b,
-                        d: Matrix::zeros(2, hidden_size),
+                        dc: vec![0.0; hidden_size].into(),
+                        dh: vec![0.0; hidden_size].into(),
+                        //d: Matrix::zeros(2, hidden_size),
                     };
                     layers.push(Layer::Lstm(layer));
                 }

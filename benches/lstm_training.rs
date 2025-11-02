@@ -41,7 +41,7 @@ pub fn train(tokenizer: Rc<Tokenizer>, raw_data: &Vec<Vec<u16>>) {
 
     let mut iteration = 0;
     let mut j = 0;
-    
+
     for data in RandomBatches::new(SEQ_LEN, raw_data).take(2) {
         model.train(data.into_iter(), LR, &mut iteration, &mut j, BATCH_SIZE);
     }

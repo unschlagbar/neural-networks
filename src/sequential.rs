@@ -3,9 +3,7 @@ use rand::random_range;
 
 use crate::{
     layer::{Activation, DenseLayer, DenseLayerGrads, softmax},
-    lstm::{
-        CLIP, DH, LSTMCache, LSTMLayer, LSTMLayerGrads, one_hot, sub_in_place, sub_vec_in_place,
-    },
+    lstm::{CLIP, LSTMCache, LSTMLayer, LSTMLayerGrads, one_hot, sub_in_place, sub_vec_in_place},
 };
 
 pub struct Sequential {
@@ -107,8 +105,8 @@ impl Sequential {
                 panic!()
             };
 
-            let input = match &mut left[end - 1] {
-                Cache::Lstm(cache) => &cache.states[DH],
+            let input: &[f32] = match &mut left[end - 1] {
+                Cache::Lstm(cache) => &cache.dh,
                 Cache::Dense(cache) => &cache.0,
             };
             match last_layer {
@@ -137,14 +135,14 @@ impl Sequential {
                 // note: pass mutable refs to dh_layer and dc_next[l] so function can read them
                 match layer {
                     Layer::Lstm(layer) => {
-                        let dconcat = layer.backwards(
+                        layer.backwards(
                             cache.lstm(),
                             &dh_layer,
                             &mut self.dc_next[l],
                             self.grads[l].lstm(),
                         );
 
-                        let (dx, dh_prev) = dconcat.split_at(layer.input_size);
+                        let (dx, dh_prev) = cache.lstm().dconcat.split_at(layer.input_size);
 
                         // prepare dh_layer for next (lower) layer: combine dh_next from same time-step and dx
                         if l > 0 {
@@ -364,7 +362,10 @@ impl Layer {
 
     pub fn clear_mem(&mut self) {
         match self {
-            Self::Lstm(layer) => layer.d.clear(),
+            Self::Lstm(layer) => {
+                layer.dc.fill(0.0);
+                layer.dh.fill(0.0)
+            }
             Self::Dense(_) => (),
         }
     }
@@ -409,7 +410,7 @@ pub enum Cache {
 impl Cache {
     pub fn output(&self) -> &[f32] {
         match self {
-            Self::Lstm(lstmcache) => &lstmcache.states[DH],
+            Self::Lstm(lstmcache) => &lstmcache.dh,
             Self::Dense(items) => &items.1,
         }
     }
