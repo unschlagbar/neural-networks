@@ -168,8 +168,17 @@ impl LSTMLayer {
         // biases
         for j in 0..h {
             grads.b[0][j] += df[j];
+        }
+
+        for j in 0..h {
             grads.b[1][j] += di[j];
+        }
+
+        for j in 0..h {
             grads.b[2][j] += dct[j];
+        }
+
+        for j in 0..h {
             grads.b[3][j] += do_[j];
         }
 
