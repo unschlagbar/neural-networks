@@ -137,12 +137,14 @@ impl Sequential {
                 // note: pass mutable refs to dh_layer and dc_next[l] so function can read them
                 match layer {
                     Layer::Lstm(layer) => {
-                        let (dh_prev, dx) = layer.backwards(
+                        let dconcat = layer.backwards(
                             cache.lstm(),
                             &dh_layer,
                             &mut self.dc_next[l],
                             self.grads[l].lstm(),
                         );
+
+                        let (dx, dh_prev) = dconcat.split_at(layer.input_size);
 
                         // prepare dh_layer for next (lower) layer: combine dh_next from same time-step and dx
                         if l > 0 {
@@ -154,7 +156,7 @@ impl Sequential {
                         }
 
                         // set dh_next for this layer (to be used when processing previous t)
-                        self.dh_next[l] = dh_prev;
+                        self.dh_next[l].copy_from_slice(dh_prev);
                     }
                     Layer::Dense(layer) => {
                         let cache_dense = cache.dense();

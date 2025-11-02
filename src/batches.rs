@@ -1,6 +1,5 @@
 use rand::{rng, seq::SliceRandom};
 
-
 pub struct Batches<'a, T> {
     data: &'a [T],
     seq_len: usize,
@@ -33,7 +32,7 @@ impl<'a, T: PartialEq> Iterator for Batches<'a, T> {
         let input = &self.data[self.index..input_end - 1];
         let target = &self.data[self.index + 1..input_end];
 
-        self.index += len / 2;
+        self.index += len;
 
         Some((input, target))
     }
@@ -65,10 +64,7 @@ impl<'a> RandomBatches<'a> {
 
         data.shuffle(&mut rng());
 
-        Self {
-            data,
-            index: 0,
-        }
+        Self { data, index: 0 }
     }
 }
 

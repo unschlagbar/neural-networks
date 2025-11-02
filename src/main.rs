@@ -4,32 +4,31 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::batches::RandomBatches;
+use crate::batches::Batches;
 use crate::data_set_loading::DataSet;
 use crate::layer::Activation;
 use crate::sequential::LayerBuilder::*;
-use crate::tokenizer::Tokenizer;
 use crate::sequential::Sequential;
+use crate::tokenizer::Tokenizer;
 
 pub mod batches;
 pub mod data_set_loading;
 pub mod jarvis;
 pub mod layer;
 pub mod lstm;
-pub mod old;
+pub mod prepare_set;
 pub mod saving;
 pub mod sequential;
 pub mod tokenizer;
-pub mod prepare_set;
 
 const MODEL_LOC: &str = "test";
 const SEQ_LEN: usize = 100;
-const LR: f32 = 0.0007;
-const BATCH_SIZE: usize = 5;
+const LR: f32 = 0.00005;
+const BATCH_SIZE: usize = 2;
 const EPOCHS: usize = 1;
 
 const MAX_LEN: usize = 2000;
-const TEMPERATURE: f32 = 0.4;
+const TEMPERATURE: f32 = 0.1;
 
 const TRAIN: bool = true;
 
@@ -52,9 +51,9 @@ pub fn train() {
         let activation = Activation::Relu;
 
         let layout = vec![
-            Dense(256, activation),
-            LSTM(256),
-            LSTM(256),
+            Dense(384, activation),
+            LSTM(384),
+            LSTM(384),
             Dense(vocab, Activation::Softmax),
         ];
 
@@ -71,10 +70,11 @@ pub fn train() {
 
     let mut total_time = Duration::from_secs(0);
 
-    let data_set = DataSet::load_from_dir(tokenizer.clone(), "political_speeches/").to_raw_data();
+    let data_set = DataSet::load_from_dir(tokenizer.clone(), "political_speeches/").into_iter();
 
     for _ in 0..EPOCHS {
-        for data in RandomBatches::new(SEQ_LEN, &data_set) {
+        for data in data_set.clone() {
+            let data = Batches::new(&data, SEQ_LEN);
             let start_time = Instant::now();
             model.train(data.into_iter(), LR, &mut iteration, &mut j, BATCH_SIZE);
             model.save(MODEL_LOC).unwrap();

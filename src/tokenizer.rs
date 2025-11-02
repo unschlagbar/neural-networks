@@ -11,11 +11,13 @@ pub struct Tokenizer {
 impl Tokenizer {
     pub fn new(charset_path: &str) -> Self {
         let chars = fs::read_to_string(charset_path).expect("Charset konnte nicht gelesen werden");
-        let mut vocab: Vec<char> = chars.chars().collect();
-
+        let mut vocab: Box<[char]> = chars.chars().collect();
         vocab.sort();
-        vocab.dedup();
 
+        Self::new_vocab(&vocab)
+    }
+
+    pub fn new_vocab(vocab: &[char]) -> Self {
         let mut stoi = HashMap::new();
         let mut itos = Vec::new();
 
