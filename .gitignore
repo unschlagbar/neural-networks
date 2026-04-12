@@ -1,11 +1,11 @@
 /target
 /cargo_rust_files
-/political_speeches
 /rust_files
 /training_files
 Jarvis
 rust_rnn
 rust_rnn2
+political_speeches.xml
 test_subject_01
 test_subject_02
 test_subject_03

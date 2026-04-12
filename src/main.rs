@@ -38,7 +38,7 @@ use crate::tokenizer::Tokenizer;
 const MODEL_LOC: &str = "model_hier3";
 const SEQ_LOC: &str = "seq_model_hier3";
 const SEQ_LEN: usize = 300;
-const LR: f32 = 0.006;
+const LR: f32 = 0.005;
 const BATCH_SIZE: usize = 1;
 const EPOCHS: usize = 1000;
 /// Save after every N completed files (0 = never save mid-epoch, only at epoch end).
