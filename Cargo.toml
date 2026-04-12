@@ -1,0 +1,23 @@
+[package]
+name = "neural-networks"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "neural-networks"
+
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[[bench]]
+name = "lstm_training"
+harness = false
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[dependencies]
+iron_oxide = { path = "../iron_oxide", default-features = false }
+rand = "0.10.0"
