@@ -78,7 +78,12 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
             1.0,
         )
         .dropout(0.3)
-        .lstm(CHAR_HIDDEN)
+        .parallel(
+            Box::new(LSTMLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 3)),
+            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, Relu)),
+            1.0,
+            1.0,
+        )
         .dropout(0.3)
         .dense(vocab, Linear)
         .softmax()
