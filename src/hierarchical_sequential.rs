@@ -49,6 +49,8 @@ pub struct HierarchicalSequential {
     /// Pre-allocated scratch buffer for `forward_over` / `sample`.
     /// Layout: [one_hot (vocab_size) | high_context (context_size)]
     full_input_buf: Vec<f32>,
+
+    pub last_high_grad_signal: f32,
 }
 
 impl HierarchicalSequential {
@@ -91,6 +93,7 @@ impl HierarchicalSequential {
             boundary_timesteps: vec![],
             word_rep_layer,
             full_input_buf,
+            last_high_grad_signal: 0.0,
         }
     }
 
@@ -308,11 +311,23 @@ impl HierarchicalSequential {
                 delta_len = new_len;
             }
 
-            for layer in &mut self.high_model.layers {
-                layer.accumulate_init_grad();
-            }
-
             word_rep_grads[word_idx].copy_from_slice(self.high_cache[word_idx][0].input_grad());
+        }
+
+        // Messe den durchschnittlichen Gradient-Norm ins High-Model
+        let high_grad_signal: f32 = if n_words > 0 {
+            word_context_grads
+                .iter()
+                .map(|g| g.iter().map(|x| x * x).sum::<f32>().sqrt())
+                .sum::<f32>()
+                / n_words as f32
+        } else {
+            0.0
+        };
+        self.last_high_grad_signal = high_grad_signal;
+
+        for layer in &mut self.high_model.layers {
+            layer.accumulate_init_grad();
         }
 
         let mut extra_deltas: Vec<Option<Vec<f32>>> = vec![None; inputs.len()];
@@ -371,8 +386,9 @@ impl HierarchicalSequential {
         }
 
         println!(
-            "{j} Hierarchical average loss = {:.4}",
-            total_loss / steps.max(1) as f32
+            "{j} | char loss = {:.4} | high ∇-signal = {:.5}",
+            total_loss / steps.max(1) as f32,
+            self.last_high_grad_signal
         );
     }
 
@@ -567,6 +583,7 @@ impl HierarchicalSequential {
             boundary_timesteps: vec![],
             word_rep_layer,
             full_input_buf,
+            last_high_grad_signal: 0.0,
         })
     }
 }
