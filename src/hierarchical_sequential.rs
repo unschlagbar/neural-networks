@@ -309,7 +309,6 @@ impl HierarchicalSequential {
             }
 
             for layer in &mut self.high_model.layers {
-                // oder self.char_model.layers
                 layer.accumulate_init_grad();
             }
 
@@ -358,13 +357,13 @@ impl HierarchicalSequential {
                     layer.clip_grads();
                     layer.apply_grads(effective_lr);
                 }
-                self.char_model.scale_grads(0.0);
+                self.char_model.clear_grads();
 
                 for layer in &mut self.high_model.layers {
                     layer.clip_grads();
                     layer.apply_grads(effective_lr);
                 }
-                self.high_model.scale_grads(0.0);
+                self.high_model.clear_grads();
 
                 *iteration = 0;
                 *j += 1;

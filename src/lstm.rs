@@ -383,8 +383,8 @@ impl NnLayer for LSTMLayer {
 
     // ← NEU: Wird von Sequential/Hierarchical nach jeder Sequenz aufgerufen
     fn accumulate_init_grad(&mut self) {
-        crate::lstm::add_vec_in_place(&mut self.grads.h_init_grad, &self.dh_bptt);
-        crate::lstm::add_vec_in_place(&mut self.grads.c_init_grad, &self.dc_bptt);
+        add_vec_in_place(&mut self.grads.h_init_grad, &self.dh_bptt);
+        add_vec_in_place(&mut self.grads.c_init_grad, &self.dc_bptt);
     }
 }
 
