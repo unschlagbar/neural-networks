@@ -105,6 +105,9 @@ pub trait NnLayer {
     fn bptt_hidden_grad(&mut self) -> Option<&[f32]> {
         None
     }
+
+    // ← NEU: Wird von Sequential/Hierarchical nach jeder Sequenz aufgerufen
+    fn accumulate_init_grad(&mut self) {}
 }
 
 // ── LayerBuilder ──────────────────────────────────────────────────────────────

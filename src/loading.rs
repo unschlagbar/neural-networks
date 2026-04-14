@@ -160,6 +160,8 @@ pub fn load_lstm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>>
     let wc = read_matrix(r)?;
     let wo = read_matrix(r)?;
     let b = read_matrix(r)?;
+    let h_init = read_f32_vec(r)?.into_boxed_slice();
+    let c_init = read_f32_vec(r)?.into_boxed_slice();
     Ok(Box::new(LSTMLayer::from_loaded(
         ctx.input_size,
         ctx.output_size,
@@ -168,6 +170,8 @@ pub fn load_lstm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>>
         wc,
         wo,
         b,
+        h_init,
+        c_init,
     )))
 }
 

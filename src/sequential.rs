@@ -141,6 +141,11 @@ impl Sequential {
                 delta_len = new_len;
             }
         }
+
+        for layer in &mut self.layers {
+            // oder self.char_model.layers
+            layer.accumulate_init_grad();
+        }
     }
 
     pub fn backwards_sequence_with_layer_deltas(
@@ -197,6 +202,10 @@ impl Sequential {
 
                 delta_len = new_len;
             }
+        }
+        for layer in &mut self.layers {
+            // oder self.char_model.layers
+            layer.accumulate_init_grad();
         }
     }
 

@@ -1,5 +1,6 @@
+use std::path::Path;
 use std::rc::Rc;
-use std::thread;
+use std::{fs, thread};
 use std::{
     io::{Write, stdin, stdout},
     time::{Duration, Instant},
@@ -22,6 +23,7 @@ pub mod sequential;
 pub mod softmax;
 pub mod tokenizer;
 
+use crate::activations::LeakyRelu;
 #[allow(unused)]
 use crate::activations::{Linear, Relu, Tanh};
 use crate::batches::{BatchDebugger, WordBoundaryBatches};
@@ -35,10 +37,10 @@ use crate::tokenizer::Tokenizer;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const MODEL_LOC: &str = "model_hier3";
-const SEQ_LOC: &str = "seq_model_hier3";
+const MODEL_LOC: &str = "models/hric";
+const SEQ_LOC: &str = "models/seq";
 const SEQ_LEN: usize = 300;
-const LR: f32 = 0.005;
+const LR: f32 = 0.01;
 const BATCH_SIZE: usize = 1;
 const EPOCHS: usize = 1000;
 /// Save after every N completed files (0 = never save mid-epoch, only at epoch end).
@@ -48,7 +50,7 @@ const MAX_LEN: usize = 1000;
 const TEMPERATURE: f32 = 0.4;
 
 const CHAR_HIDDEN: usize = 64;
-const CONTEXT_DIM: usize = 64;
+const CONTEXT_DIM: usize = 128;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -56,6 +58,9 @@ fn main() {
     let mut input = String::new();
     stdin().read_line(&mut input).unwrap();
     if input.trim().is_empty() {
+        if !Path::new("models/").exists() {
+            fs::create_dir("models/").unwrap();
+        }
         thread::spawn(|| train());
         train_new();
     } else {
@@ -72,7 +77,7 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
             Box::new(DenseLayer::new(
                 vocab + CONTEXT_DIM,
                 CHAR_HIDDEN / 4 * 1,
-                Relu,
+                LeakyRelu,
             )),
             1.0,
             1.0,
@@ -80,7 +85,7 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
         .dropout(0.3)
         .parallel(
             Box::new(LSTMLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 3)),
-            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, Relu)),
+            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, LeakyRelu)),
             1.0,
             1.0,
         )
@@ -92,14 +97,14 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
     let high_model = SequentialBuilder::new(CHAR_HIDDEN)
         .parallel(
             Box::new(LSTMLayer::new(CHAR_HIDDEN, CONTEXT_DIM / 4 * 3)),
-            Box::new(DenseLayer::new(CHAR_HIDDEN, CONTEXT_DIM / 4 * 1, Relu)),
+            Box::new(DenseLayer::new(CHAR_HIDDEN, CONTEXT_DIM / 4 * 1, LeakyRelu)),
             1.0,
             1.0,
         )
         .dropout(0.3)
         .parallel(
             Box::new(LSTMLayer::new(CONTEXT_DIM, CONTEXT_DIM / 4 * 3)),
-            Box::new(DenseLayer::new(CONTEXT_DIM, CONTEXT_DIM / 4 * 1, Relu)),
+            Box::new(DenseLayer::new(CONTEXT_DIM, CONTEXT_DIM / 4 * 1, LeakyRelu)),
             1.0,
             1.0,
         )
@@ -113,14 +118,14 @@ fn build_new_normal_model(vocab: usize) -> Sequential {
     SequentialBuilder::new(vocab)
         .parallel(
             Box::new(LSTMLayer::new(vocab, CHAR_HIDDEN / 4 * 3)),
-            Box::new(DenseLayer::new(vocab, CHAR_HIDDEN / 4 * 1, Relu)),
+            Box::new(DenseLayer::new(vocab, CHAR_HIDDEN / 4 * 1, LeakyRelu)),
             1.0,
             1.0,
         )
         .dropout(0.3)
         .parallel(
             Box::new(LSTMLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 3)),
-            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, Relu)),
+            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, LeakyRelu)),
             1.0,
             1.0,
         )

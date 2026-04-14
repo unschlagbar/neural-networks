@@ -165,7 +165,7 @@ impl HierarchicalSequential {
 
     #[inline]
     fn fill_input_buf(&mut self, token: u16, high_context: &[f32]) {
-        self.full_input_buf.fill(0.0);
+        self.full_input_buf[..self.vocab_size].fill(0.0);
         self.full_input_buf[token as usize] = 1.0;
         self.full_input_buf[self.vocab_size..].copy_from_slice(high_context);
     }
@@ -306,6 +306,11 @@ impl HierarchicalSequential {
                     }
                 }
                 delta_len = new_len;
+            }
+
+            for layer in &mut self.high_model.layers {
+                // oder self.char_model.layers
+                layer.accumulate_init_grad();
             }
 
             word_rep_grads[word_idx].copy_from_slice(self.high_cache[word_idx][0].input_grad());

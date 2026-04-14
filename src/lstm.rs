@@ -1,4 +1,5 @@
 use iron_oxide::collections::Matrix;
+use rand::random_range;
 
 use crate::{
     activations::sigmoid,
@@ -68,6 +69,9 @@ pub struct LSTMLayerGrads {
     pub wc: Matrix,
     pub wo: Matrix,
     pub b: Matrix,
+
+    pub h_init_grad: Box<[f32]>,
+    pub c_init_grad: Box<[f32]>,
 }
 
 impl LSTMLayerGrads {
@@ -78,6 +82,8 @@ impl LSTMLayerGrads {
             wc: Matrix::zeros(rows, h),
             wo: Matrix::zeros(rows, h),
             b: Matrix::zeros(4, h),
+            h_init_grad: vec![0.0; h].into_boxed_slice(),
+            c_init_grad: vec![0.0; h].into_boxed_slice(),
         }
     }
 }
@@ -104,6 +110,10 @@ pub struct LSTMLayer {
     /// BPTT gradient dL/dc flowing back from t+1 → t (= dc · f_t).
     pub dc_bptt: Box<[f32]>,
 
+    // Learnable initial hidden/cell state (updated by gradients).
+    pub h_init: Box<[f32]>,
+    pub c_init: Box<[f32]>,
+
     /// Gradient accumulators, cleared per batch, applied in `sgd_step`.
     pub grads: LSTMLayerGrads,
 }
@@ -111,6 +121,8 @@ pub struct LSTMLayer {
 impl LSTMLayer {
     pub fn new(input_size: usize, hidden_size: usize) -> Self {
         let rows = input_size + hidden_size;
+        let h_init: Box<[f32]> = (0..hidden_size).map(|_| random_range(-0.9..0.9)).collect();
+        let c_init: Box<[f32]> = (0..hidden_size).map(|_| random_range(-0.9..0.9)).collect();
         Self {
             input_size,
             hidden_size,
@@ -119,10 +131,12 @@ impl LSTMLayer {
             wc: Matrix::random(rows, hidden_size, 0.08),
             wo: Matrix::random(rows, hidden_size, 0.08),
             b: Matrix::zeros(4, hidden_size),
-            h: vec![0.0; hidden_size].into(),
-            c: vec![0.0; hidden_size].into(),
+            h: h_init.clone(),
+            c: c_init.clone(),
             dh_bptt: vec![0.0; hidden_size].into(),
             dc_bptt: vec![0.0; hidden_size].into(),
+            h_init,
+            c_init,
             grads: LSTMLayerGrads::zeros(rows, hidden_size),
         }
     }
@@ -135,6 +149,8 @@ impl LSTMLayer {
         wc: Matrix,
         wo: Matrix,
         b: Matrix,
+        h_init: Box<[f32]>,
+        c_init: Box<[f32]>,
     ) -> Self {
         Self {
             input_size,
@@ -144,8 +160,10 @@ impl LSTMLayer {
             wc,
             wo,
             b,
-            h: vec![0.0; hidden_size].into_boxed_slice(),
-            c: vec![0.0; hidden_size].into_boxed_slice(),
+            h: h_init.clone(),
+            c: c_init.clone(),
+            h_init,
+            c_init,
             dh_bptt: vec![0.0; hidden_size].into_boxed_slice(),
             dc_bptt: vec![0.0; hidden_size].into_boxed_slice(),
             grads: LSTMLayerGrads::zeros(input_size + hidden_size, hidden_size),
@@ -154,8 +172,8 @@ impl LSTMLayer {
 
     /// Clear forward state and BPTT gradients — call between sequences.
     pub fn reset(&mut self) {
-        self.h.fill(0.0);
-        self.c.fill(0.0);
+        self.h.copy_from_slice(&self.h_init);
+        self.c.copy_from_slice(&self.c_init);
         self.dh_bptt.fill(0.0);
         self.dc_bptt.fill(0.0);
     }
@@ -293,7 +311,9 @@ impl NnLayer for LSTMLayer {
         saving::write_matrix(w, &self.wi)?;
         saving::write_matrix(w, &self.wc)?;
         saving::write_matrix(w, &self.wo)?;
-        saving::write_matrix(w, &self.b)
+        saving::write_matrix(w, &self.b)?;
+        saving::write_f32_slice(w, &self.h_init)?;
+        saving::write_f32_slice(w, &self.c_init)
     }
 
     fn make_cache(&self) -> Box<dyn DynCache> {
@@ -313,6 +333,8 @@ impl NnLayer for LSTMLayer {
         sub_in_place(&mut self.wc, &self.grads.wc, lr);
         sub_in_place(&mut self.wo, &self.grads.wo, lr);
         sub_vec_in_place(self.b.as_slice_mut(), self.grads.b.as_slice(), lr);
+        sub_vec_in_place(&mut self.h_init, &self.grads.h_init_grad, lr);
+        sub_vec_in_place(&mut self.c_init, &self.grads.c_init_grad, lr);
     }
 
     fn clear_grads(&mut self) {
@@ -321,6 +343,8 @@ impl NnLayer for LSTMLayer {
         self.grads.wc.clear();
         self.grads.wo.clear();
         self.grads.b.clear();
+        self.grads.h_init_grad.fill(0.0);
+        self.grads.c_init_grad.fill(0.0);
     }
 
     fn scale_grads(&mut self, scale: f32) {
@@ -329,6 +353,8 @@ impl NnLayer for LSTMLayer {
         self.grads.wc.scale(scale);
         self.grads.wo.scale(scale);
         self.grads.b.scale(scale);
+        self.grads.h_init_grad.iter_mut().for_each(|x| *x *= scale);
+        self.grads.c_init_grad.iter_mut().for_each(|x| *x *= scale);
     }
 
     fn clip_grads(&mut self) {
@@ -337,6 +363,14 @@ impl NnLayer for LSTMLayer {
         self.grads.wc.clip(-CLIP, CLIP);
         self.grads.wo.clip(-CLIP, CLIP);
         self.grads.b.clip(-CLIP, CLIP);
+        self.grads
+            .h_init_grad
+            .iter_mut()
+            .for_each(|x| *x = x.clamp(-CLIP, CLIP));
+        self.grads
+            .c_init_grad
+            .iter_mut()
+            .for_each(|x| *x = x.clamp(-CLIP, CLIP));
     }
 
     fn reset_state(&mut self) {
@@ -345,6 +379,12 @@ impl NnLayer for LSTMLayer {
 
     fn bptt_hidden_grad(&mut self) -> Option<&[f32]> {
         Some(&self.dh_bptt)
+    }
+
+    // ← NEU: Wird von Sequential/Hierarchical nach jeder Sequenz aufgerufen
+    fn accumulate_init_grad(&mut self) {
+        crate::lstm::add_vec_in_place(&mut self.grads.h_init_grad, &self.dh_bptt);
+        crate::lstm::add_vec_in_place(&mut self.grads.c_init_grad, &self.dc_bptt);
     }
 }
 
