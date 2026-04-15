@@ -23,6 +23,7 @@ pub mod sequential;
 pub mod softmax;
 pub mod tokenizer;
 
+use crate::activations::Sigmoid;
 #[allow(unused)]
 use crate::activations::{Linear, Relu, Tanh};
 use crate::batches::{BatchDebugger, WordBoundaryBatches};
@@ -48,8 +49,8 @@ const SAVE_EVERY: usize = 5;
 const MAX_LEN: usize = 1000;
 const TEMPERATURE: f32 = 0.4;
 
-const CHAR_HIDDEN: usize = 64;
-const CONTEXT_DIM: usize = 128;
+const CHAR_HIDDEN: usize = 256;
+const CONTEXT_DIM: usize = 1024;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -63,7 +64,7 @@ fn main() {
         thread::spawn(|| train());
         train_new();
     } else {
-        sample();
+        sample_old();
     }
 }
 
@@ -89,6 +90,13 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
             1.0,
         )
         .dropout(0.3)
+        .parallel(
+            Box::new(LSTMLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 3)),
+            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, Sigmoid)),
+            1.0,
+            1.0,
+        )
+        .dropout(0.3)
         .dense(vocab, Linear)
         .softmax()
         .build();
@@ -97,6 +105,13 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
         .parallel(
             Box::new(LSTMLayer::new(CHAR_HIDDEN, CONTEXT_DIM / 4 * 3)),
             Box::new(DenseLayer::new(CHAR_HIDDEN, CONTEXT_DIM / 4 * 1, Relu)),
+            1.0,
+            1.0,
+        )
+        .dropout(0.3)
+        .parallel(
+            Box::new(LSTMLayer::new(CONTEXT_DIM, CONTEXT_DIM / 4 * 3)),
+            Box::new(DenseLayer::new(CONTEXT_DIM, CONTEXT_DIM / 4 * 1, Relu)),
             1.0,
             1.0,
         )
@@ -129,6 +144,20 @@ fn build_new_normal_model(vocab: usize) -> Sequential {
             1.0,
         )
         .dropout(0.3)
+        .parallel(
+            Box::new(LSTMLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 3)),
+            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, Relu)),
+            1.0,
+            1.0,
+        )
+        .dropout(0.3)
+        .parallel(
+            Box::new(LSTMLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 3)),
+            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, Relu)),
+            1.0,
+            1.0,
+        )
+        .dropout(0.3)
         .dense(vocab, Linear)
         .softmax()
         .build()
@@ -137,7 +166,8 @@ fn build_new_normal_model(vocab: usize) -> Sequential {
 pub fn train_new() {
     let tokenizer = Rc::new(Tokenizer::new("charset.txt", true));
     let vocab = tokenizer.vocab_size();
-    let boundary_ids = tokenizer.sentence_token_ids();
+    let sentence_boundary_ids = tokenizer.sentence_token_ids();
+    let boundary_ids = tokenizer.boundary_token_ids();
 
     // ── Load existing model or build a fresh one ──────────────────────────────
     let mut model = match HierarchicalSequential::load(MODEL_LOC) {
@@ -165,7 +195,7 @@ pub fn train_new() {
         println!("── Epoch {epoch} ──────────────────────────────────────────");
 
         for data in &data_set {
-            let batches = WordBoundaryBatches::new(&data, &boundary_ids, SEQ_LEN);
+            let batches = WordBoundaryBatches::new(&data, &sentence_boundary_ids, SEQ_LEN);
             //let batches = Batches::new(&data, SEQ_LEN);
 
             // Wrap with BatchDebugger every 100 files for a quick sanity check.

@@ -234,14 +234,14 @@ impl HierarchicalSequential {
     // double-count the gradient, which was the original bug here).
 
     pub fn backwards_sequence(&mut self, inputs: &[u16], targets: &[u16]) {
+        let n_words = self.boundary_timesteps.len();
+        if n_words < 2 {
+            return;
+        }
+
         // Pass 1: plain char backward → populates cache[t][0].input_grad() so we
         // can read dL/d(context_input) at every timestep.
         self.char_model.backwards_sequence(inputs, targets);
-
-        let n_words = self.boundary_timesteps.len();
-        if n_words == 0 {
-            return;
-        }
 
         // Accumulate dL/d(high_context) for each word boundary.
         // The context output from word W is fed as input to the char model at
@@ -315,15 +315,11 @@ impl HierarchicalSequential {
         }
 
         // Messe den durchschnittlichen Gradient-Norm ins High-Model
-        let high_grad_signal: f32 = if n_words > 0 {
-            word_context_grads
-                .iter()
-                .map(|g| g.iter().map(|x| x * x).sum::<f32>().sqrt())
-                .sum::<f32>()
-                / n_words as f32
-        } else {
-            0.0
-        };
+        let high_grad_signal: f32 = word_context_grads
+            .iter()
+            .map(|g| g.iter().map(|x| x * x).sum::<f32>().sqrt())
+            .sum::<f32>()
+            / n_words as f32;
         self.last_high_grad_signal = high_grad_signal;
 
         for layer in &mut self.high_model.layers {
@@ -386,7 +382,7 @@ impl HierarchicalSequential {
         }
 
         println!(
-            "{j} | char loss = {:.4} | high ∇-signal = {:.5}",
+            "{j} | char loss = {:.4} | high ∇-signal = {:.4}",
             total_loss / steps.max(1) as f32,
             self.last_high_grad_signal
         );
