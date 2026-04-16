@@ -1,6 +1,6 @@
+use std::fs;
 use std::path::Path;
 use std::rc::Rc;
-use std::{fs, thread};
 use std::{
     io::{Write, stdin, stdout},
     time::{Duration, Instant},
@@ -40,7 +40,7 @@ use crate::tokenizer::Tokenizer;
 const MODEL_LOC: &str = "models/hric";
 const SEQ_LOC: &str = "models/seq";
 const SEQ_LEN: usize = 300;
-const LR: f32 = 0.004;
+const LR: f32 = 0.01;
 const BATCH_SIZE: usize = 1;
 const EPOCHS: usize = 1000;
 /// Save after every N completed files (0 = never save mid-epoch, only at epoch end).
@@ -50,7 +50,7 @@ const MAX_LEN: usize = 1000;
 const TEMPERATURE: f32 = 0.4;
 
 const CHAR_HIDDEN: usize = 256;
-const CONTEXT_DIM: usize = 1024;
+const CONTEXT_DIM: usize = 512;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -61,10 +61,10 @@ fn main() {
         if !Path::new("models/").exists() {
             fs::create_dir("models/").unwrap();
         }
-        thread::spawn(|| train());
+        //thread::spawn(|| train());
         train_new();
     } else {
-        sample_old();
+        sample();
     }
 }
 
@@ -90,13 +90,6 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
             1.0,
         )
         .dropout(0.3)
-        .parallel(
-            Box::new(LSTMLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 3)),
-            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, Sigmoid)),
-            1.0,
-            1.0,
-        )
-        .dropout(0.3)
         .dense(vocab, Linear)
         .softmax()
         .build();
@@ -111,14 +104,7 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
         .dropout(0.3)
         .parallel(
             Box::new(LSTMLayer::new(CONTEXT_DIM, CONTEXT_DIM / 4 * 3)),
-            Box::new(DenseLayer::new(CONTEXT_DIM, CONTEXT_DIM / 4 * 1, Relu)),
-            1.0,
-            1.0,
-        )
-        .dropout(0.3)
-        .parallel(
-            Box::new(LSTMLayer::new(CONTEXT_DIM, CONTEXT_DIM / 4 * 3)),
-            Box::new(DenseLayer::new(CONTEXT_DIM, CONTEXT_DIM / 4 * 1, Relu)),
+            Box::new(DenseLayer::new(CONTEXT_DIM, CONTEXT_DIM / 4 * 1, Sigmoid)),
             1.0,
             1.0,
         )
