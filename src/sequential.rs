@@ -148,67 +148,6 @@ impl Sequential {
         }
     }
 
-    pub fn backwards_sequence_with_layer_deltas(
-        &mut self,
-        _seq: &[u16],
-        targets: &[u16],
-        layer_idx: usize,
-        extra_deltas: &[Option<Vec<f32>>],
-    ) {
-        let n = self.layers.len();
-        assert_eq!(extra_deltas.len(), targets.len());
-
-        let Sequential {
-            layers,
-            cache,
-            delta_buf,
-            ..
-        } = self;
-
-        for t in (0..targets.len()).rev() {
-            let out = cache[t].last().unwrap().output();
-            delta_buf[..out.len()].copy_from_slice(out);
-            delta_buf[targets[t] as usize] -= 1.0;
-
-            let mut delta_len = out.len();
-
-            // ── layer loop top → bottom ─────────────────────────────────────
-            for l in (0..n).rev() {
-                if l == layer_idx {
-                    if let Some(extra) = &extra_deltas[t] {
-                        debug_assert_eq!(extra.len(), delta_len);
-                        add_vec_in_place(&mut delta_buf[..delta_len], extra);
-                    }
-                }
-
-                layers[l].backward(&mut delta_buf[..delta_len], cache[t][l].as_mut());
-
-                if l == 0 {
-                    break;
-                }
-
-                let dx = cache[t][l].input_grad();
-                let new_len = dx.len();
-
-                match layers[l - 1].bptt_hidden_grad() {
-                    Some(bptt) => {
-                        delta_buf[..new_len].copy_from_slice(bptt);
-                        add_vec_in_place(&mut delta_buf[..new_len], dx);
-                    }
-                    None => {
-                        delta_buf[..new_len].copy_from_slice(dx);
-                    }
-                }
-
-                delta_len = new_len;
-            }
-        }
-        for layer in &mut self.layers {
-            // oder self.char_model.layers
-            layer.accumulate_init_grad();
-        }
-    }
-
     pub fn backward_from_layer(
         layers: &mut [Box<dyn NnLayer>],
         layer_idx: usize,
