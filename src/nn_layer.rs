@@ -2,9 +2,9 @@ use std::any::Any;
 use std::io;
 
 use crate::activations::Activate;
+use crate::dense::DenseLayer;
 use crate::dropout::DropoutLayer;
 use crate::indrnn::IndRNNLayer;
-use crate::layer::DenseLayer;
 use crate::lstm::LSTMLayer;
 use crate::parallel::ParallelLayer;
 use crate::projection::Projection;

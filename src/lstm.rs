@@ -121,8 +121,12 @@ pub struct LSTMLayer {
 impl LSTMLayer {
     pub fn new(input_size: usize, hidden_size: usize) -> Self {
         let rows = input_size + hidden_size;
-        let h_init: Box<[f32]> = (0..hidden_size).map(|_| random_range(-0.9..0.9)).collect();
-        let c_init: Box<[f32]> = (0..hidden_size).map(|_| random_range(-0.9..0.9)).collect();
+        let h_init: Box<[f32]> = (0..hidden_size)
+            .map(|_| random_range(-0.25..0.25))
+            .collect();
+        let c_init: Box<[f32]> = (0..hidden_size)
+            .map(|_| random_range(-0.25..0.25))
+            .collect();
         Self {
             input_size,
             hidden_size,

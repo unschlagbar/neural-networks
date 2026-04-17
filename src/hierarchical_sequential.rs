@@ -78,6 +78,8 @@ impl HierarchicalSequential {
             }
         }
 
+        dbg!(word_rep_layer);
+
         if word_rep_layer == usize::MAX {
             panic!("char_model must contain a recurrent layer producing the high model input size",)
         }

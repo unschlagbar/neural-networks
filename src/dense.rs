@@ -76,9 +76,9 @@ pub struct DenseLayer<A: Activate> {
 impl<A: Activate> DenseLayer<A> {
     pub fn new(input_size: usize, hidden_size: usize, activation: A) -> Self {
         let mut rng = rng();
-        let weights = Matrix::random(input_size, hidden_size, 1.0);
+        let weights = Matrix::random(input_size, hidden_size, 0.5);
         let biases = (0..hidden_size)
-            .map(|_| rng.random_range(-1.0..1.0))
+            .map(|_| rng.random_range(-0.5..0.5))
             .collect();
         Self {
             weights,

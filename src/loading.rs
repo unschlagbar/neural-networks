@@ -9,8 +9,8 @@ use iron_oxide::collections::Matrix;
 
 use crate::{
     activations::{LeakyRelu, Linear, Relu, Sigmoid, Tanh},
+    dense::DenseLayer,
     dropout::DropoutLayer,
-    layer::DenseLayer,
     lstm::LSTMLayer,
     nn_layer::NnLayer,
     parallel::ParallelLayer,

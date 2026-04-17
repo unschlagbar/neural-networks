@@ -9,10 +9,10 @@ use std::{
 pub mod activations;
 pub mod batches;
 pub mod data_set_loading;
+pub mod dense;
 pub mod dropout;
 pub mod hierarchical_sequential;
 pub mod indrnn;
-pub mod layer;
 pub mod loading;
 pub mod lstm;
 pub mod nn_layer;
@@ -27,8 +27,8 @@ pub mod tokenizer;
 use crate::activations::{Linear, Relu, Tanh};
 use crate::batches::{BatchDebugger, WordBoundaryBatches};
 use crate::data_set_loading::DataSet;
+use crate::dense::DenseLayer;
 use crate::hierarchical_sequential::HierarchicalSequential;
-use crate::layer::DenseLayer;
 use crate::lstm::LSTMLayer;
 use crate::nn_layer::SequentialBuilder;
 use crate::sequential::Sequential;
@@ -36,9 +36,10 @@ use crate::tokenizer::Tokenizer;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const MODEL_LOC: &str = "models/hric2";
+const MODEL_LOC: &str = "models/hric4";
 const SEQ_LOC: &str = "models/seq";
 const SEQ_LEN: usize = 300;
+const MAX_SEQ_LEN: usize = 2500;
 const LR: f32 = 0.008;
 const BATCH_SIZE: usize = 1;
 const EPOCHS: usize = 1000;
@@ -48,8 +49,8 @@ const SAVE_EVERY: usize = 2;
 const MAX_LEN: usize = 1000;
 const TEMPERATURE: f32 = 0.4;
 
-const CHAR_HIDDEN: usize = 256;
-const CONTEXT_DIM: usize = 256;
+const CHAR_HIDDEN: usize = 512;
+const CONTEXT_DIM: usize = 512;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -167,7 +168,7 @@ pub fn train_new() {
         }
     };
 
-    model.make_cache(SEQ_LEN * 5);
+    model.make_cache(MAX_SEQ_LEN);
 
     let mut iteration = 0;
     let mut j = 0; // gradient updates
@@ -233,7 +234,7 @@ pub fn train() {
         }
     };
 
-    model.make_cache(SEQ_LEN * 5);
+    model.make_cache(MAX_SEQ_LEN);
 
     let mut iteration = 0;
     let mut j = 0; // gradient updates
