@@ -121,19 +121,23 @@ pub struct LSTMLayer {
 impl LSTMLayer {
     pub fn new(input_size: usize, hidden_size: usize) -> Self {
         let rows = input_size + hidden_size;
+
+        let scale = (6.0 / rows as f32).sqrt();
+
         let h_init: Box<[f32]> = (0..hidden_size)
-            .map(|_| random_range(-0.25..0.25))
+            .map(|_| random_range(-scale..scale))
             .collect();
         let c_init: Box<[f32]> = (0..hidden_size)
-            .map(|_| random_range(-0.25..0.25))
+            .map(|_| random_range(-scale..scale))
             .collect();
+
         Self {
             input_size,
             hidden_size,
-            wf: Matrix::random(rows, hidden_size, 0.08),
-            wi: Matrix::random(rows, hidden_size, 0.08),
-            wc: Matrix::random(rows, hidden_size, 0.08),
-            wo: Matrix::random(rows, hidden_size, 0.08),
+            wf: Matrix::random(rows, hidden_size, scale),
+            wi: Matrix::random(rows, hidden_size, scale),
+            wc: Matrix::random(rows, hidden_size, scale),
+            wo: Matrix::random(rows, hidden_size, scale),
             b: Matrix::zeros(4, hidden_size),
             h: h_init.clone(),
             c: c_init.clone(),

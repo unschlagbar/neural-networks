@@ -3,7 +3,7 @@
 use std::{any::Any, io};
 
 use iron_oxide::collections::Matrix;
-use rand::{Rng, RngExt, rng};
+use rand::{Rng, RngExt, random_range, rng};
 
 use crate::{
     activations::Activate,
@@ -75,11 +75,9 @@ pub struct DenseLayer<A: Activate> {
 
 impl<A: Activate> DenseLayer<A> {
     pub fn new(input_size: usize, hidden_size: usize, activation: A) -> Self {
-        let mut rng = rng();
-        let weights = Matrix::random(input_size, hidden_size, 0.5);
-        let biases = (0..hidden_size)
-            .map(|_| rng.random_range(-0.5..0.5))
-            .collect();
+        let scale = (32.0 / (input_size as f32 + hidden_size as f32)).sqrt();
+        let weights = Matrix::random(input_size, hidden_size, scale);
+        let biases = (0..hidden_size).map(|_| random_range(-0.5..0.5)).collect();
         Self {
             weights,
             biases,

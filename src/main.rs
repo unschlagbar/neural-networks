@@ -49,7 +49,7 @@ const SAVE_EVERY: usize = 2;
 const MAX_LEN: usize = 1000;
 const TEMPERATURE: f32 = 0.4;
 
-const CHAR_HIDDEN: usize = 512;
+const CHAR_HIDDEN: usize = 256;
 const CONTEXT_DIM: usize = 512;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
