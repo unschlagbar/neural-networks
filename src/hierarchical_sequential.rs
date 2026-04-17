@@ -388,10 +388,12 @@ impl HierarchicalSequential {
             *iteration += 1;
             if *iteration % batch_size == 0 {
                 let effective_lr = lr / batch_size as f32;
+                let char_tr =
+                    self.boundary_timesteps.len() as f32 / inputs.len() as f32 * effective_lr;
 
                 for layer in &mut self.char_model.layers {
                     layer.clip_grads();
-                    layer.apply_grads(effective_lr);
+                    layer.apply_grads(char_tr);
                 }
                 self.char_model.clear_grads();
 
