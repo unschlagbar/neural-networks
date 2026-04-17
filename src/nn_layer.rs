@@ -116,6 +116,9 @@ pub struct SequentialBuilder {
     input_size: usize,
     output_size: usize,
     layers: Vec<Box<dyn NnLayer>>,
+    in_parallel: bool,
+    branch1: Option<Box<dyn NnLayer>>,
+    branch2: Option<Box<dyn NnLayer>>,
 }
 impl SequentialBuilder {
     pub fn new(input_size: usize) -> Self {
@@ -123,60 +126,77 @@ impl SequentialBuilder {
             input_size,
             output_size: input_size,
             layers: Vec::new(),
+            in_parallel: false,
+            branch1: None,
+            branch2: None,
         }
     }
 
     pub fn dense<A: Activate + 'static>(mut self, hidden: usize, act: A) -> Self {
         let layer = DenseLayer::new(self.output_size, hidden, act);
-        self.output_size = hidden;
-        self.layers.push(Box::new(layer));
+        self.layer(Box::new(layer), hidden);
         self
     }
 
     pub fn project<A: Activate + 'static>(mut self, hidden: usize, act: A) -> Self {
         let layer = Projection::new(self.output_size, hidden, act);
-        self.output_size = hidden;
-        self.layers.push(Box::new(layer));
+        self.layer(Box::new(layer), hidden);
         self
     }
 
     pub fn softmax(mut self) -> Self {
         let layer = SoftmaxLayer::new(self.output_size);
-        self.layers.push(Box::new(layer));
+        self.layer(Box::new(layer), self.output_size);
         self
     }
 
     pub fn lstm(mut self, hidden: usize) -> Self {
         let layer = LSTMLayer::new(self.output_size, hidden);
-        self.output_size = hidden;
-        self.layers.push(Box::new(layer));
+        self.layer(Box::new(layer), hidden);
         self
     }
 
     pub fn indrnn<A: Activate + 'static>(mut self, hidden: usize, act: A) -> Self {
         let layer = IndRNNLayer::new(self.output_size, hidden, act);
-        self.output_size = hidden;
-        self.layers.push(Box::new(layer));
+        self.layer(Box::new(layer), hidden);
         self
     }
 
     pub fn dropout(mut self, rate: f32) -> Self {
         let layer = DropoutLayer::new(self.output_size, rate);
-        self.layers.push(Box::new(layer));
+        self.layer(Box::new(layer), self.output_size);
         self
     }
 
-    pub fn parallel(
-        mut self,
-        branch1: Box<dyn NnLayer>,
-        branch2: Box<dyn NnLayer>,
-        lr1: f32,
-        lr2: f32,
-    ) -> Self {
-        let layer = ParallelLayer::new(branch1, branch2, lr1, lr2); // oder wo du die Datei hast
-        self.output_size = layer.output_size();
-        self.layers.push(Box::new(layer));
-        self
+    pub fn parallel<F: FnMut(Self) -> Self>(mut self, mut inside_layer: F) -> Self {
+        self.in_parallel = true;
+        let mut this = (inside_layer)(self);
+        this.in_parallel = false;
+        let layer = if let Some(branch1) = this.branch1.take()
+            && let Some(branch2) = this.branch2.take()
+        {
+            ParallelLayer::new(branch1, branch2, 1.0, 1.0)
+        } else {
+            unreachable!()
+        };
+        this.output_size = layer.output_size();
+        this.layers.push(Box::new(layer));
+        this
+    }
+
+    fn layer(&mut self, layer: Box<dyn NnLayer>, hidden: usize) {
+        if self.in_parallel {
+            if self.branch1.is_none() {
+                self.branch1 = Some(layer);
+            } else if self.branch2.is_none() {
+                self.branch2 = Some(layer);
+            } else {
+                unreachable!()
+            }
+        } else {
+            self.output_size = hidden;
+            self.layers.push(layer);
+        }
     }
 
     pub fn build(self) -> Sequential {

@@ -2,12 +2,14 @@ use iron_oxide::collections::Matrix;
 
 use crate::{
     activations::Activate,
-    lstm::{CLIP, sub_in_place, sub_vec_in_place},
+    lstm::{add_vec_in_place, sub_in_place, sub_vec_in_place},
     nn_layer::{DynCache, NnLayer},
     saving,
 };
-use rand::{RngExt, rng};
+use rand::random_range;
 use std::{any::Any, io};
+
+const CLIP: f32 = 0.1;
 
 // ── IndRNNCache ───────────────────────────────────────────────────────────────
 
@@ -45,6 +47,7 @@ pub struct IndRNNLayerGrads {
     pub w: Matrix,     // Input-Gewichte
     pub u: Box<[f32]>, // Diagonale Rekurrenz-Gewichte (IndRNN-spezifisch)
     pub b: Box<[f32]>,
+    pub h_init: Box<[f32]>,
 }
 
 impl IndRNNLayerGrads {
@@ -53,6 +56,7 @@ impl IndRNNLayerGrads {
             w: Matrix::zeros(input_size, hidden_size),
             u: vec![0.0; hidden_size].into(),
             b: vec![0.0; hidden_size].into(),
+            h_init: vec![0.0; hidden_size].into(),
         }
     }
 }
@@ -72,6 +76,7 @@ pub struct IndRNNLayer<A: Activate> {
     pub h: Box<[f32]>,
     /// BPTT-Gradient dL/dh_{t-1}
     pub dh_bptt: Box<[f32]>,
+    pub h_init: Box<[f32]>,
 
     /// Gradient-Akkumulatoren
     pub grads: IndRNNLayerGrads,
@@ -80,12 +85,12 @@ pub struct IndRNNLayer<A: Activate> {
 impl<A: Activate> IndRNNLayer<A> {
     /// Neue Konstruktor-Signatur – genau wie `DenseLayer::new`
     pub fn new(input_size: usize, hidden_size: usize, activation: A) -> Self {
-        let mut rng = rng();
         let h = hidden_size;
 
         // Gewichte exakt wie bei LSTM (kleine Initialisierung für Rekurrenz)
         let w = Matrix::random(input_size, h, 0.08);
-        let u = (0..h).map(|_| rng.random_range(-1.0..1.0)).collect(); // ✓
+        let u = (0..h).map(|_| random_range(-0.08..0.08)).collect(); // ✓
+        let h_init: Box<[f32]> = (0..h).map(|_| random_range(-0.08..0.08)).collect();
 
         Self {
             input_size,
@@ -96,6 +101,7 @@ impl<A: Activate> IndRNNLayer<A> {
             activation,
             h: vec![0.0; h].into(),
             dh_bptt: vec![0.0; h].into(),
+            h_init,
             grads: IndRNNLayerGrads::zeros(input_size, h),
         }
     }
@@ -106,6 +112,7 @@ impl<A: Activate> IndRNNLayer<A> {
         activation: A,
         w: Matrix,
         u: Box<[f32]>,
+        h_init: Box<[f32]>,
         b: Box<[f32]>,
     ) -> Self {
         debug_assert_eq!(w.rows(), input_size);
@@ -122,12 +129,13 @@ impl<A: Activate> IndRNNLayer<A> {
             activation,
             h: vec![0.0; hidden_size].into_boxed_slice(),
             dh_bptt: vec![0.0; hidden_size].into_boxed_slice(),
+            h_init,
             grads: IndRNNLayerGrads::zeros(input_size, hidden_size),
         }
     }
 
     pub fn reset(&mut self) {
-        self.h.fill(0.0);
+        self.h.copy_from_slice(&self.h_init);
         self.dh_bptt.fill(0.0);
     }
 
@@ -235,7 +243,8 @@ impl<A: Activate> NnLayer for IndRNNLayer<A> {
         saving::write_u8(w, self.activation.activation_id())?;
         saving::write_matrix(w, &self.w)?;
         saving::write_f32_slice(w, &self.u)?;
-        saving::write_f32_slice(w, &self.b)
+        saving::write_f32_slice(w, &self.b)?;
+        saving::write_f32_slice(w, &self.h_init)
     }
 
     fn make_cache(&self) -> Box<dyn DynCache> {
@@ -252,20 +261,22 @@ impl<A: Activate> NnLayer for IndRNNLayer<A> {
     fn apply_grads(&mut self, lr: f32) {
         sub_in_place(&mut self.w, &self.grads.w, lr);
         sub_vec_in_place(&mut self.u, &self.grads.u, lr);
-        self.u.iter_mut().for_each(|x| *x = x.clamp(-1.0, 1.0));
         sub_vec_in_place(&mut self.b, &self.grads.b, lr);
+        sub_vec_in_place(&mut self.h_init, &self.grads.h_init, lr);
     }
 
     fn clear_grads(&mut self) {
         self.grads.w.clear();
         self.grads.u.fill(0.0);
         self.grads.b.fill(0.0);
+        self.grads.h_init.fill(0.0);
     }
 
     fn scale_grads(&mut self, scale: f32) {
         self.grads.w.scale(scale);
         self.grads.u.iter_mut().for_each(|x| *x *= scale);
         self.grads.b.iter_mut().for_each(|x| *x *= scale);
+        self.grads.h_init.iter_mut().for_each(|x| *x *= scale);
     }
 
     fn clip_grads(&mut self) {
@@ -278,6 +289,10 @@ impl<A: Activate> NnLayer for IndRNNLayer<A> {
             .b
             .iter_mut()
             .for_each(|x| *x = x.clamp(-CLIP, CLIP));
+        self.grads
+            .h_init
+            .iter_mut()
+            .for_each(|x| *x = x.clamp(-CLIP, CLIP));
     }
 
     fn reset_state(&mut self) {
@@ -286,5 +301,9 @@ impl<A: Activate> NnLayer for IndRNNLayer<A> {
 
     fn bptt_hidden_grad(&mut self) -> Option<&[f32]> {
         Some(&self.dh_bptt)
+    }
+
+    fn accumulate_init_grad(&mut self) {
+        add_vec_in_place(&mut self.grads.h_init, &self.dh_bptt);
     }
 }

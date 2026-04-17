@@ -136,14 +136,25 @@ pub fn load_indrnn(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer
     let w: Matrix = read_matrix(r)?;
     let u: Box<[f32]> = read_f32_vec(r)?.into_boxed_slice();
     let b: Box<[f32]> = read_f32_vec(r)?.into_boxed_slice();
+    let h_init: Box<[f32]> = read_f32_vec(r)?.into_boxed_slice();
 
     use crate::indrnn::IndRNNLayer;
     let layer: Box<dyn NnLayer> = match act_id {
-        0 => Box::new(IndRNNLayer::from_loaded(input, hidden, Linear, w, u, b)),
-        1 => Box::new(IndRNNLayer::from_loaded(input, hidden, Relu, w, u, b)),
-        2 => Box::new(IndRNNLayer::from_loaded(input, hidden, Tanh, w, u, b)),
-        3 => Box::new(IndRNNLayer::from_loaded(input, hidden, Sigmoid, w, u, b)),
-        4 => Box::new(IndRNNLayer::from_loaded(input, hidden, LeakyRelu, w, u, b)),
+        0 => Box::new(IndRNNLayer::from_loaded(
+            input, hidden, Linear, w, u, b, h_init,
+        )),
+        1 => Box::new(IndRNNLayer::from_loaded(
+            input, hidden, Relu, w, u, b, h_init,
+        )),
+        2 => Box::new(IndRNNLayer::from_loaded(
+            input, hidden, Tanh, w, u, b, h_init,
+        )),
+        3 => Box::new(IndRNNLayer::from_loaded(
+            input, hidden, Sigmoid, w, u, b, h_init,
+        )),
+        4 => Box::new(IndRNNLayer::from_loaded(
+            input, hidden, LeakyRelu, w, u, b, h_init,
+        )),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

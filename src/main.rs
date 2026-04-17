@@ -27,18 +27,16 @@ pub mod tokenizer;
 use crate::activations::{Linear, Relu, Tanh};
 use crate::batches::{BatchDebugger, WordBoundaryBatches};
 use crate::data_set_loading::DataSet;
-use crate::dense::DenseLayer;
 use crate::hierarchical_sequential::HierarchicalSequential;
-use crate::lstm::LSTMLayer;
 use crate::nn_layer::SequentialBuilder;
 use crate::sequential::Sequential;
 use crate::tokenizer::Tokenizer;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const MODEL_LOC: &str = "models/hric4";
+const MODEL_LOC: &str = "models/hric5";
 const SEQ_LOC: &str = "models/seq";
-const SEQ_LEN: usize = 300;
+const SEQ_LEN: usize = 500;
 const MAX_SEQ_LEN: usize = 2500;
 const LR: f32 = 0.008;
 const BATCH_SIZE: usize = 1;
@@ -49,7 +47,7 @@ const SAVE_EVERY: usize = 2;
 const MAX_LEN: usize = 1000;
 const TEMPERATURE: f32 = 0.4;
 
-const CHAR_HIDDEN: usize = 256;
+const CHAR_HIDDEN: usize = 512;
 const CONTEXT_DIM: usize = 512;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -72,43 +70,32 @@ fn main() {
 
 fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequential {
     let char_model = SequentialBuilder::new(vocab + CONTEXT_DIM)
-        //.parallel(
-        //    Box::new(LSTMLayer::new(vocab + CONTEXT_DIM, CHAR_HIDDEN / 4 * 3)),
-        //    Box::new(DenseLayer::new(
-        //        vocab + CONTEXT_DIM,
-        //        CHAR_HIDDEN / 4 * 1,
-        //        Tanh,
-        //    )),
-        //    1.0,
-        //    1.0,
-        //)
         .lstm(CHAR_HIDDEN)
         .dropout(0.3)
-        .parallel(
-            Box::new(LSTMLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 3)),
-            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, Relu)),
-            1.0,
-            1.0,
-        )
+        .parallel(|b| {
+            b.lstm(CHAR_HIDDEN / 4 * 3)
+                .indrnn(CHAR_HIDDEN / 4 * 1, Relu)
+        })
         .dropout(0.3)
         .dense(vocab, Linear)
         .softmax()
         .build();
 
     let high_model = SequentialBuilder::new(CHAR_HIDDEN)
-        .parallel(
-            Box::new(LSTMLayer::new(CHAR_HIDDEN, CONTEXT_DIM / 4 * 3)),
-            Box::new(DenseLayer::new(CHAR_HIDDEN, CONTEXT_DIM / 4 * 1, Relu)),
-            1.0,
-            1.0,
-        )
+        .parallel(|b| {
+            b.lstm(CONTEXT_DIM / 4 * 3)
+                .indrnn(CONTEXT_DIM / 4 * 1, Relu)
+        })
         .dropout(0.3)
-        .parallel(
-            Box::new(LSTMLayer::new(CONTEXT_DIM, CONTEXT_DIM / 4 * 3)),
-            Box::new(DenseLayer::new(CONTEXT_DIM, CONTEXT_DIM / 4 * 1, Relu)),
-            1.0,
-            1.0,
-        )
+        .parallel(|b| {
+            b.lstm(CONTEXT_DIM / 4 * 3)
+                .indrnn(CONTEXT_DIM / 4 * 1, Relu)
+        })
+        .dropout(0.3)
+        .parallel(|b| {
+            b.lstm(CONTEXT_DIM / 4 * 3)
+                .indrnn(CONTEXT_DIM / 4 * 1, Relu)
+        })
         .dropout(0.3)
         .build();
 
@@ -117,33 +104,9 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
 
 fn build_new_normal_model(vocab: usize) -> Sequential {
     SequentialBuilder::new(vocab)
-        .parallel(
-            Box::new(LSTMLayer::new(vocab, CHAR_HIDDEN / 4 * 3)),
-            Box::new(DenseLayer::new(vocab, CHAR_HIDDEN / 4 * 1, Relu)),
-            1.0,
-            1.0,
-        )
+        .parallel(|b| b.lstm(CONTEXT_DIM / 2).indrnn(CONTEXT_DIM / 2, Relu))
         .dropout(0.3)
-        .parallel(
-            Box::new(LSTMLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 3)),
-            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, Relu)),
-            1.0,
-            1.0,
-        )
-        .dropout(0.3)
-        .parallel(
-            Box::new(LSTMLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 3)),
-            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, Relu)),
-            1.0,
-            1.0,
-        )
-        .dropout(0.3)
-        .parallel(
-            Box::new(LSTMLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 3)),
-            Box::new(DenseLayer::new(CHAR_HIDDEN, CHAR_HIDDEN / 4 * 1, Relu)),
-            1.0,
-            1.0,
-        )
+        .parallel(|b| b.lstm(CONTEXT_DIM / 2).indrnn(CONTEXT_DIM / 2, Relu))
         .dropout(0.3)
         .dense(vocab, Linear)
         .softmax()

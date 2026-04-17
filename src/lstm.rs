@@ -8,7 +8,7 @@ use crate::{
 };
 use std::{any::Any, io};
 
-pub const CLIP: f32 = 1.0;
+pub const CLIP: f32 = 2.0;
 
 const F: usize = 0;
 const I: usize = 1;
