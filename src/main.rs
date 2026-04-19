@@ -35,11 +35,11 @@ use crate::tokenizer::Tokenizer;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const MODEL_LOC: &str = "models/hric6";
+const MODEL_LOC: &str = "models/hric5";
 const SEQ_LOC: &str = "models/seq2";
 const SEQ_LEN: usize = 200;
 const MAX_SEQ_LEN: usize = 2500;
-const LR: f32 = 0.0001;
+const LR: f32 = 0.001;
 const BATCH_SIZE: usize = 1;
 const EPOCHS: usize = 1000;
 /// Save after every N completed files (0 = never save mid-epoch, only at epoch end).
@@ -63,7 +63,7 @@ fn main() {
         //thread::spawn(|| train());
         train_new();
     } else {
-        sample_old();
+        sample();
     }
 }
 
@@ -73,15 +73,17 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
     let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).dense(CONTEXT_DIM, Tanh);
     for _ in 0..3 {
         char_model = char_model.normed(|b| b.lstm(CONTEXT_DIM));
-        //char_model = char_model.dropout(0.01);
     }
-    let char_model = char_model.dense(vocab, Linear).softmax().build();
+    let char_model = char_model
+        //.dropout(0.1)
+        .dense(vocab, Linear)
+        .softmax()
+        .build();
 
     let mut high_model = SequentialBuilder::new(CHAR_HIDDEN).dense(CONTEXT_DIM, Relu);
     for _ in 0..3 {
         high_model = high_model.normed(|b| b.lstm(CONTEXT_DIM));
         high_model = high_model.lstm(CONTEXT_DIM);
-        high_model = high_model.dropout(0.01);
     }
 
     let high_model = high_model.build();
