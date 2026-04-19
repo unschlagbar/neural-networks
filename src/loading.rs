@@ -13,6 +13,7 @@ use crate::{
     dropout::DropoutLayer,
     lstm::LSTMLayer,
     nn_layer::NnLayer,
+    norm::LayerNormWrapper,
     parallel::ParallelLayer,
     projection::Projection,
     saving::{MAGIC, VERSION},
@@ -216,6 +217,24 @@ pub fn load_parallel(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLa
     Ok(Box::new(ParallelLayer::new(branch1, branch2, lr1, lr2)))
 }
 
+pub fn load_norm(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
+    let gamma = read_f32_vec(r)?.into_boxed_slice();
+
+    let inner_tag = read_u8(r)?;
+    let inner_input = read_u32(r)? as usize;
+    let inner_output = read_u32(r)? as usize;
+
+    let ctx = LoadCtx {
+        input_size: inner_input,
+        output_size: inner_output,
+    };
+    let inner = new_layer(r, inner_tag, ctx)?;
+
+    let mut wrapper = LayerNormWrapper::new(inner);
+    wrapper.gamma = gamma;
+    Ok(Box::new(wrapper))
+}
+
 // ── Layer factory ─────────────────────────────────────────────────────────────
 
 fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
@@ -227,6 +246,7 @@ fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLa
         4 => load_softmax(r),
         6 => load_dropout(r, ctx),
         7 => load_parallel(r, ctx),
+        8 => load_norm(r, ctx),
         o => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unknown layer tag {o}"),

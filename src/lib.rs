@@ -11,6 +11,7 @@ pub mod hierarchical_sequential;
 pub mod indrnn;
 pub mod loading;
 pub mod nn_layer;
+pub mod norm;
 pub mod parallel;
 pub mod projection;
 pub mod saving;

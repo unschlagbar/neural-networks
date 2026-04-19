@@ -76,13 +76,6 @@ impl DropoutLayer {
     }
 
     fn forward_impl(&self, input: &[f32], cache: &mut DropoutCache) {
-        if self.rate == 0.0 {
-            // Inference path: identity.
-            cache.output.copy_from_slice(input);
-            cache.mask.fill(1.0);
-            return;
-        }
-
         let scale = 1.0 / (1.0 - self.rate);
         let mut rng = rng();
 

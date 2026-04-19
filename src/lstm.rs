@@ -1,5 +1,4 @@
 use iron_oxide::collections::Matrix;
-use rand::random_range;
 
 use crate::{
     activations::sigmoid,
@@ -124,12 +123,10 @@ impl LSTMLayer {
 
         let scale = (6.0 / rows as f32).sqrt();
 
-        let h_init: Box<[f32]> = (0..hidden_size)
-            .map(|_| random_range(-scale..scale))
-            .collect();
-        let c_init: Box<[f32]> = (0..hidden_size)
-            .map(|_| random_range(-scale..scale))
-            .collect();
+        let h_init = vec![0.0; hidden_size].into_boxed_slice();
+        let c_init = vec![0.0; hidden_size].into_boxed_slice();
+
+        let b = Matrix::zeros(4, hidden_size);
 
         Self {
             input_size,
@@ -138,7 +135,7 @@ impl LSTMLayer {
             wi: Matrix::random(rows, hidden_size, scale),
             wc: Matrix::random(rows, hidden_size, scale),
             wo: Matrix::random(rows, hidden_size, scale),
-            b: Matrix::zeros(4, hidden_size),
+            b,
             h: h_init.clone(),
             c: c_init.clone(),
             dh_bptt: vec![0.0; hidden_size].into(),

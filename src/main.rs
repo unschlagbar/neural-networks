@@ -16,6 +16,7 @@ pub mod indrnn;
 pub mod loading;
 pub mod lstm;
 pub mod nn_layer;
+pub mod norm;
 pub mod parallel;
 pub mod projection;
 pub mod saving;
@@ -34,11 +35,11 @@ use crate::tokenizer::Tokenizer;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const MODEL_LOC: &str = "models/hric5";
-const SEQ_LOC: &str = "models/seq";
-const SEQ_LEN: usize = 500;
+const MODEL_LOC: &str = "models/hric6";
+const SEQ_LOC: &str = "models/seq2";
+const SEQ_LEN: usize = 200;
 const MAX_SEQ_LEN: usize = 2500;
-const LR: f32 = 0.008;
+const LR: f32 = 0.0001;
 const BATCH_SIZE: usize = 1;
 const EPOCHS: usize = 1000;
 /// Save after every N completed files (0 = never save mid-epoch, only at epoch end).
@@ -47,8 +48,8 @@ const SAVE_EVERY: usize = 2;
 const MAX_LEN: usize = 1000;
 const TEMPERATURE: f32 = 0.4;
 
-const CHAR_HIDDEN: usize = 512;
-const CONTEXT_DIM: usize = 512;
+const CHAR_HIDDEN: usize = 128;
+const CONTEXT_DIM: usize = 128;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -62,55 +63,40 @@ fn main() {
         //thread::spawn(|| train());
         train_new();
     } else {
-        sample();
+        sample_old();
     }
 }
 
 // ── Training ──────────────────────────────────────────────────────────────────
 
 fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequential {
-    let char_model = SequentialBuilder::new(vocab + CONTEXT_DIM)
-        .lstm(CHAR_HIDDEN)
-        .dropout(0.3)
-        .parallel(|b| {
-            b.lstm(CHAR_HIDDEN / 4 * 3)
-                .indrnn(CHAR_HIDDEN / 4 * 1, Relu)
-        })
-        .dropout(0.3)
-        .dense(vocab, Linear)
-        .softmax()
-        .build();
+    let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).dense(CONTEXT_DIM, Tanh);
+    for _ in 0..3 {
+        char_model = char_model.normed(|b| b.lstm(CONTEXT_DIM));
+        //char_model = char_model.dropout(0.01);
+    }
+    let char_model = char_model.dense(vocab, Linear).softmax().build();
 
-    let high_model = SequentialBuilder::new(CHAR_HIDDEN)
-        .parallel(|b| {
-            b.lstm(CONTEXT_DIM / 4 * 3)
-                .indrnn(CONTEXT_DIM / 4 * 1, Relu)
-        })
-        .dropout(0.3)
-        .parallel(|b| {
-            b.lstm(CONTEXT_DIM / 4 * 3)
-                .indrnn(CONTEXT_DIM / 4 * 1, Relu)
-        })
-        .dropout(0.3)
-        .parallel(|b| {
-            b.lstm(CONTEXT_DIM / 4 * 3)
-                .indrnn(CONTEXT_DIM / 4 * 1, Relu)
-        })
-        .dropout(0.3)
-        .build();
+    let mut high_model = SequentialBuilder::new(CHAR_HIDDEN).dense(CONTEXT_DIM, Relu);
+    for _ in 0..3 {
+        high_model = high_model.normed(|b| b.lstm(CONTEXT_DIM));
+        high_model = high_model.lstm(CONTEXT_DIM);
+        high_model = high_model.dropout(0.01);
+    }
+
+    let high_model = high_model.build();
 
     HierarchicalSequential::new(char_model, high_model, vocab, boundary_ids)
 }
 
 fn build_new_normal_model(vocab: usize) -> Sequential {
-    SequentialBuilder::new(vocab)
-        .parallel(|b| b.lstm(CONTEXT_DIM / 2).indrnn(CONTEXT_DIM / 2, Relu))
-        .dropout(0.3)
-        .parallel(|b| b.lstm(CONTEXT_DIM / 2).indrnn(CONTEXT_DIM / 2, Relu))
-        .dropout(0.3)
-        .dense(vocab, Linear)
-        .softmax()
-        .build()
+    let mut model = SequentialBuilder::new(vocab).dense(CONTEXT_DIM, Tanh);
+
+    for _ in 0..4 {
+        model = model.normed(|b| b.lstm(CONTEXT_DIM));
+        model = model.dropout(0.01);
+    }
+    model.dense(vocab, Linear).softmax().build()
 }
 
 pub fn train_new() {

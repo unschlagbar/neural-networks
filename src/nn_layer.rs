@@ -6,6 +6,7 @@ use crate::dense::DenseLayer;
 use crate::dropout::DropoutLayer;
 use crate::indrnn::IndRNNLayer;
 use crate::lstm::LSTMLayer;
+use crate::norm::LayerNormWrapper;
 use crate::parallel::ParallelLayer;
 use crate::projection::Projection;
 use crate::sequential::Sequential;
@@ -182,6 +183,25 @@ impl SequentialBuilder {
         this.output_size = layer.output_size();
         this.layers.push(Box::new(layer));
         this
+    }
+
+    // In nn_layer.rs → impl SequentialBuilder
+    pub fn normed<F: FnMut(Self) -> Self>(mut self, mut inside_layer: F) -> Self {
+        // Inneren Builder starten (mit der aktuellen output_size als input)
+        let mut inner_builder = (inside_layer)(SequentialBuilder::new(self.output_size));
+
+        // Der Closure darf **genau einen** Layer bauen (das ist der innere Layer)
+        let inner = if let Some(layer) = inner_builder.layers.pop() {
+            layer
+        } else {
+            unreachable!("normed closure muss genau einen inneren Layer bauen!")
+        };
+
+        let wrapper = LayerNormWrapper::new(inner);
+
+        self.output_size = wrapper.input_size();
+        self.layers.push(Box::new(wrapper));
+        self
     }
 
     fn layer(&mut self, layer: Box<dyn NnLayer>, hidden: usize) {
