@@ -25,9 +25,10 @@
 use std::{any::Any, io};
 
 use crate::{
+    dropout::{DropoutCache, DropoutLayer},
     lstm::{CLIP, sub_vec_in_place},
     nn_layer::{DynCache, NnLayer},
-    saving::{write_f32_slice, write_u8, write_u32},
+    saving::{write_f32, write_f32_slice, write_u8, write_u32},
 };
 
 // Larger than f32::EPSILON to avoid denormal blow-up on near-zero vectors at init.
@@ -49,6 +50,8 @@ pub struct LayerNormWrapperCache {
     pub output: Box<[f32]>,
     /// dL/d(input) of the whole wrapper, written by backward.
     pub dx: Box<[f32]>,
+
+    pub dropout: Option<DropoutCache>,
 }
 
 impl DynCache for LayerNormWrapperCache {
@@ -70,6 +73,7 @@ impl DynCache for LayerNormWrapperCache {
 
 pub struct LayerNormWrapper {
     pub inner: Box<dyn NnLayer>,
+    pub dropout: Option<DropoutLayer>,
     /// Learnable per-element scale (init 1 → wrapper starts as near-identity).
     pub gamma: Box<[f32]>,
     pub grads_gamma: Box<[f32]>,
@@ -77,7 +81,7 @@ pub struct LayerNormWrapper {
 }
 
 impl LayerNormWrapper {
-    pub fn new(inner: Box<dyn NnLayer>) -> Self {
+    pub fn new(inner: Box<dyn NnLayer>, dropout: f32) -> Self {
         assert_eq!(
             inner.input_size(),
             inner.output_size(),
@@ -88,8 +92,14 @@ impl LayerNormWrapper {
             inner.output_size()
         );
         let n = inner.input_size();
+        let dropout = if dropout != 0.0 {
+            Some(DropoutLayer::new(n, dropout))
+        } else {
+            None
+        };
         Self {
             inner,
+            dropout,
             gamma: vec![1.0; n].into_boxed_slice(),
             grads_gamma: vec![0.0; n].into_boxed_slice(),
             norm_size: n,
@@ -143,9 +153,13 @@ impl NnLayer for LayerNormWrapper {
         );
 
         self.inner.forward(&c.normed, &mut *c.inner_cache);
+        let inner_out = if let Some(dropout) = &mut self.dropout {
+            dropout.forward_impl(c.inner_cache.output(), c.dropout.as_mut().unwrap());
+            &c.dropout.as_ref().unwrap().output
+        } else {
+            c.inner_cache.output()
+        };
 
-        // Residual: output = inner_out + x
-        let inner_out = c.inner_cache.output();
         for i in 0..self.norm_size {
             c.output[i] = inner_out[i] + input[i];
         }
@@ -191,6 +205,13 @@ impl NnLayer for LayerNormWrapper {
         // inner.backward() may clobber `delta` in-place, so we preserve δ here.
         c.dx.copy_from_slice(delta);
 
+        let delta = if let Some(dropout) = &mut self.dropout {
+            dropout.backward_impl(delta, c.dropout.as_mut().unwrap());
+            &mut c.dropout.as_mut().unwrap().dx
+        } else {
+            delta
+        };
+
         // Step 2: inner backward; d_normed = dL/dŷ lands in inner_cache.input_grad().
         self.inner.backward(delta, &mut *c.inner_cache);
         let d_normed = c.inner_cache.input_grad();
@@ -221,6 +242,7 @@ impl NnLayer for LayerNormWrapper {
 
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
         write_f32_slice(w, &self.gamma)?; // no beta — RMSNorm only
+        write_f32(w, self.dropout.as_ref().map_or(0.0, |d| d.rate))?;
         write_u8(w, self.inner.layer_tag())?;
         write_u32(w, self.inner.input_size() as u32)?;
         write_u32(w, self.inner.output_size() as u32)?;
@@ -237,6 +259,7 @@ impl NnLayer for LayerNormWrapper {
             normed: vec![0.0; n].into_boxed_slice(),
             output: vec![0.0; n].into_boxed_slice(),
             dx: vec![0.0; n].into_boxed_slice(),
+            dropout: Some(DropoutCache::new(n)),
         })
     }
 

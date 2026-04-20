@@ -219,6 +219,7 @@ pub fn load_parallel(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLa
 
 pub fn load_norm(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
     let gamma = read_f32_vec(r)?.into_boxed_slice();
+    let dropout = read_f32(r)?;
 
     let inner_tag = read_u8(r)?;
     let inner_input = read_u32(r)? as usize;
@@ -230,7 +231,7 @@ pub fn load_norm(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>
     };
     let inner = new_layer(r, inner_tag, ctx)?;
 
-    let mut wrapper = LayerNormWrapper::new(inner);
+    let mut wrapper = LayerNormWrapper::new(inner, dropout);
     wrapper.gamma = gamma;
     Ok(Box::new(wrapper))
 }

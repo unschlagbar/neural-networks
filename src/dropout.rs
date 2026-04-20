@@ -64,9 +64,9 @@ impl DynCache for DropoutCache {
 // ── DropoutLayer ──────────────────────────────────────────────────────────────
 
 pub struct DropoutLayer {
-    size: usize,
+    pub size: usize,
     /// Fraction of units to zero out (0.0 = no dropout, 0.5 = half dropped).
-    rate: f32,
+    pub rate: f32,
 }
 
 impl DropoutLayer {
@@ -75,7 +75,7 @@ impl DropoutLayer {
         Self { size, rate }
     }
 
-    fn forward_impl(&self, input: &[f32], cache: &mut DropoutCache) {
+    pub fn forward_impl(&self, input: &[f32], cache: &mut DropoutCache) {
         let scale = 1.0 / (1.0 - self.rate);
         let mut rng = rng();
 
@@ -86,7 +86,7 @@ impl DropoutLayer {
         }
     }
 
-    fn backward_impl(&self, delta: &[f32], cache: &mut DropoutCache) {
+    pub fn backward_impl(&self, delta: &[f32], cache: &mut DropoutCache) {
         // dL/dx_i = delta_i * mask_i  (mask is already 0 or scale)
         for i in 0..self.size {
             cache.dx[i] = delta[i] * cache.mask[i];
