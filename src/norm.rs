@@ -199,7 +199,7 @@ impl NnLayer for LayerNormWrapper {
         let inv_rms = c.inv_rms;
 
         // Steps 3+4: accumulate S and gamma gradient in one pass.
-        let mut s = 0.0_f32;
+        let mut s = 0.0;
         for i in 0..n {
             self.grads_gamma[i] += d_normed[i] * c.x_hat[i];
             s += self.gamma[i] * d_normed[i] * c.x_hat[i];

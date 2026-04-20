@@ -35,11 +35,11 @@ use crate::tokenizer::Tokenizer;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const MODEL_LOC: &str = "models/hric5";
+const MODEL_LOC: &str = "models/hric6";
 const SEQ_LOC: &str = "models/seq2";
-const SEQ_LEN: usize = 200;
+const SEQ_LEN: usize = 2048;
 const MAX_SEQ_LEN: usize = 2500;
-const LR: f32 = 0.001;
+const LR: f32 = 0.005;
 const BATCH_SIZE: usize = 1;
 const EPOCHS: usize = 1000;
 /// Save after every N completed files (0 = never save mid-epoch, only at epoch end).
@@ -48,8 +48,8 @@ const SAVE_EVERY: usize = 2;
 const MAX_LEN: usize = 1000;
 const TEMPERATURE: f32 = 0.4;
 
-const CHAR_HIDDEN: usize = 128;
-const CONTEXT_DIM: usize = 128;
+const CHAR_HIDDEN: usize = 256;
+const CONTEXT_DIM: usize = 256;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -70,9 +70,9 @@ fn main() {
 // ── Training ──────────────────────────────────────────────────────────────────
 
 fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequential {
-    let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).dense(CONTEXT_DIM, Tanh);
-    for _ in 0..3 {
-        char_model = char_model.normed(|b| b.lstm(CONTEXT_DIM));
+    let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).dense(CHAR_HIDDEN, Tanh);
+    for _ in 0..4 {
+        char_model = char_model.normed(|b| b.lstm(CHAR_HIDDEN));
     }
     let char_model = char_model
         //.dropout(0.1)
@@ -80,10 +80,10 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
         .softmax()
         .build();
 
-    let mut high_model = SequentialBuilder::new(CHAR_HIDDEN).dense(CONTEXT_DIM, Relu);
-    for _ in 0..3 {
+    let mut high_model = SequentialBuilder::new(CHAR_HIDDEN).dense(CONTEXT_DIM, Tanh);
+    for _ in 0..12 {
         high_model = high_model.normed(|b| b.lstm(CONTEXT_DIM));
-        high_model = high_model.lstm(CONTEXT_DIM);
+        //high_model = high_model.dense(CONTEXT_DIM, Tanh);
     }
 
     let high_model = high_model.build();
