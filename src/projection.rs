@@ -160,8 +160,4 @@ impl<A: Activate> NnLayer for Projection<A> {
     fn scale_grads(&mut self, scale: f32) {
         self.grads.weights.scale(scale);
     }
-
-    fn clip_grads(&mut self) {
-        self.grads.weights.clip(-CLIP, CLIP);
-    }
 }

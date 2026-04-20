@@ -218,12 +218,4 @@ impl<A: Activate> NnLayer for DenseLayer<A> {
         self.grads.weights.scale(scale);
         self.grads.biases.iter_mut().for_each(|x| *x *= scale);
     }
-
-    fn clip_grads(&mut self) {
-        self.grads.weights.clip(-CLIP, CLIP);
-        self.grads
-            .biases
-            .iter_mut()
-            .for_each(|x| *x = x.clamp(-CLIP, CLIP));
-    }
 }

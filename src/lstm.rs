@@ -362,22 +362,6 @@ impl NnLayer for LSTMLayer {
         self.grads.c_init_grad.iter_mut().for_each(|x| *x *= scale);
     }
 
-    fn clip_grads(&mut self) {
-        self.grads.wf.clip(-CLIP, CLIP);
-        self.grads.wi.clip(-CLIP, CLIP);
-        self.grads.wc.clip(-CLIP, CLIP);
-        self.grads.wo.clip(-CLIP, CLIP);
-        self.grads.b.clip(-CLIP, CLIP);
-        self.grads
-            .h_init_grad
-            .iter_mut()
-            .for_each(|x| *x = x.clamp(-CLIP, CLIP));
-        self.grads
-            .c_init_grad
-            .iter_mut()
-            .for_each(|x| *x = x.clamp(-CLIP, CLIP));
-    }
-
     fn reset_state(&mut self) {
         self.reset();
     }

@@ -26,7 +26,7 @@ use std::{any::Any, io};
 
 use crate::{
     dropout::{DropoutCache, DropoutLayer},
-    lstm::{CLIP, sub_vec_in_place},
+    lstm::sub_vec_in_place,
     nn_layer::{DynCache, NnLayer},
     saving::{write_f32, write_f32_slice, write_u8, write_u32},
 };
@@ -281,12 +281,6 @@ impl NnLayer for LayerNormWrapper {
     fn scale_grads(&mut self, scale: f32) {
         self.grads_gamma.iter_mut().for_each(|x| *x *= scale);
         self.inner.scale_grads(scale);
-    }
-    fn clip_grads(&mut self) {
-        self.grads_gamma
-            .iter_mut()
-            .for_each(|x| *x = x.clamp(-CLIP, CLIP));
-        self.inner.clip_grads();
     }
 
     fn reset_state(&mut self) {

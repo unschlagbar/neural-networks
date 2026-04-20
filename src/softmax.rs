@@ -127,5 +127,4 @@ impl NnLayer for SoftmaxLayer {
     fn apply_grads(&mut self, _lr: f32) {}
     fn clear_grads(&mut self) {}
     fn scale_grads(&mut self, _scale: f32) {}
-    fn clip_grads(&mut self) {}
 }

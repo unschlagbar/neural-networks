@@ -394,13 +394,13 @@ impl HierarchicalSequential {
                     self.boundary_timesteps.len() as f32 / inputs.len() as f32 * effective_lr;
 
                 for layer in &mut self.char_model.layers {
-                    layer.clip_grads();
+                    //layer.clip_grads();
                     layer.apply_grads(char_tr);
                 }
                 self.char_model.clear_grads();
 
                 for layer in &mut self.high_model.layers {
-                    layer.clip_grads();
+                    //layer.clip_grads();
                     layer.apply_grads(effective_lr);
                 }
                 self.high_model.clear_grads();

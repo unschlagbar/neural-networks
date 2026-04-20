@@ -9,8 +9,6 @@ use crate::{
 use rand::random_range;
 use std::{any::Any, io};
 
-const CLIP: f32 = 0.1;
-
 // ── IndRNNCache ───────────────────────────────────────────────────────────────
 
 /// Per-timestep cache (genau wie bei LSTM / Dense – keine Allokation im Hot-Path).
@@ -277,22 +275,6 @@ impl<A: Activate> NnLayer for IndRNNLayer<A> {
         self.grads.u.iter_mut().for_each(|x| *x *= scale);
         self.grads.b.iter_mut().for_each(|x| *x *= scale);
         self.grads.h_init.iter_mut().for_each(|x| *x *= scale);
-    }
-
-    fn clip_grads(&mut self) {
-        self.grads.w.clip(-CLIP, CLIP);
-        self.grads
-            .u
-            .iter_mut()
-            .for_each(|x| *x = x.clamp(-CLIP, CLIP));
-        self.grads
-            .b
-            .iter_mut()
-            .for_each(|x| *x = x.clamp(-CLIP, CLIP));
-        self.grads
-            .h_init
-            .iter_mut()
-            .for_each(|x| *x = x.clamp(-CLIP, CLIP));
     }
 
     fn reset_state(&mut self) {

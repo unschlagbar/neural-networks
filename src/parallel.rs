@@ -146,10 +146,7 @@ impl NnLayer for ParallelLayer {
         self.branch1.scale_grads(scale);
         self.branch2.scale_grads(scale);
     }
-    fn clip_grads(&mut self) {
-        self.branch1.clip_grads();
-        self.branch2.clip_grads();
-    }
+
     fn reset_state(&mut self) {
         self.branch1.reset_state();
         self.branch2.reset_state();

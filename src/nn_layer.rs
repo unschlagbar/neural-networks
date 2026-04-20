@@ -92,7 +92,6 @@ pub trait NnLayer {
     fn apply_grads(&mut self, lr: f32);
     fn clear_grads(&mut self);
     fn scale_grads(&mut self, scale: f32);
-    fn clip_grads(&mut self);
 
     // ── recurrent state ───────────────────────────────────────────────────────
 
