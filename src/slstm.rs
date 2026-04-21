@@ -161,9 +161,7 @@ impl SLSTMLayer {
         // Forget-gate bias init to a positive value (Jozefowicz et al. 2015;
         // xLSTM paper keeps this convention to avoid very small f_t at start).
         let mut b = Matrix::zeros(4, hidden_size);
-        for j in 0..hidden_size {
-            b[G_F][j] = 3.0;
-        }
+        b[G_F].fill(3.0);
 
         let h_init = vec![0.0; hidden_size].into_boxed_slice();
         let c_init = vec![0.0; hidden_size].into_boxed_slice();

@@ -62,9 +62,9 @@ fn main() {
             fs::create_dir("models/").unwrap();
         }
         //thread::spawn(|| train());
-        train();
+        train_new();
     } else {
-        sample_old();
+        sample();
     }
 }
 
