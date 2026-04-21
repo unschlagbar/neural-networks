@@ -124,7 +124,9 @@ impl LSTMLayer {
         let h_init = vec![0.0; hidden_size].into_boxed_slice();
         let c_init = vec![0.0; hidden_size].into_boxed_slice();
 
-        let b = Matrix::zeros(4, hidden_size);
+        let mut b = Matrix::zeros(4, hidden_size);
+
+        b[F].fill(1.0);
 
         Self {
             input_size,
