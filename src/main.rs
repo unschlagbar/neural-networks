@@ -97,7 +97,7 @@ fn build_new_normal_model(vocab: usize) -> Sequential {
     for _ in 0..8 {
         model = model.slstm(CONTEXT_DIM);
         model = model.normed();
-        model = model.slstm(CONTEXT_DIM);
+        model = model.lstm(CONTEXT_DIM);
         model = model.normed();
     }
     model.dense(vocab, Linear).softmax().build()
