@@ -192,15 +192,14 @@ impl SequentialBuilder {
     }
 
     // In nn_layer.rs → impl SequentialBuilder
-    pub fn normed(mut self, dropout: f32) -> Self {
-        // Der Closure darf **genau einen** Layer bauen (das ist der innere Layer)
+    pub fn normed(mut self) -> Self {
         let inner = if let Some(layer) = self.layers.pop() {
             layer
         } else {
             unreachable!("normed closure muss genau einen inneren Layer bauen!")
         };
 
-        let wrapper = LayerNormWrapper::new(inner, dropout);
+        let wrapper = LayerNormWrapper::new(inner);
 
         self.output_size = wrapper.input_size();
         self.layers.push(Box::new(wrapper));

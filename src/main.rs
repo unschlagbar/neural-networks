@@ -37,10 +37,10 @@ use crate::tokenizer::Tokenizer;
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const MODEL_LOC: &str = "models/hric2";
-const SEQ_LOC: &str = "models/seq4";
+const SEQ_LOC: &str = "models/seq";
 const SEQ_LEN: usize = 256;
 const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
-const LR: f32 = 0.0005;
+const LR: f32 = 0.0001;
 const BATCH_SIZE: usize = 1;
 const EPOCHS: usize = 1000;
 /// Save after every N completed files (0 = never save mid-epoch, only at epoch end).
@@ -49,8 +49,8 @@ const SAVE_EVERY: usize = 2;
 const MAX_LEN: usize = 1000;
 const TEMPERATURE: f32 = 0.4;
 
-const CHAR_HIDDEN: usize = 256;
-const CONTEXT_DIM: usize = 256;
+const CHAR_HIDDEN: usize = 64;
+const CONTEXT_DIM: usize = 128;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -71,32 +71,34 @@ fn main() {
 // ── Training ──────────────────────────────────────────────────────────────────
 
 fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequential {
-    let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).dense(CHAR_HIDDEN, Tanh);
+    let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).project(CHAR_HIDDEN, Linear);
     for _ in 0..4 {
         char_model = char_model.lstm(CHAR_HIDDEN);
-        char_model = char_model.normed(0.0);
-        char_model = char_model.dense(CHAR_HIDDEN, Tanh);
+        char_model = char_model.normed();
     }
     let char_model = char_model.dense(vocab, Linear).softmax().build();
 
-    let mut high_model = SequentialBuilder::new(CHAR_HIDDEN);
+    let mut high_model = SequentialBuilder::new(CHAR_HIDDEN).project(CONTEXT_DIM, Linear);
     for _ in 0..4 {
-        high_model = high_model.dense(CONTEXT_DIM, Tanh);
+        high_model = high_model.slstm(CONTEXT_DIM);
+        high_model = high_model.normed();
         high_model = high_model.lstm(CONTEXT_DIM);
-        high_model = high_model.normed(0.0);
+        high_model = high_model.normed();
     }
 
-    let high_model = high_model.dense(CONTEXT_DIM, Tanh).build();
+    let high_model = high_model.build();
 
     HierarchicalSequential::new(char_model, high_model, vocab, boundary_ids)
 }
 
 fn build_new_normal_model(vocab: usize) -> Sequential {
-    let mut model = SequentialBuilder::new(vocab).dense(CONTEXT_DIM, Tanh);
+    let mut model = SequentialBuilder::new(vocab).project(CONTEXT_DIM, Linear);
 
     for _ in 0..8 {
         model = model.slstm(CONTEXT_DIM);
-        model = model.normed(0.0);
+        model = model.normed();
+        model = model.slstm(CONTEXT_DIM);
+        model = model.normed();
     }
     model.dense(vocab, Linear).softmax().build()
 }
