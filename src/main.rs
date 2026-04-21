@@ -39,7 +39,7 @@ const MODEL_LOC: &str = "models/hric2";
 const SEQ_LOC: &str = "models/seq2";
 const SEQ_LEN: usize = 256;
 const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
-const LR: f32 = 0.00005;
+const LR: f32 = 0.0005;
 const BATCH_SIZE: usize = 1;
 const EPOCHS: usize = 1000;
 /// Save after every N completed files (0 = never save mid-epoch, only at epoch end).
@@ -73,7 +73,7 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
     let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).dense(CHAR_HIDDEN, Tanh);
     for _ in 0..4 {
         char_model = char_model.lstm(CHAR_HIDDEN);
-        char_model = char_model.normed(0.1);
+        char_model = char_model.normed(0.0);
         char_model = char_model.dense(CHAR_HIDDEN, Tanh);
     }
     let char_model = char_model.dense(vocab, Linear).softmax().build();
@@ -93,10 +93,9 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
 fn build_new_normal_model(vocab: usize) -> Sequential {
     let mut model = SequentialBuilder::new(vocab).dense(CONTEXT_DIM, Tanh);
 
-    for _ in 0..8 {
+    for _ in 0..4 {
         model = model.lstm(CONTEXT_DIM);
-        model = model.normed(0.1);
-        model = model.dense(CONTEXT_DIM, Tanh);
+        model = model.normed(0.0);
     }
     model.dense(vocab, Linear).softmax().build()
 }
