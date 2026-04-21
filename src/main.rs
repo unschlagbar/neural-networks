@@ -37,7 +37,7 @@ use crate::tokenizer::Tokenizer;
 
 const MODEL_LOC: &str = "models/hric2";
 const SEQ_LOC: &str = "models/seq2";
-const SEQ_LEN: usize = 1024;
+const SEQ_LEN: usize = 256;
 const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 const LR: f32 = 0.0005;
 const BATCH_SIZE: usize = 1;
@@ -85,7 +85,10 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
         high_model = high_model.normed(0.0);
     }
 
-    let high_model = high_model.build();
+    let high_model = high_model
+        .dense(CONTEXT_DIM, Tanh)
+        .lstm(CONTEXT_DIM)
+        .build();
 
     HierarchicalSequential::new(char_model, high_model, vocab, boundary_ids)
 }
