@@ -10,6 +10,7 @@ use crate::norm::LayerNormWrapper;
 use crate::parallel::ParallelLayer;
 use crate::projection::Projection;
 use crate::sequential::Sequential;
+use crate::slstm::SLSTMLayer;
 use crate::softmax::SoftmaxLayer;
 
 // ── DynCache trait ────────────────────────────────────────────────────────────
@@ -152,6 +153,12 @@ impl SequentialBuilder {
 
     pub fn lstm(mut self, hidden: usize) -> Self {
         let layer = LSTMLayer::new(self.output_size, hidden);
+        self.layer(Box::new(layer), hidden);
+        self
+    }
+
+    pub fn slstm(mut self, hidden: usize) -> Self {
+        let layer = SLSTMLayer::new(self.output_size, hidden);
         self.layer(Box::new(layer), hidden);
         self
     }

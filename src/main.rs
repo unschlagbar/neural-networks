@@ -21,6 +21,7 @@ pub mod parallel;
 pub mod projection;
 pub mod saving;
 pub mod sequential;
+pub mod slstm;
 pub mod softmax;
 pub mod tokenizer;
 
@@ -36,7 +37,7 @@ use crate::tokenizer::Tokenizer;
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const MODEL_LOC: &str = "models/hric2";
-const SEQ_LOC: &str = "models/seq2";
+const SEQ_LOC: &str = "models/seq4";
 const SEQ_LEN: usize = 256;
 const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 const LR: f32 = 0.0005;
@@ -61,9 +62,9 @@ fn main() {
             fs::create_dir("models/").unwrap();
         }
         //thread::spawn(|| train());
-        train_new();
+        train();
     } else {
-        sample();
+        sample_old();
     }
 }
 
@@ -93,8 +94,8 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
 fn build_new_normal_model(vocab: usize) -> Sequential {
     let mut model = SequentialBuilder::new(vocab).dense(CONTEXT_DIM, Tanh);
 
-    for _ in 0..4 {
-        model = model.lstm(CONTEXT_DIM);
+    for _ in 0..8 {
+        model = model.slstm(CONTEXT_DIM);
         model = model.normed(0.0);
     }
     model.dense(vocab, Linear).softmax().build()

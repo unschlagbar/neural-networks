@@ -236,6 +236,30 @@ pub fn load_norm(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>
     Ok(Box::new(wrapper))
 }
 
+use crate::slstm::SLSTMLayer;
+
+// neue Funktion (analog zu load_lstm):
+pub fn load_slstm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
+    let wz = read_matrix(r)?;
+    let wi = read_matrix(r)?;
+    let wf = read_matrix(r)?;
+    let wo = read_matrix(r)?;
+    let b = read_matrix(r)?;
+    let h_init = read_f32_vec(r)?.into_boxed_slice();
+    let c_init = read_f32_vec(r)?.into_boxed_slice();
+    Ok(Box::new(SLSTMLayer::from_loaded(
+        ctx.input_size,
+        ctx.output_size,
+        wz,
+        wi,
+        wf,
+        wo,
+        b,
+        h_init,
+        c_init,
+    )))
+}
+
 // ── Layer factory ─────────────────────────────────────────────────────────────
 
 fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
@@ -245,6 +269,7 @@ fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLa
         2 => load_indrnn(r, ctx),
         3 => load_projection(r, ctx),
         4 => load_softmax(r),
+        5 => load_slstm(r, ctx),
         6 => load_dropout(r, ctx),
         7 => load_parallel(r, ctx),
         8 => load_norm(r, ctx),

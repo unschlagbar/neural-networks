@@ -16,5 +16,6 @@ pub mod parallel;
 pub mod projection;
 pub mod saving;
 pub mod sequential;
+pub mod slstm;
 pub mod softmax;
 pub mod tokenizer;
