@@ -26,7 +26,7 @@ pub mod softmax;
 pub mod tokenizer;
 
 #[allow(unused)]
-use crate::activations::{Linear, Relu, Tanh};
+use crate::activations::{Linear, Relu, Sigmoid, Tanh};
 use crate::batches::{BatchDebugger, WordBoundaryBatches};
 use crate::data_set_loading::DataSet;
 use crate::hierarchical_sequential::HierarchicalSequential;
@@ -71,7 +71,7 @@ fn main() {
 // ── Training ──────────────────────────────────────────────────────────────────
 
 fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequential {
-    let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).project(CHAR_HIDDEN, Linear);
+    let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).project(CHAR_HIDDEN, Sigmoid);
     for _ in 0..4 {
         char_model = char_model.lstm(CHAR_HIDDEN);
         char_model = char_model.normed();
