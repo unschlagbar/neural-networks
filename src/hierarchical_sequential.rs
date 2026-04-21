@@ -263,9 +263,17 @@ impl HierarchicalSequential {
             }
         }
 
-        let mut current_context_word = n_words - 1;
+        let mut current_context_word: Option<usize> = if n_words >= 1 {
+            Some(n_words - 1)
+        } else {
+            None
+        };
 
         for t in (0..inputs.len()).rev() {
+            if is_boundary[t] {
+                let w = boundary_to_word_idx[t];
+                current_context_word = if w == 0 { None } else { Some(w - 1) };
+            }
             // 1. Cross-entropy gradient (char model)
             let out = char_cache[t].last().unwrap().output();
             char_delta_buf[..out.len()].copy_from_slice(out);
@@ -334,15 +342,10 @@ impl HierarchicalSequential {
             }
 
             // 3. Accumulate context gradient
-            let boundary_of_current = self.boundary_timesteps[current_context_word];
-            if t > boundary_of_current {
+            if let Some(w) = current_context_word {
                 let dx_full = char_cache[t][0].input_grad();
                 let context_dx = &dx_full[self.vocab_size..];
-                add_vec_in_place(&mut word_context_grads[current_context_word], context_dx);
-            }
-
-            if is_boundary[t] && current_context_word > 0 {
-                current_context_word -= 1;
+                add_vec_in_place(&mut word_context_grads[w], context_dx);
             }
         }
 
@@ -390,12 +393,12 @@ impl HierarchicalSequential {
                 for layer in &mut self.char_model.layers {
                     layer.apply_grads(lr);
                 }
-                self.char_model.clear_grads();
+                self.char_model.scale_grads(0.5);
 
                 for layer in &mut self.high_model.layers {
                     layer.apply_grads(lr);
                 }
-                self.high_model.clear_grads();
+                self.high_model.scale_grads(0.5);
 
                 *iteration = 0;
                 *j += 1;
