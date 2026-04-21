@@ -8,7 +8,7 @@ use rand::{Rng, rng};
 use crate::{
     activations::Activate,
     dense::{DenseCache, DenseGrads},
-    lstm::{CLIP, add_vec_in_place, sub_in_place, sub_vec_in_place},
+    lstm::{add_vec_in_place, sub_in_place, sub_vec_in_place},
     nn_layer::{DynCache, NnLayer},
 };
 

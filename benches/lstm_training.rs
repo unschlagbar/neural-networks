@@ -9,8 +9,8 @@ use neural_networks::{
 
 const HIDDEN_SIZE: usize = 128;
 const SEQ_LEN: usize = 25;
-const LR: f32 = 0.01;
-const BATCH_SIZE: usize = 2;
+const LR: f32 = 0.005;
+const BATCH_SIZE: usize = 1;
 
 pub const VOCAB: &[char] = &[
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',

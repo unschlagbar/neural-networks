@@ -299,15 +299,12 @@ impl HierarchicalSequential {
                         let dx = high_cache_word[hl].input_grad();
                         let new_len = dx.len();
 
-                        match high_layers[hl - 1].bptt_hidden_grad() {
-                            Some(bptt) => {
-                                high_delta_buf[..new_len].copy_from_slice(bptt);
-                                add_vec_in_place(&mut high_delta_buf[..new_len], dx);
-                            }
-                            None => {
-                                high_delta_buf[..new_len].copy_from_slice(dx);
-                            }
+                        high_delta_buf[..new_len].copy_from_slice(dx);
+
+                        if let Some(bptt) = high_layers[hl - 1].bptt_hidden_grad() {
+                            add_vec_in_place(&mut high_delta_buf[..new_len], bptt);
                         }
+
                         high_delta_len = new_len;
                     }
 
@@ -327,15 +324,12 @@ impl HierarchicalSequential {
                 let dx = char_cache[t][l].input_grad();
                 let new_len = dx.len();
 
-                match char_layers[l - 1].bptt_hidden_grad() {
-                    Some(bptt) => {
-                        char_delta_buf[..new_len].copy_from_slice(bptt);
-                        add_vec_in_place(&mut char_delta_buf[..new_len], dx);
-                    }
-                    None => {
-                        char_delta_buf[..new_len].copy_from_slice(dx);
-                    }
+                char_delta_buf[..new_len].copy_from_slice(dx);
+
+                if let Some(bptt) = char_layers[l - 1].bptt_hidden_grad() {
+                    add_vec_in_place(&mut char_delta_buf[..new_len], bptt);
                 }
+
                 delta_len = new_len;
             }
 

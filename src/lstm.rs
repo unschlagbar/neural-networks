@@ -7,8 +7,6 @@ use crate::{
 };
 use std::{any::Any, io};
 
-pub const CLIP: f32 = 5.0;
-
 const F: usize = 0;
 const I: usize = 1;
 const C: usize = 2;
@@ -32,14 +30,8 @@ pub struct LSTMCache {
     pub ot: Box<[f32]>,
     /// h_t output (carries to next layer or timestep)
     pub h: Box<[f32]>,
-    /// c_t raw (no tanh applied — tanh is computed on the fly during backward)
+    /// c_t (tanh is applied)
     pub c: Box<[f32]>,
-    // ── backward scratch (no allocation during backward) ──────────────────────
-    pub dc_grad: Box<[f32]>, // dL/dc_t before BPTT chain
-    pub do_: Box<[f32]>,
-    pub df: Box<[f32]>,
-    pub di: Box<[f32]>,
-    pub dct: Box<[f32]>,
     /// dconcat layout: [dL/d(x_t) | dh_{t-1}]
     pub dconcat: Box<[f32]>,
 }
@@ -115,6 +107,12 @@ pub struct LSTMLayer {
 
     /// Gradient accumulators, cleared per batch, applied in `sgd_step`.
     pub grads: LSTMLayerGrads,
+
+    // ── backward scratch (no allocation during backward) ──────────────────────
+    pub do_: Box<[f32]>,
+    pub df: Box<[f32]>,
+    pub di: Box<[f32]>,
+    pub dct: Box<[f32]>,
 }
 
 impl LSTMLayer {
@@ -143,6 +141,11 @@ impl LSTMLayer {
             h_init,
             c_init,
             grads: LSTMLayerGrads::zeros(rows, hidden_size),
+
+            do_: vec![0.0; hidden_size].into(),
+            df: vec![0.0; hidden_size].into(),
+            di: vec![0.0; hidden_size].into(),
+            dct: vec![0.0; hidden_size].into(),
         }
     }
 
@@ -172,6 +175,11 @@ impl LSTMLayer {
             dh_bptt: vec![0.0; hidden_size].into_boxed_slice(),
             dc_bptt: vec![0.0; hidden_size].into_boxed_slice(),
             grads: LSTMLayerGrads::zeros(input_size + hidden_size, hidden_size),
+
+            do_: vec![0.0; hidden_size].into(),
+            df: vec![0.0; hidden_size].into(),
+            di: vec![0.0; hidden_size].into(),
+            dct: vec![0.0; hidden_size].into(),
         }
     }
 
@@ -207,53 +215,53 @@ impl LSTMLayer {
             self.c[j] = cache.ft[j] * cache.c_prev[j] + cache.it[j] * cache.ct[j];
         }
         for j in 0..h {
-            self.h[j] = cache.ot[j] * self.c[j].tanh();
+            let tanh_c = self.c[j].tanh();
+            self.h[j] = cache.ot[j] * tanh_c;
+            cache.c[j] = tanh_c;
         }
 
         cache.h.copy_from_slice(&self.h);
-        cache.c.copy_from_slice(&self.c);
     }
 
-    pub fn backward(&mut self, delta: &[f32], cache: &mut LSTMCache) {
+    pub fn backward(&mut self, delta: &mut [f32], cache: &mut LSTMCache) {
         let h = self.hidden_size;
         let r = self.input_size + h;
 
         for i in 0..h {
-            let tanh_c = cache.c[i].tanh();
-            cache.dc_grad[i] = delta[i] * cache.ot[i] * (1.0 - tanh_c * tanh_c) + self.dc_bptt[i];
+            self.do_[i] = delta[i] * cache.c[i] * dsigmoid(cache.ot[i]);
         }
 
         for i in 0..h {
-            cache.do_[i] = delta[i] * cache.c[i].tanh() * dsigmoid(cache.ot[i]);
+            delta[i] *= cache.ot[i] * dtanh(cache.c[i]) + self.dc_bptt[i];
         }
 
         for i in 0..h {
-            let dc = cache.dc_grad[i];
-            cache.df[i] = dc * cache.c_prev[i] * dsigmoid(cache.ft[i]);
-            cache.di[i] = dc * cache.ct[i] * dsigmoid(cache.it[i]);
-            cache.dct[i] = dc * cache.it[i] * dtanh(cache.ct[i]);
+            let dc = delta[i];
+            self.df[i] = dc * cache.c_prev[i] * dsigmoid(cache.ft[i]);
+            self.di[i] = dc * cache.ct[i] * dsigmoid(cache.it[i]);
+            self.dct[i] = dc * cache.it[i] * dtanh(cache.ct[i]);
         }
 
         let g = &mut self.grads;
-        g.wf.add_outer(&cache.xh, &cache.df); // wf += xhᵀ · df
-        g.wi.add_outer(&cache.xh, &cache.di);
-        g.wc.add_outer(&cache.xh, &cache.dct);
-        g.wo.add_outer(&cache.xh, &cache.do_);
+        g.wf.add_outer(&cache.xh, &self.df); // wf += xhᵀ · df
+        g.wi.add_outer(&cache.xh, &self.di);
+        g.wc.add_outer(&cache.xh, &self.dct);
+        g.wo.add_outer(&cache.xh, &self.do_);
 
         for j in 0..h {
-            g.b[F][j] += cache.df[j];
-            g.b[I][j] += cache.di[j];
-            g.b[C][j] += cache.dct[j];
-            g.b[O][j] += cache.do_[j];
+            g.b[F][j] += self.df[j];
+            g.b[I][j] += self.di[j];
+            g.b[C][j] += self.dct[j];
+            g.b[O][j] += self.do_[j];
         }
 
         for i in 0..r {
             let mut s = 0.0;
             for j in 0..h {
-                s += self.wf[i][j] * cache.df[j]
-                    + self.wi[i][j] * cache.di[j]
-                    + self.wc[i][j] * cache.dct[j]
-                    + self.wo[i][j] * cache.do_[j];
+                s += self.wf[i][j] * self.df[j]
+                    + self.wi[i][j] * self.di[j]
+                    + self.wc[i][j] * self.dct[j]
+                    + self.wo[i][j] * self.do_[j];
             }
             cache.dconcat[i] = s;
         }
@@ -261,7 +269,7 @@ impl LSTMLayer {
         self.dh_bptt
             .copy_from_slice(&cache.dconcat[self.input_size..]);
         for i in 0..h {
-            self.dc_bptt[i] = cache.dc_grad[i] * cache.ft[i];
+            self.dc_bptt[i] = delta[i] * cache.ft[i];
         }
     }
 
@@ -278,11 +286,6 @@ impl LSTMLayer {
             ot: vec![0.0; h].into(),
             h: vec![0.0; h].into(),
             c: vec![0.0; h].into(),
-            dc_grad: vec![0.0; h].into(),
-            do_: vec![0.0; h].into(),
-            df: vec![0.0; h].into(),
-            di: vec![0.0; h].into(),
-            dct: vec![0.0; h].into(),
             dconcat: vec![0.0; r].into(),
         }
     }

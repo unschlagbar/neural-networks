@@ -35,11 +35,11 @@ use crate::tokenizer::Tokenizer;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const MODEL_LOC: &str = "models/hric1";
+const MODEL_LOC: &str = "models/hric2";
 const SEQ_LOC: &str = "models/seq2";
 const SEQ_LEN: usize = 1024;
-const MAX_SEQ_LEN: usize = SEQ_LEN + 512;
-const LR: f32 = 0.0001;
+const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
+const LR: f32 = 0.0005;
 const BATCH_SIZE: usize = 1;
 const EPOCHS: usize = 1000;
 /// Save after every N completed files (0 = never save mid-epoch, only at epoch end).
@@ -70,9 +70,10 @@ fn main() {
 // ── Training ──────────────────────────────────────────────────────────────────
 
 fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequential {
-    let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).dense(CHAR_HIDDEN, Relu);
+    let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).dense(CHAR_HIDDEN, Tanh);
     for _ in 0..4 {
-        char_model = char_model.normed(|b| b.lstm(CHAR_HIDDEN), 0.1);
+        char_model = char_model.lstm(CHAR_HIDDEN);
+        char_model = char_model.normed(0.1);
         char_model = char_model.dense(CHAR_HIDDEN, Tanh);
     }
     let char_model = char_model.dense(vocab, Linear).softmax().build();
@@ -80,7 +81,8 @@ fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequenti
     let mut high_model = SequentialBuilder::new(CHAR_HIDDEN);
     for _ in 0..4 {
         high_model = high_model.dense(CONTEXT_DIM, Tanh);
-        high_model = high_model.normed(|b| b.lstm(CONTEXT_DIM), 0.1);
+        high_model = high_model.lstm(CONTEXT_DIM);
+        high_model = high_model.normed(0.0);
     }
 
     let high_model = high_model.build();
@@ -92,7 +94,8 @@ fn build_new_normal_model(vocab: usize) -> Sequential {
     let mut model = SequentialBuilder::new(vocab).dense(CONTEXT_DIM, Tanh);
 
     for _ in 0..8 {
-        model = model.normed(|b| b.lstm(CONTEXT_DIM), 0.1);
+        model = model.lstm(CONTEXT_DIM);
+        model = model.normed(0.1);
         model = model.dense(CONTEXT_DIM, Tanh);
     }
     model.dense(vocab, Linear).softmax().build()

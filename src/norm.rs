@@ -73,6 +73,7 @@ impl DynCache for LayerNormWrapperCache {
 
 pub struct LayerNormWrapper {
     pub inner: Box<dyn NnLayer>,
+    pub mask_created: bool,
     pub dropout: Option<DropoutLayer>,
     /// Learnable per-element scale (init 1 → wrapper starts as near-identity).
     pub gamma: Box<[f32]>,
@@ -99,6 +100,7 @@ impl LayerNormWrapper {
         };
         Self {
             inner,
+            mask_created: false,
             dropout,
             gamma: vec![1.0; n].into_boxed_slice(),
             grads_gamma: vec![0.0; n].into_boxed_slice(),
@@ -154,7 +156,12 @@ impl NnLayer for LayerNormWrapper {
 
         self.inner.forward(&c.normed, &mut *c.inner_cache);
         let inner_out = if let Some(dropout) = &mut self.dropout {
-            dropout.forward_impl(c.inner_cache.output(), c.dropout.as_mut().unwrap());
+            dropout.forward_mask(
+                c.inner_cache.output(),
+                c.dropout.as_mut().unwrap(),
+                !self.mask_created,
+            );
+            self.mask_created = true;
             &c.dropout.as_ref().unwrap().output
         } else {
             c.inner_cache.output()
@@ -285,6 +292,7 @@ impl NnLayer for LayerNormWrapper {
 
     fn reset_state(&mut self) {
         self.inner.reset_state();
+        self.mask_created = false;
     }
     fn bptt_hidden_grad(&mut self) -> Option<&[f32]> {
         self.inner.bptt_hidden_grad()

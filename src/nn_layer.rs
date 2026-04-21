@@ -185,12 +185,9 @@ impl SequentialBuilder {
     }
 
     // In nn_layer.rs → impl SequentialBuilder
-    pub fn normed<F: FnMut(Self) -> Self>(mut self, mut inside_layer: F, dropout: f32) -> Self {
-        // Inneren Builder starten (mit der aktuellen output_size als input)
-        let mut inner_builder = (inside_layer)(SequentialBuilder::new(self.output_size));
-
+    pub fn normed(mut self, dropout: f32) -> Self {
         // Der Closure darf **genau einen** Layer bauen (das ist der innere Layer)
-        let inner = if let Some(layer) = inner_builder.layers.pop() {
+        let inner = if let Some(layer) = self.layers.pop() {
             layer
         } else {
             unreachable!("normed closure muss genau einen inneren Layer bauen!")

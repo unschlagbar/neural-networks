@@ -86,6 +86,23 @@ impl DropoutLayer {
         }
     }
 
+    pub fn forward_mask(&self, input: &[f32], cache: &mut DropoutCache, mask: bool) {
+        let scale = 1.0 / (1.0 - self.rate);
+        let mut rng = rng();
+
+        if mask {
+            for i in 0..self.size {
+                let keep = rng.random::<f32>() >= self.rate;
+                cache.mask[i] = if keep { scale } else { 0.0 };
+                cache.output[i] = input[i] * cache.mask[i];
+            }
+        } else {
+            for i in 0..self.size {
+                cache.output[i] = input[i] * cache.mask[i];
+            }
+        }
+    }
+
     pub fn backward_impl(&self, delta: &[f32], cache: &mut DropoutCache) {
         // dL/dx_i = delta_i * mask_i  (mask is already 0 or scale)
         for i in 0..self.size {

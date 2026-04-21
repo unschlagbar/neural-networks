@@ -126,16 +126,10 @@ impl Sequential {
                 let dx = cache[t][l].input_grad();
                 let new_len = dx.len();
 
-                match layers[l - 1].bptt_hidden_grad() {
-                    Some(bptt) => {
-                        // bptt borrows from layers[l-1]; dx borrows from cache[t][l].
-                        // delta_buf is a separate field — no conflict.
-                        delta_buf[..new_len].copy_from_slice(bptt);
-                        add_vec_in_place(&mut delta_buf[..new_len], dx);
-                    }
-                    None => {
-                        delta_buf[..new_len].copy_from_slice(dx);
-                    }
+                delta_buf[..new_len].copy_from_slice(dx);
+
+                if let Some(bptt) = layers[l - 1].bptt_hidden_grad() {
+                    add_vec_in_place(&mut delta_buf[..new_len], bptt);
                 }
 
                 delta_len = new_len;
