@@ -272,7 +272,6 @@ impl Sequential {
 
     fn sgd_step(&mut self, lr: f32) {
         for layer in &mut self.layers {
-            //layer.clip_grads();
             layer.apply_grads(lr);
         }
         self.scale_grads(0.0);

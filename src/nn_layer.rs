@@ -5,12 +5,15 @@ use crate::activations::Activate;
 use crate::dense::DenseLayer;
 use crate::dropout::DropoutLayer;
 use crate::indrnn::IndRNNLayer;
+use crate::linear::LinearLayer;
 use crate::lstm::LSTMLayer;
-use crate::norm::LayerNormWrapper;
 use crate::parallel::ParallelLayer;
 use crate::projection::Projection;
+use crate::rms_norm::{RMSNorm, RMSNormResidual};
 use crate::sequential::Sequential;
+use crate::silu_dense::SiluDenseLayer;
 use crate::slstm::SLSTMLayer;
+use crate::slstm_block::SLSTMBlock;
 use crate::softmax::SoftmaxLayer;
 
 // ── DynCache trait ────────────────────────────────────────────────────────────
@@ -70,12 +73,6 @@ pub trait NnLayer {
     /// Activation-ID für den Architektur-Header.
     /// Nur Dense (tag 1), IndRNN (tag 2) und Projection (tag 3) überschreiben das.
     fn activation_id(&self) -> Option<u8> {
-        None
-    }
-
-    /// Dropout-Rate für den Architektur-Header.
-    /// Nur DropoutLayer (tag 6) überschreibt das.
-    fn dropout_rate(&self) -> Option<f32> {
         None
     }
 
@@ -139,6 +136,18 @@ impl SequentialBuilder {
         self
     }
 
+    pub fn silu_dense(mut self, hidden: usize) -> Self {
+        let layer = SiluDenseLayer::new(self.output_size, hidden);
+        self.layer(Box::new(layer), hidden);
+        self
+    }
+
+    pub fn linear(mut self, hidden: usize) -> Self {
+        let layer = LinearLayer::new(self.output_size, hidden);
+        self.layer(Box::new(layer), hidden);
+        self
+    }
+
     pub fn project<A: Activate + 'static>(mut self, hidden: usize, act: A) -> Self {
         let layer = Projection::new(self.output_size, hidden, act);
         self.layer(Box::new(layer), hidden);
@@ -159,6 +168,25 @@ impl SequentialBuilder {
 
     pub fn slstm(mut self, hidden: usize) -> Self {
         let layer = SLSTMLayer::new(self.output_size, hidden);
+        self.layer(Box::new(layer), hidden);
+        self
+    }
+
+    /// xLSTM-style sLSTM-Block:
+    ///   Pre-RMSNorm → sLSTM-Zelle → Post-RMSNorm → SwiGLU-MLP → Residual.
+    ///
+    /// Ein-/Ausgang ist jeweils `hidden` (das ist der Sinn des Residuals — man
+    /// kann den Block einfach stapeln). Die interne SwiGLU-Weite (`up_size`)
+    /// wird als `4·hidden/3` gewählt (MLP-Parameter ≈ 8·H², analog zu GPT-NeoX
+    /// / LLaMA-Style-Blöcken).
+    pub fn slstm_block(mut self, hidden: usize) -> Self {
+        assert_eq!(
+            self.output_size, hidden,
+            "slstm_block erwartet input_size == hidden ({} != {})",
+            self.output_size, hidden,
+        );
+        let up = (hidden * 4) / 3;
+        let layer = SLSTMBlock::new(hidden, up);
         self.layer(Box::new(layer), hidden);
         self
     }
@@ -192,16 +220,23 @@ impl SequentialBuilder {
     }
 
     // In nn_layer.rs → impl SequentialBuilder
-    pub fn normed(mut self) -> Self {
+    pub fn res_rms_norm(mut self) -> Self {
         let inner = if let Some(layer) = self.layers.pop() {
             layer
         } else {
             unreachable!("normed closure muss genau einen inneren Layer bauen!")
         };
 
-        let wrapper = LayerNormWrapper::new(inner);
+        let wrapper = RMSNormResidual::new(inner);
 
         self.output_size = wrapper.input_size();
+        self.layers.push(Box::new(wrapper));
+        self
+    }
+
+    // In nn_layer.rs → impl SequentialBuilder
+    pub fn rms_norm(mut self) -> Self {
+        let wrapper = RMSNorm::new(self.output_size);
         self.layers.push(Box::new(wrapper));
         self
     }

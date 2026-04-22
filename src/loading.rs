@@ -11,13 +11,17 @@ use crate::{
     activations::{LeakyRelu, Linear, Relu, Sigmoid, Tanh},
     dense::DenseLayer,
     dropout::DropoutLayer,
+    linear::LinearLayer,
     lstm::LSTMLayer,
     nn_layer::NnLayer,
-    norm::LayerNormWrapper,
     parallel::ParallelLayer,
     projection::Projection,
+    rms_norm::{RMSNorm, RMSNormResidual},
     saving::{MAGIC, VERSION},
     sequential::Sequential,
+    silu_dense::SiluDenseLayer,
+    slstm::SLSTMLayer,
+    slstm_block::SLSTMBlock,
     softmax::SoftmaxLayer,
 };
 
@@ -95,6 +99,17 @@ pub fn load_dense(r: &mut dyn Read) -> io::Result<Box<dyn NnLayer>> {
             ));
         }
     };
+    Ok(layer)
+}
+
+pub fn load_linear(r: &mut dyn Read) -> io::Result<Box<dyn NnLayer>> {
+    let input = read_u32(r)? as usize;
+    let output = read_u32(r)? as usize;
+    let weights = read_matrix(r)?;
+    let biases: Box<[f32]> = read_f32_vec(r)?.into_boxed_slice();
+
+    let layer: Box<dyn NnLayer> =
+        Box::new(LinearLayer::from_loaded(input, output, weights, biases));
     Ok(layer)
 }
 
@@ -217,7 +232,7 @@ pub fn load_parallel(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLa
     Ok(Box::new(ParallelLayer::new(branch1, branch2, lr1, lr2)))
 }
 
-pub fn load_norm(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
+pub fn load_res_norm(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
     let gamma = read_f32_vec(r)?.into_boxed_slice();
 
     let inner_tag = read_u8(r)?;
@@ -230,14 +245,18 @@ pub fn load_norm(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>
     };
     let inner = new_layer(r, inner_tag, ctx)?;
 
-    let mut wrapper = LayerNormWrapper::new(inner);
+    let mut wrapper = RMSNormResidual::new(inner);
     wrapper.gamma = gamma;
     Ok(Box::new(wrapper))
 }
 
-use crate::slstm::SLSTMLayer;
+pub fn load_norm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
+    let gamma = read_f32_vec(r)?.into_boxed_slice();
+    let mut wrapper = RMSNorm::new(ctx.input_size);
+    wrapper.gamma = gamma;
+    Ok(Box::new(wrapper))
+}
 
-// neue Funktion (analog zu load_lstm):
 pub fn load_slstm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
     let wz = read_matrix(r)?;
     let wi = read_matrix(r)?;
@@ -259,6 +278,73 @@ pub fn load_slstm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>
     )))
 }
 
+pub fn load_silu_dense(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
+    let input = ctx.input_size;
+    let output = ctx.output_size;
+    let weights = read_matrix(r)?;
+    let biases: Box<[f32]> = read_f32_vec(r)?.into_boxed_slice();
+    Ok(Box::new(SiluDenseLayer::from_loaded(
+        input, output, weights, biases,
+    )))
+}
+
+/// xLSTM-style sLSTM-Block. Layout muss 1:1 zu `SLSTMBlock::save` passen.
+///
+/// Sequential-Header liefert uns hidden_size (= ctx.input_size == ctx.output_size).
+/// Danach in dieser Reihenfolge:
+///   - up_size: u32
+///   - pre_gamma, post_gamma: f32_vec(H)
+///   - cell-Matrizen: wz, wi, wf, wo, b, h_init, c_init  (wie `SLSTMLayer::save`)
+///   - SwiGLU: w_gate, b_gate, w_value, b_value, w_down, b_down
+pub fn load_slstm_block(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
+    if ctx.input_size != ctx.output_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "SLSTMBlock erwartet input_size == output_size, bekam {} != {}",
+                ctx.input_size, ctx.output_size,
+            ),
+        ));
+    }
+    let hidden_size = ctx.input_size;
+    let up_size = read_u32(r)? as usize;
+
+    let pre_gamma: Box<[f32]> = read_f32_vec(r)?.into_boxed_slice();
+    let post_gamma: Box<[f32]> = read_f32_vec(r)?.into_boxed_slice();
+
+    // Zell-Gewichte — identische Reihenfolge wie in load_slstm.
+    let wz = read_matrix(r)?;
+    let wi = read_matrix(r)?;
+    let wf = read_matrix(r)?;
+    let wo = read_matrix(r)?;
+    let b = read_matrix(r)?;
+    let h_init: Box<[f32]> = read_f32_vec(r)?.into_boxed_slice();
+    let c_init: Box<[f32]> = read_f32_vec(r)?.into_boxed_slice();
+    let cell = SLSTMLayer::from_loaded(hidden_size, hidden_size, wz, wi, wf, wo, b, h_init, c_init);
+
+    // SwiGLU.
+    let w_gate = read_matrix(r)?;
+    let b_gate: Box<[f32]> = read_f32_vec(r)?.into_boxed_slice();
+    let w_value = read_matrix(r)?;
+    let b_value: Box<[f32]> = read_f32_vec(r)?.into_boxed_slice();
+    let w_down = read_matrix(r)?;
+    let b_down: Box<[f32]> = read_f32_vec(r)?.into_boxed_slice();
+
+    Ok(Box::new(SLSTMBlock::from_loaded(
+        hidden_size,
+        up_size,
+        pre_gamma,
+        post_gamma,
+        cell,
+        w_gate,
+        b_gate,
+        w_value,
+        b_value,
+        w_down,
+        b_down,
+    )))
+}
+
 // ── Layer factory ─────────────────────────────────────────────────────────────
 
 fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
@@ -271,7 +357,12 @@ fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLa
         5 => load_slstm(r, ctx),
         6 => load_dropout(r, ctx),
         7 => load_parallel(r, ctx),
-        8 => load_norm(r, ctx),
+        8 => load_res_norm(r, ctx),
+        9 => load_norm(r, ctx),
+        10 => load_silu_dense(r, ctx),
+        11 => load_slstm_block(r, ctx),
+        12 => load_linear(r),
+
         o => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unknown layer tag {o}"),

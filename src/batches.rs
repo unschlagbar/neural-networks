@@ -225,7 +225,10 @@ impl<'a> Iterator for WordBoundaryBatches<'a> {
     type Item = (&'a [u16], &'a [u16]);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index + 1 >= self.data.len() {
+        let remaining = self.data.len().saturating_sub(self.index);
+
+        // At least 2 tokens needed (1 input + 1 target).
+        if remaining < 2 {
             return None;
         }
 
@@ -240,6 +243,74 @@ impl<'a> Iterator for WordBoundaryBatches<'a> {
         let target = &self.data[self.index + 1..end];
 
         self.index = end;
+        Some((input, target))
+    }
+}
+
+pub struct WordBoundaryBatches2<'a> {
+    data: &'a [u16],
+    boundary_ids: &'a [u16],
+    seq_len: usize,
+    index: usize,
+    overlap: usize,
+}
+
+impl<'a> WordBoundaryBatches2<'a> {
+    pub fn new(data: &'a [u16], boundary_ids: &'a [u16], seq_len: usize, overlap: usize) -> Self {
+        Self {
+            data,
+            boundary_ids,
+            seq_len,
+            index: 0,
+            overlap,
+        }
+    }
+
+    fn is_boundary(&self, token: u16) -> bool {
+        self.boundary_ids.contains(&token)
+    }
+
+    fn find_next_word_start(&self, mut idx: usize) -> usize {
+        while idx < self.data.len() {
+            if idx == 0 || self.is_boundary(self.data[idx - 1]) {
+                return idx;
+            }
+            idx += 1;
+        }
+        self.data.len()
+    }
+}
+
+impl<'a> Iterator for WordBoundaryBatches2<'a> {
+    type Item = (&'a [u16], &'a [u16]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.data.len() {
+            return None;
+        }
+
+        // 1. Zum nächsten Wortanfang springen
+        let start = self.find_next_word_start(self.index);
+
+        if start + 1 >= self.data.len() {
+            return None;
+        }
+
+        // 2. Hartes seq_len Limit
+        let end = (start + self.seq_len).min(self.data.len());
+
+        if end - start < 2 {
+            return None;
+        }
+
+        let input = &self.data[start..end - 1];
+        let target = &self.data[start + 1..end];
+
+        // 3. Nächster Index mit Overlap
+        let next_index = end.saturating_sub(self.overlap);
+
+        self.index = next_index;
+
         Some((input, target))
     }
 }

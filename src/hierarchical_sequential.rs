@@ -57,10 +57,11 @@ pub struct HierarchicalSequential {
 impl HierarchicalSequential {
     /// `boundary_token_ids` — from `tokenizer.boundary_token_ids()`.
     pub fn new(
-        mut char_model: Sequential,
+        char_model: Sequential,
         high_model: Sequential,
         vocab_size: usize,
         boundary_token_ids: Vec<u16>,
+        word_rep_layer: usize,
     ) -> Self {
         let context_size = high_model.output_size;
         assert_eq!(
@@ -69,14 +70,12 @@ impl HierarchicalSequential {
             "char_model.input_size must equal vocab_size + context_size"
         );
 
-        let mut word_rep_layer = usize::MAX;
+        //let mut word_rep_layer = usize::MAX;
 
-        for (i, l) in char_model.layers.iter_mut().enumerate().rev() {
-            if l.bptt_hidden_grad().is_some() && l.output_size() == high_model.input_size {
-                word_rep_layer = i;
-                break;
-            }
-        }
+        assert_eq!(
+            char_model.layers[word_rep_layer].output_size(),
+            high_model.input_size
+        );
 
         dbg!(word_rep_layer);
 
@@ -255,7 +254,7 @@ impl HierarchicalSequential {
 
         // Fast boundary lookup
         let mut is_boundary = vec![false; inputs.len()];
-        let mut boundary_to_word_idx = vec![0usize; inputs.len()];
+        let mut boundary_to_word_idx = vec![0; inputs.len()];
         for (w, &bt) in self.boundary_timesteps.iter().enumerate() {
             if bt < inputs.len() {
                 is_boundary[bt] = true;
@@ -524,6 +523,7 @@ impl HierarchicalSequential {
         crate::saving::write_u32(w, HIER_MAGIC)?;
         write_u32(w, self.vocab_size as u32)?;
         write_u32(w, self.context_size as u32)?;
+        write_u32(w, self.word_rep_layer as u32)?;
         write_u32(w, self.boundary_token_ids.len() as u32)?;
         for &id in &self.boundary_token_ids {
             write_u16(w, id)?;
@@ -549,27 +549,17 @@ impl HierarchicalSequential {
 
         let vocab_size = read_u32(r)? as usize;
         let context_size = read_u32(r)? as usize;
+        let word_rep_layer = read_u32(r)? as usize;
         let n_boundaries = read_u32(r)? as usize;
         let mut boundary_token_ids = Vec::with_capacity(n_boundaries);
         for _ in 0..n_boundaries {
             boundary_token_ids.push(read_u16(r)?);
         }
 
-        let mut char_model = Sequential::load_from(r)?;
+        let char_model = Sequential::load_from(r)?;
         let high_model = Sequential::load_from(r)?;
 
         let full_input_buf = vec![0.0; vocab_size + context_size];
-
-        let mut word_rep_layer = usize::MAX;
-
-        for (i, l) in char_model.layers.iter_mut().enumerate().rev() {
-            if l.bptt_hidden_grad().is_some() && l.output_size() == high_model.input_size {
-                word_rep_layer = i;
-                break;
-            }
-        }
-
-        dbg!(word_rep_layer);
 
         if word_rep_layer == usize::MAX {
             panic!("char_model must contain a recurrent layer producing the high model input size",)

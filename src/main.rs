@@ -1,338 +1,68 @@
-use std::fs;
-use std::path::Path;
-use std::rc::Rc;
+// ── main.rs ──────────────────────────────────────────────────────────────────
+//
+// Dünner Dispatcher. Die eigentliche Logik liegt in config/model/training/
+// sampling. Argumente:
+//
+//   (nichts / leere Zeile)  → train_normal     (sLSTM-Block-Stapel)
+//   "h"                     → train_hierarchical
+//   "s"                     → sample_normal
+//   "hs"                    → sample_hierarchical
+//
+// Die alte Variante „leere Zeile = train, sonst = sample_old" war zu
+// implizit, man konnte den hierarchischen Pfad gar nicht direkt ansteuern.
+
 use std::{
-    io::{Write, stdin, stdout},
-    time::{Duration, Instant},
+    fs,
+    io::{BufRead, stdin},
+    path::Path,
 };
 
 pub mod activations;
 pub mod batches;
+pub mod config;
 pub mod data_set_loading;
 pub mod dense;
 pub mod dropout;
 pub mod hierarchical_sequential;
 pub mod indrnn;
+pub mod linear;
 pub mod loading;
 pub mod lstm;
+pub mod model;
 pub mod nn_layer;
-pub mod norm;
 pub mod parallel;
 pub mod projection;
+pub mod rms_norm;
+pub mod sampling;
 pub mod saving;
 pub mod sequential;
+pub mod silu_dense;
 pub mod slstm;
+pub mod slstm_block;
 pub mod softmax;
 pub mod tokenizer;
-
-#[allow(unused)]
-use crate::activations::{Linear, Relu, Sigmoid, Tanh};
-use crate::batches::{BatchDebugger, WordBoundaryBatches};
-use crate::data_set_loading::DataSet;
-use crate::hierarchical_sequential::HierarchicalSequential;
-use crate::nn_layer::SequentialBuilder;
-use crate::sequential::Sequential;
-use crate::tokenizer::Tokenizer;
-
-// ── Config ────────────────────────────────────────────────────────────────────
-
-const MODEL_LOC: &str = "models/hric2";
-const SEQ_LOC: &str = "models/seq";
-const SEQ_LEN: usize = 256;
-const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
-const LR: f32 = 0.0001;
-const BATCH_SIZE: usize = 1;
-const EPOCHS: usize = 1000;
-/// Save after every N completed files (0 = never save mid-epoch, only at epoch end).
-const SAVE_EVERY: usize = 2;
-
-const MAX_LEN: usize = 1000;
-const TEMPERATURE: f32 = 0.4;
-
-const CHAR_HIDDEN: usize = 64;
-const CONTEXT_DIM: usize = 128;
-
-// ── Entry point ───────────────────────────────────────────────────────────────
+pub mod training;
 
 fn main() {
-    let mut input = String::new();
-    stdin().read_line(&mut input).unwrap();
-    if input.trim().is_empty() {
-        if !Path::new("models/").exists() {
-            fs::create_dir("models/").unwrap();
-        }
-        //thread::spawn(|| train());
-        train_new();
-    } else {
-        sample();
-    }
-}
-
-// ── Training ──────────────────────────────────────────────────────────────────
-
-fn build_new_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequential {
-    let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).project(CHAR_HIDDEN, Sigmoid);
-    for _ in 0..4 {
-        char_model = char_model.lstm(CHAR_HIDDEN);
-        char_model = char_model.normed();
-    }
-    let char_model = char_model.dense(vocab, Linear).softmax().build();
-
-    let mut high_model = SequentialBuilder::new(CHAR_HIDDEN).project(CONTEXT_DIM, Linear);
-    for _ in 0..4 {
-        high_model = high_model.slstm(CONTEXT_DIM);
-        high_model = high_model.normed();
-        high_model = high_model.lstm(CONTEXT_DIM);
-        high_model = high_model.normed();
+    if !Path::new("models/").exists() {
+        fs::create_dir("models/").unwrap();
     }
 
-    let high_model = high_model.build();
+    let mut line = String::new();
+    stdin().lock().read_line(&mut line).unwrap();
+    let cmd = line.trim();
 
-    HierarchicalSequential::new(char_model, high_model, vocab, boundary_ids)
-}
-
-fn build_new_normal_model(vocab: usize) -> Sequential {
-    let mut model = SequentialBuilder::new(vocab).project(CONTEXT_DIM, Linear);
-
-    for _ in 0..8 {
-        model = model.slstm(CONTEXT_DIM);
-        model = model.normed();
-        model = model.lstm(CONTEXT_DIM);
-        model = model.normed();
-    }
-    model.dense(vocab, Linear).softmax().build()
-}
-
-pub fn train_new() {
-    let tokenizer = Rc::new(Tokenizer::new("charset.txt", true));
-    let vocab = tokenizer.vocab_size();
-    let sentence_boundary_ids = tokenizer.sentence_token_ids();
-    let boundary_ids = tokenizer.boundary_token_ids();
-
-    // ── Load existing model or build a fresh one ──────────────────────────────
-    let mut model = match HierarchicalSequential::load(MODEL_LOC) {
-        Ok(m) => {
-            println!("Loaded model from '{MODEL_LOC}'.");
-            m
+    match cmd {
+        "" => training::train_normal(),
+        "h" => training::train_hierarchical(),
+        "s" => sampling::sample_normal(),
+        "hs" => sampling::sample_hierarchical(),
+        other => {
+            eprintln!(
+                "Unknown mode {other:?}. Erlaubt: '' (train_normal), 'h' (train_hierarchical), \
+                 's' (sample_normal), 'hs' (sample_hierarchical).",
+            );
+            std::process::exit(2);
         }
-        Err(e) => {
-            println!("Could not load '{MODEL_LOC}' ({e}) — creating a new model.");
-            build_new_model(vocab, boundary_ids.clone())
-        }
-    };
-
-    model.make_cache(MAX_SEQ_LEN);
-
-    let mut iteration = 0;
-    let mut j = 0; // gradient updates
-    let mut file_count = 0; // files processed this run
-    let mut total_time = Duration::ZERO;
-
-    let data_set = DataSet::load_from_dir(tokenizer.clone(), "political_speeches/");
-    println!("Dataset: {} files, {EPOCHS} epochs", data_set.len());
-
-    for epoch in 1..=EPOCHS {
-        println!("── Epoch {epoch} ──────────────────────────────────────────");
-
-        for data in &data_set {
-            let batches = WordBoundaryBatches::new(&data, &sentence_boundary_ids, SEQ_LEN);
-            //let batches = Batches::new(&data, SEQ_LEN);
-
-            // Wrap with BatchDebugger every 100 files for a quick sanity check.
-            let start = Instant::now();
-            if file_count % 100 == 0 {
-                let mut dbg = BatchDebugger::new(batches, format!("file {file_count}"));
-                model.train(&mut dbg, LR, &mut iteration, &mut j, BATCH_SIZE);
-                dbg.print_summary();
-            } else {
-                model.train(batches, LR, &mut iteration, &mut j, BATCH_SIZE);
-            }
-            total_time += start.elapsed();
-            file_count += 1;
-
-            if file_count % 10 == 0 {
-                println!(
-                    "  [{file_count} files | {j} updates | avg {:.0?}/file]  \r",
-                    total_time / file_count as u32
-                );
-                stdout().flush().unwrap();
-            }
-
-            // Periodic mid-epoch save.
-            if SAVE_EVERY > 0 && file_count % SAVE_EVERY == 0 {
-                save_model(&model);
-            }
-        }
-
-        // End-of-epoch save.
-        println!();
-        save_model(&model);
-    }
-}
-
-pub fn train() {
-    let tokenizer = Rc::new(Tokenizer::new("charset.txt", true));
-    let vocab = tokenizer.vocab_size();
-    let boundary_ids = tokenizer.sentence_token_ids();
-
-    // ── Load existing model or build a fresh one ──────────────────────────────
-    let mut model = match Sequential::load(SEQ_LOC) {
-        Ok(m) => {
-            println!("Loaded model from '{SEQ_LOC}'.");
-            m
-        }
-        Err(e) => {
-            println!("Could not load '{SEQ_LOC}' ({e}) — creating a new model.");
-            build_new_normal_model(vocab)
-        }
-    };
-
-    model.make_cache(MAX_SEQ_LEN);
-
-    let mut iteration = 0;
-    let mut j = 0; // gradient updates
-    let mut file_count = 0; // files processed this run
-    let mut total_time = Duration::ZERO;
-
-    let data_set = DataSet::load_from_dir(tokenizer.clone(), "political_speeches/");
-    println!("Dataset: {} files, {EPOCHS} epochs", data_set.len());
-
-    for epoch in 1..=EPOCHS {
-        println!("── Epoch {epoch} ──────────────────────────────────────────");
-
-        for data in &data_set {
-            let batches = WordBoundaryBatches::new(&data, &boundary_ids, SEQ_LEN);
-            //let batches = Batches::new(&data, SEQ_LEN);
-
-            // Wrap with BatchDebugger every 100 files for a quick sanity check.
-            let start = Instant::now();
-            if file_count % 100 == 0 {
-                let mut dbg = BatchDebugger::new(batches, format!("file {file_count}"));
-                model.train(&mut dbg, LR, &mut iteration, &mut j, BATCH_SIZE);
-                dbg.print_summary();
-            } else {
-                model.train(batches, LR, &mut iteration, &mut j, BATCH_SIZE);
-            }
-            total_time += start.elapsed();
-            file_count += 1;
-
-            if file_count % 10 == 0 {
-                println!(
-                    "  [{file_count} files | {j} updates | avg {:.0?}/file]  \r",
-                    total_time / file_count as u32
-                );
-                stdout().flush().unwrap();
-            }
-
-            // Periodic mid-epoch save.
-            if SAVE_EVERY > 0 && file_count % SAVE_EVERY == 0 {
-                model.save(SEQ_LOC).unwrap();
-            }
-        }
-
-        // End-of-epoch save.
-        println!();
-        model.save(SEQ_LOC).unwrap();
-    }
-}
-
-fn save_model(model: &HierarchicalSequential) {
-    match model.save(MODEL_LOC) {
-        Ok(()) => println!("  ✓ saved to '{MODEL_LOC}'"),
-        Err(e) => eprintln!("  ✗ save failed: {e}"),
-    }
-}
-
-// ── Sampling ──────────────────────────────────────────────────────────────────
-
-pub fn sample() {
-    let tokenizer = Tokenizer::new("charset.txt", false);
-
-    let mut model = match HierarchicalSequential::load(MODEL_LOC) {
-        Ok(m) => {
-            println!("Loaded hierarchical model from '{MODEL_LOC}'.");
-            m
-        }
-        Err(e) => {
-            eprintln!("Failed to load '{MODEL_LOC}': {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // cache[0] is enough for one-step sampling.
-    model.make_cache(1);
-
-    loop {
-        println!("\nSample mode — type a prefix (empty = random start):");
-        let mut input = String::new();
-        stdin().read_line(&mut input).unwrap();
-
-        let prefix: Vec<u16> = if !input.trim().is_empty() {
-            tokenizer.to_tokens(input.trim())
-        } else {
-            Vec::new()
-        };
-
-        print!(">>> ");
-        stdout().flush().unwrap();
-
-        model.sample(&prefix, MAX_LEN, TEMPERATURE, |token| {
-            let s = tokenizer.get_char(token);
-            if s == "<END>" {
-                false
-            } else {
-                print!("{s}");
-                stdout().flush().unwrap();
-                true
-            }
-        });
-
-        println!();
-    }
-}
-
-pub fn sample_old() {
-    let tokenizer = Tokenizer::new("charset.txt", false);
-
-    let mut model = match Sequential::load(SEQ_LOC) {
-        Ok(m) => {
-            println!("Loaded lstm model from '{MODEL_LOC}'.");
-            m
-        }
-        Err(e) => {
-            eprintln!("Failed to load '{MODEL_LOC}': {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // cache[0] is enough for one-step sampling.
-    model.make_cache(1);
-
-    loop {
-        println!("\nSample mode — type a prefix (empty = random start):");
-        let mut input = String::new();
-        stdin().read_line(&mut input).unwrap();
-
-        let prefix: Vec<u16> = if !input.trim().is_empty() {
-            tokenizer.to_tokens(input.trim())
-        } else {
-            Vec::new()
-        };
-
-        print!(">>> ");
-        stdout().flush().unwrap();
-
-        model.sample(&prefix, MAX_LEN, TEMPERATURE, |token| {
-            let s = tokenizer.get_char(token);
-            if s == "<END>" {
-                false
-            } else {
-                print!("{s}");
-                stdout().flush().unwrap();
-                true
-            }
-        });
-
-        println!();
     }
 }

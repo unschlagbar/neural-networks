@@ -32,6 +32,8 @@ const I: usize = 1; // input gate (ĩ)
 const G_F: usize = 2; // forget gate (f̃)
 const O: usize = 3; // output gate (õ)
 
+const CLIP: f32 = 15.0;
+
 // ── SLSTMCache ────────────────────────────────────────────────────────────────
 
 /// All per-timestep activations + scratch needed for backward.
@@ -162,6 +164,7 @@ impl SLSTMLayer {
         // xLSTM paper keeps this convention to avoid very small f_t at start).
         let mut b = Matrix::zeros(4, hidden_size);
         b[G_F].fill(3.0);
+        b[I].fill(-1.0);
 
         let h_init = vec![0.0; hidden_size].into_boxed_slice();
         let c_init = vec![0.0; hidden_size].into_boxed_slice();
@@ -474,6 +477,9 @@ impl NnLayer for SLSTMLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
+        self.grads.wi.clip(-CLIP, CLIP);
+        self.grads.wf.clip(-CLIP, CLIP);
+
         sub_in_place(&mut self.wz, &self.grads.wz, lr);
         sub_in_place(&mut self.wi, &self.grads.wi, lr);
         sub_in_place(&mut self.wf, &self.grads.wf, lr);

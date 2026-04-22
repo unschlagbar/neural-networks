@@ -17,7 +17,7 @@ fn political() {
     fs::create_dir(DIR).unwrap();
 
     for (i, speech) in speeches.into_iter().enumerate() {
-        let mut file = fs::File::create(format!("{DIR}/{i}")).unwrap();
+        let mut file = fs::File::create(format!("{DIR}/{i}.txt")).unwrap();
 
         for part in speech.split("&amp;") {
             for part in part.split("apos;") {

@@ -85,10 +85,12 @@ impl<A: Activate> IndRNNLayer<A> {
     pub fn new(input_size: usize, hidden_size: usize, activation: A) -> Self {
         let h = hidden_size;
 
+        let scale = (6.0 / (input_size + hidden_size) as f32).sqrt();
+
         // Gewichte exakt wie bei LSTM (kleine Initialisierung für Rekurrenz)
-        let w = Matrix::random(input_size, h, 0.08);
-        let u = (0..h).map(|_| random_range(-0.08..0.08)).collect(); // ✓
-        let h_init: Box<[f32]> = (0..h).map(|_| random_range(-0.08..0.08)).collect();
+        let w = Matrix::random(input_size, h, scale);
+        let u = (0..h).map(|_| random_range(-scale..scale)).collect(); // ✓
+        let h_init: Box<[f32]> = (0..h).map(|_| random_range(-scale..scale)).collect();
 
         Self {
             input_size,

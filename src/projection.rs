@@ -35,7 +35,8 @@ pub struct Projection<A: Activate> {
 
 impl<A: Activate> Projection<A> {
     pub fn new(input_size: usize, output_size: usize, activation: A) -> Self {
-        let weights = Matrix::random(input_size, output_size, 1.0);
+        let scale = (6.0 / (input_size as f32 + output_size as f32)).sqrt();
+        let weights = Matrix::random(input_size, output_size, scale);
 
         Self {
             weights,

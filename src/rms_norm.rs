@@ -35,7 +35,7 @@ const EPS: f32 = 1e-6;
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 
-pub struct LayerNormWrapperCache {
+pub struct RMSNormResidualCache {
     pub inner_cache: Box<dyn DynCache>,
     /// Saved raw input x (residual add + backward).
     pub input: Box<[f32]>,
@@ -51,7 +51,7 @@ pub struct LayerNormWrapperCache {
     pub dx: Box<[f32]>,
 }
 
-impl DynCache for LayerNormWrapperCache {
+impl DynCache for RMSNormResidualCache {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
@@ -66,9 +66,35 @@ impl DynCache for LayerNormWrapperCache {
     }
 }
 
-// ── Wrapper ───────────────────────────────────────────────────────────────────
+pub struct RMSNormCache {
+    /// Saved raw input x (residual add + backward).
+    pub input: Box<[f32]>,
+    /// x̂ = x / rms — reused in the backward pass.
+    pub x_hat: Box<[f32]>,
+    /// 1 / rms (scalar) — stored to avoid re-sqrt in backward.
+    pub inv_rms: f32,
+    /// Final output = inner(normed) + x — seen by the next layer.
+    pub output: Box<[f32]>,
+    /// dL/d(input) of the whole wrapper, written by backward.
+    pub dx: Box<[f32]>,
+}
 
-pub struct LayerNormWrapper {
+impl DynCache for RMSNormCache {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn output(&self) -> &[f32] {
+        &self.output
+    }
+    fn input_grad(&self) -> &[f32] {
+        &self.dx
+    }
+}
+
+pub struct RMSNormResidual {
     pub inner: Box<dyn NnLayer>,
     /// Learnable per-element scale (init 1 → wrapper starts as near-identity).
     pub gamma: Box<[f32]>,
@@ -76,7 +102,7 @@ pub struct LayerNormWrapper {
     pub norm_size: usize,
 }
 
-impl LayerNormWrapper {
+impl RMSNormResidual {
     pub fn new(inner: Box<dyn NnLayer>) -> Self {
         assert_eq!(
             inner.input_size(),
@@ -123,13 +149,13 @@ impl LayerNormWrapper {
 
 // ── NnLayer impl ─────────────────────────────────────────────────────────────
 
-impl NnLayer for LayerNormWrapper {
+impl NnLayer for RMSNormResidual {
     // ── forward ───────────────────────────────────────────────────────────────
 
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()
-            .downcast_mut::<LayerNormWrapperCache>()
+            .downcast_mut::<RMSNormResidualCache>()
             .unwrap();
 
         c.input.copy_from_slice(input);
@@ -184,7 +210,7 @@ impl NnLayer for LayerNormWrapper {
     fn backward(&mut self, delta: &mut [f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()
-            .downcast_mut::<LayerNormWrapperCache>()
+            .downcast_mut::<RMSNormResidualCache>()
             .unwrap();
 
         // Save δ into dx now (residual branch, step 1+5).
@@ -228,7 +254,7 @@ impl NnLayer for LayerNormWrapper {
 
     fn make_cache(&self) -> Box<dyn DynCache> {
         let n = self.norm_size;
-        Box::new(LayerNormWrapperCache {
+        Box::new(RMSNormResidualCache {
             inner_cache: self.inner.make_cache(),
             input: vec![0.0; n].into_boxed_slice(),
             x_hat: vec![0.0; n].into_boxed_slice(),
@@ -267,5 +293,132 @@ impl NnLayer for LayerNormWrapper {
     }
     fn accumulate_init_grad(&mut self) {
         self.inner.accumulate_init_grad()
+    }
+}
+
+pub struct RMSNorm {
+    /// Learnable per-element scale (init 1 → wrapper starts as near-identity).
+    pub gamma: Box<[f32]>,
+    pub grads_gamma: Box<[f32]>,
+    pub norm_size: usize,
+}
+
+impl RMSNorm {
+    pub fn new(size: usize) -> Self {
+        let n = size;
+
+        Self {
+            gamma: vec![1.0; n].into_boxed_slice(),
+            grads_gamma: vec![0.0; n].into_boxed_slice(),
+            norm_size: n,
+        }
+    }
+
+    // ── RMSNorm forward kernel ────────────────────────────────────────────────
+    //   rms    = sqrt( mean(x²) + ε )
+    //   x̂[i]  = x[i] / rms
+    //   out[i] = gamma[i] · x̂[i]
+
+    #[inline]
+    fn rms_norm(
+        input: &[f32],
+        gamma: &[f32],
+        x_hat: &mut [f32],
+        normed: &mut [f32],
+        inv_rms: &mut f32,
+        n: usize,
+    ) {
+        let ss: f32 = input.iter().map(|&v| v * v).sum();
+        let rms = (ss / n as f32 + EPS).sqrt();
+        *inv_rms = 1.0 / rms;
+        for i in 0..n {
+            x_hat[i] = input[i] * *inv_rms;
+            normed[i] = gamma[i] * x_hat[i];
+        }
+    }
+}
+
+// ── NnLayer impl ─────────────────────────────────────────────────────────────
+
+impl NnLayer for RMSNorm {
+    // ── forward ───────────────────────────────────────────────────────────────
+
+    fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
+        let c = cache.as_any_mut().downcast_mut::<RMSNormCache>().unwrap();
+
+        c.input.copy_from_slice(input);
+
+        Self::rms_norm(
+            input,
+            &self.gamma,
+            &mut c.x_hat,
+            &mut c.output,
+            &mut c.inv_rms,
+            self.norm_size,
+        );
+    }
+
+    fn forward_sample(&mut self, input: &[f32], cache: &mut dyn DynCache) {
+        self.forward(input, cache);
+    }
+
+    fn backward(&mut self, delta: &mut [f32], cache: &mut dyn DynCache) {
+        let c = cache.as_any_mut().downcast_mut::<RMSNormCache>().unwrap();
+
+        c.dx.copy_from_slice(delta);
+        let d_normed = &mut c.dx;
+
+        let n = self.norm_size;
+        let inv_rms = c.inv_rms;
+
+        // Steps 3+4: accumulate S and gamma gradient in one pass.
+        let mut s = 0.0;
+        for i in 0..n {
+            self.grads_gamma[i] += d_normed[i] * c.x_hat[i];
+            s += self.gamma[i] * d_normed[i] * c.x_hat[i];
+        }
+        let s_over_n = s / n as f32;
+
+        for i in 0..n {
+            d_normed[i] = inv_rms * (self.gamma[i] * d_normed[i] - c.x_hat[i] * s_over_n);
+        }
+    }
+
+    // ── bookkeeping ───────────────────────────────────────────────────────────
+
+    fn layer_tag(&self) -> u8 {
+        9
+    } // TAG_NORM_WRAPPER (unchanged)
+
+    fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
+        write_f32_slice(w, &self.gamma)
+    }
+
+    fn make_cache(&self) -> Box<dyn DynCache> {
+        let n = self.norm_size;
+        Box::new(RMSNormCache {
+            input: vec![0.0; n].into_boxed_slice(),
+            x_hat: vec![0.0; n].into_boxed_slice(),
+            inv_rms: 0.0,
+            output: vec![0.0; n].into_boxed_slice(),
+            dx: vec![0.0; n].into_boxed_slice(),
+        })
+    }
+
+    fn input_size(&self) -> usize {
+        self.norm_size
+    }
+    fn output_size(&self) -> usize {
+        self.norm_size
+    }
+
+    fn apply_grads(&mut self, lr: f32) {
+        sub_vec_in_place(&mut self.gamma, &self.grads_gamma, lr);
+    }
+    fn clear_grads(&mut self) {
+        self.grads_gamma.fill(0.0);
+    }
+    fn scale_grads(&mut self, scale: f32) {
+        self.grads_gamma.iter_mut().for_each(|x| *x *= scale);
     }
 }
