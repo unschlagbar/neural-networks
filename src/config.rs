@@ -9,12 +9,12 @@
 /// Pfad für das hierarchische Modell (char- + sentence-level).
 pub const MODEL_LOC: &str = "models/hric1";
 /// Pfad für das „normale" Char-Level-Sequential-Modell.
-pub const SEQ_LOC: &str = "models/seq1";
+pub const SEQ_LOC: &str = "models/seq2";
 
 // ── Sequenz-Längen ───────────────────────────────────────────────────────────
 
 /// Trainings-Sequenzlänge (Anzahl Tokens pro BPTT-Chunk).
-pub const SEQ_LEN: usize = 256;
+pub const SEQ_LEN: usize = 128;
 /// Reserve für den Forward-Cache (unsere BatchIter kann länger werden als SEQ_LEN).
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 
@@ -46,7 +46,7 @@ pub const TEMPERATURE: f32 = 0.4;
 // ── Modell-Dimensionen ───────────────────────────────────────────────────────
 
 pub const CHAR_HIDDEN: usize = 128;
-pub const CONTEXT_DIM: usize = 128;
+pub const CONTEXT_DIM: usize = 256;
 
 // ── Dataset ──────────────────────────────────────────────────────────────────
 
