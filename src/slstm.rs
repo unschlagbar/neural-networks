@@ -32,7 +32,7 @@ const I: usize = 1; // input gate (ĩ)
 const G_F: usize = 2; // forget gate (f̃)
 const O: usize = 3; // output gate (õ)
 
-const CLIP: f32 = 15.0;
+const CLIP: f32 = 10.0;
 
 // ── SLSTMCache ────────────────────────────────────────────────────────────────
 
