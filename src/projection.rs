@@ -12,6 +12,8 @@ use crate::{
     nn_layer::{DynCache, NnLayer},
 };
 
+const CLIP: f32 = 15.0;
+
 pub struct ProjectionGrads {
     pub weights: Matrix,
 }
@@ -151,6 +153,7 @@ impl<A: Activate> NnLayer for Projection<A> {
     }
 
     fn apply_grads(&mut self, lr: f32) {
+        self.grads.weights.clip(-CLIP, CLIP);
         sub_in_place(&mut self.weights, &self.grads.weights, lr);
     }
 

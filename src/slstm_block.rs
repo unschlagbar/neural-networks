@@ -157,10 +157,10 @@ fn silu_prime(pre: f32) -> f32 {
 
 impl SLSTMBlock {
     pub fn new(hidden_size: usize, up_size: usize) -> Self {
-        let scale_up = (3.0 / (hidden_size as f32 + up_size as f32)).sqrt();
+        let scale_up = (4.0 / (hidden_size as f32 + up_size as f32)).sqrt();
         // Down-Projektion etwas kleiner initialisieren → Residual-Pfad dominiert
         // am Anfang, der Block startet quasi als Identität. (Standard-Trick.)
-        let scale_dn = (3.0 / (up_size as f32 + hidden_size as f32)).sqrt();
+        let scale_dn = (4.0 / (up_size as f32 + hidden_size as f32)).sqrt() * 0.5;
 
         Self {
             hidden_size,

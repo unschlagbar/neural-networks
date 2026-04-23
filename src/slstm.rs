@@ -164,7 +164,7 @@ impl SLSTMLayer {
         // xLSTM paper keeps this convention to avoid very small f_t at start).
         let mut b = Matrix::zeros(4, hidden_size);
         b[G_F].fill(3.0);
-        b[I].fill(-1.0);
+        b[I].fill(-10.0);
 
         let h_init = vec![0.0; hidden_size].into_boxed_slice();
         let c_init = vec![0.0; hidden_size].into_boxed_slice();

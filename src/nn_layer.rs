@@ -148,6 +148,12 @@ impl SequentialBuilder {
         self
     }
 
+    pub fn linear_zeroed(mut self, hidden: usize) -> Self {
+        let layer = LinearLayer::zeroed(self.output_size, hidden);
+        self.layer(Box::new(layer), hidden);
+        self
+    }
+
     pub fn project<A: Activate + 'static>(mut self, hidden: usize, act: A) -> Self {
         let layer = Projection::new(self.output_size, hidden, act);
         self.layer(Box::new(layer), hidden);

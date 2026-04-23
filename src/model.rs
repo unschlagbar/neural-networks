@@ -8,7 +8,6 @@
 // es im Builder und nicht erst beim Training.
 
 use crate::{
-    activations::Linear,
     config::{CHAR_HIDDEN, CONTEXT_DIM},
     hierarchical_sequential::HierarchicalSequential,
     nn_layer::SequentialBuilder,
@@ -55,18 +54,18 @@ pub fn build_normal_model(vocab: usize) -> Sequential {
 pub fn build_hierarchical_model(vocab: usize, boundary_ids: Vec<u16>) -> HierarchicalSequential {
     // ── Char-Level-Teilmodell ─────────────────────────────────────────────
     // Input: one-hot(vocab) ⊕ context(CONTEXT_DIM)   (siehe HierarchicalSequential)
-    let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).project(CHAR_HIDDEN, Linear);
-    for _ in 0..4 {
+    let mut char_model = SequentialBuilder::new(vocab + CONTEXT_DIM).linear(CHAR_HIDDEN);
+    for _ in 0..6 {
         char_model = char_model.slstm_block(CHAR_HIDDEN);
     }
-    let char_model = char_model.project(vocab, Linear).softmax().build();
+    let char_model = char_model.linear(vocab).softmax().build();
 
     // ── High-Level-Teilmodell ─────────────────────────────────────────────
-    let mut high_model = SequentialBuilder::new(CHAR_HIDDEN).project(CONTEXT_DIM, Linear);
-    for _ in 0..4 {
+    let mut high_model = SequentialBuilder::new(CHAR_HIDDEN).linear(CONTEXT_DIM);
+    for _ in 0..6 {
         high_model = high_model.slstm_block(CONTEXT_DIM);
     }
-    let high_model = high_model.project(CONTEXT_DIM, Linear).build();
+    let high_model = high_model.linear_zeroed(CONTEXT_DIM).build();
 
-    HierarchicalSequential::new(char_model, high_model, vocab, boundary_ids, 5)
+    HierarchicalSequential::new(char_model, high_model, vocab, boundary_ids, 1)
 }

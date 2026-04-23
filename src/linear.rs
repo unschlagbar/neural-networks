@@ -11,6 +11,8 @@ use crate::{
     nn_layer::{DynCache, NnLayer},
 };
 
+const CLIP: f32 = 15.0;
+
 // ── DenseCache ────────────────────────────────────────────────────────────────
 
 pub struct LinearCache {
@@ -84,6 +86,15 @@ impl LinearLayer {
         Self {
             weights,
             biases,
+            grads: LinearGrads::zeros(input_size, hidden_size),
+        }
+    }
+
+    pub fn zeroed(input_size: usize, hidden_size: usize) -> Self {
+        let weights = Matrix::zeros(input_size, hidden_size);
+        Self {
+            weights,
+            biases: vec![0.0; hidden_size].into(),
             grads: LinearGrads::zeros(input_size, hidden_size),
         }
     }
@@ -192,6 +203,11 @@ impl NnLayer for LinearLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
+        self.grads.weights.clip(-CLIP, CLIP);
+        self.grads
+            .biases
+            .iter_mut()
+            .for_each(|v| *v = v.clamp(-CLIP, CLIP));
         sub_in_place(&mut self.weights, &self.grads.weights, lr);
         sub_vec_in_place(&mut self.biases, &self.grads.biases, lr);
     }

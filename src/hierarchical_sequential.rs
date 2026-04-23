@@ -77,8 +77,6 @@ impl HierarchicalSequential {
             high_model.input_size
         );
 
-        dbg!(word_rep_layer);
-
         if word_rep_layer == usize::MAX {
             panic!("char_model must contain a recurrent layer producing the high model input size",)
         }
@@ -386,18 +384,17 @@ impl HierarchicalSequential {
             *iteration += 1;
             if *iteration % batch_size == 0 {
                 let lr = lr / batch_size as f32;
-                //let char_tr =
-                //    self.boundary_timesteps.len() as f32 / inputs.len() as f32 * effective_lr;
+                //let char_lr = self.boundary_timesteps.len() as f32 / inputs.len() as f32 * lr;
 
                 for layer in &mut self.char_model.layers {
                     layer.apply_grads(lr);
                 }
-                self.char_model.scale_grads(0.5);
+                self.char_model.clear_grads();
 
                 for layer in &mut self.high_model.layers {
                     layer.apply_grads(lr);
                 }
-                self.high_model.scale_grads(0.5);
+                self.high_model.clear_grads();
 
                 *iteration = 0;
                 *j += 1;
@@ -405,9 +402,10 @@ impl HierarchicalSequential {
         }
 
         println!(
-            "{j} | char loss = {:.4} | high ∇ = {:.4}",
+            "{j} | char loss = {:.4} | high ∇ = {:.4} | pp = {:.4}",
             total_loss / steps.max(1) as f32,
-            self.last_high_grad_signal
+            self.last_high_grad_signal,
+            (total_loss / steps.max(1) as f32).exp()
         );
     }
 

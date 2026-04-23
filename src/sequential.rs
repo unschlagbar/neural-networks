@@ -203,7 +203,7 @@ impl Sequential {
 
             *iteration += 1;
             if *iteration % batch_size == 0 {
-                self.sgd_step(lr / batch_size as f32);
+                self.sgd_step(lr);
                 *iteration = 0;
                 *j += 1;
             }
@@ -274,7 +274,7 @@ impl Sequential {
         for layer in &mut self.layers {
             layer.apply_grads(lr);
         }
-        self.scale_grads(0.0);
+        self.clear_grads();
     }
 
     pub fn clear_grads(&mut self) {
