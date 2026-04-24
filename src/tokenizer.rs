@@ -217,7 +217,7 @@ impl Tokenizer {
     // ── Boundary ids ─────────────────────────────────────────────────────────
 
     /// Token ids that count as word/segment boundaries for the hierarchical model.
-    pub fn boundary_token_ids(&self) -> Vec<u16> {
+    pub fn word_token_ids(&self) -> Vec<u16> {
         let mut ids = vec![self.id_space, self.id_space2, self.id_space4];
         for c in [".", "!", "?", ",", ";", ":", "\n"] {
             if let Some(&id) = self.stoi.get(c) {

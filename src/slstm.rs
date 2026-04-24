@@ -236,15 +236,12 @@ impl SLSTMLayer {
         }
     }
 
-    /// Reset recurrent state and BPTT accumulators between sequences.
+    /// Clear forward recurrent state (h, c, n, m) — call between sequences.
     pub fn reset(&mut self) {
         self.h.copy_from_slice(&self.h_init);
         self.c.copy_from_slice(&self.c_init);
         self.n.fill(0.0);
         self.m.fill(0.0);
-        self.dh_bptt.fill(0.0);
-        self.dc_bptt.fill(0.0);
-        self.dn_bptt.fill(0.0);
     }
 
     // ── forward ───────────────────────────────────────────────────────────────
@@ -515,6 +512,12 @@ impl NnLayer for SLSTMLayer {
 
     fn bptt_hidden_grad(&mut self) -> Option<&[f32]> {
         Some(&self.dh_bptt)
+    }
+
+    fn zero_bptt_state(&mut self) {
+        self.dh_bptt.fill(0.0);
+        self.dc_bptt.fill(0.0);
+        self.dn_bptt.fill(0.0);
     }
 
     fn accumulate_init_grad(&mut self) {

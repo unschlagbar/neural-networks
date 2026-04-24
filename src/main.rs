@@ -24,6 +24,7 @@ pub mod data_set_loading;
 pub mod dense;
 pub mod dropout;
 pub mod hierarchical_sequential;
+//pub mod hm_rnn;
 pub mod indrnn;
 pub mod linear;
 pub mod loading;

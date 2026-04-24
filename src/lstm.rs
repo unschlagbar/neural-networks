@@ -189,6 +189,9 @@ impl LSTMLayer {
     pub fn reset(&mut self) {
         self.h.copy_from_slice(&self.h_init);
         self.c.copy_from_slice(&self.c_init);
+    }
+
+    pub fn reset_backwards(&mut self) {
         self.dh_bptt.fill(0.0);
         self.dc_bptt.fill(0.0);
     }
@@ -375,7 +378,11 @@ impl NnLayer for LSTMLayer {
         Some(&self.dh_bptt)
     }
 
-    // ← NEU: Wird von Sequential/Hierarchical nach jeder Sequenz aufgerufen
+    fn zero_bptt_state(&mut self) {
+        self.dh_bptt.fill(0.0);
+        self.dc_bptt.fill(0.0);
+    }
+
     fn accumulate_init_grad(&mut self) {
         add_vec_in_place(&mut self.grads.h_init_grad, &self.dh_bptt);
         add_vec_in_place(&mut self.grads.c_init_grad, &self.dc_bptt);

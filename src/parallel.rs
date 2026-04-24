@@ -170,4 +170,9 @@ impl NnLayer for ParallelLayer {
             Some(&self.bptt_grad)
         }
     }
+
+    fn zero_bptt_state(&mut self) {
+        self.branch1.zero_bptt_state();
+        self.branch2.zero_bptt_state();
+    }
 }

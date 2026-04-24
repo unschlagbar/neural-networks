@@ -7,14 +7,14 @@
 // ── Model-Pfade ──────────────────────────────────────────────────────────────
 
 /// Pfad für das hierarchische Modell (char- + sentence-level).
-pub const MODEL_LOC: &str = "models/hric2";
+pub const MODEL_LOC: &str = "models/hric3";
 /// Pfad für das „normale" Char-Level-Sequential-Modell.
 pub const SEQ_LOC: &str = "models/seq2";
 
 // ── Sequenz-Längen ───────────────────────────────────────────────────────────
 
 /// Trainings-Sequenzlänge (Anzahl Tokens pro BPTT-Chunk).
-pub const SEQ_LEN: usize = 128;
+pub const SEQ_LEN: usize = 512;
 /// Reserve für den Forward-Cache (unsere BatchIter kann länger werden als SEQ_LEN).
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 
@@ -29,7 +29,7 @@ pub const LR: f32 = 1e-4;
 /// Sequenzen (Sequential skaliert automatisch mit 1/BATCH_SIZE).
 /// BATCH_SIZE = 1 war ein Hauptgrund für das Rauschen. 8 ist ein guter
 /// Kompromiss zwischen Stabilität und Update-Frequenz.
-pub const BATCH_SIZE: usize = 8;
+pub const BATCH_SIZE: usize = 1;
 
 // ── Training-Schedule ────────────────────────────────────────────────────────
 
@@ -41,12 +41,12 @@ pub const SAVE_EVERY: usize = 4;
 // ── Sampling ─────────────────────────────────────────────────────────────────
 
 pub const MAX_LEN: usize = 1000;
-pub const TEMPERATURE: f32 = 0.4;
+pub const TEMPERATURE: f32 = 0.0;
 
 // ── Modell-Dimensionen ───────────────────────────────────────────────────────
 
 pub const CHAR_HIDDEN: usize = 128;
-pub const CONTEXT_DIM: usize = 128;
+pub const CONTEXT_DIM: usize = 512;
 
 // ── Dataset ──────────────────────────────────────────────────────────────────
 

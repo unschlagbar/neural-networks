@@ -93,7 +93,7 @@ pub trait NnLayer {
 
     // ── recurrent state ───────────────────────────────────────────────────────
 
-    /// Clear h, c, dh_bptt, dc_bptt between sequences (no-op for Dense).
+    /// Clear h, c
     fn reset_state(&mut self) {}
 
     /// dL/dh flowing from future timestep t+1 → t, or `None` for non-recurrent layers.
@@ -103,6 +103,12 @@ pub trait NnLayer {
     fn bptt_hidden_grad(&mut self) -> Option<&[f32]> {
         None
     }
+
+    /// Zero BPTT gradient accumulators (dh_bptt, dc_bptt, …) without touching
+    /// the forward hidden state (h, c).  Called at HM-RNN FLUSH boundaries so
+    /// that gradients do not leak across a char-model reset.  No-op for
+    /// stateless layers.
+    fn zero_bptt_state(&mut self) {}
 
     // ← NEU: Wird von Sequential/Hierarchical nach jeder Sequenz aufgerufen
     fn accumulate_init_grad(&mut self) {}

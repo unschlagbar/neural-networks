@@ -564,6 +564,12 @@ impl NnLayer for SLSTMBlock {
         None
     }
 
+    fn zero_bptt_state(&mut self) {
+        self.cell.dh_bptt.fill(0.0);
+        self.cell.dc_bptt.fill(0.0);
+        self.cell.dn_bptt.fill(0.0);
+    }
+
     fn accumulate_init_grad(&mut self) {
         self.cell.accumulate_init_grad();
     }

@@ -287,6 +287,10 @@ impl<A: Activate> NnLayer for IndRNNLayer<A> {
         Some(&self.dh_bptt)
     }
 
+    fn zero_bptt_state(&mut self) {
+        self.dh_bptt.fill(0.0);
+    }
+
     fn accumulate_init_grad(&mut self) {
         add_vec_in_place(&mut self.grads.h_init, &self.dh_bptt);
     }

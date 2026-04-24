@@ -41,6 +41,7 @@ use crate::sequential::Sequential;
 
 pub const MAGIC: u32 = 0x4E4E_4657;
 pub const HIER_MAGIC: u32 = 0x4849_4552;
+pub const HM_RNN_MAGIC: u32 = 0x484D_524E; // "HMRN"
 pub const VERSION: u8 = 2;
 
 // ── Primitive writers ─────────────────────────────────────────────────────────

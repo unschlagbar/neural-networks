@@ -100,22 +100,22 @@ pub fn train_normal() {
     }
 }
 
-// ── hierarchisches Modell ────────────────────────────────────────────────────
+// ── HM-RNN (Chung, Ahn, Bengio 2016) ─────────────────────────────────────────
 
 pub fn train_hierarchical() {
     let tokenizer = Rc::new(Tokenizer::new(crate::config::CHARSET, true));
     let vocab = tokenizer.vocab_size();
     let sentence_boundary_ids = tokenizer.sentence_token_ids();
-    let boundary_ids = tokenizer.boundary_token_ids();
+    let word_boundary_ids = tokenizer.word_token_ids();
 
     let mut model = match HierarchicalSequential::load(MODEL_LOC) {
         Ok(m) => {
-            println!("Loaded model from '{MODEL_LOC}'.");
+            println!("Loaded HM-RNN from '{MODEL_LOC}'.");
             m
         }
         Err(e) => {
-            println!("Could not load '{MODEL_LOC}' ({e}) — creating a new model.");
-            build_hierarchical_model(vocab, boundary_ids.clone())
+            println!("Could not load '{MODEL_LOC}' ({e}) — creating new HM-RNN.");
+            build_hierarchical_model(vocab, word_boundary_ids)
         }
     };
 
@@ -146,6 +146,7 @@ pub fn train_hierarchical() {
             } else {
                 model.train(batches, LR, &mut iteration, &mut j, BATCH_SIZE);
             }
+
             total_time += start.elapsed();
             file_count += 1;
 

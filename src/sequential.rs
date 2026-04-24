@@ -209,7 +209,11 @@ impl Sequential {
             }
         }
 
-        println!("{j} Average loss = {:.4}", total_loss / steps.max(1) as f32);
+        println!(
+            "{j} Average loss = {:.4}, pp = {:.4}",
+            total_loss / steps.max(1) as f32,
+            (total_loss / steps.max(1) as f32).exp()
+        );
     }
 
     // ── sampling ──────────────────────────────────────────────────────────────

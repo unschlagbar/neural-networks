@@ -291,6 +291,9 @@ impl NnLayer for RMSNormResidual {
     fn bptt_hidden_grad(&mut self) -> Option<&[f32]> {
         self.inner.bptt_hidden_grad()
     }
+    fn zero_bptt_state(&mut self) {
+        self.inner.zero_bptt_state();
+    }
     fn accumulate_init_grad(&mut self) {
         self.inner.accumulate_init_grad()
     }
