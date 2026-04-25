@@ -152,25 +152,6 @@ impl NnLayer for ParallelLayer {
         self.branch2.reset_state();
     }
 
-    fn bptt_hidden_grad(&mut self) -> Option<&[f32]> {
-        let hidden1 = self.branch1.bptt_hidden_grad();
-        let hidden2 = self.branch2.bptt_hidden_grad();
-
-        if hidden1.is_none() && hidden2.is_none() {
-            return None;
-        } else {
-            if let Some(hidden) = hidden1 {
-                self.bptt_grad[..self.branch1_size].copy_from_slice(hidden);
-            }
-
-            if let Some(hidden) = hidden2 {
-                self.bptt_grad[self.branch1_size..].copy_from_slice(hidden);
-            }
-
-            Some(&self.bptt_grad)
-        }
-    }
-
     fn zero_bptt_state(&mut self) {
         self.branch1.zero_bptt_state();
         self.branch2.zero_bptt_state();

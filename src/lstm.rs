@@ -232,12 +232,16 @@ impl LSTMLayer {
         let h = self.hidden_size;
         let r = self.input_size + h;
 
+        for j in 0..h {
+            delta[j] += self.dh_bptt[j];
+        }
+
         for i in 0..h {
             self.do_[i] = delta[i] * cache.c[i] * dsigmoid(cache.ot[i]);
         }
 
         for i in 0..h {
-            delta[i] *= cache.ot[i] * dtanh(cache.c[i]) + self.dc_bptt[i];
+            delta[i] = delta[i] * cache.ot[i] * dtanh(cache.c[i]) + self.dc_bptt[i];
         }
 
         for i in 0..h {
@@ -372,10 +376,6 @@ impl NnLayer for LSTMLayer {
 
     fn reset_state(&mut self) {
         self.reset();
-    }
-
-    fn bptt_hidden_grad(&mut self) -> Option<&[f32]> {
-        Some(&self.dh_bptt)
     }
 
     fn zero_bptt_state(&mut self) {

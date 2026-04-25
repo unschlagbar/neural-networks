@@ -2,7 +2,7 @@ use iron_oxide::collections::Matrix;
 use rand::random_range;
 
 use crate::{
-    lstm::{add_vec_in_place, one_hot},
+    lstm::one_hot,
     nn_layer::{DynCache, NnLayer},
     softmax::softmax,
 };
@@ -120,61 +120,13 @@ impl Sequential {
                     break;
                 }
 
-                // Form delta for layer l-1:
-                //   delta = input_grad(l) + bptt_hidden_grad(l-1)   [if recurrent]
-                //         = input_grad(l)                            [otherwise]
                 let dx = cache[t][l].input_grad();
                 let new_len = dx.len();
 
                 delta_buf[..new_len].copy_from_slice(dx);
 
-                if let Some(bptt) = layers[l - 1].bptt_hidden_grad() {
-                    add_vec_in_place(&mut delta_buf[..new_len], bptt);
-                }
-
                 delta_len = new_len;
             }
-        }
-
-        for layer in &mut self.layers {
-            // oder self.char_model.layers
-            layer.accumulate_init_grad();
-        }
-    }
-
-    pub fn backward_from_layer(
-        layers: &mut [Box<dyn NnLayer>],
-        layer_idx: usize,
-        mut delta: Vec<f32>,
-        cache_t: &mut [Box<dyn DynCache>],
-    ) {
-        let n = layers.len();
-        assert!(layer_idx < n, "backward_from_layer: invalid layer index");
-
-        let mut delta_len = delta.len();
-
-        for l in (0..=layer_idx).rev() {
-            layers[l].backward(&mut delta[..delta_len], cache_t[l].as_mut());
-
-            if l == 0 {
-                break;
-            }
-
-            let dx = cache_t[l].input_grad();
-            let new_len = dx.len();
-
-            match layers[l - 1].bptt_hidden_grad() {
-                Some(bptt) => {
-                    delta.resize(new_len, 0.0);
-                    delta.copy_from_slice(bptt);
-                    add_vec_in_place(&mut delta[..new_len], dx);
-                }
-                None => {
-                    delta.resize(new_len, 0.0);
-                    delta.copy_from_slice(dx);
-                }
-            }
-            delta_len = new_len;
         }
     }
 
@@ -203,6 +155,10 @@ impl Sequential {
                 layer.zero_bptt_state();
             }
             self.backwards_sequence(inputs, targets);
+
+            for layer in &mut self.layers {
+                layer.accumulate_init_grad();
+            }
 
             *iteration += 1;
             if *iteration % batch_size == 0 {

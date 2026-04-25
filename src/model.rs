@@ -8,6 +8,7 @@
 // es im Builder und nicht erst beim Training.
 
 use crate::{
+    activations::Sigmoid,
     config::{CHAR_HIDDEN, CONTEXT_DIM},
     hierarchical_sequential::HierarchicalSequential,
     nn_layer::SequentialBuilder,
@@ -38,11 +39,12 @@ use crate::{
 // Semantik. 3 Blöcke ≈ die vorige Tiefe, aber mit weniger Parametern pro
 // Block und höherer effektiver Kapazität durch das Gate.
 pub fn build_normal_model(vocab: usize) -> Sequential {
-    let mut model = SequentialBuilder::new(vocab).linear(CONTEXT_DIM);
-    for _ in 0..3 {
-        model = model.slstm_block(CONTEXT_DIM).res_rms_norm();
+    let mut model = SequentialBuilder::new(vocab);
+    for _ in 0..1 {
+        model = model.slstm_block(vocab);
+        // model = model.lstm(CONTEXT_DIM);
     }
-    model.linear(vocab).softmax().build()
+    model.softmax().build()
 }
 
 // ── Hierarchisches Modell (HierarchicalSequential) ───────────────────────────
@@ -79,23 +81,19 @@ pub fn build_hierarchical_model(
 ) -> HierarchicalSequential {
     // ── char_model (vocab → CHAR_HIDDEN) ──────────────────────────────────
     // Kurz (2 Blöcke): wird oft zurückgesetzt, mehr Tiefe bringt hier wenig.
-    let char_model = SequentialBuilder::new(vocab)
-        .linear(CHAR_HIDDEN)
-        .slstm_block(CHAR_HIDDEN)
-        .build();
+    let char_model = SequentialBuilder::new(vocab).slstm_block(vocab).build();
 
     // ── high_model (CHAR_HIDDEN → CONTEXT_DIM) ────────────────────────────
     // Ein Block reicht: der Informationsfluss kommt kondensiert aus char_model.
-    let high_model = SequentialBuilder::new(CHAR_HIDDEN)
-        .linear(CONTEXT_DIM)
-        .slstm_block(CONTEXT_DIM)
-        .slstm_block(CONTEXT_DIM)
+    let high_model = SequentialBuilder::new(vocab)
+        .slstm_block(vocab)
+        .slstm_block(vocab)
         .build();
 
     // ── char2_model ([CHAR_HIDDEN + CONTEXT_DIM] → vocab) ─────────────────
     // Prediction-Head: SiluDense für nichtlineare Interaktion, dann auf vocab.
-    let char2_model = SequentialBuilder::new(CHAR_HIDDEN + CONTEXT_DIM)
-        .slstm_block(CHAR_HIDDEN + CONTEXT_DIM)
+    let char2_model = SequentialBuilder::new(vocab + vocab)
+        //.slstm_block(vocab)
         .linear(vocab)
         .softmax()
         .build();

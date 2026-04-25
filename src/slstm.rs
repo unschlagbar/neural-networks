@@ -320,6 +320,10 @@ impl SLSTMLayer {
         let h = self.hidden_size;
         let r = self.input_size + h;
 
+        for j in 0..h {
+            delta[j] += self.dh_bptt[j];
+        }
+
         // ── 1. Output gate ────────────────────────────────────────────────────
         //   h = o · (c / ψ)   →   do/dõ = δh · c/ψ · o·(1-o)
         for j in 0..h {
@@ -509,11 +513,6 @@ impl NnLayer for SLSTMLayer {
     fn reset_state(&mut self) {
         self.reset();
     }
-
-    fn bptt_hidden_grad(&mut self) -> Option<&[f32]> {
-        Some(&self.dh_bptt)
-    }
-
     fn zero_bptt_state(&mut self) {
         self.dh_bptt.fill(0.0);
         self.dc_bptt.fill(0.0);

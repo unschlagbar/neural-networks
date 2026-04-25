@@ -283,10 +283,6 @@ impl<A: Activate> NnLayer for IndRNNLayer<A> {
         self.reset();
     }
 
-    fn bptt_hidden_grad(&mut self) -> Option<&[f32]> {
-        Some(&self.dh_bptt)
-    }
-
     fn zero_bptt_state(&mut self) {
         self.dh_bptt.fill(0.0);
     }

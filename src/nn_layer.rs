@@ -96,14 +96,6 @@ pub trait NnLayer {
     /// Clear h, c
     fn reset_state(&mut self) {}
 
-    /// dL/dh flowing from future timestep t+1 → t, or `None` for non-recurrent layers.
-    ///
-    /// `Sequential::backwards_sequence` reads this to combine with the dx coming
-    /// from the layer above before passing `delta` down.
-    fn bptt_hidden_grad(&mut self) -> Option<&[f32]> {
-        None
-    }
-
     /// Zero BPTT gradient accumulators (dh_bptt, dc_bptt, …) without touching
     /// the forward hidden state (h, c).  Called at HM-RNN FLUSH boundaries so
     /// that gradients do not leak across a char-model reset.  No-op for
