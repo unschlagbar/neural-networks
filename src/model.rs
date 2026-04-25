@@ -83,11 +83,13 @@ pub fn build_hierarchical_model(
     let char_model = SequentialBuilder::new(vocab)
         .linear(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
+        .slstm_block(CHAR_HIDDEN)
         .build();
 
     // ── high_model (CHAR_HIDDEN → CONTEXT_DIM) ────────────────────────────
     // Ein Block reicht: der Informationsfluss kommt kondensiert aus char_model.
-    let high_model = SequentialBuilder::new(CHAR_HIDDEN)
+    let high_model = SequentialBuilder::new(vocab + CHAR_HIDDEN)
+        .linear(CONTEXT_DIM)
         .slstm_block(CONTEXT_DIM)
         .slstm_block(CONTEXT_DIM)
         .build();
@@ -95,7 +97,7 @@ pub fn build_hierarchical_model(
     // ── char2_model ([CHAR_HIDDEN + CONTEXT_DIM] → vocab) ─────────────────
     // Prediction-Head: SiluDense für nichtlineare Interaktion, dann auf vocab.
     let char2_model = SequentialBuilder::new(CHAR_HIDDEN + CONTEXT_DIM)
-        //.slstm_block(vocab)
+        .slstm_block(CHAR_HIDDEN + CONTEXT_DIM)
         .linear(vocab)
         .softmax()
         .build();

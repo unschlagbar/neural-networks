@@ -7,7 +7,6 @@ use crate::dropout::DropoutLayer;
 use crate::indrnn::IndRNNLayer;
 use crate::linear::LinearLayer;
 use crate::lstm::LSTMLayer;
-use crate::parallel::ParallelLayer;
 use crate::projection::Projection;
 use crate::rms_norm::{RMSNorm, RMSNormResidual};
 use crate::sequential::Sequential;
@@ -206,23 +205,6 @@ impl SequentialBuilder {
         self.layer(Box::new(layer), self.output_size);
         self
     }
-
-    pub fn parallel<F: FnMut(Self) -> Self>(mut self, mut inside_layer: F) -> Self {
-        self.in_parallel = true;
-        let mut this = (inside_layer)(self);
-        this.in_parallel = false;
-        let layer = if let Some(branch1) = this.branch1.take()
-            && let Some(branch2) = this.branch2.take()
-        {
-            ParallelLayer::new(branch1, branch2, 1.0, 1.0)
-        } else {
-            unreachable!()
-        };
-        this.output_size = layer.output_size();
-        this.layers.push(Box::new(layer));
-        this
-    }
-
     // In nn_layer.rs → impl SequentialBuilder
     pub fn res_rms_norm(mut self) -> Self {
         let inner = if let Some(layer) = self.layers.pop() {

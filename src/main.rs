@@ -31,7 +31,6 @@ pub mod loading;
 pub mod lstm;
 pub mod model;
 pub mod nn_layer;
-pub mod parallel;
 pub mod projection;
 pub mod rms_norm;
 pub mod sampling;

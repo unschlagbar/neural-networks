@@ -14,7 +14,6 @@ use crate::{
     linear::LinearLayer,
     lstm::LSTMLayer,
     nn_layer::NnLayer,
-    parallel::ParallelLayer,
     projection::Projection,
     rms_norm::{RMSNorm, RMSNormResidual},
     saving::{MAGIC, VERSION},
@@ -202,36 +201,6 @@ pub fn load_lstm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>>
     )))
 }
 
-pub fn load_parallel(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
-    let tag1 = read_u8(r)?;
-    let input_size1 = read_u32(r)? as usize;
-    let out_size1 = read_u32(r)? as usize;
-    let lr1 = read_f32(r)?;
-    let branch1 = new_layer(
-        r,
-        tag1,
-        LoadCtx {
-            input_size: input_size1,
-            output_size: out_size1,
-        },
-    )?;
-
-    let tag2 = read_u8(r)?;
-    let input_size2 = read_u32(r)? as usize;
-    let out_size2 = read_u32(r)? as usize;
-    let lr2 = read_f32(r)?;
-    let branch2 = new_layer(
-        r,
-        tag2,
-        LoadCtx {
-            input_size: input_size2,
-            output_size: out_size2,
-        },
-    )?;
-
-    Ok(Box::new(ParallelLayer::new(branch1, branch2, lr1, lr2)))
-}
-
 pub fn load_res_norm(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
     let gamma = read_f32_vec(r)?.into_boxed_slice();
 
@@ -356,7 +325,6 @@ fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLa
         4 => load_softmax(r),
         5 => load_slstm(r, ctx),
         6 => load_dropout(r, ctx),
-        7 => load_parallel(r, ctx),
         8 => load_res_norm(r, ctx),
         9 => load_norm(r, ctx),
         10 => load_silu_dense(r, ctx),
