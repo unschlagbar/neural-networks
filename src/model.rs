@@ -49,31 +49,6 @@ pub fn build_normal_model(vocab: usize) -> Sequential {
 // ── Hierarchisches Modell (HierarchicalSequential) ───────────────────────────
 //
 // Drei gekoppelte Sub-Modelle mit FESTEN (token-basierten) Wortgrenzen:
-//
-//   char_model  : vocab → Linear(H) → sLSTMBlock×2
-//                 Läuft Token für Token, wird an jeder Wortgrenze zurückgesetzt.
-//                 Kapazität für Zeichenmuster innerhalb eines Worts.
-//                 Ausgang (H = CHAR_HIDDEN) dient als Wort-Repräsentation.
-//
-//   high_model  : H → Linear(C) → sLSTMBlock×1
-//                 Bekommt h_t des char_model an jeder Wortgrenze, läuft nicht
-//                 zurück. Akkumuliert Satzstruktur über Wörter hinweg.
-//                 Ausgang (C = CONTEXT_DIM) ist der globale Kontext.
-//
-//   char2_model : [H | C] → SiluDense(H+C) → Linear(vocab) → Softmax
-//                 Prediction-Head — kein Recurrence. Kombiniert lokale
-//                 Zeichenebene und globalen Kontext zu einem Logit-Vektor.
-//                 SiluDense gibt dem Head etwas nichtlineare Kapazität.
-//
-// Dimensionen:
-//   H = CHAR_HIDDEN = 128
-//   C = CONTEXT_DIM = 128
-//   char2_model.input = H + C = 256
-//
-// Parameter-Überschlag (grob):
-//   char_model  ≈ vocab×H + 2 × sLSTMBlock(H)  ≈  V·128 + 2 × (128²·4 + 128·128·4/3)
-//   high_model  ≈ H×C     + 1 × sLSTMBlock(C)  ≈  128²  +     128²·4
-//   char2_model ≈ (H+C)²  + (H+C)×vocab        ≈  256²   + 256·V
 pub fn build_hierarchical_model(
     vocab: usize,
     boundary_token_ids: Vec<u16>,

@@ -314,19 +314,14 @@ impl HierarchicalSequential {
                 // A. Capture init-grad for the word segment that starts AFTER this
                 //    boundary (chars from t+1 up to the next boundary).  Their BPTT
                 //    signal has fully propagated into dh_bptt / dc_bptt by now.
-                for layer in &mut self.char_model.layers {
-                    layer.accumulate_init_grad();
-                }
-                for layer in &mut self.char2_model.layers {
-                    layer.accumulate_init_grad();
-                }
-
                 // B. Zero char BPTT — the char model was reset in the forward pass,
                 //    so no gradient should cross this word boundary.
                 for layer in &mut self.char_model.layers {
+                    layer.accumulate_init_grad();
                     layer.zero_bptt_state();
                 }
                 for layer in &mut self.char2_model.layers {
+                    layer.accumulate_init_grad();
                     layer.zero_bptt_state();
                 }
 

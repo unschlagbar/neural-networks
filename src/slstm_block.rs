@@ -409,7 +409,7 @@ impl SLSTMBlock {
         // VOLLSTÄNDIG innerhalb des Blocks. Sequential sieht den Block als
         // nicht-rekurrent (bptt_hidden_grad() = None unten), also müssen wir
         // dh_bptt hier selbst aufsummieren, sonst ignorieren wir BPTT komplett.
-        add_vec_in_place(&mut self.sc_h2, &self.cell.dh_bptt);
+        //add_vec_in_place(&mut self.sc_h2, &self.cell.dh_bptt);
         self.cell.backward(&mut self.sc_h2, &mut cache.cell);
         // cache.cell.dconcat[..H] enthält jetzt d(pre_normed) = dL/d(Zelleneingang)
 
