@@ -334,7 +334,7 @@ impl HierarchicalSequential {
                 //    d_high_ctx = Σ dx2[char_output..] for all t STRICTLY AFTER this
                 //    boundary — exactly dL/d(high_ctx_NEW).
                 high_grad_accum +=
-                    d_high_ctx.iter().map(|x| x * x).sum::<f32>().sqrt() / context_size as f32;
+                    d_high_ctx.iter().map(|x| x * x).sum::<f32>() / context_size as f32;
 
                 delta_buf[..context_size].copy_from_slice(&d_high_ctx);
                 backward_through_layers(
@@ -443,7 +443,7 @@ impl HierarchicalSequential {
         }
 
         self.last_high_grad_signal = if self.boundary_timesteps.len() > 0 {
-            high_grad_accum / self.boundary_timesteps.len() as f32
+            (high_grad_accum / self.boundary_timesteps.len() as f32).sqrt()
         } else {
             0.0
         };
