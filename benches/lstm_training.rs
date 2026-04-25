@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use neural_networks::activations::{Linear, Relu};
+use neural_networks::activations::Relu;
 use std::{rc::Rc, time::Duration};
 
 use neural_networks::nn_layer::SequentialBuilder;
@@ -26,9 +26,9 @@ pub fn train(tokenizer: Rc<Tokenizer>, raw_data: &Vec<Vec<u16>>) {
 
     let mut model = SequentialBuilder::new(vocab)
         .dense(HIDDEN_SIZE, Relu)
-        .lstm(HIDDEN_SIZE)
-        .lstm(HIDDEN_SIZE)
-        .dense(vocab, Linear)
+        .slstm(HIDDEN_SIZE)
+        .slstm(HIDDEN_SIZE)
+        .linear(vocab)
         .softmax()
         .build();
 

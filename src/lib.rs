@@ -7,7 +7,6 @@ pub mod dropout;
 pub mod hierarchical_sequential;
 //pub mod hm_rnn;
 pub mod indrnn;
-pub mod jarvis;
 pub mod linear;
 pub mod loading;
 pub mod lstm;

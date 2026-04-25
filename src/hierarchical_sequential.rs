@@ -164,6 +164,7 @@ impl HierarchicalSequential {
         let char_output = self.char_model.output_size;
         for t in 0..input.len() {
             let token = input[t];
+            let next_token = input.get(t + 1);
 
             self.fill_input_buf(token);
 
@@ -174,8 +175,7 @@ impl HierarchicalSequential {
             );
 
             let char1_output = self.char_model.cache[t].last().unwrap().output();
-            self.assert_no_nan(char1_output, "char_output", t);
-            self.word_context[0..char_output].copy_from_slice(char1_output);
+            self.word_context[..char_output].copy_from_slice(char1_output);
 
             Self::forward_step(
                 &mut self.char2_model.layers,
@@ -183,7 +183,13 @@ impl HierarchicalSequential {
                 &self.word_context,
             );
 
-            let is_boundary = self.boundary_token_ids.contains(&token);
+            self.assert_no_nan(
+                self.char2_model.cache[t].last().unwrap().output(),
+                "char_output",
+                t,
+            );
+
+            let is_boundary = next_token.map_or(false, |v| self.boundary_token_ids.contains(v));
 
             if is_boundary {
                 self.boundary_timesteps.push(t);
@@ -211,185 +217,173 @@ impl HierarchicalSequential {
         }
     }
 
-    // ── Backward ─────────────────────────────────────────────────────────────
+    // ── Backward pass (BPTT) ─────────────────────────────────────────────────
     //
-    // Struktur der Rückwärtspropagation:
+    // Graph recap (forward):
     //
-    //   Für jedes t rückwärts von len-1 bis 0:
-    //     1. Flush — wenn boundary_timesteps[current_word-1] >= t, lasse den
-    //        bisher akkumulierten d_context durch high_model[current_word-1]
-    //        laufen; das Ergebnis ist dL/d(word_rep) und wird als „pending" grad
-    //        für char_model an t = boundary zurückgelegt.
-    //     2. char2_model rückwärts mit Cross-Entropy-Start-Delta.
-    //        cache[t][0].input_grad() = dL/d([char_out_t, context_t]).
-    //        d_char_output → startet char_delta,  d_context → d_context_accum.
-    //     3. Falls pending_target_t == t:  char_delta += pending_word_rep_grad.
-    //     4. char_model rückwärts mit char_delta.
-    //     5. Word-Start (t==0 oder boundary bei t-1): accumulate_init_grad +
-    //        reset_backwards auf char_model, weil der Forward bei t-1 ein
-    //        reset_state durchgeführt hat — h_{t-1} war h_init.  BPTT darf
-    //        nicht über die Wortgrenze hinaus fließen.
+    //   for each char t:
+    //     char1[t]  = char_model(one_hot(inputs[t]))          ← char-level LSTM
+    //     char2[t]  = char2_model([char1[t] | high_ctx])      ← output LSTM
+    //     loss[t]   = CE(char2[t], targets[t])
     //
-    //   Nach der Schleife: accumulate_init_grad für char2_model und high_model
-    //   (diese werden innerhalb der Sequenz nie resettet).
+    //   at word boundary after t:
+    //     high[w]   = high_model(char1[t])                    ← word-level LSTM
+    //     high_ctx  ← high[w]                                 ← fed to char2 from t+1
+    //     char_model.reset_state()
+    //     char2_model.reset_state()
     //
-    // Cross-word BPTT für high_model passiert automatisch: zwischen Wort W und
-    // W-1 überdauert dh_bptt in der Zelle und wird beim nächsten Backward
-    // wieder eingefüttert — entweder direkt von Sequential (für nackte sLSTMs)
-    // oder block-intern (für SLSTMBlock, siehe slstm_block.rs).
+    // Backward must undo this in strict reverse order.
+    // Per timestep (t descending):
+    //
+    //   1.  dL/dchar2_out[t] = softmax_out[t] − one_hot(targets[t])   (CE gradient)
+    //   2.  Backprop through char2_model → gives dx = dL/d[char1[t] | high_ctx]
+    //       dx splits into:
+    //         d_char1[t]   = dx[..char_output]
+    //         d_high_ctx  += dx[char_output..]       (accumulated across the word)
+    //
+    //   3.  If t is a word boundary (boundary_timesteps contains t), THEN first:
+    //       a.  Backprop through high_model[w] with d_high_ctx as the start delta.
+    //           The high model's input was char1[t], so its input_grad = d_char1_from_high.
+    //       b.  d_char1[t] += high_model.cache[w][0].input_grad()
+    //       c.  Carry high model's BPTT signal forward (to t-1 of the word-level
+    //           sequence) via layers[0].bptt_hidden_grad() — already done inside
+    //           backward_through_layers for the high model.
+    //       d.  Reset d_high_ctx = 0 for the previous word segment.
+    //
+    //   4.  Backprop through char_model[t] using d_char1[t] as the start delta.
+    //
+    // This matches equations (8)/(9) of Hwang & Sung (arXiv:1609.03777v2):
+    // the reset and clock signals are differentiable because the reset zeros the
+    // previous hidden state, making its gradient contribution zero for the
+    // boundary step — which is exactly what we get by stopping BPTT at the
+    // reset point.
 
-    pub fn backwards_sequence(&mut self, _inputs: &[u16], targets: &[u16]) {
-        if targets.is_empty() {
-            return;
-        }
-
+    pub fn backwards_sequence(&mut self, inputs: &[u16], targets: &[u16]) {
+        let t_len = targets.len();
         let char_output = self.char_model.output_size;
         let context_size = self.context_size;
-        let vocab = self.vocab_size;
+
+        // --- shared delta scratch buffers (pre-allocated, no heap per step) ---
+        // We need the largest possible delta size:
+        //   char2_model input = char_output + context_size
+        let max_delta = (char_output + context_size)
+            .max(self.char2_model.output_size)
+            .max(self.high_model.output_size)
+            .max(self.high_model.input_size)
+            .max(self.char_model.output_size);
+
+        let mut delta_buf = vec![0.0f32; max_delta];
+
+        // Accumulated gradient w.r.t. the high-model context that was broadcast
+        // to *all* char2 timesteps in the current word.  Reset at each boundary.
+        let mut d_high_ctx = vec![0.0f32; context_size];
+
+        // Track which word boundary index we are currently processing (going backward).
         let n_boundaries = self.boundary_timesteps.len();
+        let mut next_boundary_ptr: isize = n_boundaries as isize - 1; // index into boundary_timesteps
 
-        // Destructure so we can borrow each sub-model independently of the others.
-        let HierarchicalSequential {
-            char_model,
-            char2_model,
-            high_model,
-            boundary_timesteps,
-            ..
-        } = self;
+        // Snapshot of last_high_grad_signal (L2 norm) for logging.
+        let mut high_grad_sq_sum = 0.0f32;
+        let mut high_grad_count = 0usize;
 
-        // ── BPTT state defensiv zurücksetzen (letzte Backward-Sequenz hat
-        //    dh_bptt / dc_bptt in den Layern hinterlassen, die sonst beim
-        //    ersten Backward-Schritt mitlaufen würden). ───────────────────────
-        for l in &mut char_model.layers {
-            l.zero_bptt_state();
-        }
-        for l in &mut char2_model.layers {
-            l.zero_bptt_state();
-        }
-        for l in &mut high_model.layers {
-            l.zero_bptt_state();
-        }
+        for t in (0..t_len).rev() {
+            // ── Step 1: cross-entropy delta for char2_model output ────────────
+            let out2 = self.char2_model.cache[t].last().unwrap().output();
+            let out2_len = out2.len();
+            delta_buf[..out2_len].copy_from_slice(out2);
+            delta_buf[targets[t] as usize] -= 1.0;
 
-        // ── Zwischenpuffer ────────────────────────────────────────────────────
-        let mut d_context_accum = vec![0.0; context_size];
-        let mut pending_word_rep_grad = vec![0.0; char_output];
-        let mut pending_target_t = None;
+            // ── Step 2: backprop through char2_model ──────────────────────────
+            backward_through_layers(
+                &mut self.char2_model.layers,
+                &mut self.char2_model.cache[t],
+                &mut delta_buf,
+                out2_len,
+            );
 
-        // w_ptr zeigt auf „das nächste noch NICHT geflushte Wort + 1".  Wir
-        // starten oberhalb des letzten Wortes und wandern rückwärts, wobei wir
-        // pro Boundary einmal high_model-Backward aufrufen.
-        let mut w_ptr = n_boundaries;
+            // The input gradient of char2_model is d/d([char1[t] | high_ctx]).
+            let dx2 = self.char2_model.cache[t][0].input_grad().to_vec();
+            // d_char1 contribution from char2
+            let mut d_char1 = dx2[..char_output].to_vec();
+            // accumulate high-context gradient for the current word
+            for i in 0..context_size {
+                d_high_ctx[i] += dx2[char_output + i];
+            }
 
-        let mut total_grad_sq = 0.0;
+            // ── Step 3: if t is a word boundary, backprop high_model ─────────
+            let is_boundary =
+                next_boundary_ptr >= 0 && self.boundary_timesteps[next_boundary_ptr as usize] == t;
 
-        for t in (0..targets.len()).rev() {
-            // ── A. Boundaries flushen, deren t bereits „hinter uns" liegt ────
-            //
-            // `boundary_timesteps[w_ptr - 1] >= t` heißt: alle t' > boundary_ts
-            // haben wir verarbeitet und d_context_accum ist komplett für dieses
-            // Wort.  Jetzt durch high_model backward jagen.
-            while w_ptr > 0 && boundary_timesteps[w_ptr - 1] >= t {
-                let word_idx = w_ptr - 1;
+            if is_boundary {
+                let word_idx = next_boundary_ptr as usize;
+                next_boundary_ptr -= 1;
 
-                // delta_buf für high_model befüllen mit d_context_accum
-                high_model.delta_buf[..context_size].copy_from_slice(&d_context_accum);
+                // The high_model output gradient = d_high_ctx accumulated over this word.
+                // (char2 received the same high_ctx for every t in this word.)
+                let high_out_len = self.high_model.output_size;
+                delta_buf[..high_out_len].copy_from_slice(&d_high_ctx[..high_out_len]);
+
+                high_grad_sq_sum += d_high_ctx[..high_out_len]
+                    .iter()
+                    .map(|x| x * x)
+                    .sum::<f32>();
+                high_grad_count += 1;
 
                 backward_through_layers(
-                    &mut high_model.layers,
-                    &mut high_model.cache[word_idx],
-                    &mut high_model.delta_buf,
-                    context_size,
+                    &mut self.high_model.layers,
+                    &mut self.high_model.cache[word_idx],
+                    &mut delta_buf,
+                    high_out_len,
                 );
 
-                // high_model's erster Layer hat als Input char_model[boundary_t].output,
-                // also ist input_grad() jetzt dL/d(word_rep).
-                let g = high_model.cache[word_idx][0].input_grad();
-                pending_word_rep_grad.copy_from_slice(&g[..char_output]);
-
-                // Für die Grad-Norm-Telemetry
-                for &v in &pending_word_rep_grad[..] {
-                    total_grad_sq += v * v;
+                // high_model input was char1[t], so add its input gradient
+                let dx_high = self.high_model.cache[word_idx][0].input_grad();
+                let dx_high_len = dx_high.len(); // == char_output
+                for i in 0..dx_high_len.min(d_char1.len()) {
+                    d_char1[i] += dx_high[i];
                 }
 
-                pending_target_t = Some(boundary_timesteps[word_idx]);
-                d_context_accum.fill(0.0);
-                w_ptr -= 1;
-            }
+                // Reset the accumulated context gradient for the next (earlier) word
+                d_high_ctx.fill(0.0);
 
-            // ── B. char2_model rückwärts (Cross-Entropy-Start) ───────────────
-            let last_out = char2_model.cache[t].last().unwrap().output();
-            char2_model.delta_buf[..vocab].copy_from_slice(last_out);
-            char2_model.delta_buf[targets[t] as usize] -= 1.0;
-
-            backward_through_layers(
-                &mut char2_model.layers,
-                &mut char2_model.cache[t],
-                &mut char2_model.delta_buf,
-                vocab,
-            );
-
-            // ── C. input_grad von char2_model splitten ───────────────────────
-            //   char2_model.cache[t][0] ist die erste (nicht-rekurrente) Input-
-            //   Projektion — ihr Input war [char_out_t, context_t].
-            {
-                let grad_in = char2_model.cache[t][0].input_grad();
-
-                // char_model-Delta vorbereiten
-                char_model.delta_buf[..char_output].copy_from_slice(&grad_in[..char_output]);
-
-                // d_context akkumulieren (geht an das Wort, dessen Boundary
-                // VOR t liegt — flush erfolgt in A bei der nächsten Runde).
-                for i in 0..context_size {
-                    d_context_accum[i] += grad_in[char_output + i];
-                }
-            }
-
-            // ── D. Pending word_rep-Grad an Boundary-t einspeisen ────────────
-            if pending_target_t == Some(t) {
-                for i in 0..char_output {
-                    char_model.delta_buf[i] += pending_word_rep_grad[i];
-                }
-                pending_target_t = None;
-            }
-
-            // ── E. char_model rückwärts ──────────────────────────────────────
-            backward_through_layers(
-                &mut char_model.layers,
-                &mut char_model.cache[t],
-                &mut char_model.delta_buf,
-                char_output,
-            );
-
-            // ── F. Word-Start?  (t==0 oder boundary bei t-1) ─────────────────
-            //
-            //   Nach `reset_state` im Forward war h_{t-1} = h_init, c_{t-1} =
-            //   c_init.  Also sind die aktuellen dh_bptt / dc_bptt gerade die
-            //   Grads für h_init / c_init.  -> accumulate + reset, sonst
-            //   würden sie in den backward bei t-1 (letztes Zeichen des
-            //   Vorgängerworts) hineinsickern und dort FALSCH als Cross-Word-
-            //   BPTT wirken.
-            let is_word_start =
-                t == 0 || (w_ptr > 0 && boundary_timesteps[w_ptr.saturating_sub(1)] == t - 1);
-
-            if is_word_start {
-                for layer in &mut char_model.layers {
-                    layer.accumulate_init_grad();
+                // Per the paper: char_model was reset at this boundary, so its BPTT
+                // hidden state does not propagate across the boundary — zero it here
+                // so the subsequent (earlier) char backward steps start clean.
+                for layer in &mut self.char_model.layers {
                     layer.zero_bptt_state();
                 }
-
-                for layer in &mut char2_model.layers {
-                    layer.accumulate_init_grad();
+                for layer in &mut self.char2_model.layers {
                     layer.zero_bptt_state();
                 }
             }
+
+            // ── Step 4: backprop through char_model[t] ────────────────────────
+            let d_char1_len = d_char1.len();
+            delta_buf[..d_char1_len].copy_from_slice(&d_char1);
+            backward_through_layers(
+                &mut self.char_model.layers,
+                &mut self.char_model.cache[t],
+                &mut delta_buf,
+                d_char1_len,
+            );
         }
 
-        for layer in &mut high_model.layers {
+        // Accumulate h0-gradient for recurrent init (consistent with Sequential)
+        for layer in &mut self.char_model.layers {
+            layer.accumulate_init_grad();
+        }
+        for layer in &mut self.char2_model.layers {
+            layer.accumulate_init_grad();
+        }
+        for layer in &mut self.high_model.layers {
             layer.accumulate_init_grad();
         }
 
-        // Kleine Telemetrie für das train()-Logging.
-        self.last_high_grad_signal = total_grad_sq.sqrt();
+        self.last_high_grad_signal = if high_grad_count > 0 {
+            (high_grad_sq_sum / high_grad_count as f32).sqrt()
+        } else {
+            0.0
+        };
     }
     // ── Training ─────────────────────────────────────────────────────────────
 
@@ -414,15 +408,15 @@ impl HierarchicalSequential {
 
             *iteration += 1;
             if *iteration % batch_size == 0 {
-                let char_lr = self.boundary_timesteps.len() as f32 / inputs.len() as f32 * lr;
+                //let char_lr = self.boundary_timesteps.len() as f32 / inputs.len() as f32 * lr;
 
                 for layer in &mut self.char_model.layers {
-                    layer.apply_grads(char_lr);
+                    layer.apply_grads(lr);
                 }
                 self.char_model.clear_grads();
 
                 for layer in &mut self.char2_model.layers {
-                    layer.apply_grads(char_lr);
+                    layer.apply_grads(lr);
                 }
                 self.char2_model.clear_grads();
 
@@ -437,7 +431,7 @@ impl HierarchicalSequential {
         }
 
         println!(
-            "{j} | char loss = {:.4} | high ∇ = {:.4} | pp = {:.4}",
+            "{j} | char loss = {:.4} | high ∇ = {:.4} | ppl = {:.4}",
             total_loss / steps.max(1) as f32,
             self.last_high_grad_signal,
             (total_loss / steps.max(1) as f32).exp()
@@ -453,9 +447,8 @@ impl HierarchicalSequential {
     ) -> Vec<u16> {
         self.reset();
 
-        // Prefix (bis auf das letzte Token) durch das Netz jagen, damit der
-        // rekurrente Zustand aufgebaut wird.  Das letzte Prefix-Token wird
-        // below als erstes „last_token" fürs Sampling benutzt.
+        // Feed the prefix through the model to warm up all states.
+        // The last token of the prefix becomes the first "last_token".
         let mut last_token = if prefix.is_empty() {
             rand::random_range(0..self.vocab_size) as u16
         } else {
@@ -463,62 +456,61 @@ impl HierarchicalSequential {
             prefix[prefix.len() - 1]
         };
 
-        let char_output = self.char_model.output_size;
         let mut out = Vec::with_capacity(max_len);
 
         for _ in 0..max_len {
-            // ── 1. char_model forward (ein Schritt, cache[0]) ────────────────
+            // ── one char step (uses cache[0]) ────────────────────────────────
             self.fill_input_buf(last_token);
+
+            // char_model step → raw embedding
             Self::forward_sample_step(
                 &mut self.char_model.layers,
                 &mut self.char_model.cache[0],
                 &self.char_input_buf,
             );
-            {
-                let char_out_slice = self.char_model.cache[0].last().unwrap().output();
-                self.word_context[0..char_output].copy_from_slice(char_out_slice);
-            }
 
-            // ── 2. char2_model forward (mit [char_out, context]) ─────────────
+            // copy char1 output into word_context[..char_output]
+            let char_output = self.char_model.output_size;
+            let char1_out = self.char_model.cache[0].last().unwrap().output().to_vec();
+            self.word_context[..char_output].copy_from_slice(&char1_out);
+
+            // char2_model step → logits over vocab
             Self::forward_sample_step(
                 &mut self.char2_model.layers,
                 &mut self.char2_model.cache[0],
                 &self.word_context,
             );
 
-            // ── 3. Boundary?  → high_model updaten, char_model resetten ──────
-            if self.boundary_token_ids.contains(&last_token) {
-                // Word-Repräsentation kopieren, damit char_model als &mut
-                // verwendet werden kann.
-                let mut word_rep = vec![0.0f32; char_output];
-                word_rep.copy_from_slice(self.char_model.cache[0].last().unwrap().output());
+            let logits = self.char2_model.cache[0].last().unwrap().output();
 
+            // Temperature-scaled softmax sampling (identical to Sequential::sample)
+            let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature.max(1e-8)).collect();
+            let probs = softmax(&scaled);
+            let next = self.sample_from_probs(&probs);
+
+            // ── word-boundary handling ────────────────────────────────────────
+            // If the *just-emitted* token is a boundary, clock the high model.
+            // (The paper feeds the boundary token to the word-level RNN.)
+            if self.boundary_token_ids.contains(&next) {
                 Self::forward_sample_step(
                     &mut self.high_model.layers,
                     &mut self.high_model.cache[0],
-                    &word_rep,
+                    &char1_out,
                 );
 
+                // Reset char-level states for the next word
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
+                for layer in &mut self.char2_model.layers {
+                    layer.reset_state();
+                }
 
-                let high_out_slice = self.high_model.cache[0].last().unwrap().output();
-                self.word_context[char_output..].copy_from_slice(high_out_slice);
+                // Update context fed into char2 for the next word
+                let high_out = self.high_model.cache[0].last().unwrap().output().to_vec();
+                self.word_context[char_output..].copy_from_slice(&high_out);
             }
 
-            // ── 4. Sampling aus den Logits ───────────────────────────────────
-            //   forward_sample hat die Softmax übersprungen → letzte Ausgabe
-            //   des char2_model enthält Roh-Logits; wir wenden Temperature +
-            //   Softmax einmal extern an.
-            let probs: Box<[f32]> = {
-                let logits = self.char2_model.cache[0].last().unwrap().output();
-                let temp = temperature.max(1e-8);
-                let scaled: Vec<f32> = logits.iter().map(|&v| v / temp).collect();
-                softmax(&scaled)
-            };
-
-            let next = self.sample_from_probs(&probs);
             out.push(next);
             if !callback(next) {
                 break;
@@ -529,13 +521,17 @@ impl HierarchicalSequential {
         out
     }
 
-    /// Prefix-Feed fürs Sampling — identisch zu `forward_over`, aber
-    /// (a) nutzt forward_sample_step (keine Softmax) und
-    /// (b) arbeitet auf cache[0] (nur 1 Timestep gespeichert).
+    /// Feed a prefix into the model *without* saving training caches —
+    /// updates all layer states (h, c) so subsequent `sample` steps are
+    /// conditioned on the prefix.  Uses cache[0] as a single-step scratch.
     fn forward_sample_prefix(&mut self, prefix: &[u16]) {
         let char_output = self.char_model.output_size;
+        self.word_context.fill(0.0);
 
-        for &token in prefix {
+        for t in 0..prefix.len() {
+            let token = prefix[t];
+            let next_token = prefix.get(t + 1);
+
             self.fill_input_buf(token);
 
             Self::forward_sample_step(
@@ -543,10 +539,9 @@ impl HierarchicalSequential {
                 &mut self.char_model.cache[0],
                 &self.char_input_buf,
             );
-            {
-                let char_out_slice = self.char_model.cache[0].last().unwrap().output();
-                self.word_context[0..char_output].copy_from_slice(char_out_slice);
-            }
+
+            let char1_out = self.char_model.cache[0].last().unwrap().output().to_vec();
+            self.word_context[..char_output].copy_from_slice(&char1_out);
 
             Self::forward_sample_step(
                 &mut self.char2_model.layers,
@@ -554,22 +549,24 @@ impl HierarchicalSequential {
                 &self.word_context,
             );
 
-            if self.boundary_token_ids.contains(&token) {
-                let mut word_rep = vec![0.0f32; char_output];
-                word_rep.copy_from_slice(self.char_model.cache[0].last().unwrap().output());
+            let is_boundary = next_token.map_or(false, |v| self.boundary_token_ids.contains(v));
 
+            if is_boundary {
                 Self::forward_sample_step(
                     &mut self.high_model.layers,
                     &mut self.high_model.cache[0],
-                    &word_rep,
+                    &char1_out,
                 );
 
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
+                for layer in &mut self.char2_model.layers {
+                    layer.reset_state();
+                }
 
-                let high_out_slice = self.high_model.cache[0].last().unwrap().output();
-                self.word_context[char_output..].copy_from_slice(high_out_slice);
+                let high_out = self.high_model.cache[0].last().unwrap().output().to_vec();
+                self.word_context[char_output..].copy_from_slice(&high_out);
             }
         }
     }

@@ -199,6 +199,9 @@ impl Sequential {
             total_loss += self.seq_loss(targets);
             steps += 1;
 
+            for layer in &mut self.layers {
+                layer.zero_bptt_state();
+            }
             self.backwards_sequence(inputs, targets);
 
             *iteration += 1;
@@ -210,7 +213,7 @@ impl Sequential {
         }
 
         println!(
-            "{j} Average loss = {:.4}, pp = {:.4}",
+            "{j} Average loss = {:.4}, ppl = {:.4}",
             total_loss / steps.max(1) as f32,
             (total_loss / steps.max(1) as f32).exp()
         );
