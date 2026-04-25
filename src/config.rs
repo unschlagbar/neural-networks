@@ -14,7 +14,7 @@ pub const SEQ_LOC: &str = "models/seq2";
 // ── Sequenz-Längen ───────────────────────────────────────────────────────────
 
 /// Trainings-Sequenzlänge (Anzahl Tokens pro BPTT-Chunk).
-pub const SEQ_LEN: usize = 512;
+pub const SEQ_LEN: usize = 1024;
 /// Reserve für den Forward-Cache (unsere BatchIter kann länger werden als SEQ_LEN).
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 
@@ -45,7 +45,7 @@ pub const TEMPERATURE: f32 = 0.0;
 
 // ── Modell-Dimensionen ───────────────────────────────────────────────────────
 
-pub const CHAR_HIDDEN: usize = 64;
+pub const CHAR_HIDDEN: usize = 128;
 pub const CONTEXT_DIM: usize = 128;
 
 // ── Dataset ──────────────────────────────────────────────────────────────────

@@ -8,7 +8,6 @@
 // es im Builder und nicht erst beim Training.
 
 use crate::{
-    activations::Sigmoid,
     config::{CHAR_HIDDEN, CONTEXT_DIM},
     hierarchical_sequential::HierarchicalSequential,
     nn_layer::SequentialBuilder,
@@ -81,18 +80,21 @@ pub fn build_hierarchical_model(
 ) -> HierarchicalSequential {
     // ── char_model (vocab → CHAR_HIDDEN) ──────────────────────────────────
     // Kurz (2 Blöcke): wird oft zurückgesetzt, mehr Tiefe bringt hier wenig.
-    let char_model = SequentialBuilder::new(vocab).slstm_block(vocab).build();
+    let char_model = SequentialBuilder::new(vocab)
+        .linear(CHAR_HIDDEN)
+        .slstm_block(CHAR_HIDDEN)
+        .build();
 
     // ── high_model (CHAR_HIDDEN → CONTEXT_DIM) ────────────────────────────
     // Ein Block reicht: der Informationsfluss kommt kondensiert aus char_model.
-    let high_model = SequentialBuilder::new(vocab)
-        .slstm_block(vocab)
-        .slstm_block(vocab)
+    let high_model = SequentialBuilder::new(CHAR_HIDDEN)
+        .slstm_block(CONTEXT_DIM)
+        .slstm_block(CONTEXT_DIM)
         .build();
 
     // ── char2_model ([CHAR_HIDDEN + CONTEXT_DIM] → vocab) ─────────────────
     // Prediction-Head: SiluDense für nichtlineare Interaktion, dann auf vocab.
-    let char2_model = SequentialBuilder::new(vocab + vocab)
+    let char2_model = SequentialBuilder::new(CHAR_HIDDEN + CONTEXT_DIM)
         //.slstm_block(vocab)
         .linear(vocab)
         .softmax()
