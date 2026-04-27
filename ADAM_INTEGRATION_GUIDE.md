@@ -38,7 +38,7 @@ impl DenseGrads {
     pub fn zeros(input_size: usize, output_size: usize) -> Self {
         Self {
             weights: Matrix::zeros(input_size, output_size),
-            biases: vec![0.0; output_size].into_boxed_slice(),
+            biases: vec![0.0; output_size].into(),
             // NEU:
             weights_moments: MatrixMoments::zeros(input_size, output_size),
             biases_moments: VectorMoments::zeros(output_size),

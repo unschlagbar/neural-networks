@@ -73,8 +73,8 @@ impl LSTMLayerGrads {
             wc: Matrix::zeros(rows, h),
             wo: Matrix::zeros(rows, h),
             b: Matrix::zeros(4, h),
-            h_init_grad: vec![0.0; h].into_boxed_slice(),
-            c_init_grad: vec![0.0; h].into_boxed_slice(),
+            h_init_grad: vec![0.0; h].into(),
+            c_init_grad: vec![0.0; h].into(),
         }
     }
 }
@@ -121,8 +121,8 @@ impl LSTMLayer {
 
         let scale = (6.0 / rows as f32).sqrt();
 
-        let h_init = vec![0.0; hidden_size].into_boxed_slice();
-        let c_init = vec![0.0; hidden_size].into_boxed_slice();
+        let h_init: Box<[f32]> = vec![0.0; hidden_size].into();
+        let c_init: Box<[f32]> = vec![0.0; hidden_size].into();
 
         let mut b = Matrix::zeros(4, hidden_size);
 
@@ -174,8 +174,8 @@ impl LSTMLayer {
             c: c_init.clone(),
             h_init,
             c_init,
-            dh_bptt: vec![0.0; hidden_size].into_boxed_slice(),
-            dc_bptt: vec![0.0; hidden_size].into_boxed_slice(),
+            dh_bptt: vec![0.0; hidden_size].into(),
+            dc_bptt: vec![0.0; hidden_size].into(),
             grads: LSTMLayerGrads::zeros(input_size + hidden_size, hidden_size),
 
             do_: vec![0.0; hidden_size].into(),
@@ -183,17 +183,6 @@ impl LSTMLayer {
             di: vec![0.0; hidden_size].into(),
             dct: vec![0.0; hidden_size].into(),
         }
-    }
-
-    /// Clear forward state and BPTT gradients — call between sequences.
-    pub fn reset(&mut self) {
-        self.h.copy_from_slice(&self.h_init);
-        self.c.copy_from_slice(&self.c_init);
-    }
-
-    pub fn reset_backwards(&mut self) {
-        self.dh_bptt.fill(0.0);
-        self.dc_bptt.fill(0.0);
     }
 
     pub fn forward(&mut self, input: &[f32], cache: &mut LSTMCache) {
@@ -375,7 +364,8 @@ impl NnLayer for LSTMLayer {
     }
 
     fn reset_state(&mut self) {
-        self.reset();
+        self.c.copy_from_slice(&self.c_init);
+        self.h.copy_from_slice(&self.h_init);
     }
 
     fn zero_bptt_state(&mut self) {

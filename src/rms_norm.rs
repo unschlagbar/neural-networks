@@ -117,8 +117,8 @@ impl RMSNormResidual {
 
         Self {
             inner,
-            gamma: vec![1.0; n].into_boxed_slice(),
-            grads_gamma: vec![0.0; n].into_boxed_slice(),
+            gamma: vec![1.0; n].into(),
+            grads_gamma: vec![0.0; n].into(),
             norm_size: n,
         }
     }
@@ -256,12 +256,12 @@ impl NnLayer for RMSNormResidual {
         let n = self.norm_size;
         Box::new(RMSNormResidualCache {
             inner_cache: self.inner.make_cache(),
-            input: vec![0.0; n].into_boxed_slice(),
-            x_hat: vec![0.0; n].into_boxed_slice(),
+            input: vec![0.0; n].into(),
+            x_hat: vec![0.0; n].into(),
             inv_rms: 0.0,
-            normed: vec![0.0; n].into_boxed_slice(),
-            output: vec![0.0; n].into_boxed_slice(),
-            dx: vec![0.0; n].into_boxed_slice(),
+            normed: vec![0.0; n].into(),
+            output: vec![0.0; n].into(),
+            dx: vec![0.0; n].into(),
         })
     }
 
@@ -308,8 +308,8 @@ impl RMSNorm {
         let n = size;
 
         Self {
-            gamma: vec![1.0; n].into_boxed_slice(),
-            grads_gamma: vec![0.0; n].into_boxed_slice(),
+            gamma: vec![1.0; n].into(),
+            grads_gamma: vec![0.0; n].into(),
             norm_size: n,
         }
     }
@@ -397,11 +397,11 @@ impl NnLayer for RMSNorm {
     fn make_cache(&self) -> Box<dyn DynCache> {
         let n = self.norm_size;
         Box::new(RMSNormCache {
-            input: vec![0.0; n].into_boxed_slice(),
-            x_hat: vec![0.0; n].into_boxed_slice(),
+            input: vec![0.0; n].into(),
+            x_hat: vec![0.0; n].into(),
             inv_rms: 0.0,
-            output: vec![0.0; n].into_boxed_slice(),
-            dx: vec![0.0; n].into_boxed_slice(),
+            output: vec![0.0; n].into(),
+            dx: vec![0.0; n].into(),
         })
     }
 

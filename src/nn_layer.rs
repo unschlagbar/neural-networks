@@ -4,7 +4,7 @@ use std::io;
 use crate::activations::Activate;
 use crate::dense::DenseLayer;
 use crate::dropout::DropoutLayer;
-use crate::indrnn::IndRNNLayer;
+use crate::embedding::EmbeddingLayer;
 use crate::linear::LinearLayer;
 use crate::lstm::LSTMLayer;
 use crate::projection::Projection;
@@ -133,6 +133,12 @@ impl SequentialBuilder {
         self
     }
 
+    pub fn embedding(mut self, hidden: usize) -> Self {
+        let layer = EmbeddingLayer::new(self.output_size, hidden);
+        self.layer(Box::new(layer), hidden);
+        self
+    }
+
     pub fn silu_dense(mut self, hidden: usize) -> Self {
         let layer = SiluDenseLayer::new(self.output_size, hidden);
         self.layer(Box::new(layer), hidden);
@@ -194,12 +200,6 @@ impl SequentialBuilder {
         self
     }
 
-    pub fn indrnn<A: Activate + 'static>(mut self, hidden: usize, act: A) -> Self {
-        let layer = IndRNNLayer::new(self.output_size, hidden, act);
-        self.layer(Box::new(layer), hidden);
-        self
-    }
-
     pub fn dropout(mut self, rate: f32) -> Self {
         let layer = DropoutLayer::new(self.output_size, rate);
         self.layer(Box::new(layer), self.output_size);
@@ -255,7 +255,7 @@ impl SequentialBuilder {
             output_size: self.output_size,
             layers: self.layers,
             cache: Vec::new(),
-            delta_buf: vec![0.0; max_size],
+            delta_buf: vec![0.0; max_size].into(),
         }
     }
 }

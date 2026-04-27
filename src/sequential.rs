@@ -16,7 +16,7 @@ pub struct Sequential {
     /// cache[t][l] — pre-allocated, never reallocated during training.
     pub cache: Vec<Vec<Box<dyn DynCache>>>,
     /// Reusable scratch buffer for the backward delta — no heap alloc per step.
-    pub delta_buf: Vec<f32>,
+    pub delta_buf: Box<[f32]>,
 }
 
 impl Sequential {
@@ -91,7 +91,7 @@ impl Sequential {
 
     // ── backward ──────────────────────────────────────────────────────────────
 
-    pub fn backwards_sequence(&mut self, _seq: &[u16], targets: &[u16]) {
+    pub fn backwards_sequence(&mut self, targets: &[u16]) {
         let n = self.layers.len();
 
         // Destructure so we can mutably borrow delta_buf independently of
@@ -154,7 +154,7 @@ impl Sequential {
             for layer in &mut self.layers {
                 layer.zero_bptt_state();
             }
-            self.backwards_sequence(inputs, targets);
+            self.backwards_sequence(targets);
 
             for layer in &mut self.layers {
                 layer.accumulate_init_grad();
@@ -162,7 +162,7 @@ impl Sequential {
 
             *iteration += 1;
             if *iteration % batch_size == 0 {
-                self.sgd_step(lr);
+                self.sgd_step(lr / batch_size as f32);
                 *iteration = 0;
                 *j += 1;
             }

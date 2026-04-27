@@ -111,8 +111,8 @@ impl SLSTMLayerGrads {
             wf: Matrix::zeros(rows, h),
             wo: Matrix::zeros(rows, h),
             b: Matrix::zeros(4, h),
-            h_init_grad: vec![0.0; h].into_boxed_slice(),
-            c_init_grad: vec![0.0; h].into_boxed_slice(),
+            h_init_grad: vec![0.0; h].into(),
+            c_init_grad: vec![0.0; h].into(),
         }
     }
 }
@@ -166,8 +166,8 @@ impl SLSTMLayer {
         b[G_F].fill(3.0);
         b[I].fill(-10.0);
 
-        let h_init = vec![0.0; hidden_size].into_boxed_slice();
-        let c_init = vec![0.0; hidden_size].into_boxed_slice();
+        let h_init: Box<[f32]> = vec![0.0; hidden_size].into();
+        let c_init: Box<[f32]> = vec![0.0; hidden_size].into();
 
         Self {
             input_size,
@@ -179,8 +179,8 @@ impl SLSTMLayer {
             b,
             h: h_init.clone(),
             c: c_init.clone(),
-            n: vec![0.0; hidden_size].into_boxed_slice(),
-            m: vec![0.0; hidden_size].into_boxed_slice(),
+            n: vec![0.0; hidden_size].into(),
+            m: vec![0.0; hidden_size].into(),
             dh_bptt: vec![0.0; hidden_size].into(),
             dc_bptt: vec![0.0; hidden_size].into(),
             dn_bptt: vec![0.0; hidden_size].into(),
@@ -219,8 +219,8 @@ impl SLSTMLayer {
             b,
             h: h_init.clone(),
             c: c_init.clone(),
-            n: vec![0.0; hidden_size].into_boxed_slice(),
-            m: vec![0.0; hidden_size].into_boxed_slice(),
+            n: vec![0.0; hidden_size].into(),
+            m: vec![0.0; hidden_size].into(),
             dh_bptt: vec![0.0; hidden_size].into(),
             dc_bptt: vec![0.0; hidden_size].into(),
             dn_bptt: vec![0.0; hidden_size].into(),

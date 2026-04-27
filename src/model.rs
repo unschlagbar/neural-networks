@@ -38,12 +38,11 @@ use crate::{
 // Semantik. 3 Blöcke ≈ die vorige Tiefe, aber mit weniger Parametern pro
 // Block und höherer effektiver Kapazität durch das Gate.
 pub fn build_normal_model(vocab: usize) -> Sequential {
-    let mut model = SequentialBuilder::new(vocab);
-    for _ in 0..1 {
-        model = model.slstm_block(vocab);
-        // model = model.lstm(CONTEXT_DIM);
+    let mut model = SequentialBuilder::new(vocab).embedding(CONTEXT_DIM);
+    for _ in 0..4 {
+        model = model.slstm_block(CONTEXT_DIM);
     }
-    model.softmax().build()
+    model.linear(vocab).softmax().build()
 }
 
 // ── Hierarchisches Modell (HierarchicalSequential) ───────────────────────────
@@ -53,26 +52,21 @@ pub fn build_hierarchical_model(
     vocab: usize,
     boundary_token_ids: Vec<u16>,
 ) -> HierarchicalSequential {
-    // ── char_model (vocab → CHAR_HIDDEN) ──────────────────────────────────
-    // Kurz (2 Blöcke): wird oft zurückgesetzt, mehr Tiefe bringt hier wenig.
     let char_model = SequentialBuilder::new(vocab)
-        .linear(CHAR_HIDDEN)
-        .slstm_block(CHAR_HIDDEN)
+        .embedding(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
         .build();
 
-    // ── high_model (CHAR_HIDDEN → CONTEXT_DIM) ────────────────────────────
-    // Ein Block reicht: der Informationsfluss kommt kondensiert aus char_model.
     let high_model = SequentialBuilder::new(vocab + CHAR_HIDDEN)
         .linear(CONTEXT_DIM)
         .slstm_block(CONTEXT_DIM)
         .slstm_block(CONTEXT_DIM)
+        .slstm_block(CONTEXT_DIM)
         .build();
 
-    // ── char2_model ([CHAR_HIDDEN + CONTEXT_DIM] → vocab) ─────────────────
-    // Prediction-Head: SiluDense für nichtlineare Interaktion, dann auf vocab.
     let char2_model = SequentialBuilder::new(CHAR_HIDDEN + CONTEXT_DIM)
-        .slstm_block(CHAR_HIDDEN + CONTEXT_DIM)
+        .linear(CHAR_HIDDEN)
+        .slstm_block(CHAR_HIDDEN)
         .linear(vocab)
         .softmax()
         .build();

@@ -403,13 +403,6 @@ impl SLSTMBlock {
                 * (self.post_gamma[i] * self.sc_h1[i] - cache.post_x_hat[i] * s_post_over_h);
         }
 
-        // ── (d) cell.dh_bptt einfüttern, dann cell.backward ─────────────────
-        //
-        // Der rekurrente Pfad (cell h_{t-1} → cell xh_t → cell h_t) lebt
-        // VOLLSTÄNDIG innerhalb des Blocks. Sequential sieht den Block als
-        // nicht-rekurrent (bptt_hidden_grad() = None unten), also müssen wir
-        // dh_bptt hier selbst aufsummieren, sonst ignorieren wir BPTT komplett.
-        //add_vec_in_place(&mut self.sc_h2, &self.cell.dh_bptt);
         self.cell.backward(&mut self.sc_h2, &mut cache.cell);
         // cache.cell.dconcat[..H] enthält jetzt d(pre_normed) = dL/d(Zelleneingang)
 

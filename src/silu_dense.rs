@@ -26,10 +26,10 @@ pub struct SiluDenseCache {
 impl SiluDenseCache {
     pub fn new(input_size: usize, output_size: usize) -> Self {
         Self {
-            input: vec![0.0; input_size].into_boxed_slice(),
-            pre_activation: vec![0.0; output_size].into_boxed_slice(),
-            output: vec![0.0; output_size].into_boxed_slice(),
-            dx: vec![0.0; input_size].into_boxed_slice(),
+            input: vec![0.0; input_size].into(),
+            pre_activation: vec![0.0; output_size].into(),
+            output: vec![0.0; output_size].into(),
+            dx: vec![0.0; input_size].into(),
         }
     }
 }
@@ -60,7 +60,7 @@ impl SiluDenseGrads {
     pub fn zeros(input_size: usize, output_size: usize) -> Self {
         Self {
             weights: Matrix::zeros(input_size, output_size),
-            biases: vec![0.0; output_size].into_boxed_slice(),
+            biases: vec![0.0; output_size].into(),
         }
     }
 }
