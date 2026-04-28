@@ -49,7 +49,7 @@ pub const TEMPERATURE: f32 = 0.0;
 
 // ── Modell-Dimensionen ───────────────────────────────────────────────────────
 
-pub const CHAR_HIDDEN: usize = 512;
+pub const CHAR_HIDDEN: usize = 64;
 pub const CONTEXT_DIM: usize = 512;
 
 // ── Dataset ──────────────────────────────────────────────────────────────────

@@ -60,10 +60,11 @@ pub fn build_hierarchical_model(
     let high_model = SequentialBuilder::new(vocab + CHAR_HIDDEN)
         .linear(CONTEXT_DIM)
         .slstm_block(CONTEXT_DIM)
-        .slstm_block(CONTEXT_DIM)
         .build();
 
     let char2_model = SequentialBuilder::new(CHAR_HIDDEN + CONTEXT_DIM)
+        .silu_dense(CHAR_HIDDEN + CONTEXT_DIM)
+        .rms_norm()
         .silu_dense(CHAR_HIDDEN + CONTEXT_DIM)
         .linear(vocab)
         .softmax()

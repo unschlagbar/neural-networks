@@ -27,6 +27,7 @@ use crate::{
 pub fn train_normal() {
     let tokenizer = Rc::new(Tokenizer::new(crate::config::CHARSET, false));
     let vocab = tokenizer.vocab_size();
+    let word_boundary_ids = tokenizer.word_token_ids();
 
     // Existierendes Modell laden, sonst neu bauen.
     let mut model = match Sequential::load(SEQ_LOC) {
@@ -44,7 +45,7 @@ pub fn train_normal() {
     // ── Dataset einmal vorbereiten ────────────────────────────────────────────
     println!("Preparing dataset from '{DATA_DIR}' ...");
     let prep_start = Instant::now();
-    let mut data = PreparedDataSet::from_dir(&tokenizer, DATA_DIR, SEQ_LEN, &[]);
+    let mut data = PreparedDataSet::from_dir(&tokenizer, DATA_DIR, SEQ_LEN, &word_boundary_ids);
     println!(
         "  {} files → {} windows, {} tokens (prep took {:.1?})",
         data.num_sequences(),
