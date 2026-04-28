@@ -10,6 +10,7 @@ pub mod hierarchical_sequential;
 pub mod linear;
 pub mod loading;
 pub mod lstm;
+pub mod mlstm;
 pub mod model;
 pub mod nn_layer;
 pub mod prepare_set;
@@ -24,3 +25,33 @@ pub mod slstm_block;
 pub mod softmax;
 pub mod tokenizer;
 pub mod training;
+
+use std::{
+    fs,
+    io::{BufRead, stdin},
+    path::Path,
+};
+
+pub fn run() {
+    if !Path::new("models/").exists() {
+        fs::create_dir("models/").unwrap();
+    }
+
+    let mut line = String::new();
+    stdin().lock().read_line(&mut line).unwrap();
+    let cmd = line.trim();
+
+    match cmd {
+        "" => training::train_normal(),
+        "h" => training::train_hierarchical(),
+        "s" => sampling::sample_normal(),
+        "hs" => sampling::sample_hierarchical(),
+        other => {
+            eprintln!(
+                "Unknown mode {other:?}. Erlaubt: '' (train_normal), 'h' (train_hierarchical), \
+                 's' (sample_normal), 'hs' (sample_hierarchical).",
+            );
+            std::process::exit(2);
+        }
+    }
+}

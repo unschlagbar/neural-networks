@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs;
+use std::{char, fs};
 
 // ── Tokenizer ─────────────────────────────────────────────────────────────────
 //
@@ -15,9 +15,6 @@ pub struct Tokenizer {
     pub stoi: HashMap<String, u16>,
     /// token id → display string
     pub itos: Vec<String>,
-    /// Fast O(1) lookup for ASCII bytes 0..128.
-    /// Entry is u16::MAX when the byte has no token.
-    ascii_map: Box<[u16; 128]>,
     // Cached ids for the hot encode path
     id_space: u16,
     id_space2: u16,
@@ -55,26 +52,6 @@ impl Tokenizer {
 
         println!("Vocabulary size: {}", itos.len());
 
-        // ── ASCII fast-lookup table ───────────────────────────────────────────
-        let mut ascii_map = Box::new([u16::MAX; 128]);
-        for (s, &id) in &stoi {
-            if s.len() == 1 {
-                let b = s.as_bytes()[0];
-                if (b as usize) < 128 {
-                    ascii_map[b as usize] = id;
-                }
-            }
-        }
-        // If lowercase, remap uppercase bytes to point at their lowercase token id.
-        if lowercase {
-            for b in b'A'..=b'Z' {
-                let lower = b.to_ascii_lowercase();
-                if ascii_map[lower as usize] != u16::MAX {
-                    ascii_map[b as usize] = ascii_map[lower as usize];
-                }
-            }
-        }
-
         let id_space = stoi[" "];
         let id_space2 = stoi["<SPACE2>"];
         let id_space4 = stoi["<SPACE4>"];
@@ -83,7 +60,6 @@ impl Tokenizer {
             lowercase,
             stoi,
             itos,
-            ascii_map,
             id_space,
             id_space2,
             id_space4,
@@ -117,9 +93,9 @@ impl Tokenizer {
     /// Encode `text` into a token sequence.
     pub fn to_tokens(&self, text: &str) -> Vec<u16> {
         let mut tokens = Vec::with_capacity(text.len());
-        let mut spaces = 0usize;
+        let mut spaces = 0;
 
-        for c in text.chars() {
+        for mut c in text.chars() {
             if c == ' ' {
                 spaces += 1;
                 continue;
@@ -132,22 +108,12 @@ impl Tokenizer {
             }
 
             // ── em-dash → hyphen ─────────────────────────────────────────────
-            let c = if c == '—' { '-' } else { c };
+            if c == '—' {
+                c = '-'
+            };
 
-            // ── ASCII fast path (avoids HashMap) ─────────────────────────────
-            let byte = c as u32;
-            if byte < 128 {
-                let effective = if self.lowercase && (c as u8).is_ascii_uppercase() {
-                    c.to_ascii_lowercase() as usize
-                } else {
-                    byte as usize
-                };
-                let id = self.ascii_map[effective];
-                if id != u16::MAX {
-                    tokens.push(id);
-                }
-                // Unknown ASCII chars are silently skipped (same as original).
-                continue;
+            if self.lowercase {
+                c = c.to_ascii_lowercase()
             }
 
             // ── Non-ASCII slow path ───────────────────────────────────────────
@@ -183,6 +149,11 @@ impl Tokenizer {
             Some(s) => s,
             None => panic!("Token {} not in vocabulary", token),
         }
+    }
+
+    /// Display string for a token id (panics on unknown id).
+    pub fn display_tokens(&self, tokens: &[u16]) -> String {
+        tokens.iter().map(|&t| self.display(t)).collect()
     }
 
     /// Alias kept for backwards compatibility.

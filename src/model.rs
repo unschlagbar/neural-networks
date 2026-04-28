@@ -39,7 +39,7 @@ use crate::{
 // Block und höherer effektiver Kapazität durch das Gate.
 pub fn build_normal_model(vocab: usize) -> Sequential {
     let mut model = SequentialBuilder::new(vocab).embedding(CONTEXT_DIM);
-    for _ in 0..4 {
+    for _ in 0..2 {
         model = model.slstm_block(CONTEXT_DIM);
     }
     model.linear(vocab).softmax().build()
@@ -61,12 +61,10 @@ pub fn build_hierarchical_model(
         .linear(CONTEXT_DIM)
         .slstm_block(CONTEXT_DIM)
         .slstm_block(CONTEXT_DIM)
-        .slstm_block(CONTEXT_DIM)
         .build();
 
     let char2_model = SequentialBuilder::new(CHAR_HIDDEN + CONTEXT_DIM)
-        .linear(CHAR_HIDDEN)
-        .slstm_block(CHAR_HIDDEN)
+        .silu_dense(CHAR_HIDDEN + CONTEXT_DIM)
         .linear(vocab)
         .softmax()
         .build();

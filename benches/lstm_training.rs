@@ -1,11 +1,9 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use neural_networks::activations::Relu;
+use neural_networks::batches::PreparedDataSet;
 use std::{rc::Rc, time::Duration};
 
 use neural_networks::nn_layer::SequentialBuilder;
-use neural_networks::{
-    self, batches::RandomBatches, data_set_loading::DataSet, tokenizer::Tokenizer,
-};
+use neural_networks::{self, tokenizer::Tokenizer};
 
 const HIDDEN_SIZE: usize = 128;
 const SEQ_LEN: usize = 25;
@@ -21,11 +19,11 @@ pub const VOCAB: &[char] = &[
     '~', '"', '\'', '`', '\\', '_', '$', '“', '„', '🦀', '·', '\n',
 ];
 
-pub fn train(tokenizer: Rc<Tokenizer>, raw_data: &Vec<Vec<u16>>) {
+pub fn train(tokenizer: Rc<Tokenizer>, data: &PreparedDataSet) {
     let vocab = tokenizer.vocab_size();
 
     let mut model = SequentialBuilder::new(vocab)
-        .dense(HIDDEN_SIZE, Relu)
+        .embedding(HIDDEN_SIZE)
         .slstm(HIDDEN_SIZE)
         .slstm(HIDDEN_SIZE)
         .linear(vocab)
@@ -36,10 +34,17 @@ pub fn train(tokenizer: Rc<Tokenizer>, raw_data: &Vec<Vec<u16>>) {
 
     let mut iteration = 0;
     let mut j = 0;
+    let mut step = 0;
 
-    for data in RandomBatches::new(SEQ_LEN, BATCH_SIZE, raw_data).take(2) {
-        model.train(data.into_iter(), LR, &mut iteration, &mut j, BATCH_SIZE);
-    }
+    model.train(
+        data.iter().take(2),
+        LR,
+        &mut iteration,
+        &mut j,
+        BATCH_SIZE,
+        1,
+        &mut step,
+    );
 }
 
 fn benchmark_lstm_behavior(c: &mut Criterion) {
@@ -48,10 +53,11 @@ fn benchmark_lstm_behavior(c: &mut Criterion) {
     group.measurement_time(Duration::from_nanos(1));
 
     let tokenizer = Rc::new(Tokenizer::new_vocab(VOCAB, false));
-    let raw_data = DataSet::load_from_dir(tokenizer.clone(), "political_speeches/").to_raw_data();
+    let boundaries = tokenizer.word_token_ids();
+    let data = PreparedDataSet::from_dir(&tokenizer, "political_speeches/", SEQ_LEN, &boundaries);
 
     group.bench_function("lstm_training", |b| {
-        b.iter(|| train(tokenizer.clone(), &raw_data));
+        b.iter(|| train(tokenizer.clone(), &data));
     });
 
     group.finish();

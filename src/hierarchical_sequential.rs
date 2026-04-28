@@ -1,13 +1,14 @@
 use std::{
     fs::File,
     io::{self, Cursor, Read, Write},
+    time::Instant,
     u32,
 };
 
 use crate::{
-    loading::read_u16,
-    loading::read_u32,
-    nn_layer::NnLayer,
+    config::{MODEL_LOC, SAVE_EVERY},
+    loading::{read_u16, read_u32},
+    nn_layer::{DynCache, NnLayer},
     saving::{HIER_MAGIC, write_u16, write_u32},
     sequential::Sequential,
     softmax::softmax,
@@ -121,7 +122,7 @@ impl HierarchicalSequential {
 
     fn forward_step(
         layers: &mut [Box<dyn NnLayer>],
-        caches_t: &mut [Box<dyn crate::nn_layer::DynCache>],
+        caches_t: &mut [Box<dyn DynCache>],
         input: &[f32],
     ) {
         for l in 0..layers.len() {
@@ -133,7 +134,7 @@ impl HierarchicalSequential {
 
     fn forward_sample_step(
         layers: &mut [Box<dyn NnLayer>],
-        caches_t: &mut [Box<dyn crate::nn_layer::DynCache>],
+        caches_t: &mut [Box<dyn DynCache>],
         input: &[f32],
     ) {
         for l in 0..layers.len() {
@@ -222,7 +223,6 @@ impl HierarchicalSequential {
         let mut d_char1_buf = vec![0.0; char_output];
 
         let mut boundary_i = self.boundary_timesteps.len() - 1;
-
         let mut high_grad_accum = 0.0;
 
         for t in (0..targets.len()).rev() {
@@ -271,8 +271,8 @@ impl HierarchicalSequential {
 
                 let d_hi = self.high_model.cache[boundary_i][0].input_grad();
                 d_char1_buf.copy_from_slice(&d_hi[..char_output]);
-
                 d_high_ctx.fill(0.0);
+
                 for layer in &mut self.char_model.layers {
                     layer.accumulate_init_grad();
                     layer.zero_bptt_state();
@@ -309,52 +309,75 @@ impl HierarchicalSequential {
         iteration: &mut usize,
         j: &mut usize,
         batch_size: usize,
+        print_every: usize,
+        step: &mut usize,
     ) {
-        let mut total_loss = 0.0;
-        let mut steps = 0;
+        let mut window_loss = 0.0;
+        let mut window_steps = 0;
+        let mut window_tokens = 0;
+        let mut window_start = Instant::now();
 
         for (inputs, targets) in data {
             self.reset();
             self.forward_over(inputs);
 
-            total_loss += self.char2_model.seq_loss(targets);
-            steps += 1;
+            let loss = self.char2_model.seq_loss(targets);
+            window_loss += loss;
+            window_steps += 1;
+            window_tokens += inputs.len();
+            *step += 1;
+
+            if *step % SAVE_EVERY == 0 {
+                match self.save(MODEL_LOC) {
+                    Ok(()) => println!("saved"),
+                    Err(e) => eprintln!("save failed: {e}"),
+                }
+            }
 
             self.backwards_sequence(targets);
 
             *iteration += 1;
             if *iteration % batch_size == 0 {
                 let scale = lr / batch_size as f32;
-                //let scale_high =
-                //    scale * (inputs.len() as f32 / self.boundary_timesteps.len() as f32);
-                let scale_high = scale;
 
-                for layer in &mut self.char_model.layers {
-                    layer.apply_grads(scale);
-                }
-                self.char_model.clear_grads();
-
-                for layer in &mut self.char2_model.layers {
-                    layer.apply_grads(scale);
-                }
-                self.char2_model.clear_grads();
-
-                for layer in &mut self.high_model.layers {
-                    layer.apply_grads(scale_high);
-                }
-                self.high_model.clear_grads();
+                self.char_model.sgd_step(scale);
+                self.char2_model.sgd_step(scale);
+                self.high_model.sgd_step(scale);
 
                 *iteration = 0;
                 *j += 1;
             }
+
+            if print_every > 0 && window_steps >= print_every {
+                let avg = window_loss / window_steps as f32;
+                let elapsed = window_start.elapsed();
+                println!(
+                    "{} | char loss {:.4} | ppl {:.4} | high ∇ {:.4} | {} tok | {:.1?}",
+                    *step,
+                    avg,
+                    avg.exp(),
+                    self.last_high_grad_signal,
+                    window_tokens,
+                    elapsed,
+                );
+                window_loss = 0.0;
+                window_steps = 0;
+                window_tokens = 0;
+                window_start = std::time::Instant::now();
+            }
         }
 
-        println!(
-            "{j} | char loss = {:.4} | high ∇ = {:.4} | ppl = {:.4}",
-            total_loss / steps.max(1) as f32,
-            self.last_high_grad_signal,
-            (total_loss / steps.max(1) as f32).exp()
-        );
+        if window_steps > 0 {
+            let avg = window_loss / window_steps as f32;
+            println!(
+                "  step {:>7} | upd {:>5} | char loss {:.4} | ppl {:.4} | high ∇ {:.4}  (flush)",
+                *step,
+                *j,
+                avg,
+                avg.exp(),
+                self.last_high_grad_signal,
+            );
+        }
     }
 
     pub fn sample(
@@ -612,7 +635,7 @@ impl HierarchicalSequential {
 
 fn backward_through_layers(
     layers: &mut [Box<dyn NnLayer>],
-    caches_t: &mut [Box<dyn crate::nn_layer::DynCache>],
+    caches_t: &mut [Box<dyn DynCache>],
     delta_buf: &mut [f32],
     mut delta_len: usize,
 ) {

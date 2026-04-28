@@ -3,9 +3,6 @@ name = "neural-networks"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "neural-networks"
-
 
 [profile.release]
 lto = "fat"

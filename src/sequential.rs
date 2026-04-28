@@ -1,7 +1,10 @@
+use std::time::Instant;
+
 use iron_oxide::collections::Matrix;
 use rand::random_range;
 
 use crate::{
+    config::{SAVE_EVERY, SEQ_LOC},
     lstm::one_hot,
     nn_layer::{DynCache, NnLayer},
     softmax::softmax,
@@ -131,7 +134,6 @@ impl Sequential {
     }
 
     // ── training ──────────────────────────────────────────────────────────────
-
     pub fn train<'a, I: Iterator<Item = (&'a [u16], &'a [u16])>>(
         &mut self,
         data: I,
@@ -139,17 +141,24 @@ impl Sequential {
         iteration: &mut usize,
         j: &mut usize,
         batch_size: usize,
+        print_every: usize,
+        step: &mut usize,
     ) {
-        let mut total_loss = 0.0;
-        let mut steps = 0;
+        let mut window_loss = 0.0;
+        let mut window_steps = 0;
+        let mut window_tokens = 0;
+        let mut window_start = Instant::now();
 
         for (inputs, targets) in data {
             for layer in &mut self.layers {
                 layer.reset_state();
             }
             self.forward_over(inputs);
-            total_loss += self.seq_loss(targets);
-            steps += 1;
+            let loss = self.seq_loss(targets);
+            window_loss += loss;
+            window_steps += 1;
+            window_tokens += inputs.len();
+            *step += 1;
 
             for layer in &mut self.layers {
                 layer.zero_bptt_state();
@@ -166,13 +175,31 @@ impl Sequential {
                 *iteration = 0;
                 *j += 1;
             }
-        }
 
-        println!(
-            "{j} Average loss = {:.4}, ppl = {:.4}",
-            total_loss / steps.max(1) as f32,
-            (total_loss / steps.max(1) as f32).exp()
-        );
+            if *step % SAVE_EVERY == 0 {
+                match self.save(SEQ_LOC) {
+                    Ok(()) => println!("saved"),
+                    Err(e) => eprintln!("save failed: {e}"),
+                }
+            }
+
+            if print_every > 0 && window_steps >= print_every {
+                let avg = window_loss / window_steps as f32;
+                let elapsed = window_start.elapsed();
+                println!(
+                    "{} | loss {:.4} | ppl {:.4} | {} tok | {:.1?}",
+                    *step,
+                    avg,
+                    avg.exp(),
+                    window_tokens,
+                    elapsed,
+                );
+                window_loss = 0.0;
+                window_steps = 0;
+                window_tokens = 0;
+                window_start = Instant::now();
+            }
+        }
     }
 
     // ── sampling ──────────────────────────────────────────────────────────────
@@ -233,7 +260,7 @@ impl Sequential {
 
     // ── gradient helpers ──────────────────────────────────────────────────────
 
-    fn sgd_step(&mut self, lr: f32) {
+    pub fn sgd_step(&mut self, lr: f32) {
         for layer in &mut self.layers {
             layer.apply_grads(lr);
         }

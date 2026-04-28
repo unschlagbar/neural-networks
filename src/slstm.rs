@@ -236,14 +236,6 @@ impl SLSTMLayer {
         }
     }
 
-    /// Clear forward recurrent state (h, c, n, m) — call between sequences.
-    pub fn reset(&mut self) {
-        self.h.copy_from_slice(&self.h_init);
-        self.c.copy_from_slice(&self.c_init);
-        self.n.fill(0.0);
-        self.m.fill(0.0);
-    }
-
     // ── forward ───────────────────────────────────────────────────────────────
 
     pub fn forward(&mut self, input: &[f32], cache: &mut SLSTMCache) {
@@ -511,7 +503,10 @@ impl NnLayer for SLSTMLayer {
     }
 
     fn reset_state(&mut self) {
-        self.reset();
+        self.h.copy_from_slice(&self.h_init);
+        self.c.copy_from_slice(&self.c_init);
+        self.n.fill(0.0);
+        self.m.fill(0.0);
     }
     fn zero_bptt_state(&mut self) {
         self.dh_bptt.fill(0.0);

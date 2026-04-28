@@ -49,7 +49,7 @@ pub fn read_u32(r: &mut dyn Read) -> io::Result<u32> {
 pub fn read_f32(r: &mut dyn Read) -> io::Result<f32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
-    Ok(f32::from_bits(u32::from_le_bytes(b)))
+    Ok(f32::from_le_bytes(b))
 }
 pub fn read_f32_vec(r: &mut dyn Read) -> io::Result<Vec<f32>> {
     let len = read_u32(r)? as usize;
@@ -288,6 +288,44 @@ pub fn load_slstm_block(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn Nn
     )))
 }
 
+pub fn load_mlstm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
+    use crate::mlstm::MLSTMLayer;
+    let w_q = read_matrix(r)?;
+    let w_k = read_matrix(r)?;
+    let w_v = read_matrix(r)?;
+    let w_o = read_matrix(r)?;
+    let b_q = read_f32_vec(r)?.into_boxed_slice();
+    let b_k = read_f32_vec(r)?.into_boxed_slice();
+    let b_v = read_f32_vec(r)?.into_boxed_slice();
+    let b_o = read_f32_vec(r)?.into_boxed_slice();
+    let w_i = read_f32_vec(r)?.into_boxed_slice();
+    let w_f = read_f32_vec(r)?.into_boxed_slice();
+    let b_i = read_f32(r)?;
+    let b_f = read_f32(r)?;
+    let c_init = read_f32_vec(r)?.into_boxed_slice();
+    let n_init = read_f32_vec(r)?.into_boxed_slice();
+    let m_init = read_f32(r)?;
+    Ok(Box::new(MLSTMLayer::from_loaded(
+        ctx.input_size,
+        ctx.output_size,
+        w_q,
+        w_k,
+        w_v,
+        w_o,
+        b_q,
+        b_k,
+        b_v,
+        b_o,
+        w_i,
+        w_f,
+        b_i,
+        b_f,
+        c_init,
+        n_init,
+        m_init,
+    )))
+}
+
 // ── Layer factory ─────────────────────────────────────────────────────────────
 
 fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
@@ -304,6 +342,7 @@ fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLa
         10 => load_silu_dense(r, ctx),
         11 => load_slstm_block(r, ctx),
         12 => load_linear(r),
+        13 => load_mlstm(r, ctx),
 
         o => Err(io::Error::new(
             io::ErrorKind::InvalidData,

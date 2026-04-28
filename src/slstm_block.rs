@@ -547,7 +547,7 @@ impl NnLayer for SLSTMBlock {
     }
 
     fn reset_state(&mut self) {
-        self.cell.reset();
+        self.cell.reset_state();
     }
 
     fn zero_bptt_state(&mut self) {

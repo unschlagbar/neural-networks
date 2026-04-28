@@ -7,14 +7,14 @@
 // ── Model-Pfade ──────────────────────────────────────────────────────────────
 
 /// Pfad für das hierarchische Modell (char- + sentence-level).
-pub const MODEL_LOC: &str = "models/hric4";
+pub const MODEL_LOC: &str = "models/hric";
 /// Pfad für das „normale" Char-Level-Sequential-Modell.
-pub const SEQ_LOC: &str = "models/seq3";
+pub const SEQ_LOC: &str = "models/seq";
 
 // ── Sequenz-Längen ───────────────────────────────────────────────────────────
 
 /// Trainings-Sequenzlänge (Anzahl Tokens pro BPTT-Chunk).
-pub const SEQ_LEN: usize = 512;
+pub const SEQ_LEN: usize = 256;
 /// Reserve für den Forward-Cache (unsere BatchIter kann länger werden als SEQ_LEN).
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 
@@ -23,7 +23,7 @@ pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 // Die alte LR = 1e-5 ist für ein Netz mit Residual-Pfaden und RMSNorm einfach
 // zu klein. Deep-RNNs mit Pre-Norm laufen typisch bei 3e-4 – 1e-3. Weil wir
 // SGD (keinen Adam) haben, bleiben wir konservativ am unteren Ende.
-pub const LR: f32 = 2e-4;
+pub const LR: f32 = 1e-4;
 
 /// Gradienten-Akkumulation: wir rufen `apply_grads` erst nach BATCH_SIZE
 /// Sequenzen (Sequential skaliert automatisch mit 1/BATCH_SIZE).
@@ -36,7 +36,11 @@ pub const BATCH_SIZE: usize = 1;
 pub const EPOCHS: usize = 1000;
 
 /// Save nach jeweils N abgeschlossenen Files (0 = nur am Ende jeder Epoche).
-pub const SAVE_EVERY: usize = 4;
+pub const SAVE_EVERY: usize = 50;
+
+/// Loss-Ausgabe alle N Trainings-Steps (= Forward-/Backward-Durchgänge über
+/// ein Window). 0 = nur am Ende jeder Epoche flushen.
+pub const PRINT_EVERY: usize = 10;
 
 // ── Sampling ─────────────────────────────────────────────────────────────────
 
@@ -45,8 +49,8 @@ pub const TEMPERATURE: f32 = 0.0;
 
 // ── Modell-Dimensionen ───────────────────────────────────────────────────────
 
-pub const CHAR_HIDDEN: usize = 128;
-pub const CONTEXT_DIM: usize = 128;
+pub const CHAR_HIDDEN: usize = 512;
+pub const CONTEXT_DIM: usize = 512;
 
 // ── Dataset ──────────────────────────────────────────────────────────────────
 

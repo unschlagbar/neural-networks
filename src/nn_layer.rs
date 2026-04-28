@@ -7,6 +7,7 @@ use crate::dropout::DropoutLayer;
 use crate::embedding::EmbeddingLayer;
 use crate::linear::LinearLayer;
 use crate::lstm::LSTMLayer;
+use crate::mlstm::MLSTMLayer;
 use crate::projection::Projection;
 use crate::rms_norm::{RMSNorm, RMSNormResidual};
 use crate::sequential::Sequential;
@@ -177,6 +178,12 @@ impl SequentialBuilder {
 
     pub fn slstm(mut self, hidden: usize) -> Self {
         let layer = SLSTMLayer::new(self.output_size, hidden);
+        self.layer(Box::new(layer), hidden);
+        self
+    }
+
+    pub fn mlstm(mut self, hidden: usize) -> Self {
+        let layer = MLSTMLayer::new(self.output_size, hidden);
         self.layer(Box::new(layer), hidden);
         self
     }
