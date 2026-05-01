@@ -211,7 +211,8 @@ impl HierarchicalSequential {
         }
     }
 
-    pub fn backwards_sequence(&mut self, targets: &[u16]) {
+    #[allow(unused)]
+    pub fn backwards_sequence(&mut self, targets: &[u16], lr: f32) {
         if self.boundary_timesteps.is_empty() {
             return;
         }
@@ -282,6 +283,9 @@ impl HierarchicalSequential {
                     layer.zero_bptt_state();
                 }
 
+                //self.char_model.sgd_step(lr * 0.5);
+                //self.char2_model.sgd_step(lr * 0.5);
+
                 boundary_i = boundary_i.wrapping_sub(1);
             }
         }
@@ -326,7 +330,7 @@ impl HierarchicalSequential {
             window_steps += 1;
             window_tokens += inputs.len();
 
-            self.backwards_sequence(targets);
+            self.backwards_sequence(targets, lr / batch_size as f32);
 
             *step += 1;
             *iteration += 1;
