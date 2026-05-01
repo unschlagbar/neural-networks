@@ -14,6 +14,7 @@ use crate::sequential::Sequential;
 use crate::silu_dense::SiluDenseLayer;
 use crate::slstm::SLSTMLayer;
 use crate::slstm_block::SLSTMBlock;
+use crate::slstm_block2::SLSTMBlock2;
 use crate::softmax::SoftmaxLayer;
 
 // ── DynCache trait ────────────────────────────────────────────────────────────
@@ -203,6 +204,18 @@ impl SequentialBuilder {
         );
         let up = (hidden * 4) / 3;
         let layer = SLSTMBlock::new(hidden, up);
+        self.layer(Box::new(layer), hidden);
+        self
+    }
+
+    pub fn slstm_block2(mut self, hidden: usize) -> Self {
+        assert_eq!(
+            self.output_size, hidden,
+            "slstm_block erwartet input_size == hidden ({} != {})",
+            self.output_size, hidden,
+        );
+        let up = (hidden * 4) / 3;
+        let layer = SLSTMBlock2::new(hidden, up);
         self.layer(Box::new(layer), hidden);
         self
     }

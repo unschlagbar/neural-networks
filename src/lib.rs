@@ -22,6 +22,7 @@ pub mod sequential;
 pub mod silu_dense;
 pub mod slstm;
 pub mod slstm_block;
+pub mod slstm_block2;
 pub mod softmax;
 pub mod tokenizer;
 pub mod training;

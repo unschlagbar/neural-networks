@@ -1,39 +1,47 @@
-// slstm_block.rs ── xLSTM-style sLSTM block
+// slstm_block.rs ── xLSTM-style sLSTM block (Transformer-Layout)
 //
-// Per-Timestep Architektur:
+// Per-Timestep Architektur (zwei Sub-Blöcke mit Pre-Norm + Residual,
+// genau wie ein klassischer Transformer-Block):
 //
-//     x ──┬─► RMSNorm(pre) ─► sLSTM-Zelle ─► RMSNorm(post) ─► SwiGLU ─┐
-//         │                                                            │
-//         └───────────────────────────────── (+) ◄────────────────────┘
+//     x ──┬─► RMSNorm(pre)  ─► sLSTM-Zelle ──► (+) ──┬─► RMSNorm(ffn) ─► SwiGLU ─► (+) ──► out
+//         │                                    ▲     │                                ▲
+//         └────────────────────────────────────┘     └────────────────────────────────┘
+//                          erstes Residual                          zweites Residual
 //
 // SwiGLU-MLP(h) = W_down · ( SiLU(W_gate · h + b_gate) ⊙ (W_value · h + b_value) )
 //                 + b_down                                          (⊙ = elementwise)
 //
-// Das ist der Teil der im xLSTM-Paper (Beck et al. 2024) als "post up-projection"
-// beschrieben wird — er liefert die eigentliche Channel-Mixing-Schicht UND das
-// Gating zwischen zwei rekurrenten Zellen. Ohne ihn stapelst du nur nackte
-// sLSTM-Zellen hintereinander, was praktisch null Repräsentations-Gewinn bringt.
+// Unterschied zur alten Variante:
+//   • früher gab es NUR einen Skip (input → output) und die zweite Norm saß
+//     zwischen Zelle und SwiGLU.
+//   • jetzt gibt es ZWEI Skips:
+//       - mid    = x   + cell.h          (Residual nach der Zelle)
+//       - output = mid + down_out         (Residual nach dem FFN)
+//   • die zweite Norm (Feld `post_gamma`, Cache `post_*`) operiert jetzt auf
+//     `mid`, nicht mehr auf `cell.h`. Sie ist also semantisch die FFN-Pre-Norm.
+//     Save-Reihenfolge und Layer-Tag sind unverändert; alte Checkpoints laden
+//     strukturell weiter.
 //
-// Verglichen mit dem alten `build_new_normal_model`:
-//   • pre-norm stabilisiert die Gradienten durch tiefe Stapel
-//   • post-norm begrenzt die Varianz des Zellausgangs (wichtig bei sLSTM,
-//     wo h = o·c/max(|n|,1) stark streuen kann)
-//   • SwiGLU macht echtes Channel-Mixing MIT gesteuertem Gate
-//   • Residual macht ≥ 4 Block-Stapel trainierbar
-//
-// Die Zelle selbst wird via Komposition wiederverwendet (`SLSTMLayer` +
-// `SLSTMCache`), es gibt keinen duplizierten BPTT-Code.
+// Warum das Standard-LLM-Layout besser ist:
+//   • zwei klar getrennte Residual-Pfade ⇒ Gradienten haben einen direkten
+//     Highway durch beide Sub-Blöcke (skip-Pfad pro Komponente)
+//   • Pre-Norm vor jedem Sub-Block stabilisiert tiefe Stapel besser
+//     als ein gemeinsamer Norm-Sandwich
+//   • SwiGLU bleibt das Channel-Mixing, aber sein Eingang ist jetzt
+//     `RMSNorm(x + cell.h)` — also bereits durch den Residual angereichert
 //
 // Shape-Konvention:  H = hidden_size,  U = up_size  (typisch U = 4·H / 3).
 //
 // Wichtig zum BPTT-Protokoll:
 //   Die Zelle schreibt ihr `dh_bptt` (dL/d h_{t-1}) bei jedem Backward — das
 //   MUSS beim nächsten (früheren) Backward zurück ins Delta injiziert werden.
-//   Sequential macht das automatisch nur für Zellen, die direkt im Layer-
-//   Stack liegen. Weil unsere Zelle in einem Block gekapselt ist, erledigen
-//   wir diese Injektion hier selbst: nach der Post-Norm-Rückwärtsphase
-//   addieren wir `cell.dh_bptt` auf `dh` bevor wir `cell.backward` rufen.
-//   Nach außen gibt der Block daher `bptt_hidden_grad() = None` zurück.
+//   Das macht `SLSTMLayer::backward` SELBST am Anfang (delta += dh_bptt). Wir
+//   müssen hier nichts manuell injizieren; wir reichen den korrekten
+//   d(cell.h)-Vektor an cell.backward weiter, das ist alles.
+//
+//   Achtung: cell.backward mutiert seinen `delta`-Puffer in-place. Wir
+//   sichern daher den Residual-Anteil von `dmid` nach `cache.dx` BEVOR
+//   wir die Zelle aufrufen.
 
 use iron_oxide::collections::Matrix;
 use std::{any::Any, io};
@@ -61,10 +69,14 @@ pub struct SLSTMBlockCache {
     // sLSTM-Zelle
     pub cell: SLSTMCache,
 
-    // Post-Norm auf cell.h
-    pub post_x_hat: Box<[f32]>,
+    // ERSTER Residual: mid = x + cell.h     (Eingang der FFN-Pre-Norm)
+    pub mid: Box<[f32]>, // (H)
+
+    // FFN-Pre-Norm (operiert auf `mid`; Felder heißen weiterhin post_*
+    // damit Save-Format und from_loaded-API stabil bleiben)
+    pub post_x_hat: Box<[f32]>, // (H)  mid / rms
     pub post_inv_rms: f32,
-    pub post_normed: Box<[f32]>, // (H)  → Input der SwiGLU
+    pub post_normed: Box<[f32]>, // (H)  post_gamma · post_x_hat  (Eingang der SwiGLU)
 
     // SwiGLU
     pub gate_pre: Box<[f32]>, // (U)  W_gate · post_normed + b_gate
@@ -73,7 +85,7 @@ pub struct SLSTMBlockCache {
     pub mixed: Box<[f32]>,    // (U)  gate_act ⊙ value
     pub down_out: Box<[f32]>, // (H)  W_down · mixed + b_down
 
-    pub output: Box<[f32]>, // (H)  = input + down_out
+    pub output: Box<[f32]>, // (H)  = mid + down_out
     pub dx: Box<[f32]>,     // (H)  dL/d(input)
 }
 
@@ -94,18 +106,19 @@ impl DynCache for SLSTMBlockCache {
 
 // ── Layer ────────────────────────────────────────────────────────────────────
 
-pub struct SLSTMBlock {
+pub struct SLSTMBlock2 {
     pub hidden_size: usize,
     pub up_size: usize,
 
-    // Pre-Norm
+    // Pre-Norm vor der Zelle
     pub pre_gamma: Box<[f32]>,
     pub pre_gamma_grad: Box<[f32]>,
 
     // sLSTM-Zelle (input_size = hidden_size = H, hidden_size = H)
     pub cell: SLSTMLayer,
 
-    // Post-Norm
+    // FFN-Pre-Norm (Felder behalten den Namen post_* aus Kompatibilitätsgründen
+    // mit dem Save-Format; semantisch ist es die zweite Pre-Norm)
     pub post_gamma: Box<[f32]>,
     pub post_gamma_grad: Box<[f32]>,
 
@@ -126,8 +139,8 @@ pub struct SLSTMBlock {
     pub b_down_grad: Box<[f32]>,
 
     // Scratch-Puffer für Backward (keine Allokation im Hot Path)
-    pub sc_h1: Box<[f32]>, // (H)  d_post_normed  /  dh
-    pub sc_h2: Box<[f32]>, // (H)  dh-Scratch für cell.backward
+    pub sc_h1: Box<[f32]>, // (H)  d_post_normed (= d_mid_normed)
+    pub sc_h2: Box<[f32]>, // (H)  dmid bzw. dh-Scratch für cell.backward
     pub sc_u1: Box<[f32]>, // (U)  d_mixed
     pub sc_u2: Box<[f32]>, // (U)  d_gate_act
     pub sc_u3: Box<[f32]>, // (U)  d_value → später d_gate_pre
@@ -155,11 +168,12 @@ fn silu_prime(pre: f32) -> f32 {
     s * (1.0 + pre * (1.0 - s))
 }
 
-impl SLSTMBlock {
+impl SLSTMBlock2 {
     pub fn new(hidden_size: usize, up_size: usize) -> Self {
         let scale_up = (6.0 / (hidden_size as f32 + up_size as f32)).sqrt();
-        // Down-Projektion etwas kleiner initialisieren → Residual-Pfad dominiert
-        // am Anfang, der Block startet quasi als Identität. (Standard-Trick.)
+        // Down-Projektion etwas kleiner initialisieren → FFN-Residual-Pfad
+        // dominiert am Anfang, der zweite Sub-Block startet quasi als Identität.
+        // (Standard-Trick für tiefe Pre-Norm-Stapel.)
         let scale_dn = (6.0 / (up_size as f32 + hidden_size as f32)).sqrt();
 
         Self {
@@ -240,6 +254,13 @@ impl SLSTMBlock {
     }
 
     // ── forward ─────────────────────────────────────────────────────────────
+    //
+    //   1) pre_normed = RMSNorm(x, pre_gamma)
+    //   2) cell.h     = sLSTM(pre_normed)
+    //   3) mid        = x + cell.h                  ← erstes Residual
+    //   4) post_normed = RMSNorm(mid, post_gamma)
+    //   5) down_out   = SwiGLU(post_normed)
+    //   6) output     = mid + down_out              ← zweites Residual
 
     pub fn forward(&mut self, input: &[f32], cache: &mut SLSTMBlockCache) {
         let h = self.hidden_size;
@@ -260,16 +281,21 @@ impl SLSTMBlock {
         self.cell.forward(&cache.pre_normed, &mut cache.cell);
         // Output der Zelle sitzt in cache.cell.h  (Shape H)
 
-        // 3. Post-Norm auf cell.h
-        let ss2: f32 = cache.cell.h.iter().map(|&v| v * v).sum();
+        // 3. Erster Residual: mid = x + cell.h
+        for i in 0..h {
+            cache.mid[i] = input[i] + cache.cell.h[i];
+        }
+
+        // 4. FFN-Pre-Norm (auf mid)
+        let ss2: f32 = cache.mid.iter().map(|&v| v * v).sum();
         let post_inv_rms = 1.0 / (ss2 / h as f32 + EPS).sqrt();
         cache.post_inv_rms = post_inv_rms;
         for i in 0..h {
-            cache.post_x_hat[i] = cache.cell.h[i] * post_inv_rms;
+            cache.post_x_hat[i] = cache.mid[i] * post_inv_rms;
             cache.post_normed[i] = self.post_gamma[i] * cache.post_x_hat[i];
         }
 
-        // 4. SwiGLU
+        // 5. SwiGLU
         //   gate_pre = W_gate · post_normed + b_gate
         cache.gate_pre.copy_from_slice(&self.b_gate);
         for (i, &x) in cache.post_normed.iter().enumerate() {
@@ -300,28 +326,34 @@ impl SLSTMBlock {
             }
         }
 
-        // 5. Residual
+        // 6. Zweites Residual: output = mid + down_out
         for i in 0..h {
-            cache.output[i] = input[i] + cache.down_out[i];
+            cache.output[i] = cache.mid[i] + cache.down_out[i];
         }
     }
 
     // ── backward ────────────────────────────────────────────────────────────
     //
-    // `delta` = dL/d(output). Wir:
-    //   (a) nehmen delta direkt als Residual-Beitrag zu dx,
-    //   (b) gehen durch SwiGLU (down → mixed → gate_act/value → W_gate/W_value),
-    //   (c) Post-Norm rückwärts → dh,
-    //   (d) cell.dh_bptt addieren, cell.backward rufen,
-    //   (e) Pre-Norm rückwärts → dx_rms,
-    //   (f) cache.dx = delta + dx_rms.
+    // `delta` = dL/d(output). Es gibt zwei Residual-Pfade — einer zwischen
+    // mid und output (zweites Residual), einer zwischen x und mid (erstes
+    // Residual).  Daher bauen wir den Backward in Stufen:
+    //
+    //   (a) sc_h2 = delta                     — Residual mid ← output
+    //   (b) SwiGLU rückwärts                  → sc_h1 = d(post_normed)
+    //   (c) FFN-Pre-Norm rückwärts            → sc_h2 += dmid_norm
+    //                                           jetzt: sc_h2 = dmid (vollständig)
+    //   (d) cache.dx = sc_h2                   — Residual x ← mid (vor cell!)
+    //   (e) cell.backward(&mut sc_h2, ...)    — Zelle, mutiert sc_h2 in-place
+    //   (f) Pre-Norm rückwärts                → cache.dx += dx_pre_norm
 
     pub fn backward(&mut self, delta: &mut [f32], cache: &mut SLSTMBlockCache) {
         let h = self.hidden_size;
         let u = self.up_size;
 
-        // (a) Residual-Beitrag schon jetzt in cache.dx parken — am Ende += dx_rms.
-        cache.dx.copy_from_slice(delta);
+        // ── (a) Residual zwischen mid und output: dmid bekommt zunächst delta ─
+        //     (sc_h2 ist jetzt Träger von "dmid", baut sich nach SwiGLU + Norm
+        //      vollständig auf).
+        self.sc_h2.copy_from_slice(delta);
 
         // ── (b) SwiGLU rückwärts ────────────────────────────────────────────
 
@@ -380,17 +412,19 @@ impl SLSTMBlock {
             }
             *dp += s;
         }
-        // sc_h1 enthält jetzt das vollständige d_post_normed.
+        // sc_h1 enthält jetzt das vollständige d(post_normed) = d(mid_normed).
 
-        // ── (c) Post-Norm rückwärts ─────────────────────────────────────────
+        // ── (c) FFN-Pre-Norm rückwärts (operiert auf `mid`) ─────────────────
         //
         //   post_normed[i] = post_gamma[i] · post_x_hat[i]
-        //   post_x_hat[i]  = cell.h[i] · post_inv_rms
+        //   post_x_hat[i]  = mid[i] · post_inv_rms
         //
         //   post_gamma_grad[i] += d_post_normed[i] · post_x_hat[i]
         //   S = Σⱼ post_gamma[j] · d_post_normed[j] · post_x_hat[j]
-        //   dh[i] = post_inv_rms · ( post_gamma[i]·d_post_normed[i]
-        //                            − post_x_hat[i] · S/H )
+        //   dmid_norm[i] = post_inv_rms · ( post_gamma[i]·d_post_normed[i]
+        //                                   − post_x_hat[i] · S/H )
+        //
+        //   sc_h2 += dmid_norm   ⇒   sc_h2 = dmid (Residual + Norm-Anteil).
         let mut s_post = 0.0;
         for i in 0..h {
             self.post_gamma_grad[i] += self.sc_h1[i] * cache.post_x_hat[i];
@@ -399,14 +433,24 @@ impl SLSTMBlock {
         let s_post_over_h = s_post / h as f32;
         let post_inv_rms = cache.post_inv_rms;
         for i in 0..h {
-            self.sc_h2[i] = post_inv_rms
+            self.sc_h2[i] += post_inv_rms
                 * (self.post_gamma[i] * self.sc_h1[i] - cache.post_x_hat[i] * s_post_over_h);
         }
+        // sc_h2 ist nun dmid = dL/d(x + cell.h).
 
+        // ── (d) Residual zwischen x und mid: cache.dx ← dmid ────────────────
+        //     mid = x + cell.h splittet sich:
+        //       - dL/dx   (Residual-Anteil)  = dmid
+        //       - dL/d(cell.h)               = dmid
+        //     Wir parken den Residual-Anteil JETZT in cache.dx, weil
+        //     cell.backward sc_h2 in-place mutiert (delta += dh_bptt).
+        cache.dx.copy_from_slice(&self.sc_h2);
+
+        // ── (e) sLSTM-Zelle rückwärts ───────────────────────────────────────
         self.cell.backward(&mut self.sc_h2, &mut cache.cell);
         // cache.cell.dconcat[..H] enthält jetzt d(pre_normed) = dL/d(Zelleneingang)
 
-        // ── (e) Pre-Norm rückwärts ──────────────────────────────────────────
+        // ── (f) Pre-Norm rückwärts → dx-Beitrag, aufaddiert auf cache.dx ────
         let mut s_pre = 0.0;
         for i in 0..h {
             let d_pn = cache.cell.dconcat[i];
@@ -416,12 +460,11 @@ impl SLSTMBlock {
         let s_pre_over_h = s_pre / h as f32;
         let pre_inv_rms = cache.pre_inv_rms;
 
-        // ── (f) Pre-Norm-dx + Residual-dx zusammenführen ────────────────────
         for i in 0..h {
             let d_pn = cache.cell.dconcat[i];
             let dx_rms =
                 pre_inv_rms * (self.pre_gamma[i] * d_pn - cache.pre_x_hat[i] * s_pre_over_h);
-            cache.dx[i] += dx_rms; // cache.dx war schon = delta (Residual)
+            cache.dx[i] += dx_rms; // cache.dx war = dmid (Residual), jetzt vollständig
         }
     }
 
@@ -434,6 +477,7 @@ impl SLSTMBlock {
             pre_inv_rms: 0.0,
             pre_normed: vec![0.0; h].into(),
             cell: self.cell.alloc_cache(),
+            mid: vec![0.0; h].into(),
             post_x_hat: vec![0.0; h].into(),
             post_inv_rms: 0.0,
             post_normed: vec![0.0; h].into(),
@@ -450,13 +494,13 @@ impl SLSTMBlock {
 
 // ── NnLayer-Impl ─────────────────────────────────────────────────────────────
 
-impl NnLayer for SLSTMBlock {
+impl NnLayer for SLSTMBlock2 {
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()
             .downcast_mut::<SLSTMBlockCache>()
             .expect("SLSTMBlock::forward — expected SLSTMBlockCache");
-        SLSTMBlock::forward(self, input, c);
+        SLSTMBlock2::forward(self, input, c);
     }
 
     fn backward(&mut self, delta: &mut [f32], cache: &mut dyn DynCache) {
@@ -464,12 +508,12 @@ impl NnLayer for SLSTMBlock {
             .as_any_mut()
             .downcast_mut::<SLSTMBlockCache>()
             .expect("SLSTMBlock::backward — expected SLSTMBlockCache");
-        SLSTMBlock::backward(self, delta, c);
+        SLSTMBlock2::backward(self, delta, c);
     }
 
     fn layer_tag(&self) -> u8 {
-        11
-    } // TAG_SLSTM_BLOCK — neu, siehe loading.rs/new_layer
+        14
+    } // TAG_SLSTM_BLOCK — unverändert
 
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
         // hidden_size ist bereits im Sequential-Architekturheader (input_size

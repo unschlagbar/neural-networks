@@ -325,23 +325,16 @@ impl HierarchicalSequential {
             window_loss += loss;
             window_steps += 1;
             window_tokens += inputs.len();
-            *step += 1;
-
-            if *step % SAVE_EVERY == 0 {
-                match self.save(MODEL_LOC) {
-                    Ok(()) => println!("saved"),
-                    Err(e) => eprintln!("save failed: {e}"),
-                }
-            }
 
             self.backwards_sequence(targets);
 
+            *step += 1;
             *iteration += 1;
             if *iteration % batch_size == 0 {
                 let scale = lr / batch_size as f32;
 
-                self.char_model.sgd_step(scale);
-                self.char2_model.sgd_step(scale);
+                self.char_model.sgd_step(lr);
+                self.char2_model.sgd_step(lr);
                 self.high_model.sgd_step(scale);
 
                 *iteration = 0;
@@ -364,6 +357,12 @@ impl HierarchicalSequential {
                 window_steps = 0;
                 window_tokens = 0;
                 window_start = std::time::Instant::now();
+            }
+            if *step % SAVE_EVERY == 0 {
+                match self.save(MODEL_LOC) {
+                    Ok(()) => println!("saved"),
+                    Err(e) => eprintln!("save failed: {e}"),
+                }
             }
         }
 
