@@ -7,14 +7,14 @@
 // ── Model-Pfade ──────────────────────────────────────────────────────────────
 
 /// Pfad für das hierarchische Modell (char- + sentence-level).
-pub const MODEL_LOC: &str = "models/hric";
+pub const MODEL_LOC: &str = "models/hric2";
 /// Pfad für das „normale" Char-Level-Sequential-Modell.
 pub const SEQ_LOC: &str = "models/seq";
 
 // ── Sequenz-Längen ───────────────────────────────────────────────────────────
 
 /// Trainings-Sequenzlänge (Anzahl Tokens pro BPTT-Chunk).
-pub const SEQ_LEN: usize = 512;
+pub const SEQ_LEN: usize = 1024;
 /// Reserve für den Forward-Cache (unsere BatchIter kann länger werden als SEQ_LEN).
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 
@@ -23,7 +23,7 @@ pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 // Die alte LR = 1e-5 ist für ein Netz mit Residual-Pfaden und RMSNorm einfach
 // zu klein. Deep-RNNs mit Pre-Norm laufen typisch bei 3e-4 – 1e-3. Weil wir
 // SGD (keinen Adam) haben, bleiben wir konservativ am unteren Ende.
-pub const LR: f32 = 1e-4;
+pub const LR: f32 = 2e-5;
 
 /// Gradienten-Akkumulation: wir rufen `apply_grads` erst nach BATCH_SIZE
 /// Sequenzen (Sequential skaliert automatisch mit 1/BATCH_SIZE).

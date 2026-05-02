@@ -221,14 +221,14 @@ impl HierarchicalSequential {
         let context_size = self.context_size;
 
         let mut d_high_ctx = vec![0.0; context_size];
-        let mut d_char1_buf = vec![0.0; char_output];
+        let mut high_grad_accum = 0.0;
 
         let mut boundary_i = self.boundary_timesteps.len() - 1;
-        let mut high_grad_accum = 0.0;
 
         for t in (0..targets.len()).rev() {
             let is_boundary = boundary_i != usize::MAX && self.boundary_timesteps[boundary_i] == t;
 
+            // ── 1. char2 backward ────────────────────────────────────────────────
             let out_len = {
                 let out = self.char2_model.cache[t].last().unwrap().output();
                 let len = out.len();
@@ -243,23 +243,21 @@ impl HierarchicalSequential {
                 out_len,
             );
 
-            let dx2 = self.char2_model.cache[t][0].input_grad();
-            for i in 0..context_size {
-                d_high_ctx[i] += dx2[char_output + i];
-            }
+            let (d_char1_from_char2, d_high_from_char2) = {
+                let dx2 = self.char2_model.cache[t][0].input_grad();
+                // Gradient w.r.t. char1_out (von char2-path)
+                let mut c = vec![0.0; char_output];
+                c.copy_from_slice(&dx2[..char_output]);
+                // Gradient w.r.t. high_ctx akkumulieren
+                for i in 0..context_size {
+                    d_high_ctx[i] += dx2[char_output + i];
+                }
+                (c, ())
+            };
+            let _ = d_high_from_char2;
 
-            for i in 0..char_output {
-                self.delta_buf[i] = dx2[i] + d_char1_buf[i];
-            }
-            d_char1_buf.fill(0.0);
-
-            backward_through_layers(
-                &mut self.char_model.layers,
-                &mut self.char_model.cache[t],
-                &mut self.delta_buf,
-                char_output,
-            );
-            if is_boundary {
+            // ── 2. An Boundary: high_model backward JETZT, vor char1 ─────────────
+            let d_char1_from_high = if is_boundary {
                 high_grad_accum +=
                     d_high_ctx.iter().map(|x| x.abs()).sum::<f32>() / context_size as f32;
 
@@ -271,9 +269,27 @@ impl HierarchicalSequential {
                 );
 
                 let d_hi = self.high_model.cache[boundary_i][0].input_grad();
-                d_char1_buf.copy_from_slice(&d_hi[..char_output]);
+                let mut g = vec![0.0; char_output];
+                g.copy_from_slice(&d_hi[..char_output]);
                 d_high_ctx.fill(0.0);
+                g
+            } else {
+                vec![0.0; char_output]
+            };
 
+            // ── 3. Beide Char1-Gradienten kombinieren und char1 backward ──────────
+            for i in 0..char_output {
+                self.delta_buf[i] = d_char1_from_char2[i] + d_char1_from_high[i];
+            }
+            backward_through_layers(
+                &mut self.char_model.layers,
+                &mut self.char_model.cache[t],
+                &mut self.delta_buf,
+                char_output,
+            );
+
+            // ── 4. An Boundary: BPTT-States zurücksetzen ─────────────────────────
+            if is_boundary {
                 for layer in &mut self.char_model.layers {
                     layer.accumulate_init_grad();
                     layer.zero_bptt_state();
@@ -282,14 +298,16 @@ impl HierarchicalSequential {
                     layer.accumulate_init_grad();
                     layer.zero_bptt_state();
                 }
-
-                //self.char_model.sgd_step(lr * 0.5);
-                //self.char2_model.sgd_step(lr * 0.5);
+                for layer in &mut self.high_model.layers {
+                    layer.accumulate_init_grad();
+                    layer.zero_bptt_state();
+                }
 
                 boundary_i = boundary_i.wrapping_sub(1);
             }
         }
 
+        // Letzten Segment abschließen
         for layer in &mut self.char_model.layers {
             layer.accumulate_init_grad();
             layer.zero_bptt_state();
@@ -298,14 +316,9 @@ impl HierarchicalSequential {
             layer.accumulate_init_grad();
             layer.zero_bptt_state();
         }
-        for layer in &mut self.high_model.layers {
-            layer.accumulate_init_grad();
-            layer.zero_bptt_state();
-        }
 
         self.last_high_grad_signal = high_grad_accum / self.boundary_timesteps.len() as f32;
     }
-
     pub fn train<'a, I: Iterator<Item = (&'a [u16], &'a [u16])>>(
         &mut self,
         data: I,
@@ -337,8 +350,8 @@ impl HierarchicalSequential {
             if *iteration % batch_size == 0 {
                 let lr = lr / batch_size as f32;
 
-                self.char_model.sgd_step(lr / 5.0);
-                self.char2_model.sgd_step(lr / 5.0);
+                self.char_model.sgd_step(lr);
+                self.char2_model.sgd_step(lr);
                 self.high_model.sgd_step(lr);
 
                 *iteration = 0;
