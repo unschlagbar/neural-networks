@@ -6,7 +6,7 @@ pub mod data_set_loading;
 pub mod dense;
 pub mod dropout;
 pub mod embedding;
-pub mod hierarchical_sequential;
+pub mod hierarchical;
 pub mod linear;
 pub mod loading;
 pub mod lstm;

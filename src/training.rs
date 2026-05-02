@@ -16,7 +16,7 @@ use crate::{
     config::{
         BATCH_SIZE, DATA_DIR, EPOCHS, LR, MAX_SEQ_LEN, MODEL_LOC, PRINT_EVERY, SEQ_LEN, SEQ_LOC,
     },
-    hierarchical_sequential::HierarchicalSequential,
+    hierarchical::HierarchicalSequential,
     model::{build_hierarchical_model, build_normal_model},
     sequential::Sequential,
     tokenizer::Tokenizer,

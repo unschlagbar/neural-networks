@@ -335,11 +335,11 @@ impl HierarchicalSequential {
             *step += 1;
             *iteration += 1;
             if *iteration % batch_size == 0 {
-                let scale = lr / batch_size as f32;
+                let lr = lr / batch_size as f32;
 
-                self.char_model.sgd_step(lr);
-                self.char2_model.sgd_step(lr);
-                self.high_model.sgd_step(scale);
+                self.char_model.sgd_step(lr / 5.0);
+                self.char2_model.sgd_step(lr / 5.0);
+                self.high_model.sgd_step(lr);
 
                 *iteration = 0;
                 *j += 1;

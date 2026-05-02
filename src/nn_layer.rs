@@ -202,7 +202,7 @@ impl SequentialBuilder {
             "slstm_block erwartet input_size == hidden ({} != {})",
             self.output_size, hidden,
         );
-        let up = (hidden * 4) / 3;
+        let up = (hidden * 8) / 3;
         let layer = SLSTMBlock::new(hidden, up);
         self.layer(Box::new(layer), hidden);
         self

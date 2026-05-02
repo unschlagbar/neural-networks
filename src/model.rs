@@ -1,6 +1,6 @@
 use crate::{
     config::{CHAR_HIDDEN, WORD_HIDDEN},
-    hierarchical_sequential::HierarchicalSequential,
+    hierarchical::HierarchicalSequential,
     nn_layer::SequentialBuilder,
     sequential::Sequential,
 };
@@ -8,7 +8,7 @@ use crate::{
 pub fn build_normal_model(vocab: usize) -> Sequential {
     let mut model = SequentialBuilder::new(vocab).embedding(WORD_HIDDEN);
     for _ in 0..2 {
-        model = model.slstm_block2(WORD_HIDDEN);
+        model = model.slstm_block(WORD_HIDDEN);
     }
     model.linear(vocab).softmax().build()
 }
@@ -28,11 +28,8 @@ pub fn build_hierarchical_model(
 
     let high_model = SequentialBuilder::new(vocab + CHAR_HIDDEN)
         .linear(WORD_HIDDEN)
-        .slstm_block2(WORD_HIDDEN)
-        .slstm_block2(WORD_HIDDEN)
-        .slstm_block2(WORD_HIDDEN)
-        .slstm_block2(WORD_HIDDEN)
-        .slstm_block2(WORD_HIDDEN)
+        .slstm_block(WORD_HIDDEN)
+        .slstm_block(WORD_HIDDEN)
         .rms_norm()
         .build();
 

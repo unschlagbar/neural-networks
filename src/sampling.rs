@@ -15,7 +15,7 @@ use std::io::{Write, stdin, stdout};
 
 use crate::{
     config::{CHARSET, MAX_LEN, MODEL_LOC, SEQ_LOC, TEMPERATURE},
-    hierarchical_sequential::HierarchicalSequential,
+    hierarchical::HierarchicalSequential,
     sequential::Sequential,
     tokenizer::Tokenizer,
 };
