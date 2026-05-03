@@ -33,7 +33,7 @@ pub const BATCH_SIZE: usize = 1;
 
 // ── Training-Schedule ────────────────────────────────────────────────────────
 
-pub const EPOCHS: usize = 1000;
+pub const EPOCHS: usize = 1;
 
 /// Save nach jeweils N abgeschlossenen Files (0 = nur am Ende jeder Epoche).
 pub const SAVE_EVERY: usize = 30;

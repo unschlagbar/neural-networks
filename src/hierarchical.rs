@@ -18,7 +18,7 @@ use crate::{
 pub struct HierarchicalSequential {
     pub char_model: Sequential,
     pub char2_model: Sequential,
-    pub high_model: Sequential,
+    pub word_model: Sequential,
 
     pub vocab_size: usize,
     pub context_size: usize,
@@ -47,11 +47,11 @@ impl HierarchicalSequential {
     pub fn new(
         char_model: Sequential,
         char2_model: Sequential,
-        high_model: Sequential,
+        word_model: Sequential,
         vocab_size: usize,
         boundary_token_ids: Vec<u16>,
     ) -> Self {
-        let context_size = high_model.output_size;
+        let context_size = word_model.output_size;
         assert_eq!(
             char_model.input_size, vocab_size,
             "char_model.input_size must equal vocab_size"
@@ -67,13 +67,13 @@ impl HierarchicalSequential {
         // Therefore high_model.input_size = char_model.output_size + vocab_size.
         assert_eq!(
             char_model.output_size + vocab_size,
-            high_model.input_size,
+            word_model.input_size,
             "high_model.input_size must equal char_model.output_size + vocab_size (boundary char is concatenated to the word embedding)"
         );
 
         assert_eq!(
             char2_model.input_size,
-            high_model.output_size + char_model.output_size
+            word_model.output_size + char_model.output_size
         );
 
         let char_input_buf = vec![0.0; vocab_size].into();
@@ -94,7 +94,7 @@ impl HierarchicalSequential {
         Self {
             char_model,
             char2_model,
-            high_model,
+            word_model,
             vocab_size,
             context_size,
             boundary_token_ids,
@@ -116,7 +116,7 @@ impl HierarchicalSequential {
     pub fn make_cache(&mut self, seq_len: usize) {
         self.char_model.make_cache(seq_len);
         self.char2_model.make_cache(seq_len);
-        self.high_model.make_cache((seq_len / 5).max(1));
+        self.word_model.make_cache((seq_len / 5).max(1));
     }
 
     // ── State reset ───────────────────────────────────────────────────────────
@@ -128,7 +128,7 @@ impl HierarchicalSequential {
         for layer in &mut self.char2_model.layers {
             layer.reset_state();
         }
-        for layer in &mut self.high_model.layers {
+        for layer in &mut self.word_model.layers {
             layer.reset_state();
         }
         self.boundary_timesteps.clear();
@@ -184,8 +184,8 @@ impl HierarchicalSequential {
                 self.high_input_buf[char_output + token as usize] = 1.0;
 
                 Self::forward_step(
-                    &mut self.high_model.layers,
-                    &mut self.high_model.cache[word_idx],
+                    &mut self.word_model.layers,
+                    &mut self.word_model.cache[word_idx],
                     &self.high_input_buf,
                 );
 
@@ -196,7 +196,7 @@ impl HierarchicalSequential {
                     layer.reset_state();
                 }
 
-                let high_out = self.high_model.cache[word_idx].last().unwrap().output();
+                let high_out = self.word_model.cache[word_idx].last().unwrap().output();
                 self.assert_no_nan(high_out, "high_output", word_idx);
                 self.word_context[char_output..].copy_from_slice(high_out);
             }
@@ -275,15 +275,15 @@ impl HierarchicalSequential {
                     self.d_high_ctx.iter().map(|x| x.abs()).sum::<f32>() / context_size as f32;
 
                 backward_through_layers(
-                    &mut self.high_model.layers,
-                    &mut self.high_model.cache[bi],
+                    &mut self.word_model.layers,
+                    &mut self.word_model.cache[bi],
                     &mut self.d_high_ctx,
                     context_size,
                 );
 
                 // d_hi[..char_output] = ∂L/∂char_model.output[t-1]
                 // → Carry für die nächste Iteration (t-1), NICHT für t!
-                let d_hi = self.high_model.cache[bi][0].input_grad();
+                let d_hi = self.word_model.cache[bi][0].input_grad();
                 self.d_char1_new_carry.copy_from_slice(&d_hi[..char_output]);
                 self.d_high_ctx.fill(0.0);
             } else {
@@ -325,7 +325,7 @@ impl HierarchicalSequential {
             layer.accumulate_init_grad();
             layer.zero_bptt_state();
         }
-        for layer in &mut self.high_model.layers {
+        for layer in &mut self.word_model.layers {
             layer.accumulate_init_grad();
             layer.zero_bptt_state();
         }
@@ -366,7 +366,7 @@ impl HierarchicalSequential {
 
                 self.char_model.sgd_step(lr);
                 self.char2_model.sgd_step(lr);
-                self.high_model.sgd_step(lr);
+                self.word_model.sgd_step(lr);
 
                 *iteration = 0;
                 *j += 1;
@@ -481,12 +481,12 @@ impl HierarchicalSequential {
                     self.high_input_buf[char_output + next_token as usize] = 1.0;
                 }
                 Self::forward_sample_step(
-                    &mut self.high_model.layers,
-                    &mut self.high_model.cache[0],
+                    &mut self.word_model.layers,
+                    &mut self.word_model.cache[0],
                     &self.high_input_buf,
                 );
                 {
-                    let high_out = self.high_model.cache[0].last().unwrap().output();
+                    let high_out = self.word_model.cache[0].last().unwrap().output();
                     self.word_context[char_output..].copy_from_slice(high_out);
                 }
                 for layer in &mut self.char_model.layers {
@@ -524,14 +524,14 @@ impl HierarchicalSequential {
                     self.high_input_buf[char_output + token as usize] = 1.0;
                 }
                 Self::forward_sample_step(
-                    &mut self.high_model.layers,
-                    &mut self.high_model.cache[0],
+                    &mut self.word_model.layers,
+                    &mut self.word_model.cache[0],
                     &self.high_input_buf,
                 );
 
                 // Update high context in word_context
                 {
-                    let high_out = self.high_model.cache[0].last().unwrap().output();
+                    let high_out = self.word_model.cache[0].last().unwrap().output();
                     self.word_context[char_output..].copy_from_slice(high_out);
                 }
 
@@ -608,7 +608,7 @@ impl HierarchicalSequential {
         // Sub-models
         self.char_model.write_to(w)?;
         self.char2_model.write_to(w)?;
-        self.high_model.write_to(w)?;
+        self.word_model.write_to(w)?;
 
         File::create(path)?.write_all(&buf.into_inner())
     }
@@ -657,7 +657,7 @@ impl HierarchicalSequential {
             boundary_token_ids,
             char_model,
             char2_model,
-            high_model,
+            word_model: high_model,
             word_context,
             delta_buf,
             boundary_timesteps: vec![],
