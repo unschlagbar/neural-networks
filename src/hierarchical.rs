@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io::{self, Cursor, Read, Write},
+    mem,
     time::Instant,
     u32,
 };
@@ -31,6 +32,12 @@ pub struct HierarchicalSequential {
 
     char_input_buf: Box<[f32]>,
     high_input_buf: Box<[f32]>,
+
+    // ── Backward scratch (pre-allocated, never heap during training) ──────────
+    d_high_ctx: Box<[f32]>,         // [context_size]
+    d_char1_carry: Box<[f32]>,      // [char_output]
+    d_char1_new_carry: Box<[f32]>,  // [char_output]
+    d_char1_from_char2: Box<[f32]>, // [char_output]
 
     pub last_high_grad_signal: f32,
 }
@@ -79,6 +86,11 @@ impl HierarchicalSequential {
 
         let delta_buf = vec![0.0; buf_size].into();
 
+        let d_high_ctx = vec![0.0; context_size].into();
+        let d_char1_carry = vec![0.0; char_model.output_size].into();
+        let d_char1_new_carry = vec![0.0; char_model.output_size].into();
+        let d_char1_from_char2 = vec![0.0; char_model.output_size].into();
+
         Self {
             char_model,
             char2_model,
@@ -91,6 +103,10 @@ impl HierarchicalSequential {
             boundary_timesteps: vec![],
             char_input_buf,
             high_input_buf,
+            d_high_ctx,
+            d_char1_carry,
+            d_char1_new_carry,
+            d_char1_from_char2,
             last_high_grad_signal: 0.0,
         }
     }
@@ -211,8 +227,7 @@ impl HierarchicalSequential {
         }
     }
 
-    #[allow(unused)]
-    pub fn backwards_sequence(&mut self, targets: &[u16], lr: f32) {
+    pub fn backwards_sequence(&mut self, targets: &[u16]) {
         if self.boundary_timesteps.is_empty() {
             return;
         }
@@ -220,15 +235,22 @@ impl HierarchicalSequential {
         let char_output = self.char_model.output_size;
         let context_size = self.context_size;
 
-        let mut d_high_ctx = vec![0.0; context_size];
         let mut high_grad_accum = 0.0;
 
-        let mut boundary_i = self.boundary_timesteps.len() - 1;
+        // Scratch-Buffer zurücksetzen (keine Allokation)
+        self.d_high_ctx.fill(0.0);
+        self.d_char1_carry.fill(0.0);
+        self.d_char1_new_carry.fill(0.0);
+        self.d_char1_from_char2.fill(0.0);
+
+        let mut boundary_i: Option<usize> = self.boundary_timesteps.len().checked_sub(1);
 
         for t in (0..targets.len()).rev() {
-            let is_boundary = boundary_i != usize::MAX && self.boundary_timesteps[boundary_i] == t;
+            // Prüfe ob aktuelles t eine Boundary ist
+            let current_bi = boundary_i.filter(|&bi| self.boundary_timesteps[bi] == t);
+            let is_boundary = current_bi.is_some();
 
-            // ── 1. char2 backward ────────────────────────────────────────────────
+            // ── 1. char2 backward ─────────────────────────────────────────────────
             let out_len = {
                 let out = self.char2_model.cache[t].last().unwrap().output();
                 let len = out.len();
@@ -242,45 +264,38 @@ impl HierarchicalSequential {
                 &mut self.delta_buf,
                 out_len,
             );
-
-            let (d_char1_from_char2, d_high_from_char2) = {
+            {
                 let dx2 = self.char2_model.cache[t][0].input_grad();
-                // Gradient w.r.t. char1_out (von char2-path)
-                let mut c = vec![0.0; char_output];
-                c.copy_from_slice(&dx2[..char_output]);
-                // Gradient w.r.t. high_ctx akkumulieren
+                self.d_char1_from_char2.copy_from_slice(&dx2[..char_output]);
                 for i in 0..context_size {
-                    d_high_ctx[i] += dx2[char_output + i];
+                    self.d_high_ctx[i] += dx2[char_output + i];
                 }
-                (c, ())
-            };
-            let _ = d_high_from_char2;
+            }
 
-            // ── 2. An Boundary: high_model backward JETZT, vor char1 ─────────────
-            let d_char1_from_high = if is_boundary {
+            if let Some(bi) = current_bi {
                 high_grad_accum +=
-                    d_high_ctx.iter().map(|x| x.abs()).sum::<f32>() / context_size as f32;
+                    self.d_high_ctx.iter().map(|x| x.abs()).sum::<f32>() / context_size as f32;
 
                 backward_through_layers(
                     &mut self.high_model.layers,
-                    &mut self.high_model.cache[boundary_i],
-                    &mut d_high_ctx,
+                    &mut self.high_model.cache[bi],
+                    &mut self.d_high_ctx,
                     context_size,
                 );
 
-                let d_hi = self.high_model.cache[boundary_i][0].input_grad();
-                let mut g = vec![0.0; char_output];
-                g.copy_from_slice(&d_hi[..char_output]);
-                d_high_ctx.fill(0.0);
-                g
+                // d_hi[..char_output] = ∂L/∂char_model.output[t-1]
+                // → Carry für die nächste Iteration (t-1), NICHT für t!
+                let d_hi = self.high_model.cache[bi][0].input_grad();
+                self.d_char1_new_carry.copy_from_slice(&d_hi[..char_output]);
+                self.d_high_ctx.fill(0.0);
             } else {
-                vec![0.0; char_output]
-            };
-
-            // ── 3. Beide Char1-Gradienten kombinieren und char1 backward ──────────
-            for i in 0..char_output {
-                self.delta_buf[i] = d_char1_from_char2[i] + d_char1_from_high[i];
+                self.d_char1_new_carry.fill(0.0);
             }
+
+            for i in 0..char_output {
+                self.delta_buf[i] = self.d_char1_from_char2[i] + self.d_char1_carry[i];
+            }
+
             backward_through_layers(
                 &mut self.char_model.layers,
                 &mut self.char_model.cache[t],
@@ -288,7 +303,7 @@ impl HierarchicalSequential {
                 char_output,
             );
 
-            // ── 4. An Boundary: BPTT-States zurücksetzen ─────────────────────────
+            // ── 4. Boundary: BPTT-States zurücksetzen ─────────────────────────────
             if is_boundary {
                 for layer in &mut self.char_model.layers {
                     layer.accumulate_init_grad();
@@ -302,12 +317,13 @@ impl HierarchicalSequential {
                     layer.accumulate_init_grad();
                     layer.zero_bptt_state();
                 }
-
-                boundary_i = boundary_i.wrapping_sub(1);
+                // checked_sub: gibt None wenn bi == 0 → keine weiteren Boundaries
+                boundary_i = boundary_i.and_then(|bi| bi.checked_sub(1));
             }
+
+            mem::swap(&mut self.d_char1_carry, &mut self.d_char1_new_carry);
         }
 
-        // Letzten Segment abschließen
         for layer in &mut self.char_model.layers {
             layer.accumulate_init_grad();
             layer.zero_bptt_state();
@@ -319,6 +335,7 @@ impl HierarchicalSequential {
 
         self.last_high_grad_signal = high_grad_accum / self.boundary_timesteps.len() as f32;
     }
+
     pub fn train<'a, I: Iterator<Item = (&'a [u16], &'a [u16])>>(
         &mut self,
         data: I,
@@ -343,7 +360,7 @@ impl HierarchicalSequential {
             window_steps += 1;
             window_tokens += inputs.len();
 
-            self.backwards_sequence(targets, lr / batch_size as f32);
+            self.backwards_sequence(targets);
 
             *step += 1;
             *iteration += 1;
@@ -373,7 +390,7 @@ impl HierarchicalSequential {
                 window_loss = 0.0;
                 window_steps = 0;
                 window_tokens = 0;
-                window_start = std::time::Instant::now();
+                window_start = Instant::now();
             }
             if *step % SAVE_EVERY == 0 {
                 match self.save(MODEL_LOC) {
@@ -632,6 +649,11 @@ impl HierarchicalSequential {
 
         let delta_buf = vec![0.0; buf_size].into();
 
+        let d_high_ctx = vec![0.0; context_size].into();
+        let d_char1_carry = vec![0.0; char_model.output_size].into();
+        let d_char1_new_carry = vec![0.0; char_model.output_size].into();
+        let d_char1_from_char2 = vec![0.0; char_model.output_size].into();
+
         Ok(Self {
             vocab_size,
             context_size,
@@ -644,6 +666,10 @@ impl HierarchicalSequential {
             boundary_timesteps: vec![],
             char_input_buf,
             high_input_buf,
+            d_high_ctx,
+            d_char1_carry,
+            d_char1_new_carry,
+            d_char1_from_char2,
             last_high_grad_signal: 0.0,
         })
     }

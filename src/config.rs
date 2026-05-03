@@ -23,7 +23,7 @@ pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 // Die alte LR = 1e-5 ist für ein Netz mit Residual-Pfaden und RMSNorm einfach
 // zu klein. Deep-RNNs mit Pre-Norm laufen typisch bei 3e-4 – 1e-3. Weil wir
 // SGD (keinen Adam) haben, bleiben wir konservativ am unteren Ende.
-pub const LR: f32 = 2e-5;
+pub const LR: f32 = 1e-4;
 
 /// Gradienten-Akkumulation: wir rufen `apply_grads` erst nach BATCH_SIZE
 /// Sequenzen (Sequential skaliert automatisch mit 1/BATCH_SIZE).
