@@ -5,7 +5,6 @@ pub mod embedding;
 pub mod linear;
 pub mod linear_nb;
 pub mod lstm;
-pub mod mlstm;
 pub mod rms_norm;
 pub mod silu_dense;
 pub mod slstm;

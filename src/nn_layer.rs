@@ -6,7 +6,6 @@ use crate::nn::embedding::EmbeddingLayer;
 use crate::nn::linear::LinearLayer;
 use crate::nn::linear_nb::LinearNBLayer;
 use crate::nn::lstm::LSTMLayer;
-use crate::nn::mlstm::MLSTMLayer;
 use crate::nn::rms_norm::{RMSNorm, RMSNormResidual};
 use crate::nn::silu_dense::SiluDenseLayer;
 use crate::nn::slstm::SLSTMLayer;
@@ -170,12 +169,6 @@ impl SequentialBuilder {
 
     pub fn slstm(mut self, hidden: usize) -> Self {
         let layer = SLSTMLayer::new(self.output_size, hidden);
-        self.layer(Box::new(layer), hidden);
-        self
-    }
-
-    pub fn mlstm(mut self, hidden: usize) -> Self {
-        let layer = MLSTMLayer::new(self.output_size, hidden);
         self.layer(Box::new(layer), hidden);
         self
     }
