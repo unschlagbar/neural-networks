@@ -336,6 +336,65 @@ impl RMSNorm {
             normed[i] = gamma[i] * x_hat[i];
         }
     }
+
+    pub fn from_loaded(size: usize, gamma: Box<[f32]>) -> Self {
+        Self {
+            gamma,
+            grads_gamma: vec![0.0; size].into(),
+            norm_size: size,
+        }
+    }
+
+    /// Allokiert einen passenden Cache ohne Boxing.
+    pub fn alloc_cache(&self) -> RMSNormCache {
+        let n = self.norm_size;
+        RMSNormCache {
+            input: vec![0.0; n].into(),
+            x_hat: vec![0.0; n].into(),
+            inv_rms: 0.0,
+            output: vec![0.0; n].into(),
+            dx: vec![0.0; n].into(),
+        }
+    }
+
+    /// Forward mit konkretem Cache — kein dyn-Overhead.
+    ///
+    ///   rms    = sqrt( mean(x²) + ε )
+    ///   x̂[i]  = x[i] / rms
+    ///   out[i] = gamma[i] · x̂[i]   → cache.output
+    pub fn forward_into(&mut self, input: &[f32], cache: &mut RMSNormCache) {
+        cache.input.copy_from_slice(input);
+        Self::rms_norm(
+            input,
+            &self.gamma,
+            &mut cache.x_hat,
+            &mut cache.output,
+            &mut cache.inv_rms,
+            self.norm_size,
+        );
+    }
+
+    /// Backward mit konkretem Cache.
+    ///
+    /// `delta` = dL/d(output). Schreibt dL/d(input) nach `cache.dx`.
+    /// Akkumuliert `grads_gamma` wie gewohnt.
+    ///
+    /// Jacobian (RMSNorm ohne Bias):
+    ///   S          = Σⱼ gamma[j] · delta[j] · x̂[j]
+    ///   dx[i]      = inv_rms · ( gamma[i]·delta[i] − x̂[i]·S/n )
+    pub fn backward_into(&mut self, delta: &[f32], cache: &mut RMSNormCache) {
+        let n = self.norm_size;
+        let irms = cache.inv_rms;
+        let mut s = 0.0_f32;
+        for i in 0..n {
+            self.grads_gamma[i] += delta[i] * cache.x_hat[i];
+            s += self.gamma[i] * delta[i] * cache.x_hat[i];
+        }
+        let s_n = s / n as f32;
+        for i in 0..n {
+            cache.dx[i] = irms * (self.gamma[i] * delta[i] - cache.x_hat[i] * s_n);
+        }
+    }
 }
 
 // ── NnLayer impl ─────────────────────────────────────────────────────────────

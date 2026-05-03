@@ -202,10 +202,13 @@ pub fn load_slstm_block(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn Nn
     let hidden_size = ctx.input_size;
     let up_size = read_u32(r)? as usize;
 
+    // Norm-Gewichte
     let pre_gamma: Box<[f32]> = read_f32_vec(r)?.into();
     let post_gamma: Box<[f32]> = read_f32_vec(r)?.into();
+    let pre_norm = RMSNorm::from_loaded(hidden_size, pre_gamma);
+    let post_norm = RMSNorm::from_loaded(hidden_size, post_gamma);
 
-    // Zell-Gewichte — identische Reihenfolge wie in load_slstm.
+    // Zell-Gewichte (identische Reihenfolge wie in load_slstm)
     let wz = read_matrix(r)?;
     let wi = read_matrix(r)?;
     let wf = read_matrix(r)?;
@@ -215,26 +218,35 @@ pub fn load_slstm_block(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn Nn
     let c_init: Box<[f32]> = read_f32_vec(r)?.into();
     let cell = SLSTMLayer::from_loaded(hidden_size, hidden_size, wz, wi, wf, wo, b, h_init, c_init);
 
-    // SwiGLU.
-    let w_gate = read_matrix(r)?;
-    let b_gate: Box<[f32]> = read_f32_vec(r)?.into();
-    let w_value = read_matrix(r)?;
-    let b_value: Box<[f32]> = read_f32_vec(r)?.into();
-    let w_down = read_matrix(r)?;
-    let b_down: Box<[f32]> = read_f32_vec(r)?.into();
+    // SwiGLU-Projektionen
+    let lin_gate = LinearLayer::from_loaded(
+        hidden_size,
+        up_size,
+        read_matrix(r)?,
+        read_f32_vec(r)?.into(),
+    );
+    let lin_value = LinearLayer::from_loaded(
+        hidden_size,
+        up_size,
+        read_matrix(r)?,
+        read_f32_vec(r)?.into(),
+    );
+    let lin_down = LinearLayer::from_loaded(
+        up_size,
+        hidden_size,
+        read_matrix(r)?,
+        read_f32_vec(r)?.into(),
+    );
 
     Ok(Box::new(SLSTMBlock::from_loaded(
         hidden_size,
         up_size,
-        pre_gamma,
-        post_gamma,
+        pre_norm,
+        post_norm,
         cell,
-        w_gate,
-        b_gate,
-        w_value,
-        b_value,
-        w_down,
-        b_down,
+        lin_gate,
+        lin_value,
+        lin_down,
     )))
 }
 

@@ -8,7 +8,7 @@ use crate::{
     nn_layer::{DynCache, NnLayer},
 };
 
-//const CLIP: f32 = 15.0;
+const CLIP: f32 = 15.0;
 
 // ── DenseCache ────────────────────────────────────────────────────────────────
 
@@ -200,11 +200,11 @@ impl NnLayer for LinearLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
-        //self.grads.weights.clip(-CLIP, CLIP);
-        //self.grads
-        //    .biases
-        //    .iter_mut()
-        //    .for_each(|v| *v = v.clamp(-CLIP, CLIP));
+        self.grads.weights.clip(-CLIP, CLIP);
+        self.grads
+            .biases
+            .iter_mut()
+            .for_each(|v| *v = v.clamp(-CLIP, CLIP));
         sub_in_place(&mut self.weights, &self.grads.weights, lr);
         sub_vec_in_place(&mut self.biases, &self.grads.biases, lr);
     }
