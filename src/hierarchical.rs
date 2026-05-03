@@ -9,10 +9,10 @@ use std::{
 use crate::{
     config::{MODEL_LOC, SAVE_EVERY},
     loading::{read_u16, read_u32},
+    nn::softmax::softmax,
     nn_layer::{DynCache, NnLayer},
     saving::{HIER_MAGIC, write_u16, write_u32},
     sequential::Sequential,
-    softmax::softmax,
 };
 
 pub struct HierarchicalSequential {
@@ -116,7 +116,7 @@ impl HierarchicalSequential {
     pub fn make_cache(&mut self, seq_len: usize) {
         self.char_model.make_cache(seq_len);
         self.char2_model.make_cache(seq_len);
-        self.high_model.make_cache(seq_len);
+        self.high_model.make_cache((seq_len / 5).max(1));
     }
 
     // ── State reset ───────────────────────────────────────────────────────────
@@ -237,7 +237,6 @@ impl HierarchicalSequential {
 
         let mut high_grad_accum = 0.0;
 
-        // Scratch-Buffer zurücksetzen (keine Allokation)
         self.d_high_ctx.fill(0.0);
         self.d_char1_carry.fill(0.0);
         self.d_char1_new_carry.fill(0.0);
@@ -247,8 +246,7 @@ impl HierarchicalSequential {
 
         for t in (0..targets.len()).rev() {
             // Prüfe ob aktuelles t eine Boundary ist
-            let current_bi = boundary_i.filter(|&bi| self.boundary_timesteps[bi] == t);
-            let is_boundary = current_bi.is_some();
+            let boundary = boundary_i.filter(|&bi| self.boundary_timesteps[bi] == t);
 
             // ── 1. char2 backward ─────────────────────────────────────────────────
             let out_len = {
@@ -272,7 +270,7 @@ impl HierarchicalSequential {
                 }
             }
 
-            if let Some(bi) = current_bi {
+            if let Some(bi) = boundary {
                 high_grad_accum +=
                     self.d_high_ctx.iter().map(|x| x.abs()).sum::<f32>() / context_size as f32;
 
@@ -304,7 +302,7 @@ impl HierarchicalSequential {
             );
 
             // ── 4. Boundary: BPTT-States zurücksetzen ─────────────────────────────
-            if is_boundary {
+            if boundary.is_some() {
                 for layer in &mut self.char_model.layers {
                     layer.accumulate_init_grad();
                     layer.zero_bptt_state();
@@ -313,7 +311,6 @@ impl HierarchicalSequential {
                     layer.accumulate_init_grad();
                     layer.zero_bptt_state();
                 }
-                // checked_sub: gibt None wenn bi == 0 → keine weiteren Boundaries
                 boundary_i = boundary_i.and_then(|bi| bi.checked_sub(1));
             }
 

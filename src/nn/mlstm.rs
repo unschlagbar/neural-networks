@@ -30,7 +30,7 @@ use rand::random_range;
 
 use crate::{
     activations::sigmoid,
-    lstm::{add_vec_in_place, sub_in_place, sub_vec_in_place},
+    nn::{add_vec_in_place, sub_in_place, sub_vec_in_place},
     nn_layer::{DynCache, NnLayer},
     saving,
 };

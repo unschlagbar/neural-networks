@@ -1,21 +1,18 @@
 use std::any::Any;
 use std::io;
 
-use crate::activations::Activate;
-use crate::dense::DenseLayer;
-use crate::dropout::DropoutLayer;
-use crate::embedding::EmbeddingLayer;
-use crate::linear::LinearLayer;
-use crate::lstm::LSTMLayer;
-use crate::mlstm::MLSTMLayer;
-use crate::projection::Projection;
-use crate::rms_norm::{RMSNorm, RMSNormResidual};
+use crate::nn::dropout::DropoutLayer;
+use crate::nn::embedding::EmbeddingLayer;
+use crate::nn::linear::LinearLayer;
+use crate::nn::linear_nb::LinearNBLayer;
+use crate::nn::lstm::LSTMLayer;
+use crate::nn::mlstm::MLSTMLayer;
+use crate::nn::rms_norm::{RMSNorm, RMSNormResidual};
+use crate::nn::silu_dense::SiluDenseLayer;
+use crate::nn::slstm::SLSTMLayer;
+use crate::nn::slstm_block::SLSTMBlock;
+use crate::nn::softmax::SoftmaxLayer;
 use crate::sequential::Sequential;
-use crate::silu_dense::SiluDenseLayer;
-use crate::slstm::SLSTMLayer;
-use crate::slstm_block::SLSTMBlock;
-use crate::slstm_block2::SLSTMBlock2;
-use crate::softmax::SoftmaxLayer;
 
 // ── DynCache trait ────────────────────────────────────────────────────────────
 
@@ -129,12 +126,6 @@ impl SequentialBuilder {
         }
     }
 
-    pub fn dense<A: Activate + 'static>(mut self, hidden: usize, act: A) -> Self {
-        let layer = DenseLayer::new(self.output_size, hidden, act);
-        self.layer(Box::new(layer), hidden);
-        self
-    }
-
     pub fn embedding(mut self, hidden: usize) -> Self {
         let layer = EmbeddingLayer::new(self.output_size, hidden);
         self.layer(Box::new(layer), hidden);
@@ -159,8 +150,8 @@ impl SequentialBuilder {
         self
     }
 
-    pub fn project<A: Activate + 'static>(mut self, hidden: usize, act: A) -> Self {
-        let layer = Projection::new(self.output_size, hidden, act);
+    pub fn linear_no_bias(mut self, hidden: usize) -> Self {
+        let layer = LinearNBLayer::new(self.output_size, hidden);
         self.layer(Box::new(layer), hidden);
         self
     }
@@ -204,18 +195,6 @@ impl SequentialBuilder {
         );
         let up = (hidden * 8) / 3;
         let layer = SLSTMBlock::new(hidden, up);
-        self.layer(Box::new(layer), hidden);
-        self
-    }
-
-    pub fn slstm_block2(mut self, hidden: usize) -> Self {
-        assert_eq!(
-            self.output_size, hidden,
-            "slstm_block erwartet input_size == hidden ({} != {})",
-            self.output_size, hidden,
-        );
-        let up = (hidden * 4) / 3;
-        let layer = SLSTMBlock2::new(hidden, up);
         self.layer(Box::new(layer), hidden);
         self
     }

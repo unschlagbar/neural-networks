@@ -25,7 +25,7 @@
 use std::{any::Any, io};
 
 use crate::{
-    lstm::sub_vec_in_place,
+    nn::sub_vec_in_place,
     nn_layer::{DynCache, NnLayer},
     saving::{write_f32_slice, write_u8, write_u32},
 };

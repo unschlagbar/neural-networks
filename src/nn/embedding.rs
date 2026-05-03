@@ -1,13 +1,9 @@
-#![allow(unused)]
-
-use std::{any::Any, io};
+use std::any::Any;
 
 use iron_oxide::collections::Matrix;
-use rand::{Rng, RngExt, random_range, rng};
 
 use crate::{
-    activations::Activate,
-    lstm::{add_vec_in_place, sub_in_place, sub_vec_in_place},
+    nn::sub_in_place,
     nn_layer::{DynCache, NnLayer},
 };
 
@@ -73,7 +69,6 @@ impl EmbeddingLayer {
     pub fn new(input_size: usize, hidden_size: usize) -> Self {
         let scale = (6.0 / (input_size as f32 + hidden_size as f32)).sqrt();
         let weights = Matrix::random(input_size, hidden_size, scale);
-        let scale = (1.0 / input_size as f32).sqrt();
         Self {
             weights,
             grads: EmbeddingGrads::zeros(input_size, hidden_size),

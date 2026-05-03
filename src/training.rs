@@ -14,7 +14,8 @@ use std::{
 use crate::{
     batches::PreparedDataSet,
     config::{
-        BATCH_SIZE, DATA_DIR, EPOCHS, LR, MAX_SEQ_LEN, MODEL_LOC, PRINT_EVERY, SEQ_LEN, SEQ_LOC,
+        self, BATCH_SIZE, DATA_DIR, EPOCHS, LR, MAX_SEQ_LEN, MODEL_LOC, PRINT_EVERY, SEQ_LEN,
+        SEQ_LOC,
     },
     hierarchical::HierarchicalSequential,
     model::{build_hierarchical_model, build_normal_model},
@@ -94,7 +95,7 @@ pub fn train_normal() {
 // ── HM-RNN (Chung, Ahn, Bengio 2016) ─────────────────────────────────────────
 
 pub fn train_hierarchical() {
-    let tokenizer = Rc::new(Tokenizer::new(crate::config::CHARSET, true));
+    let tokenizer = Rc::new(Tokenizer::new(config::CHARSET, false));
     let vocab = tokenizer.vocab_size();
     let sentence_boundary_ids = tokenizer.sentence_token_ids();
     let word_boundary_ids = tokenizer.word_token_ids();

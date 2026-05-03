@@ -1,5 +1,5 @@
 use crate::{
-    config::{CHAR_HIDDEN, WORD_HIDDEN},
+    config::{CHAR_HIDDEN, OUT_HIDDEN, WORD_HIDDEN},
     hierarchical::HierarchicalSequential,
     nn_layer::SequentialBuilder,
     sequential::Sequential,
@@ -32,8 +32,8 @@ pub fn build_hierarchical_model(
         .build();
 
     let char2_model = SequentialBuilder::new(CHAR_HIDDEN + WORD_HIDDEN)
-        .linear(CHAR_HIDDEN * 2)
-        .slstm_block(CHAR_HIDDEN * 2)
+        .linear(OUT_HIDDEN)
+        .slstm_block(OUT_HIDDEN)
         .rms_norm()
         .linear(vocab)
         .softmax()

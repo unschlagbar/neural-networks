@@ -7,14 +7,14 @@
 // ── Model-Pfade ──────────────────────────────────────────────────────────────
 
 /// Pfad für das hierarchische Modell (char- + sentence-level).
-pub const MODEL_LOC: &str = "models/hric2";
+pub const MODEL_LOC: &str = "models/hric";
 /// Pfad für das „normale" Char-Level-Sequential-Modell.
 pub const SEQ_LOC: &str = "models/seq";
 
 // ── Sequenz-Längen ───────────────────────────────────────────────────────────
 
 /// Trainings-Sequenzlänge (Anzahl Tokens pro BPTT-Chunk).
-pub const SEQ_LEN: usize = 1024;
+pub const SEQ_LEN: usize = 512;
 /// Reserve für den Forward-Cache (unsere BatchIter kann länger werden als SEQ_LEN).
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 
@@ -36,7 +36,7 @@ pub const BATCH_SIZE: usize = 1;
 pub const EPOCHS: usize = 1000;
 
 /// Save nach jeweils N abgeschlossenen Files (0 = nur am Ende jeder Epoche).
-pub const SAVE_EVERY: usize = 20;
+pub const SAVE_EVERY: usize = 30;
 
 /// Loss-Ausgabe alle N Trainings-Steps (= Forward-/Backward-Durchgänge über
 /// ein Window). 0 = nur am Ende jeder Epoche flushen.
@@ -45,11 +45,12 @@ pub const PRINT_EVERY: usize = 10;
 // ── Sampling ─────────────────────────────────────────────────────────────────
 
 pub const MAX_LEN: usize = 1000;
-pub const TEMPERATURE: f32 = 0.3;
+pub const TEMPERATURE: f32 = 0.0;
 
 // ── Modell-Dimensionen ───────────────────────────────────────────────────────
 
-pub const CHAR_HIDDEN: usize = 128;
+pub const CHAR_HIDDEN: usize = 64;
+pub const OUT_HIDDEN: usize = 128;
 pub const WORD_HIDDEN: usize = 256;
 
 // ── Dataset ──────────────────────────────────────────────────────────────────

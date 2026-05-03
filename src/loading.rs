@@ -8,27 +8,22 @@ use std::{
 use iron_oxide::collections::Matrix;
 
 use crate::{
-    activations::{LeakyRelu, Linear, Relu, Sigmoid, Tanh},
-    dense::DenseLayer,
-    dropout::DropoutLayer,
-    embedding::EmbeddingLayer,
-    linear::LinearLayer,
-    lstm::LSTMLayer,
+    nn::{
+        dropout::DropoutLayer,
+        embedding::EmbeddingLayer,
+        linear::LinearLayer,
+        linear_nb::LinearNBLayer,
+        lstm::LSTMLayer,
+        rms_norm::{RMSNorm, RMSNormResidual},
+        silu_dense::SiluDenseLayer,
+        slstm::SLSTMLayer,
+        slstm_block::SLSTMBlock,
+        softmax::SoftmaxLayer,
+    },
     nn_layer::NnLayer,
-    projection::Projection,
-    rms_norm::{RMSNorm, RMSNormResidual},
     saving::{MAGIC, VERSION},
     sequential::Sequential,
-    silu_dense::SiluDenseLayer,
-    slstm::SLSTMLayer,
-    slstm_block::SLSTMBlock,
-    slstm_block2::SLSTMBlock2,
-    softmax::SoftmaxLayer,
 };
-
-// Bring in IndRNN only if the module exists in this crate.
-
-//use crate::indrnn::IndRNNLayer;
 
 // ── Primitive readers ─────────────────────────────────────────────────────────
 
@@ -70,39 +65,6 @@ pub struct LoadCtx {
     pub output_size: usize,
 }
 
-pub fn load_dense(r: &mut dyn Read) -> io::Result<Box<dyn NnLayer>> {
-    let input = read_u32(r)? as usize;
-    let output = read_u32(r)? as usize;
-    let act_id = read_u8(r)?;
-    let weights = read_matrix(r)?;
-    let biases: Box<[f32]> = read_f32_vec(r)?.into();
-
-    let layer: Box<dyn NnLayer> = match act_id {
-        0 => Box::new(DenseLayer::from_loaded(
-            input, output, Linear, weights, biases,
-        )),
-        1 => Box::new(DenseLayer::from_loaded(
-            input, output, Relu, weights, biases,
-        )),
-        2 => Box::new(DenseLayer::from_loaded(
-            input, output, Tanh, weights, biases,
-        )),
-        3 => Box::new(DenseLayer::from_loaded(
-            input, output, Sigmoid, weights, biases,
-        )),
-        4 => Box::new(DenseLayer::from_loaded(
-            input, output, LeakyRelu, weights, biases,
-        )),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Unknown activation for Dense",
-            ));
-        }
-    };
-    Ok(layer)
-}
-
 pub fn load_linear(r: &mut dyn Read) -> io::Result<Box<dyn NnLayer>> {
     let input = read_u32(r)? as usize;
     let output = read_u32(r)? as usize;
@@ -123,25 +85,12 @@ pub fn load_embedding(r: &mut dyn Read) -> io::Result<Box<dyn NnLayer>> {
     Ok(layer)
 }
 
-pub fn load_projection(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
-    let act_id = read_u8(r)?;
+pub fn load_linear_nb(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
     let weights = read_matrix(r)?;
     let input = ctx.input_size;
     let output = ctx.output_size;
 
-    let layer: Box<dyn NnLayer> = match act_id {
-        0 => Box::new(Projection::from_loaded(input, output, Linear, weights)),
-        1 => Box::new(Projection::from_loaded(input, output, Relu, weights)),
-        2 => Box::new(Projection::from_loaded(input, output, Tanh, weights)),
-        3 => Box::new(Projection::from_loaded(input, output, Sigmoid, weights)),
-        4 => Box::new(Projection::from_loaded(input, output, LeakyRelu, weights)),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Unknown activation for Projection",
-            ));
-        }
-    };
+    let layer: Box<dyn NnLayer> = Box::new(LinearNBLayer::from_loaded(input, output, weights));
     Ok(layer)
 }
 
@@ -289,57 +238,8 @@ pub fn load_slstm_block(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn Nn
     )))
 }
 
-pub fn load_slstm_block2(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
-    if ctx.input_size != ctx.output_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "SLSTMBlock erwartet input_size == output_size, bekam {} != {}",
-                ctx.input_size, ctx.output_size,
-            ),
-        ));
-    }
-    let hidden_size = ctx.input_size;
-    let up_size = read_u32(r)? as usize;
-
-    let pre_gamma: Box<[f32]> = read_f32_vec(r)?.into();
-    let post_gamma: Box<[f32]> = read_f32_vec(r)?.into();
-
-    // Zell-Gewichte — identische Reihenfolge wie in load_slstm.
-    let wz = read_matrix(r)?;
-    let wi = read_matrix(r)?;
-    let wf = read_matrix(r)?;
-    let wo = read_matrix(r)?;
-    let b = read_matrix(r)?;
-    let h_init: Box<[f32]> = read_f32_vec(r)?.into();
-    let c_init: Box<[f32]> = read_f32_vec(r)?.into();
-    let cell = SLSTMLayer::from_loaded(hidden_size, hidden_size, wz, wi, wf, wo, b, h_init, c_init);
-
-    // SwiGLU.
-    let w_gate = read_matrix(r)?;
-    let b_gate: Box<[f32]> = read_f32_vec(r)?.into();
-    let w_value = read_matrix(r)?;
-    let b_value: Box<[f32]> = read_f32_vec(r)?.into();
-    let w_down = read_matrix(r)?;
-    let b_down: Box<[f32]> = read_f32_vec(r)?.into();
-
-    Ok(Box::new(SLSTMBlock2::from_loaded(
-        hidden_size,
-        up_size,
-        pre_gamma,
-        post_gamma,
-        cell,
-        w_gate,
-        b_gate,
-        w_value,
-        b_value,
-        w_down,
-        b_down,
-    )))
-}
-
 pub fn load_mlstm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
-    use crate::mlstm::MLSTMLayer;
+    use crate::nn::mlstm::MLSTMLayer;
     let w_q = read_matrix(r)?;
     let w_k = read_matrix(r)?;
     let w_v = read_matrix(r)?;
@@ -381,8 +281,7 @@ pub fn load_mlstm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>
 fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
     match tag {
         0 => load_lstm(r, ctx),
-        1 => load_dense(r),
-        3 => load_projection(r, ctx),
+        3 => load_linear_nb(r, ctx),
         4 => load_softmax(r),
         5 => load_slstm(r, ctx),
         6 => load_dropout(r, ctx),
@@ -393,7 +292,6 @@ fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLa
         11 => load_slstm_block(r, ctx),
         12 => load_linear(r),
         13 => load_mlstm(r, ctx),
-        14 => load_slstm_block2(r, ctx),
 
         o => Err(io::Error::new(
             io::ErrorKind::InvalidData,

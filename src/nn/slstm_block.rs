@@ -39,10 +39,13 @@ use iron_oxide::collections::Matrix;
 use std::{any::Any, io};
 
 use crate::{
-    lstm::{add_vec_in_place, sub_in_place, sub_vec_in_place},
+    nn::{
+        add_vec_in_place,
+        slstm::{SLSTMCache, SLSTMLayer},
+        sub_in_place, sub_vec_in_place,
+    },
     nn_layer::{DynCache, NnLayer},
     saving::{write_f32_slice, write_matrix, write_u32},
-    slstm::{SLSTMCache, SLSTMLayer},
 };
 
 const EPS: f32 = 1e-6;

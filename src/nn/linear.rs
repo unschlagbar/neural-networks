@@ -1,35 +1,32 @@
-#![allow(unused)]
-
-use std::{any::Any, io};
+use std::any::Any;
 
 use iron_oxide::collections::Matrix;
-use rand::{Rng, RngExt, random_range, rng};
+use rand::random_range;
 
 use crate::{
-    activations::Activate,
-    lstm::{add_vec_in_place, sub_in_place, sub_vec_in_place},
+    nn::{add_vec_in_place, sub_in_place, sub_vec_in_place},
     nn_layer::{DynCache, NnLayer},
 };
 
-const CLIP: f32 = 15.0;
+//const CLIP: f32 = 15.0;
 
 // ── DenseCache ────────────────────────────────────────────────────────────────
 
 pub struct LinearCache {
     /// Saved input (for ∂L/∂W = x · δᵀ).
-    pub input: Vec<f32>,
+    pub input: Box<[f32]>,
     /// Post-activation output; activation derivative is applied in-place during backward.
-    pub output: Vec<f32>,
+    pub output: Box<[f32]>,
     /// dL/d(input), populated in backward.
-    pub dx: Vec<f32>,
+    pub dx: Box<[f32]>,
 }
 
 impl LinearCache {
     pub fn new(input_size: usize, output_size: usize) -> Self {
         Self {
-            input: vec![0.0; input_size],
-            output: vec![0.0; output_size],
-            dx: vec![0.0; input_size],
+            input: vec![0.0; input_size].into(),
+            output: vec![0.0; output_size].into(),
+            dx: vec![0.0; input_size].into(),
         }
     }
 }
@@ -53,14 +50,14 @@ impl DynCache for LinearCache {
 
 pub struct LinearGrads {
     pub weights: Matrix,
-    pub biases: Vec<f32>,
+    pub biases: Box<[f32]>,
 }
 
 impl LinearGrads {
     pub fn zeros(input_size: usize, output_size: usize) -> Self {
         Self {
             weights: Matrix::zeros(input_size, output_size),
-            biases: vec![0.0; output_size],
+            biases: vec![0.0; output_size].into(),
         }
     }
 }
@@ -203,11 +200,11 @@ impl NnLayer for LinearLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
-        self.grads.weights.clip(-CLIP, CLIP);
-        self.grads
-            .biases
-            .iter_mut()
-            .for_each(|v| *v = v.clamp(-CLIP, CLIP));
+        //self.grads.weights.clip(-CLIP, CLIP);
+        //self.grads
+        //    .biases
+        //    .iter_mut()
+        //    .for_each(|v| *v = v.clamp(-CLIP, CLIP));
         sub_in_place(&mut self.weights, &self.grads.weights, lr);
         sub_vec_in_place(&mut self.biases, &self.grads.biases, lr);
     }

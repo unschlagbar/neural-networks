@@ -20,7 +20,7 @@
 use iron_oxide::collections::Matrix;
 
 use crate::{
-    lstm::{add_vec_in_place, sub_in_place, sub_vec_in_place},
+    nn::{add_vec_in_place, sub_in_place, sub_vec_in_place},
     nn_layer::{DynCache, NnLayer},
     saving,
 };

@@ -1,38 +1,36 @@
-#![allow(unused)]
-
-use std::{any::Any, io};
+use std::any::Any;
 
 use iron_oxide::collections::Matrix;
-use rand::{Rng, RngExt, random_range, rng};
 
 use crate::{
-    activations::Activate,
-    lstm::{add_vec_in_place, sub_in_place, sub_vec_in_place},
+    nn::sub_in_place,
     nn_layer::{DynCache, NnLayer},
 };
 
+const CLIP: f32 = 15.0;
+
 // ── DenseCache ────────────────────────────────────────────────────────────────
 
-pub struct DenseCache {
+pub struct LinearNBCache {
     /// Saved input (for ∂L/∂W = x · δᵀ).
-    pub input: Vec<f32>,
+    pub input: Box<[f32]>,
     /// Post-activation output; activation derivative is applied in-place during backward.
-    pub output: Vec<f32>,
+    pub output: Box<[f32]>,
     /// dL/d(input), populated in backward.
-    pub dx: Vec<f32>,
+    pub dx: Box<[f32]>,
 }
 
-impl DenseCache {
+impl LinearNBCache {
     pub fn new(input_size: usize, output_size: usize) -> Self {
         Self {
-            input: vec![0.0; input_size],
-            output: vec![0.0; output_size],
-            dx: vec![0.0; input_size],
+            input: vec![0.0; input_size].into(),
+            output: vec![0.0; output_size].into(),
+            dx: vec![0.0; input_size].into(),
         }
     }
 }
 
-impl DynCache for DenseCache {
+impl DynCache for LinearNBCache {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
@@ -49,74 +47,59 @@ impl DynCache for DenseCache {
 
 // ── DenseGrads (stored inside the layer) ─────────────────────────────────────
 
-pub struct DenseGrads {
+pub struct LinearNBGrads {
     pub weights: Matrix,
-    pub biases: Vec<f32>,
 }
 
-impl DenseGrads {
+impl LinearNBGrads {
     pub fn zeros(input_size: usize, output_size: usize) -> Self {
         Self {
             weights: Matrix::zeros(input_size, output_size),
-            biases: vec![0.0; output_size],
         }
     }
 }
 
 // ── DenseLayer ────────────────────────────────────────────────────────────────
 
-pub struct DenseLayer<A: Activate> {
+pub struct LinearNBLayer {
     pub weights: Matrix,
-    pub biases: Box<[f32]>,
-    pub activation: A,
     /// Gradient accumulators — cleared per batch, applied in `sgd_step`.
-    pub grads: DenseGrads,
+    pub grads: LinearNBGrads,
 }
 
-impl<A: Activate> DenseLayer<A> {
-    pub fn new(input_size: usize, hidden_size: usize, activation: A) -> Self {
+impl LinearNBLayer {
+    pub fn new(input_size: usize, hidden_size: usize) -> Self {
         let scale = (6.0 / (input_size as f32 + hidden_size as f32)).sqrt();
         let weights = Matrix::random(input_size, hidden_size, scale);
-        let scale = (1.0 / input_size as f32).sqrt();
-        let biases = (0..hidden_size)
-            .map(|_| random_range(-scale..scale))
-            .collect();
+
         Self {
             weights,
-            biases,
-            activation,
-            grads: DenseGrads::zeros(input_size, hidden_size),
+            grads: LinearNBGrads::zeros(input_size, hidden_size),
         }
     }
 
-    pub fn from_loaded(
-        input_size: usize,
-        output_size: usize,
-        activation: A,
-        weights: Matrix,
-        biases: Box<[f32]>,
-    ) -> Self {
+    pub fn zeroed(input_size: usize, hidden_size: usize) -> Self {
+        let weights = Matrix::zeros(input_size, hidden_size);
+        Self {
+            weights,
+            grads: LinearNBGrads::zeros(input_size, hidden_size),
+        }
+    }
+
+    pub fn from_loaded(input_size: usize, output_size: usize, weights: Matrix) -> Self {
         debug_assert_eq!(weights.rows(), input_size);
         debug_assert_eq!(weights.cols(), output_size);
-        debug_assert_eq!(biases.len(), output_size);
 
         Self {
             weights,
-            biases,
-            activation,
-            grads: DenseGrads::zeros(input_size, output_size),
+            grads: LinearNBGrads::zeros(input_size, output_size),
         }
-    }
-
-    /// Convenience: pass a concrete activation directly — it is boxed internally.
-    pub fn with_activation(input_size: usize, output_size: usize, activation: A) -> Self {
-        Self::new(input_size, output_size, activation)
     }
 
     /// matmul + bias into a pre-allocated output buffer.
     #[inline]
-    fn matmul_add_bias(&self, input: &[f32], out: &mut [f32]) {
-        out.copy_from_slice(&self.biases);
+    fn matmul(&self, input: &[f32], out: &mut [f32]) {
+        out.fill(0.0);
         for (i, &x) in input.iter().enumerate() {
             for (j, &w) in self.weights[i].iter().enumerate() {
                 out[j] += x * w;
@@ -125,10 +108,9 @@ impl<A: Activate> DenseLayer<A> {
     }
 
     /// Standard forward: z = Wx+b → activation(z).
-    pub fn forward(&self, input: &[f32], cache: &mut DenseCache) {
+    pub fn forward(&self, input: &[f32], cache: &mut LinearNBCache) {
         cache.input.copy_from_slice(input);
-        self.matmul_add_bias(input, &mut cache.output);
-        self.activation.activate(&mut cache.output);
+        self.matmul(input, &mut cache.output);
     }
 
     /// Backward.
@@ -138,15 +120,8 @@ impl<A: Activate> DenseLayer<A> {
     ///   - Softmax output layer: caller passes the fused cross-entropy gradient ŷ−y.
     ///
     /// `cache.dx` ← dL/d(input) = Wᵀ · delta.
-    pub fn backward(&mut self, delta: &mut [f32], cache: &mut DenseCache) {
-        self.activation.derivative_active(&mut cache.output);
-        delta
-            .iter_mut()
-            .zip(&cache.output)
-            .for_each(|(d, o)| *d *= o);
-
+    pub fn backward(&mut self, delta: &mut [f32], cache: &mut LinearNBCache) {
         self.grads.weights.add_outer(&cache.input, delta);
-        add_vec_in_place(&mut self.grads.biases, delta);
 
         cache.dx.fill(0.0);
         for (i, dx) in cache.dx.iter_mut().enumerate() {
@@ -166,38 +141,36 @@ impl<A: Activate> DenseLayer<A> {
 
 // ── impl NnLayer for DenseLayer ───────────────────────────────────────────────
 
-impl<A: Activate> NnLayer for DenseLayer<A> {
+impl NnLayer for LinearNBLayer {
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()
-            .downcast_mut::<DenseCache>()
+            .downcast_mut::<LinearNBCache>()
             .expect("DenseLayer::forward — expected DenseCache");
-        DenseLayer::forward(self, input, c);
+        LinearNBLayer::forward(self, input, c);
     }
 
     fn backward(&mut self, delta: &mut [f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()
-            .downcast_mut::<DenseCache>()
+            .downcast_mut::<LinearNBCache>()
             .expect("DenseLayer::backward — expected DenseCache");
-        DenseLayer::backward(self, delta, c);
+        LinearNBLayer::backward(self, delta, c);
     }
 
     fn layer_tag(&self) -> u8 {
-        1
+        3
     } // TAG_DENSE
 
     fn save(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         crate::saving::write_u32(w, self.input_size() as u32)?;
         crate::saving::write_u32(w, self.output_size() as u32)?;
-        crate::saving::write_u8(w, self.activation.activation_id())?;
         crate::saving::write_matrix(w, &self.weights)?;
-        crate::saving::write_f32_slice(w, &self.biases)?;
         Ok(())
     }
 
     fn make_cache(&self) -> Box<dyn DynCache> {
-        Box::new(DenseCache::new(self.input_size(), self.output_size()))
+        Box::new(LinearNBCache::new(self.input_size(), self.output_size()))
     }
 
     fn input_size(&self) -> usize {
@@ -208,17 +181,15 @@ impl<A: Activate> NnLayer for DenseLayer<A> {
     }
 
     fn apply_grads(&mut self, lr: f32) {
+        self.grads.weights.clip(-CLIP, CLIP);
         sub_in_place(&mut self.weights, &self.grads.weights, lr);
-        sub_vec_in_place(&mut self.biases, &self.grads.biases, lr);
     }
 
     fn clear_grads(&mut self) {
         self.grads.weights.clear();
-        self.grads.biases.fill(0.0);
     }
 
     fn scale_grads(&mut self, scale: f32) {
         self.grads.weights.scale(scale);
-        self.grads.biases.iter_mut().for_each(|x| *x *= scale);
     }
 }

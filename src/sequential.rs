@@ -5,9 +5,8 @@ use rand::random_range;
 
 use crate::{
     config::{SAVE_EVERY, SEQ_LOC},
-    lstm::one_hot,
+    nn::{one_hot, softmax::softmax},
     nn_layer::{DynCache, NnLayer},
-    softmax::softmax,
 };
 
 // ── Sequential ────────────────────────────────────────────────────────────────

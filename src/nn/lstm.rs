@@ -2,6 +2,7 @@ use iron_oxide::collections::Matrix;
 
 use crate::{
     activations::sigmoid,
+    nn::{add_vec_in_place, sub_in_place, sub_vec_in_place},
     nn_layer::{DynCache, NnLayer},
     saving,
 };
@@ -377,32 +378,6 @@ impl NnLayer for LSTMLayer {
         add_vec_in_place(&mut self.grads.h_init_grad, &self.dh_bptt);
         add_vec_in_place(&mut self.grads.c_init_grad, &self.dc_bptt);
     }
-}
-
-// ── standalone helpers ────────────────────────────────────────────────────────
-
-pub fn one_hot(index: usize, size: usize) -> Vec<f32> {
-    let mut out = vec![0.0; size];
-    out[index] = 1.0;
-    out
-}
-
-pub fn add_vec_in_place(x: &mut [f32], y: &[f32]) {
-    debug_assert_eq!(x.len(), y.len());
-    x.iter_mut().zip(y).for_each(|(x, y)| *x += y);
-}
-
-pub fn sub_in_place(a: &mut Matrix, b: &Matrix, lr: f32) {
-    debug_assert_eq!(a.rows(), b.rows());
-    debug_assert_eq!(a.cols(), b.cols());
-    a.as_slice_mut()
-        .iter_mut()
-        .zip(b.as_slice())
-        .for_each(|(a, b)| *a -= lr * b);
-}
-
-pub fn sub_vec_in_place(a: &mut [f32], b: &[f32], lr: f32) {
-    a.iter_mut().zip(b).for_each(|(a, b)| *a -= lr * b);
 }
 
 #[inline]

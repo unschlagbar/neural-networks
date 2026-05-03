@@ -1,12 +1,10 @@
-#![allow(unused)]
-
 use std::any::Any;
 
 use iron_oxide::collections::Matrix;
 use rand::random_range;
 
 use crate::{
-    lstm::{add_vec_in_place, sub_in_place, sub_vec_in_place},
+    nn::{add_vec_in_place, sub_in_place, sub_vec_in_place},
     nn_layer::{DynCache, NnLayer},
 };
 
