@@ -45,7 +45,7 @@ pub const PRINT_EVERY: usize = 10;
 // ── Sampling ─────────────────────────────────────────────────────────────────
 
 pub const MAX_LEN: usize = 1000;
-pub const TEMPERATURE: f32 = 0.0;
+pub const TEMPERATURE: f32 = 0.3;
 
 // ── Modell-Dimensionen ───────────────────────────────────────────────────────
 

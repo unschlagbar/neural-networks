@@ -313,10 +313,6 @@ impl HierarchicalSequential {
                     layer.accumulate_init_grad();
                     layer.zero_bptt_state();
                 }
-                for layer in &mut self.high_model.layers {
-                    layer.accumulate_init_grad();
-                    layer.zero_bptt_state();
-                }
                 // checked_sub: gibt None wenn bi == 0 → keine weiteren Boundaries
                 boundary_i = boundary_i.and_then(|bi| bi.checked_sub(1));
             }
@@ -329,6 +325,10 @@ impl HierarchicalSequential {
             layer.zero_bptt_state();
         }
         for layer in &mut self.char2_model.layers {
+            layer.accumulate_init_grad();
+            layer.zero_bptt_state();
+        }
+        for layer in &mut self.high_model.layers {
             layer.accumulate_init_grad();
             layer.zero_bptt_state();
         }
