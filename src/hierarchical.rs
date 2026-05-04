@@ -1,7 +1,6 @@
 use std::{
     fs::File,
     io::{self, Cursor, Read, Write},
-    mem,
     time::Instant,
     u32,
 };
@@ -24,20 +23,14 @@ pub struct HierarchicalSequential {
     pub context_size: usize,
 
     pub boundary_token_ids: Vec<u16>,
-
-    word_context: Box<[f32]>,
     boundary_timesteps: Vec<usize>,
 
     delta_buf: Box<[f32]>,
 
-    char_input_buf: Box<[f32]>,
-    high_input_buf: Box<[f32]>,
+    char_input: Box<[f32]>,
+    char2_input: Box<[f32]>,
 
-    // ── Backward scratch (pre-allocated, never heap during training) ──────────
-    d_high_ctx: Box<[f32]>,         // [context_size]
-    d_char1_carry: Box<[f32]>,      // [char_output]
-    d_char1_new_carry: Box<[f32]>,  // [char_output]
-    d_char1_from_char2: Box<[f32]>, // [char_output]
+    d_high_ctx: Box<[f32]>,
 
     pub last_high_grad_signal: f32,
 }
@@ -52,44 +45,35 @@ impl HierarchicalSequential {
         boundary_token_ids: Vec<u16>,
     ) -> Self {
         let context_size = word_model.output_size;
+
         assert_eq!(
             char_model.input_size, vocab_size,
             "char_model.input_size must equal vocab_size"
         );
-
         assert_eq!(
             char2_model.output_size, vocab_size,
             "char2_model.output_size must equal vocab_size"
         );
-
-        // Paper (Hwang & Sung 2016): the boundary token itself is fed to the
-        // word-level (high) module together with the character embedding.
-        // Therefore high_model.input_size = char_model.output_size + vocab_size.
+        // word_model now only receives char1_out — no boundary token one-hot
         assert_eq!(
-            char_model.output_size + vocab_size,
-            word_model.input_size,
-            "high_model.input_size must equal char_model.output_size + vocab_size (boundary char is concatenated to the word embedding)"
+            char_model.output_size, word_model.input_size,
+            "word_model.input_size must equal char_model.output_size"
         );
-
         assert_eq!(
             char2_model.input_size,
-            word_model.output_size + char_model.output_size
+            word_model.output_size + char_model.output_size,
+            "char2_model.input_size must equal word_model.output_size + char_model.output_size"
         );
 
-        let char_input_buf = vec![0.0; vocab_size].into();
-        let high_input_buf = vec![0.0; char_model.output_size + vocab_size].into();
-        let word_context = vec![0.0; char_model.output_size + context_size].into();
+        let char_input = vec![0.0; vocab_size].into();
+        let char2_input = vec![0.0; char_model.output_size + context_size].into();
 
         let buf_size = vocab_size
-            .max(char2_model.input_size) // char_output + context_size
-            .max(char_model.output_size + vocab_size); // high i
+            .max(char2_model.input_size)
+            .max(char_model.output_size);
 
         let delta_buf = vec![0.0; buf_size].into();
-
         let d_high_ctx = vec![0.0; context_size].into();
-        let d_char1_carry = vec![0.0; char_model.output_size].into();
-        let d_char1_new_carry = vec![0.0; char_model.output_size].into();
-        let d_char1_from_char2 = vec![0.0; char_model.output_size].into();
 
         Self {
             char_model,
@@ -98,15 +82,11 @@ impl HierarchicalSequential {
             vocab_size,
             context_size,
             boundary_token_ids,
-            word_context,
+            char2_input,
             delta_buf,
             boundary_timesteps: vec![],
-            char_input_buf,
-            high_input_buf,
+            char_input,
             d_high_ctx,
-            d_char1_carry,
-            d_char1_new_carry,
-            d_char1_from_char2,
             last_high_grad_signal: 0.0,
         }
     }
@@ -166,27 +146,34 @@ impl HierarchicalSequential {
         }
     }
 
-    // ── Forward (training) ───────────────────────────────────────────────────
-
     pub fn forward_over(&mut self, input: &[u16]) {
-        self.word_context.fill(0.0);
+        self.char2_input.fill(0.0);
         let char_output = self.char_model.output_size;
+
         for t in 0..input.len() {
             let token = input[t];
+
+            // ── 1. char1 forward ──────────────────────────────────────────────
+            self.char_input.fill(0.0);
+            self.char_input[token as usize] = 1.0;
+            Self::forward_step(
+                &mut self.char_model.layers,
+                &mut self.char_model.cache[t],
+                &self.char_input,
+            );
+            {
+                let char1_out = self.char_model.cache[t].last().unwrap().output();
+                self.char2_input[..char_output].copy_from_slice(char1_out);
+            }
 
             if self.boundary_token_ids.contains(&token) {
                 self.boundary_timesteps.push(t);
                 let word_idx = self.boundary_timesteps.len() - 1;
 
-                self.high_input_buf[..char_output]
-                    .copy_from_slice(&self.word_context[..char_output]);
-                self.high_input_buf[char_output..].fill(0.0);
-                self.high_input_buf[char_output + token as usize] = 1.0;
-
                 Self::forward_step(
                     &mut self.word_model.layers,
                     &mut self.word_model.cache[word_idx],
-                    &self.high_input_buf,
+                    &self.char2_input[..char_output],
                 );
 
                 for layer in &mut self.char_model.layers {
@@ -198,30 +185,18 @@ impl HierarchicalSequential {
 
                 let high_out = self.word_model.cache[word_idx].last().unwrap().output();
                 self.assert_no_nan(high_out, "high_output", word_idx);
-                self.word_context[char_output..].copy_from_slice(high_out);
+                self.char2_input[char_output..].copy_from_slice(high_out);
             }
 
-            self.char_input_buf.fill(0.0);
-            self.char_input_buf[token as usize] = 1.0;
-
-            Self::forward_step(
-                &mut self.char_model.layers,
-                &mut self.char_model.cache[t],
-                &self.char_input_buf,
-            );
-
-            let char1_output = self.char_model.cache[t].last().unwrap().output();
-            self.word_context[..char_output].copy_from_slice(char1_output);
-
+            // ── 2. char2 forward ──────────────────────────────────────────────
             Self::forward_step(
                 &mut self.char2_model.layers,
                 &mut self.char2_model.cache[t],
-                &self.word_context,
+                &self.char2_input,
             );
-
             self.assert_no_nan(
                 self.char2_model.cache[t].last().unwrap().output(),
-                "char_output",
+                "char2_output",
                 t,
             );
         }
@@ -236,19 +211,13 @@ impl HierarchicalSequential {
         let context_size = self.context_size;
 
         let mut high_grad_accum = 0.0;
-
         self.d_high_ctx.fill(0.0);
-        self.d_char1_carry.fill(0.0);
-        self.d_char1_new_carry.fill(0.0);
-        self.d_char1_from_char2.fill(0.0);
 
         let mut boundary_i: Option<usize> = self.boundary_timesteps.len().checked_sub(1);
 
         for t in (0..targets.len()).rev() {
-            // Prüfe ob aktuelles t eine Boundary ist
             let boundary = boundary_i.filter(|&bi| self.boundary_timesteps[bi] == t);
 
-            // ── 1. char2 backward ─────────────────────────────────────────────────
             let out_len = {
                 let out = self.char2_model.cache[t].last().unwrap().output();
                 let len = out.len();
@@ -256,18 +225,31 @@ impl HierarchicalSequential {
                 len
             };
             self.delta_buf[targets[t] as usize] -= 1.0;
+
             backward_through_layers(
                 &mut self.char2_model.layers,
                 &mut self.char2_model.cache[t],
                 &mut self.delta_buf,
                 out_len,
             );
+
+            if let Some(_) = boundary {
+                for layer in &mut self.char2_model.layers {
+                    layer.accumulate_init_grad();
+                    layer.zero_bptt_state();
+                }
+                for layer in &mut self.char_model.layers {
+                    layer.accumulate_init_grad();
+                    layer.zero_bptt_state();
+                }
+            }
+
             {
                 let dx2 = self.char2_model.cache[t][0].input_grad();
-                self.d_char1_from_char2.copy_from_slice(&dx2[..char_output]);
                 for i in 0..context_size {
                     self.d_high_ctx[i] += dx2[char_output + i];
                 }
+                self.delta_buf[..char_output].copy_from_slice(&dx2[..char_output]);
             }
 
             if let Some(bi) = boundary {
@@ -281,17 +263,11 @@ impl HierarchicalSequential {
                     context_size,
                 );
 
-                // d_hi[..char_output] = ∂L/∂char_model.output[t-1]
-                // → Carry für die nächste Iteration (t-1), NICHT für t!
                 let d_hi = self.word_model.cache[bi][0].input_grad();
-                self.d_char1_new_carry.copy_from_slice(&d_hi[..char_output]);
+                for i in 0..char_output {
+                    self.delta_buf[i] += d_hi[i];
+                }
                 self.d_high_ctx.fill(0.0);
-            } else {
-                self.d_char1_new_carry.fill(0.0);
-            }
-
-            for i in 0..char_output {
-                self.delta_buf[i] = self.d_char1_from_char2[i] + self.d_char1_carry[i];
             }
 
             backward_through_layers(
@@ -301,28 +277,17 @@ impl HierarchicalSequential {
                 char_output,
             );
 
-            // ── 4. Boundary: BPTT-States zurücksetzen ─────────────────────────────
-            if boundary.is_some() {
-                for layer in &mut self.char_model.layers {
-                    layer.accumulate_init_grad();
-                    layer.zero_bptt_state();
-                }
-                for layer in &mut self.char2_model.layers {
-                    layer.accumulate_init_grad();
-                    layer.zero_bptt_state();
-                }
+            if let Some(_) = boundary {
                 boundary_i = boundary_i.and_then(|bi| bi.checked_sub(1));
             }
-
-            mem::swap(&mut self.d_char1_carry, &mut self.d_char1_new_carry);
         }
 
         for layer in &mut self.char_model.layers {
-            layer.accumulate_init_grad();
+            //layer.accumulate_init_grad();
             layer.zero_bptt_state();
         }
         for layer in &mut self.char2_model.layers {
-            layer.accumulate_init_grad();
+            //layer.accumulate_init_grad();
             layer.zero_bptt_state();
         }
         for layer in &mut self.word_model.layers {
@@ -396,18 +361,6 @@ impl HierarchicalSequential {
                 }
             }
         }
-
-        if window_steps > 0 {
-            let avg = window_loss / window_steps as f32;
-            println!(
-                "  step {:>7} | upd {:>5} | char loss {:.4} | ppl {:.4} | high ∇ {:.4}  (flush)",
-                *step,
-                *j,
-                avg,
-                avg.exp(),
-                self.last_high_grad_signal,
-            );
-        }
     }
 
     pub fn sample(
@@ -417,18 +370,15 @@ impl HierarchicalSequential {
         temperature: f32,
         mut callback: impl FnMut(u16) -> bool,
     ) -> Vec<u16> {
-        // Ensure at least one scratch cache slot exists.
         if self.char_model.cache.is_empty() {
             self.make_cache(1);
         }
 
         self.reset();
-        self.word_context.fill(0.0);
+        self.char2_input.fill(0.0);
 
         let char_output = self.char_model.output_size;
 
-        // Warm up the model state from the prefix (all tokens but the last),
-        // then seed the generation loop with the last prefix token.
         let mut last_token = if prefix.is_empty() {
             rand::random_range(0..self.vocab_size) as u16
         } else {
@@ -441,53 +391,32 @@ impl HierarchicalSequential {
         let mut out = Vec::with_capacity(max_len);
 
         for _ in 0..max_len {
-            // ── 1. Forward char_model ─────────────────────────────────────────
-            self.char_input_buf.fill(0.0);
-            self.char_input_buf[last_token as usize] = 1.0;
+            // ── 1. char1 forward ──────────────────────────────────────────────
+            self.char_input.fill(0.0);
+            self.char_input[last_token as usize] = 1.0;
             Self::forward_sample_step(
                 &mut self.char_model.layers,
                 &mut self.char_model.cache[0],
-                &self.char_input_buf,
+                &self.char_input,
             );
-
-            // ── 2. Update word_context[..char_output] with char1 output ───────
             {
                 let char1_out = self.char_model.cache[0].last().unwrap().output();
-                self.word_context[..char_output].copy_from_slice(char1_out);
+                self.char2_input[..char_output].copy_from_slice(char1_out);
             }
 
-            // ── 3. Forward char2_model → logits ───────────────────────────────
-            Self::forward_sample_step(
-                &mut self.char2_model.layers,
-                &mut self.char2_model.cache[0],
-                &self.word_context,
-            );
-
-            // ── 4. Temperature-scaled sampling ────────────────────────────────
-            let next_token = {
-                let logits = self.char2_model.cache[0].last().unwrap().output();
-                let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature.max(1e-8)).collect();
-                let probs = softmax(&scaled);
-                self.sample_from_probs(&probs)
-            };
-
-            // ── 5. Boundary: run high_model, reset char/char2 ─────────────────
-            if self.boundary_token_ids.contains(&next_token) {
-                // high_input = [char1_out | one_hot(next_token)]
+            // ── 2. boundary: word_model with char1_out only, then reset ───────
+            if self.boundary_token_ids.contains(&last_token) {
                 {
                     let char1_out = self.char_model.cache[0].last().unwrap().output();
-                    self.high_input_buf[..char_output].copy_from_slice(char1_out);
-                    self.high_input_buf[char_output..].fill(0.0);
-                    self.high_input_buf[char_output + next_token as usize] = 1.0;
+                    Self::forward_sample_step(
+                        &mut self.word_model.layers,
+                        &mut self.word_model.cache[0],
+                        &char1_out,
+                    );
                 }
-                Self::forward_sample_step(
-                    &mut self.word_model.layers,
-                    &mut self.word_model.cache[0],
-                    &self.high_input_buf,
-                );
                 {
                     let high_out = self.word_model.cache[0].last().unwrap().output();
-                    self.word_context[char_output..].copy_from_slice(high_out);
+                    self.char2_input[char_output..].copy_from_slice(high_out);
                 }
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
@@ -496,6 +425,21 @@ impl HierarchicalSequential {
                     layer.reset_state();
                 }
             }
+
+            // ── 3. char2 → logits ─────────────────────────────────────────────
+            Self::forward_sample_step(
+                &mut self.char2_model.layers,
+                &mut self.char2_model.cache[0],
+                &self.char2_input,
+            );
+
+            // ── 4. temperature-scaled sampling ────────────────────────────────
+            let next_token = {
+                let logits = self.char2_model.cache[0].last().unwrap().output();
+                let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature.max(1e-8)).collect();
+                let probs = softmax(&scaled);
+                self.sample_from_probs(&probs)
+            };
 
             out.push(next_token);
             if !callback(next_token) {
@@ -509,33 +453,38 @@ impl HierarchicalSequential {
 
     fn forward_sample_prefix(&mut self, prefix: &[u16]) {
         let char_output = self.char_model.output_size;
-        self.word_context.fill(0.0);
+        self.char2_input.fill(0.0);
 
         for t in 0..prefix.len() {
             let token = prefix[t];
 
-            let is_boundary = self.boundary_token_ids.contains(&token);
-            if is_boundary {
-                // Fill high_input_buf = [char1_out | one_hot(boundary_token)]
+            // ── 1. char1 forward ──────────────────────────────────────────────
+            self.char_input.fill(0.0);
+            self.char_input[token as usize] = 1.0;
+            Self::forward_sample_step(
+                &mut self.char_model.layers,
+                &mut self.char_model.cache[0],
+                &self.char_input,
+            );
+            {
+                let char1_out = self.char_model.cache[0].last().unwrap().output();
+                self.char2_input[..char_output].copy_from_slice(char1_out);
+            }
+
+            // ── 2. boundary: word_model with char1_out only, then reset ───────
+            if self.boundary_token_ids.contains(&token) {
                 {
                     let char1_out = self.char_model.cache[0].last().unwrap().output();
-                    self.high_input_buf[..char_output].copy_from_slice(char1_out);
-                    self.high_input_buf[char_output..].fill(0.0);
-                    self.high_input_buf[char_output + token as usize] = 1.0;
+                    Self::forward_sample_step(
+                        &mut self.word_model.layers,
+                        &mut self.word_model.cache[0],
+                        &char1_out,
+                    );
                 }
-                Self::forward_sample_step(
-                    &mut self.word_model.layers,
-                    &mut self.word_model.cache[0],
-                    &self.high_input_buf,
-                );
-
-                // Update high context in word_context
                 {
                     let high_out = self.word_model.cache[0].last().unwrap().output();
-                    self.word_context[char_output..].copy_from_slice(high_out);
+                    self.char2_input[char_output..].copy_from_slice(high_out);
                 }
-
-                // Reset char/char2 — next char starts a fresh word
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
@@ -544,27 +493,11 @@ impl HierarchicalSequential {
                 }
             }
 
-            // Forward char_model
-            self.char_input_buf.fill(0.0);
-            self.char_input_buf[token as usize] = 1.0;
-
-            Self::forward_sample_step(
-                &mut self.char_model.layers,
-                &mut self.char_model.cache[0],
-                &self.char_input_buf,
-            );
-
-            // Copy char1 output into word_context
-            {
-                let char1_out = self.char_model.cache[0].last().unwrap().output();
-                self.word_context[..char_output].copy_from_slice(char1_out);
-            }
-
-            // Forward char2_model (we only need the state update, output discarded)
+            // ── 3. char2 state update (output discarded) ──────────────────────
             Self::forward_sample_step(
                 &mut self.char2_model.layers,
                 &mut self.char2_model.cache[0],
-                &self.word_context,
+                &self.char2_input,
             );
         }
     }
@@ -582,21 +515,11 @@ impl HierarchicalSequential {
     }
 
     // ── Persistence ───────────────────────────────────────────────────────────
-    //
-    // Format:
-    //   HIER_MAGIC    u32
-    //   vocab_size    u32
-    //   context_size  u32
-    //   n_boundaries  u32
-    //   boundary_ids  [u16 × n_boundaries]
-    //   char_model    <Sequential blob>
-    //   high_model    <Sequential blob>
 
     pub fn save(&self, path: &str) -> io::Result<()> {
         let mut buf = Cursor::new(Vec::<u8>::new());
         let w = &mut buf as &mut dyn Write;
 
-        // Header
         crate::saving::write_u32(w, HIER_MAGIC)?;
         write_u32(w, self.vocab_size as u32)?;
         write_u32(w, self.context_size as u32)?;
@@ -605,7 +528,6 @@ impl HierarchicalSequential {
             write_u16(w, id)?;
         }
 
-        // Sub-models
         self.char_model.write_to(w)?;
         self.char2_model.write_to(w)?;
         self.word_model.write_to(w)?;
@@ -637,19 +559,14 @@ impl HierarchicalSequential {
         let high_model = Sequential::load_from(r)?;
 
         let char_input_buf = vec![0.0; vocab_size].into();
-        let high_input_buf = vec![0.0; char_model.output_size + vocab_size].into();
-        let word_context = vec![0.0; char_model.output_size + context_size].into();
+        let char2_input = vec![0.0; char_model.output_size + context_size].into();
 
         let buf_size = vocab_size
-            .max(char2_model.input_size) // char_output + context_size
-            .max(char_model.output_size + vocab_size); // high i
+            .max(char2_model.input_size)
+            .max(char_model.output_size);
 
         let delta_buf = vec![0.0; buf_size].into();
-
         let d_high_ctx = vec![0.0; context_size].into();
-        let d_char1_carry = vec![0.0; char_model.output_size].into();
-        let d_char1_new_carry = vec![0.0; char_model.output_size].into();
-        let d_char1_from_char2 = vec![0.0; char_model.output_size].into();
 
         Ok(Self {
             vocab_size,
@@ -658,15 +575,11 @@ impl HierarchicalSequential {
             char_model,
             char2_model,
             word_model: high_model,
-            word_context,
+            char2_input,
             delta_buf,
             boundary_timesteps: vec![],
-            char_input_buf,
-            high_input_buf,
+            char_input: char_input_buf,
             d_high_ctx,
-            d_char1_carry,
-            d_char1_new_carry,
-            d_char1_from_char2,
             last_high_grad_signal: 0.0,
         })
     }

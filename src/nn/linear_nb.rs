@@ -163,8 +163,6 @@ impl NnLayer for LinearNBLayer {
     } // TAG_DENSE
 
     fn save(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
-        crate::saving::write_u32(w, self.input_size() as u32)?;
-        crate::saving::write_u32(w, self.output_size() as u32)?;
         crate::saving::write_matrix(w, &self.weights)?;
         Ok(())
     }

@@ -97,7 +97,6 @@ pub fn train_normal() {
 pub fn train_hierarchical() {
     let tokenizer = Rc::new(Tokenizer::new(config::CHARSET, false));
     let vocab = tokenizer.vocab_size();
-    let sentence_boundary_ids = tokenizer.sentence_token_ids();
     let word_boundary_ids = tokenizer.word_token_ids();
 
     let mut model = match HierarchicalSequential::load(MODEL_LOC) {
@@ -107,14 +106,14 @@ pub fn train_hierarchical() {
         }
         Err(e) => {
             println!("Could not load '{MODEL_LOC}' ({e}) — creating new HM-RNN.");
-            build_hierarchical_model(vocab, word_boundary_ids)
+            build_hierarchical_model(vocab, word_boundary_ids.clone())
         }
     };
     model.make_cache(MAX_SEQ_LEN);
 
     println!("Preparing dataset from '{DATA_DIR}' ...");
     let prep_start = Instant::now();
-    let mut data = PreparedDataSet::from_dir(&tokenizer, DATA_DIR, SEQ_LEN, &sentence_boundary_ids);
+    let mut data = PreparedDataSet::from_dir(&tokenizer, DATA_DIR, SEQ_LEN, &word_boundary_ids);
     println!(
         "  {} files → {} windows, {} tokens (prep took {:.1?})",
         data.num_sequences(),

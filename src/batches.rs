@@ -91,7 +91,7 @@ impl PreparedDataSet {
 
         //this.iter().skip(2).take(2).for_each(|t| {
         //    println!(
-        //        "input: \"{}\", output: \"{}\"",
+        //        "input: \"{}\"\n output: \"{}\"",
         //        tokenizer.display_tokens(t.0),
         //        tokenizer.display_tokens(t.1)
         //    )
@@ -201,7 +201,7 @@ fn build_windows(sequences: &[Vec<u16>], seq_len: usize, boundary_ids: &[u16]) -
                     start: idx as u32,
                     end: end as u32,
                 });
-                idx = end + 1;
+                idx = end;
             }
         }
         out

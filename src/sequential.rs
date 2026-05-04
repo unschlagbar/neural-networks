@@ -91,6 +91,22 @@ impl Sequential {
         logits
     }
 
+    pub fn forward(&mut self, input: u16) -> &[f32] {
+        let n = self.layers.len();
+        let out_layer = n - 1;
+
+        let Sequential {
+            output_size,
+            layers,
+            cache,
+            ..
+        } = self;
+
+        let input_vec = one_hot(input as usize, *output_size);
+        Self::forward_sample_step(&mut layers[..], &mut cache[0], &input_vec);
+        cache[0][out_layer].output()
+    }
+
     // ── backward ──────────────────────────────────────────────────────────────
 
     pub fn backwards_sequence(&mut self, targets: &[u16]) {
@@ -159,13 +175,10 @@ impl Sequential {
             window_tokens += inputs.len();
             *step += 1;
 
-            for layer in &mut self.layers {
-                layer.zero_bptt_state();
-            }
             self.backwards_sequence(targets);
-
             for layer in &mut self.layers {
                 layer.accumulate_init_grad();
+                layer.zero_bptt_state();
             }
 
             *iteration += 1;
@@ -224,17 +237,15 @@ impl Sequential {
         let mut out = Vec::with_capacity(max_len);
 
         for _ in 0..max_len {
-            let logits = self.forward_sample(&[last_token]);
-            let p = &logits[0];
-            let cols = logits.cols();
+            let logits = self.forward(last_token);
 
             // Temperature scaling + softmax for sampling — this path runs outside
             // the training hot loop, so the two small Vec allocs here are fine.
-            let scaled: Vec<f32> = p.iter().map(|&v| v / temperature.max(1e-8)).collect();
+            let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature.max(1e-8)).collect();
             let q = softmax(&scaled);
 
-            let mut idx: Vec<usize> = (0..cols).collect();
-            idx.sort_unstable_by(|&a, &b| p[b].partial_cmp(&p[a]).unwrap());
+            let mut idx: Vec<usize> = (0..logits.len()).collect();
+            idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
 
             let r = random_range(0.0..1.0);
             let mut cum = 0.0;

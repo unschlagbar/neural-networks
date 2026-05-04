@@ -72,16 +72,7 @@ pub fn sample_normal() {
 pub fn sample_hierarchical() {
     let tokenizer = Tokenizer::new(CHARSET, false);
 
-    let mut model = match HierarchicalSequential::load(MODEL_LOC) {
-        Ok(m) => {
-            println!("Loaded hierarchical model from '{MODEL_LOC}'.");
-            m
-        }
-        Err(e) => {
-            eprintln!("Failed to load '{MODEL_LOC}': {e}");
-            std::process::exit(1);
-        }
-    };
+    let mut model = HierarchicalSequential::load(MODEL_LOC).unwrap();
 
     model.make_cache(1);
 

@@ -6,6 +6,8 @@ use crate::nn::embedding::EmbeddingLayer;
 use crate::nn::linear::LinearLayer;
 use crate::nn::linear_nb::LinearNBLayer;
 use crate::nn::lstm::LSTMLayer;
+use crate::nn::mlstm::MLSTMLayer;
+use crate::nn::mlstm_block::MLSTMBlock;
 use crate::nn::rms_norm::{RMSNorm, RMSNormResidual};
 use crate::nn::silu_dense::SiluDenseLayer;
 use crate::nn::slstm::SLSTMLayer;
@@ -173,6 +175,25 @@ impl SequentialBuilder {
         self
     }
 
+    pub fn mlstm(mut self, head_dim: usize) -> Self {
+        let layer = MLSTMLayer::new(self.output_size, head_dim);
+        self.layer(Box::new(layer), head_dim);
+        self
+    }
+
+    pub fn mlstm_block(
+        mut self,
+        num_heads: usize,
+        d_qk: usize,
+        d_hv: usize,
+        up_size: usize,
+    ) -> Self {
+        let d = self.output_size;
+        let block = MLSTMBlock::new(d, num_heads, d_qk, d_hv, up_size);
+        self.layer(Box::new(block), d);
+        self
+    }
+
     /// xLSTM-style sLSTM-Block:
     ///   Pre-RMSNorm → sLSTM-Zelle → Post-RMSNorm → SwiGLU-MLP → Residual.
     ///
@@ -186,7 +207,7 @@ impl SequentialBuilder {
             "slstm_block erwartet input_size == hidden ({} != {})",
             self.output_size, hidden,
         );
-        let up = (hidden * 8) / 3;
+        let up = (hidden * 4) / 3;
         let layer = SLSTMBlock::new(hidden, up);
         self.layer(Box::new(layer), hidden);
         self

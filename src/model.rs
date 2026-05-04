@@ -6,11 +6,13 @@ use crate::{
 };
 
 pub fn build_normal_model(vocab: usize) -> Sequential {
-    let mut model = SequentialBuilder::new(vocab).embedding(WORD_HIDDEN);
-    for _ in 0..2 {
-        model = model.slstm_block(WORD_HIDDEN);
-    }
-    model.linear(vocab).softmax().build()
+    SequentialBuilder::new(vocab)
+        .embedding(WORD_HIDDEN)
+        .slstm_block(WORD_HIDDEN)
+        .slstm_block(WORD_HIDDEN)
+        .linear(vocab)
+        .softmax()
+        .build()
 }
 
 // ── Hierarchisches Modell (HierarchicalSequential) ───────────────────────────
@@ -25,10 +27,11 @@ pub fn build_hierarchical_model(
         .slstm_block(CHAR_HIDDEN)
         .build();
 
-    let high_model = SequentialBuilder::new(vocab + CHAR_HIDDEN)
+    let high_model = SequentialBuilder::new(CHAR_HIDDEN)
         .linear(WORD_HIDDEN)
         .slstm_block(WORD_HIDDEN)
         .slstm_block(WORD_HIDDEN)
+        .rms_norm()
         .build();
 
     let char2_model = SequentialBuilder::new(CHAR_HIDDEN + WORD_HIDDEN)
