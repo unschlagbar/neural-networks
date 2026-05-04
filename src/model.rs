@@ -8,8 +8,10 @@ use crate::{
 pub fn build_normal_model(vocab: usize) -> Sequential {
     SequentialBuilder::new(vocab)
         .embedding(WORD_HIDDEN)
-        .slstm_block(WORD_HIDDEN)
-        .slstm_block(WORD_HIDDEN)
+        .slstm(WORD_HIDDEN)
+        .rms_norm()
+        .slstm(WORD_HIDDEN)
+        .rms_norm()
         .linear(vocab)
         .softmax()
         .build()
@@ -31,7 +33,6 @@ pub fn build_hierarchical_model(
         .linear(WORD_HIDDEN)
         .slstm_block(WORD_HIDDEN)
         .slstm_block(WORD_HIDDEN)
-        .rms_norm()
         .build();
 
     let char2_model = SequentialBuilder::new(CHAR_HIDDEN + WORD_HIDDEN)

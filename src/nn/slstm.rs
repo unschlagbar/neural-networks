@@ -65,10 +65,10 @@ pub struct SLSTMCache {
     pub f_prime: Box<[f32]>, // exp(log_f + m_prev − m)
 
     // States at time t.
-    pub m: Box<[f32]>,
-    pub c: Box<[f32]>,
-    pub n: Box<[f32]>,
-    pub psi: Box<[f32]>, // denominator max(|n|, 1)
+    m: Box<[f32]>,
+    c: Box<[f32]>,
+    n: Box<[f32]>,
+    psi: Box<[f32]>, // denominator max(|n|, 1)
     pub h: Box<[f32]>,
 
     /// dL/d(concat(x_t, h_{t-1})).  First `input_size` entries = dx.
