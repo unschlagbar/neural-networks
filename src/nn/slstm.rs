@@ -136,9 +136,9 @@ pub struct SLSTMLayer {
     pub m: Box<[f32]>,
 
     // ── BPTT gradients flowing t+1 → t ───────────────────────────────────────
-    pub dh_bptt: Box<[f32]>,
-    pub dc_bptt: Box<[f32]>,
-    pub dn_bptt: Box<[f32]>,
+    dh_bptt: Box<[f32]>,
+    dc_bptt: Box<[f32]>,
+    dn_bptt: Box<[f32]>,
 
     // ── Learnable initial states (h, c only — n, m start at 0 per paper) ─────
     pub h_init: Box<[f32]>,

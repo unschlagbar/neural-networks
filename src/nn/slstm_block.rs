@@ -35,7 +35,6 @@ use std::{any::Any, io};
 
 use crate::{
     nn::{
-        add_vec_in_place,
         linear::{LinearCache, LinearLayer},
         rms_norm::{RMSNorm, RMSNormCache},
         slstm::{SLSTMCache, SLSTMLayer},
@@ -290,7 +289,6 @@ impl SLSTMBlock {
 
         // (d) BPTT-Injektion + cell.backward
         self.sc_h2.copy_from_slice(&cache.post_norm.dx);
-        add_vec_in_place(&mut self.sc_h2, &self.cell.dh_bptt);
         self.cell.backward(&mut self.sc_h2, &mut cache.cell);
         // → cache.cell.dconcat[..H] = d(pre_normed)
 
