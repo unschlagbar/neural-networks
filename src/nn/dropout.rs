@@ -141,7 +141,7 @@ impl NnLayer for DropoutLayer {
 
     fn layer_tag(&self) -> u8 {
         6
-    } // TAG_DROPOUT
+    }
 
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
         write_f32(w, self.rate)?;

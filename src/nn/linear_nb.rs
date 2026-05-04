@@ -160,7 +160,7 @@ impl NnLayer for LinearNBLayer {
 
     fn layer_tag(&self) -> u8 {
         3
-    } // TAG_DENSE
+    }
 
     fn save(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         crate::saving::write_matrix(w, &self.weights)?;

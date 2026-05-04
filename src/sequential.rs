@@ -176,6 +176,7 @@ impl Sequential {
             *step += 1;
 
             self.backwards_sequence(targets);
+            assert_eq!(inputs[1], targets[0]);
             for layer in &mut self.layers {
                 layer.accumulate_init_grad();
                 layer.zero_bptt_state();
@@ -221,6 +222,7 @@ impl Sequential {
         prefix: &[u16],
         max_len: usize,
         temperature: f32,
+        top_p: f32,
         mut callback: impl FnMut(u16) -> bool,
     ) -> Vec<u16> {
         for layer in &mut self.layers {
@@ -239,18 +241,30 @@ impl Sequential {
         for _ in 0..max_len {
             let logits = self.forward(last_token);
 
-            // Temperature scaling + softmax for sampling — this path runs outside
-            // the training hot loop, so the two small Vec allocs here are fine.
             let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature.max(1e-8)).collect();
             let q = softmax(&scaled);
 
-            let mut idx: Vec<usize> = (0..logits.len()).collect();
-            idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+            let mut idx: Vec<usize> = (0..q.len()).collect();
+            idx.sort_unstable_by(|&a, &b| q[b].partial_cmp(&q[a]).unwrap());
 
-            let r = random_range(0.0..1.0);
             let mut cum = 0.0;
-            let mut next = 0;
-            for i in idx {
+            let candidates: Vec<usize> = idx
+                .iter()
+                .copied()
+                .take_while(|&i| {
+                    if cum >= top_p {
+                        return false;
+                    }
+                    cum += q[i];
+                    true
+                })
+                .collect();
+
+            let total: f32 = candidates.iter().map(|&i| q[i]).sum();
+            let r = random_range(0.0..total);
+            let mut cum = 0.0;
+            let mut next = candidates[0] as u16;
+            for &i in &candidates {
                 cum += q[i];
                 if cum >= r {
                     next = i as u16;
@@ -264,7 +278,6 @@ impl Sequential {
             }
             last_token = next;
         }
-
         out
     }
 

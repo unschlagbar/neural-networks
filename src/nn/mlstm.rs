@@ -614,7 +614,7 @@ impl NnLayer for MLSTMLayer {
     }
 
     fn layer_tag(&self) -> u8 {
-        12 // TAG_MLSTM  (next after TAG_SLSTM_BLOCK = 11)
+        12
     }
 
     /// Binary layout (must match `load_mlstm` in loading.rs):

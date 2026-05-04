@@ -1,14 +1,4 @@
 /target
-/cargo_rust_files
-/rust_files
-/training_files
 /models
-/political_speeches
-Jarvis
-rust_rnn
-rust_rnn2
+/data
 political_speeches.xml
-test_subject_01
-test_subject_02
-test_subject_03
-test_subject_04

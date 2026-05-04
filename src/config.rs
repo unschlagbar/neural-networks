@@ -14,7 +14,7 @@ pub const SEQ_LOC: &str = "models/seq";
 // ── Sequenz-Längen ───────────────────────────────────────────────────────────
 
 /// Trainings-Sequenzlänge (Anzahl Tokens pro BPTT-Chunk).
-pub const SEQ_LEN: usize = 512;
+pub const SEQ_LEN: usize = 1024;
 /// Reserve für den Forward-Cache (unsere BatchIter kann länger werden als SEQ_LEN).
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 
@@ -33,7 +33,7 @@ pub const BATCH_SIZE: usize = 1;
 
 // ── Training-Schedule ────────────────────────────────────────────────────────
 
-pub const EPOCHS: usize = 1;
+pub const EPOCHS: usize = 100;
 
 /// Save nach jeweils N abgeschlossenen Files (0 = nur am Ende jeder Epoche).
 pub const SAVE_EVERY: usize = 30;
@@ -45,7 +45,8 @@ pub const PRINT_EVERY: usize = 10;
 // ── Sampling ─────────────────────────────────────────────────────────────────
 
 pub const MAX_LEN: usize = 1000;
-pub const TEMPERATURE: f32 = 0.1;
+pub const TEMPERATURE: f32 = 0.3;
+pub const TOP_P: f32 = 0.95;
 
 // ── Modell-Dimensionen ───────────────────────────────────────────────────────
 
@@ -55,5 +56,5 @@ pub const WORD_HIDDEN: usize = 128;
 
 // ── Dataset ──────────────────────────────────────────────────────────────────
 
-pub const DATA_DIR: &str = "political_speeches/";
+pub const DATA_DIR: &str = "data/steel/";
 pub const CHARSET: &str = "charset.txt";

@@ -8,7 +8,7 @@ use crate::{
     nn_layer::{DynCache, NnLayer},
 };
 
-const CLIP: f32 = 15.0;
+const CLIP: f32 = 10.0;
 
 // ── DenseCache ────────────────────────────────────────────────────────────────
 
@@ -178,7 +178,7 @@ impl NnLayer for LinearLayer {
 
     fn layer_tag(&self) -> u8 {
         12
-    } // TAG_DENSE
+    }
 
     fn save(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         crate::saving::write_u32(w, self.input_size() as u32)?;

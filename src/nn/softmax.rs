@@ -95,7 +95,6 @@ impl NnLayer for SoftmaxLayer {
     fn forward_sample(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache.as_any_mut().downcast_mut::<SoftmaxCache>().unwrap();
         c.output.copy_from_slice(input);
-        //softmax_inplace(&mut c.output);
     }
 
     fn backward(&mut self, delta: &mut [f32], cache: &mut dyn DynCache) {
@@ -106,7 +105,7 @@ impl NnLayer for SoftmaxLayer {
 
     fn layer_tag(&self) -> u8 {
         4
-    } // TAG_SOFTMAX
+    }
 
     /// Keine Gewichte — size steht bereits im Architektur-Header.
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {

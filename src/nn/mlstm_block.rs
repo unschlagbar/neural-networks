@@ -921,7 +921,7 @@ impl NnLayer for MLSTMBlock {
     }
 
     fn layer_tag(&self) -> u8 {
-        14 // TAG_MLSTM_BLOCK
+        14
     }
 
     /// Binary layout:

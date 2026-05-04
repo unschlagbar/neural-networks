@@ -189,7 +189,7 @@ impl NnLayer for SiluDenseLayer {
     }
 
     fn layer_tag(&self) -> u8 {
-        10 // TAG_DENSE_SILU — noch frei in deinem `new_layer`-Match
+        10
     }
 
     fn save(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {

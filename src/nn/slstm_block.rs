@@ -321,7 +321,7 @@ impl NnLayer for SLSTMBlock {
     }
 
     fn layer_tag(&self) -> u8 {
-        11 // TAG_SLSTM_BLOCK
+        11
     }
 
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {

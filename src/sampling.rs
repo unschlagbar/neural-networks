@@ -14,7 +14,7 @@
 use std::io::{Write, stdin, stdout};
 
 use crate::{
-    config::{CHARSET, MAX_LEN, MODEL_LOC, SEQ_LOC, TEMPERATURE},
+    config::{CHARSET, MAX_LEN, MODEL_LOC, SEQ_LOC, TEMPERATURE, TOP_P},
     hierarchical::HierarchicalSequential,
     sequential::Sequential,
     tokenizer::Tokenizer,
@@ -54,7 +54,7 @@ pub fn sample_normal() {
         print!(">>> ");
         stdout().flush().unwrap();
 
-        model.sample(&prefix, MAX_LEN, TEMPERATURE, |token| {
+        model.sample(&prefix, MAX_LEN, TEMPERATURE, TOP_P, |token| {
             let s = tokenizer.get_char(token);
             if s == "<END>" {
                 false

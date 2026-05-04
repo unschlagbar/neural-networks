@@ -1,7 +1,6 @@
 use iron_oxide::collections::Matrix;
 
 use crate::{
-    activations::sigmoid,
     nn::{add_vec_in_place, sub_in_place, sub_vec_in_place},
     nn_layer::{DynCache, NnLayer},
     saving,
@@ -311,7 +310,7 @@ impl NnLayer for LSTMLayer {
 
     fn layer_tag(&self) -> u8 {
         0
-    } // TAG_LSTM
+    }
 
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
         saving::write_matrix(w, &self.wf)?;
@@ -335,6 +334,7 @@ impl NnLayer for LSTMLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
+        println!("{:?}", self.b);
         sub_in_place(&mut self.wf, &self.grads.wf, lr);
         sub_in_place(&mut self.wi, &self.grads.wi, lr);
         sub_in_place(&mut self.wc, &self.grads.wc, lr);
@@ -387,4 +387,9 @@ fn dsigmoid(y: f32) -> f32 {
 #[inline]
 fn dtanh(y: f32) -> f32 {
     1.0 - y * y
+}
+
+#[inline]
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
 }

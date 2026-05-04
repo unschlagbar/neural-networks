@@ -32,7 +32,7 @@ const I: usize = 1; // input gate (ĩ)
 const G_F: usize = 2; // forget gate (f̃)
 const O: usize = 3; // output gate (õ)
 
-const CLIP: f32 = 15.0;
+const CLIP: f32 = 10.0;
 
 // ── SLSTMCache ────────────────────────────────────────────────────────────────
 
@@ -446,7 +446,7 @@ impl NnLayer for SLSTMLayer {
 
     fn layer_tag(&self) -> u8 {
         5
-    } // TAG_SLSTM  (0=LSTM, 1=Dense, 2=IndRNN, 3=Projection, 4=Softmax, 5=sLSTM, 6=Dropout, 7=Parallel, 8=Norm)
+    }
 
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
         saving::write_matrix(w, &self.wz)?;
@@ -472,6 +472,9 @@ impl NnLayer for SLSTMLayer {
     fn apply_grads(&mut self, lr: f32) {
         self.grads.wi.clip(-CLIP, CLIP);
         self.grads.wf.clip(-CLIP, CLIP);
+
+        self.grads.wz.clip(-CLIP, CLIP);
+        self.grads.wo.clip(-CLIP, CLIP);
 
         sub_in_place(&mut self.wz, &self.grads.wz, lr);
         sub_in_place(&mut self.wi, &self.grads.wi, lr);

@@ -1,4 +1,3 @@
-pub mod activations;
 pub mod adam_optimizer;
 pub mod batches;
 pub mod config;

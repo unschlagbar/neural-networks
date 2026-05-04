@@ -447,7 +447,7 @@ impl NnLayer for RMSNorm {
 
     fn layer_tag(&self) -> u8 {
         9
-    } // TAG_NORM_WRAPPER (unchanged)
+    }
 
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
         write_f32_slice(w, &self.gamma)
