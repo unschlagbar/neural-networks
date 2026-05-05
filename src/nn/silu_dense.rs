@@ -4,8 +4,9 @@ use iron_oxide::collections::Matrix;
 use rand::random_range;
 
 use crate::{
-    nn::{add_vec_in_place, sub_in_place, sub_vec_in_place},
+    nn::add_vec_in_place,
     nn_layer::{DynCache, NnLayer},
+    opimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
 };
 
 // ── SiluDenseCache ────────────────────────────────────────────────────────────
@@ -50,15 +51,15 @@ impl DynCache for SiluDenseCache {
 // ── SiluDenseGrads ────────────────────────────────────────────────────────────
 
 pub struct SiluDenseGrads {
-    pub weights: Matrix,
-    pub biases: Box<[f32]>,
+    pub weights: GradMatrix,
+    pub biases: GradVec,
 }
 
 impl SiluDenseGrads {
     pub fn zeros(input_size: usize, output_size: usize) -> Self {
         Self {
-            weights: Matrix::zeros(input_size, output_size),
-            biases: vec![0.0; output_size].into(),
+            weights: GradMatrix::zeros(input_size, output_size),
+            biases: GradVec::zeros(output_size),
         }
     }
 }
@@ -150,8 +151,8 @@ impl SiluDenseLayer {
             *d *= s * (1.0 + z * (1.0 - s));
         }
 
-        self.grads.weights.add_outer(&cache.input, delta);
-        add_vec_in_place(&mut self.grads.biases, delta);
+        self.grads.weights.matrix().add_outer(&cache.input, delta);
+        add_vec_in_place(&mut self.grads.biases.vec(), delta);
 
         cache.dx.fill(0.0);
         for (i, dx) in cache.dx.iter_mut().enumerate() {
@@ -210,12 +211,12 @@ impl NnLayer for SiluDenseLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
-        sub_in_place(&mut self.weights, &self.grads.weights, lr);
-        sub_vec_in_place(&mut self.biases, &self.grads.biases, lr);
+        self.grads.weights.apply_to(&mut self.weights, lr);
+        self.grads.biases.apply_to(&mut self.biases, lr);
     }
 
     fn clear_grads(&mut self) {
         self.grads.weights.clear();
-        self.grads.biases.fill(0.0);
+        self.grads.biases.clear();
     }
 }

@@ -25,8 +25,8 @@
 use std::{any::Any, io};
 
 use crate::{
-    nn::sub_vec_in_place,
     nn_layer::{DynCache, NnLayer},
+    opimizers::{GradVec, GradVecOps},
     saving::{write_f32_slice, write_u8, write_u32},
 };
 
@@ -98,7 +98,7 @@ pub struct RMSNormResidual {
     pub inner: Box<dyn NnLayer>,
     /// Learnable per-element scale (init 1 → wrapper starts as near-identity).
     pub gamma: Box<[f32]>,
-    pub grads_gamma: Box<[f32]>,
+    pub grads_gamma: GradVec,
     pub norm_size: usize,
 }
 
@@ -118,7 +118,7 @@ impl RMSNormResidual {
         Self {
             inner,
             gamma: vec![1.0; n].into(),
-            grads_gamma: vec![0.0; n].into(),
+            grads_gamma: GradVec::zeros(n),
             norm_size: n,
         }
     }
@@ -226,7 +226,7 @@ impl NnLayer for RMSNormResidual {
         // Steps 3+4: accumulate S and gamma gradient in one pass.
         let mut s = 0.0;
         for i in 0..n {
-            self.grads_gamma[i] += d_normed[i] * c.x_hat[i];
+            self.grads_gamma.vec()[i] += d_normed[i] * c.x_hat[i];
             s += self.gamma[i] * d_normed[i] * c.x_hat[i];
         }
         let s_over_n = s / n as f32;
@@ -273,11 +273,11 @@ impl NnLayer for RMSNormResidual {
     }
 
     fn apply_grads(&mut self, lr: f32) {
-        sub_vec_in_place(&mut self.gamma, &self.grads_gamma, lr);
+        self.grads_gamma.apply_to(&mut self.gamma, lr);
         self.inner.apply_grads(lr);
     }
     fn clear_grads(&mut self) {
-        self.grads_gamma.fill(0.0);
+        self.grads_gamma.clear();
         self.inner.clear_grads();
     }
 
@@ -295,7 +295,7 @@ impl NnLayer for RMSNormResidual {
 pub struct RMSNorm {
     /// Learnable per-element scale (init 1 → wrapper starts as near-identity).
     pub gamma: Box<[f32]>,
-    pub grads_gamma: Box<[f32]>,
+    pub grads_gamma: GradVec,
     pub norm_size: usize,
 }
 
@@ -305,7 +305,7 @@ impl RMSNorm {
 
         Self {
             gamma: vec![1.0; n].into(),
-            grads_gamma: vec![0.0; n].into(),
+            grads_gamma: GradVec::zeros(n),
             norm_size: n,
         }
     }
@@ -336,7 +336,7 @@ impl RMSNorm {
     pub fn from_loaded(size: usize, gamma: Box<[f32]>) -> Self {
         Self {
             gamma,
-            grads_gamma: vec![0.0; size].into(),
+            grads_gamma: GradVec::zeros(size),
             norm_size: size,
         }
     }
@@ -383,7 +383,7 @@ impl RMSNorm {
         let irms = cache.inv_rms;
         let mut s = 0.0_f32;
         for i in 0..n {
-            self.grads_gamma[i] += delta[i] * cache.x_hat[i];
+            self.grads_gamma.vec()[i] += delta[i] * cache.x_hat[i];
             s += self.gamma[i] * delta[i] * cache.x_hat[i];
         }
         let s_n = s / n as f32;
@@ -429,7 +429,7 @@ impl NnLayer for RMSNorm {
         // Steps 3+4: accumulate S and gamma gradient in one pass.
         let mut s = 0.0;
         for i in 0..n {
-            self.grads_gamma[i] += d_normed[i] * c.x_hat[i];
+            self.grads_gamma.vec()[i] += d_normed[i] * c.x_hat[i];
             s += self.gamma[i] * d_normed[i] * c.x_hat[i];
         }
         let s_over_n = s / n as f32;
@@ -468,9 +468,9 @@ impl NnLayer for RMSNorm {
     }
 
     fn apply_grads(&mut self, lr: f32) {
-        sub_vec_in_place(&mut self.gamma, &self.grads_gamma, lr);
+        self.grads_gamma.apply_to(&mut self.gamma, lr);
     }
     fn clear_grads(&mut self) {
-        self.grads_gamma.fill(0.0);
+        self.grads_gamma.clear();
     }
 }

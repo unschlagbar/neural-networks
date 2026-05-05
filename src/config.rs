@@ -18,7 +18,7 @@ pub const SEQ_LEN: usize = 1024;
 /// Reserve für den Forward-Cache (unsere BatchIter kann länger werden als SEQ_LEN).
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 
-pub const LR: f32 = 1e-4;
+pub const LR: f32 = 1e-3;
 pub const BATCH_SIZE: usize = 1;
 
 // ── Training-Schedule ────────────────────────────────────────────────────────
@@ -46,5 +46,5 @@ pub const WORD_HIDDEN: usize = 384;
 
 // ── Dataset ──────────────────────────────────────────────────────────────────
 
-pub const DATA_DIR: &str = "data/political_speeches/";
+pub const DATA_DIR: &str = "data/rust-std/";
 pub const CHARSET: &str = "charset.txt";

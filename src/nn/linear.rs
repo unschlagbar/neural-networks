@@ -4,11 +4,10 @@ use iron_oxide::collections::Matrix;
 use rand::random_range;
 
 use crate::{
-    nn::{add_vec_in_place, sub_in_place, sub_vec_in_place},
+    nn::add_vec_in_place,
     nn_layer::{DynCache, NnLayer},
+    opimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
 };
-
-const CLIP: f32 = 10.0;
 
 // ── DenseCache ────────────────────────────────────────────────────────────────
 
@@ -49,15 +48,15 @@ impl DynCache for LinearCache {
 // ── DenseGrads (stored inside the layer) ─────────────────────────────────────
 
 pub struct LinearGrads {
-    pub weights: Matrix,
-    pub biases: Box<[f32]>,
+    pub weights: GradMatrix,
+    pub biases: GradVec,
 }
 
 impl LinearGrads {
     pub fn zeros(input_size: usize, output_size: usize) -> Self {
         Self {
-            weights: Matrix::zeros(input_size, output_size),
-            biases: vec![0.0; output_size].into(),
+            weights: GradMatrix::zeros(input_size, output_size),
+            biases: GradVec::zeros(output_size),
         }
     }
 }
@@ -138,8 +137,8 @@ impl LinearLayer {
     ///
     /// `cache.dx` ← dL/d(input) = Wᵀ · delta.
     pub fn backward(&mut self, delta: &mut [f32], cache: &mut LinearCache) {
-        self.grads.weights.add_outer(&cache.input, delta);
-        add_vec_in_place(&mut self.grads.biases, delta);
+        self.grads.weights.matrix().add_outer(&cache.input, delta);
+        add_vec_in_place(&mut self.grads.biases.vec(), delta);
 
         cache.dx.fill(0.0);
         for (i, dx) in cache.dx.iter_mut().enumerate() {
@@ -200,17 +199,14 @@ impl NnLayer for LinearLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
-        self.grads.weights.clip(-CLIP, CLIP);
-        self.grads
-            .biases
-            .iter_mut()
-            .for_each(|v| *v = v.clamp(-CLIP, CLIP));
-        sub_in_place(&mut self.weights, &self.grads.weights, lr);
-        sub_vec_in_place(&mut self.biases, &self.grads.biases, lr);
+        self.grads.weights.clip();
+        self.grads.biases.clip();
+        self.grads.weights.apply_to(&mut self.weights, lr);
+        self.grads.biases.apply_to(&mut self.biases, lr);
     }
 
     fn clear_grads(&mut self) {
         self.grads.weights.clear();
-        self.grads.biases.fill(0.0);
+        self.grads.biases.clear();
     }
 }

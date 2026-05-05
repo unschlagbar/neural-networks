@@ -44,16 +44,12 @@
 use iron_oxide::collections::Matrix;
 
 use crate::{
-    nn::{
-        linear::{LinearCache, LinearLayer},
-        sub_in_place, sub_vec_in_place,
-    },
+    nn::linear::{LinearCache, LinearLayer},
     nn_layer::{DynCache, NnLayer},
+    opimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
     saving,
 };
 use std::{any::Any, io};
-
-const CLIP: f32 = 10.0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -142,37 +138,37 @@ impl DynCache for MLSTMCache {
 // ── MLSTMLayerGrads ──────────────────────────────────────────────────────────
 
 pub struct MLSTMLayerGrads {
-    pub wq: Matrix, // d × H·dqk
-    pub wk: Matrix, // d × H·dqk
-    pub wv: Matrix, // d × d
-    pub wo: Matrix, // d × d
-    pub wi: Matrix, // d × H
-    pub wf: Matrix, // d × H
+    pub wq: GradMatrix, // d × H·dqk
+    pub wk: GradMatrix, // d × H·dqk
+    pub wv: GradMatrix, // d × d
+    pub wo: GradMatrix, // d × d
+    pub wi: GradMatrix, // d × H
+    pub wf: GradMatrix, // d × H
 
-    pub bq: Box<[f32]>, // H·dqk
-    pub bk: Box<[f32]>, // H·dqk
-    pub bv: Box<[f32]>, // d
-    pub bo: Box<[f32]>, // d
-    pub bi: Box<[f32]>, // H
-    pub bf: Box<[f32]>, // H
+    pub bq: GradVec, // H·dqk
+    pub bk: GradVec, // H·dqk
+    pub bv: GradVec, // d
+    pub bo: GradVec, // d
+    pub bi: GradVec, // H
+    pub bf: GradVec, // H
 }
 
 impl MLSTMLayerGrads {
     pub fn zeros(input_size: usize, hidden_size: usize, num_heads: usize, dqk: usize) -> Self {
         let d_qk = num_heads * dqk;
         Self {
-            wq: Matrix::zeros(input_size, d_qk),
-            wk: Matrix::zeros(input_size, d_qk),
-            wv: Matrix::zeros(input_size, hidden_size),
-            wo: Matrix::zeros(input_size, hidden_size),
-            wi: Matrix::zeros(input_size, num_heads),
-            wf: Matrix::zeros(input_size, num_heads),
-            bq: vec![0.0; d_qk].into(),
-            bk: vec![0.0; d_qk].into(),
-            bv: vec![0.0; hidden_size].into(),
-            bo: vec![0.0; hidden_size].into(),
-            bi: vec![0.0; num_heads].into(),
-            bf: vec![0.0; num_heads].into(),
+            wq: GradMatrix::zeros(input_size, d_qk),
+            wk: GradMatrix::zeros(input_size, d_qk),
+            wv: GradMatrix::zeros(input_size, hidden_size),
+            wo: GradMatrix::zeros(input_size, hidden_size),
+            wi: GradMatrix::zeros(input_size, num_heads),
+            wf: GradMatrix::zeros(input_size, num_heads),
+            bq: GradVec::zeros(d_qk),
+            bk: GradVec::zeros(d_qk),
+            bv: GradVec::zeros(hidden_size),
+            bo: GradVec::zeros(hidden_size),
+            bi: GradVec::zeros(num_heads),
+            bf: GradVec::zeros(num_heads),
         }
     }
 }
@@ -605,24 +601,24 @@ impl MLSTMLayer {
 
         // ── 4. Gewicht-/Bias-Gradienten akkumulieren ─────────────────────────
         let g = &mut self.grads;
-        g.wq.add_outer(&cache.x, &self.dq);
-        g.wk.add_outer(&cache.x, &self.dk_pre);
-        g.wv.add_outer(&cache.x, &self.dv);
-        g.wo.add_outer(&cache.x, &self.do_pre);
-        g.wi.add_outer(&cache.x, &self.di_pre);
-        g.wf.add_outer(&cache.x, &self.df_pre);
+        g.wq.matrix().add_outer(&cache.x, &self.dq);
+        g.wk.matrix().add_outer(&cache.x, &self.dk_pre);
+        g.wv.matrix().add_outer(&cache.x, &self.dv);
+        g.wo.matrix().add_outer(&cache.x, &self.do_pre);
+        g.wi.matrix().add_outer(&cache.x, &self.di_pre);
+        g.wf.matrix().add_outer(&cache.x, &self.df_pre);
 
         for j in 0..d_qk {
-            g.bq[j] += self.dq[j];
-            g.bk[j] += self.dk_pre[j];
+            g.bq.vec()[j] += self.dq[j];
+            g.bk.vec()[j] += self.dk_pre[j];
         }
         for j in 0..d {
-            g.bv[j] += self.dv[j];
-            g.bo[j] += self.do_pre[j];
+            g.bv.vec()[j] += self.dv[j];
+            g.bo.vec()[j] += self.do_pre[j];
         }
         for hd in 0..h {
-            g.bi[hd] += self.di_pre[hd];
-            g.bf[hd] += self.df_pre[hd];
+            g.bi.vec()[hd] += self.di_pre[hd];
+            g.bf.vec()[hd] += self.df_pre[hd];
         }
 
         // ── 5. dL/dx via Wᵀ · grads, alle Pfade summiert ─────────────────────
@@ -738,38 +734,33 @@ impl NnLayer for MLSTMLayer {
 
     fn apply_grads(&mut self, lr: f32) {
         // Matrizen
-        self.grads.wq.clip(-CLIP, CLIP);
-        self.grads.wk.clip(-CLIP, CLIP);
-        self.grads.wv.clip(-CLIP, CLIP);
-        self.grads.wo.clip(-CLIP, CLIP);
-        self.grads.wi.clip(-CLIP, CLIP);
-        self.grads.wf.clip(-CLIP, CLIP);
-        sub_in_place(&mut self.wq, &self.grads.wq, lr);
-        sub_in_place(&mut self.wk, &self.grads.wk, lr);
-        sub_in_place(&mut self.wv, &self.grads.wv, lr);
-        sub_in_place(&mut self.wo, &self.grads.wo, lr);
-        sub_in_place(&mut self.wi, &self.grads.wi, lr);
-        sub_in_place(&mut self.wf, &self.grads.wf, lr);
+        self.grads.wq.clip();
+        self.grads.wk.clip();
+        self.grads.wv.clip();
+        self.grads.wo.clip();
+        self.grads.wi.clip();
+        self.grads.wf.clip();
 
-        // Biases clippen
-        for v in self
-            .grads
-            .bq
-            .iter_mut()
-            .chain(self.grads.bk.iter_mut())
-            .chain(self.grads.bv.iter_mut())
-            .chain(self.grads.bo.iter_mut())
-            .chain(self.grads.bi.iter_mut())
-            .chain(self.grads.bf.iter_mut())
-        {
-            *v = v.clamp(-CLIP, CLIP);
-        }
-        sub_vec_in_place(&mut self.bq, &self.grads.bq, lr);
-        sub_vec_in_place(&mut self.bk, &self.grads.bk, lr);
-        sub_vec_in_place(&mut self.bv, &self.grads.bv, lr);
-        sub_vec_in_place(&mut self.bo, &self.grads.bo, lr);
-        sub_vec_in_place(&mut self.bi, &self.grads.bi, lr);
-        sub_vec_in_place(&mut self.bf, &self.grads.bf, lr);
+        self.grads.wq.apply_to(&mut self.wq, lr);
+        self.grads.wk.apply_to(&mut self.wk, lr);
+        self.grads.wv.apply_to(&mut self.wv, lr);
+        self.grads.wo.apply_to(&mut self.wo, lr);
+        self.grads.wi.apply_to(&mut self.wi, lr);
+        self.grads.wf.apply_to(&mut self.wf, lr);
+
+        self.grads.bq.clip();
+        self.grads.bk.clip();
+        self.grads.bv.clip();
+        self.grads.bo.clip();
+        self.grads.bi.clip();
+        self.grads.bf.clip();
+
+        self.grads.bq.apply_to(&mut self.bq, lr);
+        self.grads.bk.apply_to(&mut self.bk, lr);
+        self.grads.bv.apply_to(&mut self.bv, lr);
+        self.grads.bo.apply_to(&mut self.bo, lr);
+        self.grads.bi.apply_to(&mut self.bi, lr);
+        self.grads.bf.apply_to(&mut self.bf, lr);
 
         // W_out verwaltet seine Grads selbst
         self.w_out.apply_grads(lr);
@@ -782,12 +773,12 @@ impl NnLayer for MLSTMLayer {
         self.grads.wo.clear();
         self.grads.wi.clear();
         self.grads.wf.clear();
-        self.grads.bq.fill(0.0);
-        self.grads.bk.fill(0.0);
-        self.grads.bv.fill(0.0);
-        self.grads.bo.fill(0.0);
-        self.grads.bi.fill(0.0);
-        self.grads.bf.fill(0.0);
+        self.grads.bq.clear();
+        self.grads.bk.clear();
+        self.grads.bv.clear();
+        self.grads.bo.clear();
+        self.grads.bi.clear();
+        self.grads.bf.clear();
         self.w_out.clear_grads();
     }
 

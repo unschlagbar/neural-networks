@@ -30,5 +30,5 @@ pub trait GradVecOps {
 }
 
 // Type-Aliase für Layer
-pub type OptGradMatrix = <Optimizer as OptimizerGradTypes>::GradMatrix;
-pub type OptGradVec = <Optimizer as OptimizerGradTypes>::GradVec;
+pub type GradMatrix = <Optimizer as OptimizerGradTypes>::GradMatrix;
+pub type GradVec = <Optimizer as OptimizerGradTypes>::GradVec;

@@ -3,7 +3,7 @@ use iron_oxide::collections::Matrix;
 use crate::{
     nn::add_vec_in_place,
     nn_layer::{DynCache, NnLayer},
-    opimizers::{GradMatrixOps, GradVecOps, OptGradMatrix, OptGradVec},
+    opimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
     saving,
 };
 use std::{any::Any, io};
@@ -56,13 +56,13 @@ impl DynCache for LSTMCache {
 // ── LSTMLayerGrads ────────────────────────────────────────────────────────────
 
 pub struct LSTMLayerGrads {
-    pub wf: OptGradMatrix,
-    pub wi: OptGradMatrix,
-    pub wc: OptGradMatrix,
-    pub wo: OptGradMatrix,
-    pub b: OptGradMatrix,
-    pub h_init_grad: OptGradVec,
-    pub c_init_grad: OptGradVec,
+    pub wf: GradMatrix,
+    pub wi: GradMatrix,
+    pub wc: GradMatrix,
+    pub wo: GradMatrix,
+    pub b: GradMatrix,
+    pub h_init_grad: GradVec,
+    pub c_init_grad: GradVec,
 }
 
 impl LSTMLayerGrads {

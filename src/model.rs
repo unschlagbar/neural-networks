@@ -11,8 +11,7 @@ const DQK: usize = WORD_HIDDEN / NUM_HEADS;
 pub fn build_normal_model(vocab: usize) -> Sequential {
     SequentialBuilder::new(vocab)
         .embedding(WORD_HIDDEN)
-        .lstm(WORD_HIDDEN)
-        .res_rms_norm()
+        .mlstm_block(NUM_HEADS, DQK)
         .linear_no_bias(vocab)
         .softmax()
         .build()

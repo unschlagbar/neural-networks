@@ -3,11 +3,9 @@ use std::any::Any;
 use iron_oxide::collections::Matrix;
 
 use crate::{
-    nn::sub_in_place,
     nn_layer::{DynCache, NnLayer},
+    opimizers::{GradMatrix, GradMatrixOps},
 };
-
-const CLIP: f32 = 15.0;
 
 // ── DenseCache ────────────────────────────────────────────────────────────────
 
@@ -48,13 +46,13 @@ impl DynCache for LinearNBCache {
 // ── DenseGrads (stored inside the layer) ─────────────────────────────────────
 
 pub struct LinearNBGrads {
-    pub weights: Matrix,
+    pub weights: GradMatrix,
 }
 
 impl LinearNBGrads {
     pub fn zeros(input_size: usize, output_size: usize) -> Self {
         Self {
-            weights: Matrix::zeros(input_size, output_size),
+            weights: GradMatrix::zeros(input_size, output_size),
         }
     }
 }
@@ -121,7 +119,7 @@ impl LinearNBLayer {
     ///
     /// `cache.dx` ← dL/d(input) = Wᵀ · delta.
     pub fn backward(&mut self, delta: &mut [f32], cache: &mut LinearNBCache) {
-        self.grads.weights.add_outer(&cache.input, delta);
+        self.grads.weights.matrix().add_outer(&cache.input, delta);
 
         cache.dx.fill(0.0);
         for (i, dx) in cache.dx.iter_mut().enumerate() {
@@ -179,8 +177,8 @@ impl NnLayer for LinearNBLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
-        self.grads.weights.clip(-CLIP, CLIP);
-        sub_in_place(&mut self.weights, &self.grads.weights, lr);
+        self.grads.weights.clip();
+        self.grads.weights.apply_to(&mut self.weights, lr);
     }
 
     fn clear_grads(&mut self) {

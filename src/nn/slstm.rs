@@ -20,8 +20,9 @@
 use iron_oxide::collections::Matrix;
 
 use crate::{
-    nn::{add_vec_in_place, sub_in_place, sub_vec_in_place},
+    nn::add_vec_in_place,
     nn_layer::{DynCache, NnLayer},
+    opimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
     saving,
 };
 use std::{any::Any, io};
@@ -31,8 +32,6 @@ const Z: usize = 0; // cell input (z̃)
 const I: usize = 1; // input gate (ĩ)
 const G_F: usize = 2; // forget gate (f̃)
 const O: usize = 3; // output gate (õ)
-
-const CLIP: f32 = 10.0;
 
 // ── SLSTMCache ────────────────────────────────────────────────────────────────
 
@@ -93,26 +92,26 @@ impl DynCache for SLSTMCache {
 // ── SLSTMLayerGrads ───────────────────────────────────────────────────────────
 
 pub struct SLSTMLayerGrads {
-    pub wz: Matrix,
-    pub wi: Matrix,
-    pub wf: Matrix,
-    pub wo: Matrix,
-    pub b: Matrix, // (4, h)
+    pub wz: GradMatrix,
+    pub wi: GradMatrix,
+    pub wf: GradMatrix,
+    pub wo: GradMatrix,
+    pub b: GradMatrix, // (4, h)
 
-    pub h_init_grad: Box<[f32]>,
-    pub c_init_grad: Box<[f32]>,
+    pub h_init_grad: GradVec,
+    pub c_init_grad: GradVec,
 }
 
 impl SLSTMLayerGrads {
     pub fn zeros(rows: usize, h: usize) -> Self {
         Self {
-            wz: Matrix::zeros(rows, h),
-            wi: Matrix::zeros(rows, h),
-            wf: Matrix::zeros(rows, h),
-            wo: Matrix::zeros(rows, h),
-            b: Matrix::zeros(4, h),
-            h_init_grad: vec![0.0; h].into(),
-            c_init_grad: vec![0.0; h].into(),
+            wz: GradMatrix::zeros(rows, h),
+            wi: GradMatrix::zeros(rows, h),
+            wf: GradMatrix::zeros(rows, h),
+            wo: GradMatrix::zeros(rows, h),
+            b: GradMatrix::zeros(4, h),
+            h_init_grad: GradVec::zeros(h),
+            c_init_grad: GradVec::zeros(h),
         }
     }
 }
@@ -370,16 +369,16 @@ impl SLSTMLayer {
 
         // ── 4. Weight and bias gradients ──────────────────────────────────────
         let g = &mut self.grads;
-        g.wz.add_outer(&cache.xh, &self.dz);
-        g.wi.add_outer(&cache.xh, &self.di_pre);
-        g.wf.add_outer(&cache.xh, &self.df_pre);
-        g.wo.add_outer(&cache.xh, &self.do_pre);
+        g.wz.matrix().add_outer(&cache.xh, &self.dz);
+        g.wi.matrix().add_outer(&cache.xh, &self.di_pre);
+        g.wf.matrix().add_outer(&cache.xh, &self.df_pre);
+        g.wo.matrix().add_outer(&cache.xh, &self.do_pre);
 
         for j in 0..h {
-            g.b[Z][j] += self.dz[j];
-            g.b[I][j] += self.di_pre[j];
-            g.b[G_F][j] += self.df_pre[j];
-            g.b[O][j] += self.do_pre[j];
+            g.b.matrix()[Z][j] += self.dz[j];
+            g.b.matrix()[I][j] += self.di_pre[j];
+            g.b.matrix()[G_F][j] += self.df_pre[j];
+            g.b.matrix()[O][j] += self.do_pre[j];
         }
 
         // ── 5. dL/d(xh) for layers below + BPTT to h_{t-1} ────────────────────
@@ -470,19 +469,20 @@ impl NnLayer for SLSTMLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
-        self.grads.wi.clip(-CLIP, CLIP);
-        self.grads.wf.clip(-CLIP, CLIP);
+        self.grads.wi.clip();
+        self.grads.wf.clip();
 
-        self.grads.wz.clip(-CLIP, CLIP);
-        self.grads.wo.clip(-CLIP, CLIP);
+        self.grads.wz.clip();
+        self.grads.wo.clip();
 
-        sub_in_place(&mut self.wz, &self.grads.wz, lr);
-        sub_in_place(&mut self.wi, &self.grads.wi, lr);
-        sub_in_place(&mut self.wf, &self.grads.wf, lr);
-        sub_in_place(&mut self.wo, &self.grads.wo, lr);
-        sub_vec_in_place(self.b.as_slice_mut(), self.grads.b.as_slice(), lr);
-        sub_vec_in_place(&mut self.h_init, &self.grads.h_init_grad, lr);
-        sub_vec_in_place(&mut self.c_init, &self.grads.c_init_grad, lr);
+        self.grads.wz.apply_to(&mut self.wz, lr);
+        self.grads.wi.apply_to(&mut self.wi, lr);
+        self.grads.wf.apply_to(&mut self.wf, lr);
+        self.grads.wo.apply_to(&mut self.wo, lr);
+
+        self.grads.b.apply_to(&mut self.b, lr);
+        self.grads.c_init_grad.apply_to(&mut self.c_init, lr);
+        self.grads.h_init_grad.apply_to(&mut self.h_init, lr);
     }
 
     fn clear_grads(&mut self) {
@@ -491,8 +491,8 @@ impl NnLayer for SLSTMLayer {
         self.grads.wf.clear();
         self.grads.wo.clear();
         self.grads.b.clear();
-        self.grads.h_init_grad.fill(0.0);
-        self.grads.c_init_grad.fill(0.0);
+        self.grads.h_init_grad.clear();
+        self.grads.c_init_grad.clear();
     }
 
     fn reset_state(&mut self) {
@@ -508,8 +508,8 @@ impl NnLayer for SLSTMLayer {
     }
 
     fn accumulate_init_grad(&mut self) {
-        add_vec_in_place(&mut self.grads.h_init_grad, &self.dh_bptt);
-        add_vec_in_place(&mut self.grads.c_init_grad, &self.dc_bptt);
+        add_vec_in_place(&mut self.grads.h_init_grad.vec(), &self.dh_bptt);
+        add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
     }
 }
 
