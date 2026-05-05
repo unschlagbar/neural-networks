@@ -23,7 +23,7 @@ pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 // Die alte LR = 1e-5 ist für ein Netz mit Residual-Pfaden und RMSNorm einfach
 // zu klein. Deep-RNNs mit Pre-Norm laufen typisch bei 3e-4 – 1e-3. Weil wir
 // SGD (keinen Adam) haben, bleiben wir konservativ am unteren Ende.
-pub const LR: f32 = 1e-4;
+pub const LR: f32 = 5e-5;
 
 /// Gradienten-Akkumulation: wir rufen `apply_grads` erst nach BATCH_SIZE
 /// Sequenzen (Sequential skaliert automatisch mit 1/BATCH_SIZE).
@@ -46,12 +46,12 @@ pub const PRINT_EVERY: usize = 10;
 
 pub const MAX_LEN: usize = 1000;
 pub const TEMPERATURE: f32 = 0.3;
-pub const TOP_P: f32 = 0.95;
+pub const TOP_P: f32 = 1.;
 
 // ── Modell-Dimensionen ───────────────────────────────────────────────────────
 
-pub const CHAR_HIDDEN: usize = 64;
-pub const OUT_HIDDEN: usize = 64;
+pub const CHAR_HIDDEN: usize = 128;
+pub const OUT_HIDDEN: usize = 256;
 pub const WORD_HIDDEN: usize = 128;
 
 // ── Dataset ──────────────────────────────────────────────────────────────────

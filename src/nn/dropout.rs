@@ -162,5 +162,4 @@ impl NnLayer for DropoutLayer {
     // No learnable parameters — all gradient ops are no-ops.
     fn apply_grads(&mut self, _lr: f32) {}
     fn clear_grads(&mut self) {}
-    fn scale_grads(&mut self, _scale: f32) {}
 }

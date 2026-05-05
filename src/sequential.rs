@@ -4,9 +4,10 @@ use iron_oxide::collections::Matrix;
 use rand::random_range;
 
 use crate::{
-    config::{SAVE_EVERY, SEQ_LOC},
+    config::SEQ_LOC,
     nn::{one_hot, softmax::softmax},
     nn_layer::{DynCache, NnLayer},
+    training::TrainingState,
 };
 
 // ── Sequential ────────────────────────────────────────────────────────────────
@@ -152,17 +153,10 @@ impl Sequential {
     pub fn train<'a, I: Iterator<Item = (&'a [u16], &'a [u16])>>(
         &mut self,
         data: I,
-        lr: f32,
-        iteration: &mut usize,
-        j: &mut usize,
-        batch_size: usize,
-        print_every: usize,
-        step: &mut usize,
+        state: &mut TrainingState,
     ) {
-        let mut window_loss = 0.0;
-        let mut window_steps = 0;
-        let mut window_tokens = 0;
-        let mut window_start = Instant::now();
+        let mut tokens = 0;
+        let mut time = Instant::now();
 
         for (inputs, targets) in data {
             for layer in &mut self.layers {
@@ -170,47 +164,38 @@ impl Sequential {
             }
             self.forward_over(inputs);
             let loss = self.seq_loss(targets);
-            window_loss += loss;
-            window_steps += 1;
-            window_tokens += inputs.len();
-            *step += 1;
+            tokens += inputs.len();
 
             self.backwards_sequence(targets);
-            assert_eq!(inputs[1], targets[0]);
             for layer in &mut self.layers {
                 layer.accumulate_init_grad();
                 layer.zero_bptt_state();
             }
 
-            *iteration += 1;
-            if *iteration % batch_size == 0 {
-                self.sgd_step(lr / batch_size as f32);
-                *iteration = 0;
-                *j += 1;
+            if let Some(lr) = state.step(loss) {
+                self.sgd_step(lr);
             }
 
-            if *step % SAVE_EVERY == 0 {
+            if state.save() {
                 match self.save(SEQ_LOC) {
                     Ok(()) => println!("saved"),
                     Err(e) => eprintln!("save failed: {e}"),
                 }
             }
 
-            if print_every > 0 && window_steps >= print_every {
-                let avg = window_loss / window_steps as f32;
-                let elapsed = window_start.elapsed();
+            if state.print() {
+                let loss = state.get_loss();
+                let elapsed = time.elapsed();
                 println!(
                     "{} | loss {:.4} | ppl {:.4} | {} tok | {:.1?}",
-                    *step,
-                    avg,
-                    avg.exp(),
-                    window_tokens,
+                    state.step,
+                    loss,
+                    loss.exp(),
+                    tokens,
                     elapsed,
                 );
-                window_loss = 0.0;
-                window_steps = 0;
-                window_tokens = 0;
-                window_start = Instant::now();
+                tokens = 0;
+                time = Instant::now();
             }
         }
     }
@@ -296,17 +281,11 @@ impl Sequential {
         }
     }
 
-    pub fn scale_grads(&mut self, scale: f32) {
-        for layer in &mut self.layers {
-            layer.scale_grads(scale);
-        }
-    }
-
     pub fn seq_loss(&self, targets: &[u16]) -> f32 {
         let last = self.layers.len() - 1;
         let mut l = 0.0;
-        for t in 0..targets.len() {
-            let p = self.cache[t][last].output()[targets[t] as usize] + 1e-12;
+        for (t, target) in targets.iter().enumerate() {
+            let p = self.cache[t][last].output()[*target as usize] + 1e-12;
             l -= p.ln();
         }
         l / targets.len() as f32

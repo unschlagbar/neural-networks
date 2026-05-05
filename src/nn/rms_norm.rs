@@ -280,10 +280,6 @@ impl NnLayer for RMSNormResidual {
         self.grads_gamma.fill(0.0);
         self.inner.clear_grads();
     }
-    fn scale_grads(&mut self, scale: f32) {
-        self.grads_gamma.iter_mut().for_each(|x| *x *= scale);
-        self.inner.scale_grads(scale);
-    }
 
     fn reset_state(&mut self) {
         self.inner.reset_state();
@@ -476,8 +472,5 @@ impl NnLayer for RMSNorm {
     }
     fn clear_grads(&mut self) {
         self.grads_gamma.fill(0.0);
-    }
-    fn scale_grads(&mut self, scale: f32) {
-        self.grads_gamma.iter_mut().for_each(|x| *x *= scale);
     }
 }

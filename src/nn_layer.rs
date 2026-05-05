@@ -88,7 +88,6 @@ pub trait NnLayer {
 
     fn apply_grads(&mut self, lr: f32);
     fn clear_grads(&mut self);
-    fn scale_grads(&mut self, scale: f32);
 
     // ── recurrent state ───────────────────────────────────────────────────────
 
@@ -175,22 +174,21 @@ impl SequentialBuilder {
         self
     }
 
-    pub fn mlstm(mut self, head_dim: usize) -> Self {
-        let layer = MLSTMLayer::new(self.output_size, head_dim);
-        self.layer(Box::new(layer), head_dim);
+    pub fn mlstm(mut self, num_heads: usize, dqk: usize) -> Self {
+        let hidden = self.output_size;
+        let layer = MLSTMLayer::new(hidden, hidden, num_heads, dqk);
+        self.layer(Box::new(layer), hidden);
         self
     }
 
-    pub fn mlstm_block(
-        mut self,
-        num_heads: usize,
-        d_qk: usize,
-        d_hv: usize,
-        up_size: usize,
-    ) -> Self {
-        let d = self.output_size;
-        let block = MLSTMBlock::new(d, num_heads, d_qk, d_hv, up_size);
-        self.layer(Box::new(block), d);
+    /// Multi-Head-mLSTM-Block im Stil von xLSTM-7B
+    /// (zwei separate Residuals + RMSNorm + SwiGLU).
+    /// up_size = 8·hidden / 3 (paper default).
+    pub fn mlstm_block(mut self, num_heads: usize, dqk: usize) -> Self {
+        let hidden = self.output_size;
+        let up = (hidden * 8) / 3;
+        let layer = MLSTMBlock::new(hidden, num_heads, dqk, up);
+        self.layer(Box::new(layer), hidden);
         self
     }
 

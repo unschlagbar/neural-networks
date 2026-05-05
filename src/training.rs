@@ -14,8 +14,8 @@ use std::{
 use crate::{
     batches::PreparedDataSet,
     config::{
-        self, BATCH_SIZE, DATA_DIR, EPOCHS, LR, MAX_SEQ_LEN, MODEL_LOC, PRINT_EVERY, SEQ_LEN,
-        SEQ_LOC,
+        self, BATCH_SIZE, DATA_DIR, EPOCHS, LR, MAX_SEQ_LEN, MODEL_LOC, PRINT_EVERY, SAVE_EVERY,
+        SEQ_LEN, SEQ_LOC,
     },
     hierarchical::HierarchicalSequential,
     model::{build_hierarchical_model, build_normal_model},
@@ -58,9 +58,7 @@ pub fn train_normal() {
         "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, log every {PRINT_EVERY} steps"
     );
 
-    let mut iteration = 0;
-    let mut j = 0;
-    let mut step = 0;
+    let mut training_state = TrainingState::new();
     let mut total_time = Duration::ZERO;
 
     for epoch in 1..=EPOCHS {
@@ -71,15 +69,8 @@ pub fn train_normal() {
         data.shuffle();
 
         let start = Instant::now();
-        model.train(
-            data.iter(),
-            LR,
-            &mut iteration,
-            &mut j,
-            BATCH_SIZE,
-            PRINT_EVERY,
-            &mut step,
-        );
+        model.train(data.iter(), &mut training_state);
+
         let epoch_time = start.elapsed();
         total_time += epoch_time;
 
@@ -125,9 +116,7 @@ pub fn train_hierarchical() {
         "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, log every {PRINT_EVERY} steps"
     );
 
-    let mut iteration = 0;
-    let mut j = 0;
-    let mut step = 0;
+    let mut training_state = TrainingState::new();
     let mut total_time = Duration::ZERO;
 
     for epoch in 1..=EPOCHS {
@@ -136,15 +125,8 @@ pub fn train_hierarchical() {
         data.shuffle();
 
         let start = Instant::now();
-        model.train(
-            data.iter(),
-            LR,
-            &mut iteration,
-            &mut j,
-            BATCH_SIZE,
-            PRINT_EVERY,
-            &mut step,
-        );
+        model.train(data.iter(), &mut training_state);
+
         let epoch_time = start.elapsed();
         total_time += epoch_time;
 
@@ -154,5 +136,55 @@ pub fn train_hierarchical() {
             ),
             Err(e) => eprintln!("  ✗ end-of-epoch save failed: {e}"),
         }
+    }
+}
+
+pub struct TrainingState {
+    pub step: usize,
+    pub batch_size: usize,
+    pub lr: f32,
+    loss: f32,
+    loss_steps: usize,
+    pub print_interval: usize,
+    pub save_interval: usize,
+}
+
+impl TrainingState {
+    pub fn new() -> Self {
+        Self {
+            step: 0,
+            lr: LR,
+            loss: 0.0,
+            loss_steps: 0,
+            batch_size: BATCH_SIZE,
+            print_interval: PRINT_EVERY,
+            save_interval: SAVE_EVERY,
+        }
+    }
+
+    pub fn step(&mut self, loss: f32) -> Option<f32> {
+        self.step += 1;
+        self.loss += loss;
+        self.loss_steps += 1;
+        if self.step.is_multiple_of(self.batch_size) {
+            Some(self.lr / self.batch_size as f32)
+        } else {
+            None
+        }
+    }
+
+    pub fn print(&mut self) -> bool {
+        self.step.is_multiple_of(self.print_interval)
+    }
+
+    pub fn get_loss(&mut self) -> f32 {
+        let loss = self.loss / self.loss_steps as f32;
+        self.loss = 0.0;
+        self.loss_steps = 0;
+        loss
+    }
+
+    pub fn save(&self) -> bool {
+        self.step.is_multiple_of(self.save_interval)
     }
 }

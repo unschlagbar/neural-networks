@@ -1,44 +1,38 @@
-// slstm_block.rs ── xLSTM-style sLSTM block
+// mlstm_block.rs ── Multi-head mLSTM-Block aus xLSTM 7B (Beck et al. 2024)
 //
-// Per-Timestep Architektur (Paper-konform, zwei getrennte Residuals):
+// Per-Timestep-Architektur (zwei separate Residuals, Transformer-Stil):
 //
-//     x ──┬─► RMSNorm(pre) ─► sLSTM-Zelle ─┬─► z ──┬─► RMSNorm(post) ─► SwiGLU ─┐
-//         │                                  │       │                             │
-//         └──────────────────────────────────┘       └─────── (+) ◄───────────────┘
-//              1. Residual: z = x + cell(x)               2. Residual: y = z + MLP(z)
+//     x ──┬─► RMSNorm(pre) ─► mLSTM-Zelle ─┬─► z ──┬─► RMSNorm(post) ─► SwiGLU ─┐
+//         │                                  │       │                            │
+//         └──────────────────────────────────┘       └─────── (+) ◄──────────────┘
+//             1. Residual: z = x + cell(x)              2. Residual: y = z + MLP(z)
 //
 // SwiGLU-MLP(h) = lin_down · ( SiLU(lin_gate · h) ⊙ (lin_value · h) )
 //
-// Bausteine (alle statisch, kein dyn):
-//   pre_norm  : RMSNorm  (H)
-//   cell      : SLSTMLayer  (H→H)
-//   post_norm : RMSNorm  (H)
-//   lin_gate  : LinearLayer  (H→U)
-//   lin_value : LinearLayer  (H→U)
-//   lin_down  : LinearLayer  (U→H)
+// Bausteine:
+//   pre_norm  : RMSNorm   (H_dim)
+//   cell      : MLSTMLayer  (multi-head, H_dim → H_dim)
+//   post_norm : RMSNorm   (H_dim)
+//   lin_gate  : LinearLayer (H_dim → U)
+//   lin_value : LinearLayer (H_dim → U)
+//   lin_down  : LinearLayer (U → H_dim)
 //
-// Shape-Konvention:  H = hidden_size,  U = up_size  (typisch U = 8·H/3).
+// (Hier benutzt H_dim als hidden_size / Block-Dim und H_n für num_heads,
+//  um die Verwechslung zwischen "hidden" und "num heads" zu vermeiden.)
 //
-// BPTT-Protokoll:
-//   cell.dh_bptt wird intern verwaltet — nach der Post-Norm-Rückwärtsphase
-//   addieren wir es zu dh, bevor cell.backward aufgerufen wird.
-//   Nach außen gibt der Block `bptt_hidden_grad() = None` zurück.
-//
-// Binär-Format (`save`) identisch zum alten Layout — kein Checkpoint-Bruch:
+// Save-Format (Tag 14):
 //   up_size : u32
-//   pre_norm.gamma, post_norm.gamma : f32_vec(H)
-//   cell: wz, wi, wf, wo, b, h_init, c_init
-//   lin_gate:  weights (H×U), biases (U)
-//   lin_value: weights (H×U), biases (U)
-//   lin_down:  weights (U×H), biases (H)
+//   pre_norm.gamma, post_norm.gamma : f32_vec(H_dim)
+//   cell-Daten   (mit num_heads, dqk vorne — siehe MLSTMLayer::save)
+//   lin_gate, lin_value, lin_down  (jeweils Matrix + Bias)
 
 use std::{any::Any, io};
 
 use crate::{
     nn::{
         linear::{LinearCache, LinearLayer},
+        mlstm::{MLSTMCache, MLSTMLayer},
         rms_norm::{RMSNorm, RMSNormCache},
-        slstm::{SLSTMCache, SLSTMLayer},
     },
     nn_layer::{DynCache, NnLayer},
     saving::{write_f32_slice, write_matrix, write_u32},
@@ -69,31 +63,21 @@ fn silu_prime(pre: f32) -> f32 {
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 
-pub struct SLSTMBlockCache {
-    // Pre-Norm
-    pub pre_norm: RMSNormCache, // .output = pre_normed (H)
-
-    // sLSTM-Zelle
-    pub cell: SLSTMCache,
-
-    // Erstes Residual: z = x + cell.h
-    pub z: Box<[f32]>, // (H)
-
-    // Post-Norm (auf z angewendet)
-    pub post_norm: RMSNormCache, // .output = post_normed (H)
-
-    // SwiGLU
-    pub lin_gate: LinearCache,  // .output = gate_pre  (U)
-    pub gate_act: Box<[f32]>,   // SiLU(gate_pre)       (U)
-    pub lin_value: LinearCache, // .output = value       (U)
-    pub mixed: Box<[f32]>,      // gate_act ⊙ value      (U)
-    pub lin_down: LinearCache,  // .output = down_out    (H)
-
-    pub output: Box<[f32]>, // z + down_out          (H)
-    pub dx: Box<[f32]>,     // dL/d(input)           (H)
+pub struct MLSTMBlockCache {
+    pub pre_norm: RMSNormCache,
+    pub cell: MLSTMCache,
+    pub z: Box<[f32]>, // (H_dim) z = x + cell.h
+    pub post_norm: RMSNormCache,
+    pub lin_gate: LinearCache,
+    pub gate_act: Box<[f32]>, // (U) SiLU(gate_pre)
+    pub lin_value: LinearCache,
+    pub mixed: Box<[f32]>, // (U) gate_act ⊙ value
+    pub lin_down: LinearCache,
+    pub output: Box<[f32]>, // (H_dim)
+    pub dx: Box<[f32]>,     // (H_dim)
 }
 
-impl DynCache for SLSTMBlockCache {
+impl DynCache for MLSTMBlockCache {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
@@ -110,33 +94,32 @@ impl DynCache for SLSTMBlockCache {
 
 // ── Layer ─────────────────────────────────────────────────────────────────────
 
-pub struct SLSTMBlock {
+pub struct MLSTMBlock {
     pub hidden_size: usize,
     pub up_size: usize,
 
     pub pre_norm: RMSNorm,
-    pub cell: SLSTMLayer,
+    pub cell: MLSTMLayer,
     pub post_norm: RMSNorm,
     pub lin_gate: LinearLayer,
     pub lin_value: LinearLayer,
     pub lin_down: LinearLayer,
 
     // Backward-Scratch (keine Allokation im Hot Path)
-    pub sc_h1: Box<[f32]>, // (H)  d_post_normed
-    pub sc_h2: Box<[f32]>, // (H)  dz + bptt, Input für cell.backward
-    pub sc_u2: Box<[f32]>, // (U)  d_gate_act
-    pub sc_u3: Box<[f32]>, // (U)  d_value  →  d_gate_pre
+    pub sc_h1: Box<[f32]>, // (H_dim)
+    pub sc_h2: Box<[f32]>, // (H_dim)
+    pub sc_u2: Box<[f32]>, // (U)
+    pub sc_u3: Box<[f32]>, // (U)
 }
 
-impl SLSTMBlock {
-    pub fn new(hidden_size: usize, up_size: usize) -> Self {
+impl MLSTMBlock {
+    pub fn new(hidden_size: usize, num_heads: usize, dqk: usize, up_size: usize) -> Self {
         let h = hidden_size;
         let u = up_size;
-        // Xavier-ähnliche Skalierung, identisch zur alten Initialisierung.
         let scale_up = (6.0 / (h as f32 + u as f32)).sqrt();
-        let scale_dn = (6.0 / (u as f32 + h as f32)).sqrt(); // gleich, aber explizit
+        let scale_dn = (6.0 / (u as f32 + h as f32)).sqrt();
 
-        // LinearLayer::new würde zufällige Biases erzeugen — wir wollen Nullbiases.
+        // LinearLayer::new würde zufällige Biases setzen — wir wollen Nullbiases.
         let make_lin = |rows: usize, cols: usize, scale: f32| {
             use iron_oxide::collections::Matrix;
             LinearLayer::from_loaded(
@@ -152,11 +135,10 @@ impl SLSTMBlock {
             up_size: u,
 
             pre_norm: RMSNorm::new(h),
-            cell: SLSTMLayer::new(h, h),
+            cell: MLSTMLayer::new(h, h, num_heads, dqk),
             post_norm: RMSNorm::new(h),
             lin_gate: make_lin(h, u, scale_up),
             lin_value: make_lin(h, u, scale_up),
-            // Down-Projektion kleiner init → Block startet nahe Identität.
             lin_down: make_lin(u, h, scale_dn),
 
             sc_h1: vec![0.0; h].into(),
@@ -171,7 +153,7 @@ impl SLSTMBlock {
         up_size: usize,
         pre_norm: RMSNorm,
         post_norm: RMSNorm,
-        cell: SLSTMLayer,
+        cell: MLSTMLayer,
         lin_gate: LinearLayer,
         lin_value: LinearLayer,
         lin_down: LinearLayer,
@@ -196,19 +178,26 @@ impl SLSTMBlock {
 
     // ── forward ──────────────────────────────────────────────────────────────
 
-    pub fn forward(&mut self, input: &[f32], cache: &mut SLSTMBlockCache) {
+    pub fn forward(&mut self, input: &[f32], cache: &mut MLSTMBlockCache) {
+        let h = self.hidden_size;
         let u = self.up_size;
 
+        // 1. Pre-Norm
         self.pre_norm.forward_into(input, &mut cache.pre_norm);
 
+        // 2. mLSTM-Zelle auf normiertem Input
         self.cell.forward(&cache.pre_norm.output, &mut cache.cell);
 
-        for i in 0..self.hidden_size {
-            cache.z[i] = input[i] + cache.cell.h[i];
+        // 3. Erstes Residual: z = x + cell.output
+        // (cell-Output liegt in cache.cell.w_out.output)
+        for i in 0..h {
+            cache.z[i] = input[i] + cache.cell.w_out.output[i];
         }
 
+        // 4. Post-Norm auf z
         self.post_norm.forward_into(&cache.z, &mut cache.post_norm);
 
+        // 5. SwiGLU-MLP
         self.lin_gate
             .forward(&cache.post_norm.output, &mut cache.lin_gate);
         self.lin_value
@@ -221,60 +210,72 @@ impl SLSTMBlock {
 
         self.lin_down.forward(&cache.mixed, &mut cache.lin_down);
 
-        for i in 0..self.hidden_size {
+        // 6. Zweites Residual: y = z + lin_down.output
+        for i in 0..h {
             cache.output[i] = cache.z[i] + cache.lin_down.output[i];
         }
     }
 
-    pub fn backward(&mut self, delta: &mut [f32], cache: &mut SLSTMBlockCache) {
+    pub fn backward(&mut self, delta: &mut [f32], cache: &mut MLSTMBlockCache) {
         let h = self.hidden_size;
         let u = self.up_size;
 
+        // dL/dy hat zwei Pfade:  (a) direkt nach z (residual)   (b) durch SwiGLU → post_norm → z
         cache.dx.copy_from_slice(delta);
 
+        // Backward durch lin_down
         self.lin_down.backward(delta, &mut cache.lin_down);
 
+        // mixed = gate_act ⊙ value
         for j in 0..u {
-            self.sc_u2[j] = cache.lin_down.dx[j] * cache.lin_value.output[j];
-            self.sc_u3[j] = cache.lin_down.dx[j] * cache.gate_act[j];
+            self.sc_u2[j] = cache.lin_down.dx[j] * cache.lin_value.output[j]; // d(gate_act)
+            self.sc_u3[j] = cache.lin_down.dx[j] * cache.gate_act[j]; // d(value)
         }
 
+        // value-Pfad
         self.lin_value
             .backward(&mut self.sc_u3, &mut cache.lin_value);
 
+        // gate-Pfad: durch silu'
         for j in 0..u {
             self.sc_u3[j] = self.sc_u2[j] * silu_prime(cache.lin_gate.output[j]);
         }
-
         self.lin_gate.backward(&mut self.sc_u3, &mut cache.lin_gate);
 
+        // dL/d(post_normed) = dvalue.dx + dgate.dx
         for i in 0..h {
             self.sc_h1[i] = cache.lin_value.dx[i] + cache.lin_gate.dx[i];
         }
 
+        // Backward durch post_norm → cache.post_norm.dx
         self.post_norm
             .backward_into(&self.sc_h1, &mut cache.post_norm);
 
+        // dL/dz = δ_outer + dL/dz_inner
         for i in 0..h {
             cache.dx[i] += cache.post_norm.dx[i];
         }
 
+        // dL/d(cell.output) = dL/dz  →  cell.backward
         self.sc_h2.copy_from_slice(&cache.dx);
         self.cell.backward(&mut self.sc_h2, &mut cache.cell);
+        // cache.cell.dx hat jetzt dL/d(pre_normed)
 
-        let d_pre_normed: &[f32] = &cache.cell.dconcat[..h];
+        // Backward durch pre_norm
+        let d_pre_normed = &cache.cell.dx[..h];
         self.pre_norm
             .backward_into(d_pre_normed, &mut cache.pre_norm);
 
+        // Beide Pfade nach x summieren (pre-norm-Pfad addieren — der Skip-Pfad ist schon drin)
         for i in 0..h {
             cache.dx[i] += cache.pre_norm.dx[i];
         }
     }
 
-    pub fn alloc_cache(&self) -> SLSTMBlockCache {
+    pub fn alloc_cache(&self) -> MLSTMBlockCache {
         let h = self.hidden_size;
         let u = self.up_size;
-        SLSTMBlockCache {
+        MLSTMBlockCache {
             pre_norm: self.pre_norm.alloc_cache(),
             cell: self.cell.alloc_cache(),
             z: vec![0.0; h].into(),
@@ -292,7 +293,7 @@ impl SLSTMBlock {
 
 // ── impl NnLayer ──────────────────────────────────────────────────────────────
 
-impl NnLayer for SLSTMBlock {
+impl NnLayer for MLSTMBlock {
     fn input_size(&self) -> usize {
         self.hidden_size
     }
@@ -303,31 +304,32 @@ impl NnLayer for SLSTMBlock {
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()
-            .downcast_mut::<SLSTMBlockCache>()
-            .expect("SLSTMBlock::forward — expected SLSTMBlockCache");
-        SLSTMBlock::forward(self, input, c);
+            .downcast_mut::<MLSTMBlockCache>()
+            .expect("MLSTMBlock::forward — expected MLSTMBlockCache");
+        MLSTMBlock::forward(self, input, c);
     }
 
     fn backward(&mut self, delta: &mut [f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()
-            .downcast_mut::<SLSTMBlockCache>()
-            .expect("SLSTMBlock::backward — expected SLSTMBlockCache");
-        SLSTMBlock::backward(self, delta, c);
+            .downcast_mut::<MLSTMBlockCache>()
+            .expect("MLSTMBlock::backward — expected MLSTMBlockCache");
+        MLSTMBlock::backward(self, delta, c);
     }
 
     fn make_cache(&self) -> Box<dyn DynCache> {
-        Box::new(SLSTMBlock::alloc_cache(self))
+        Box::new(MLSTMBlock::alloc_cache(self))
     }
 
     fn layer_tag(&self) -> u8 {
-        11
+        14
     }
 
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
         write_u32(w, self.up_size as u32)?;
         write_f32_slice(w, &self.pre_norm.gamma)?;
         write_f32_slice(w, &self.post_norm.gamma)?;
+        // cell.save schreibt selbst num_heads, dqk + alle Gewichte
         self.cell.save(w)?;
         write_matrix(w, &self.lin_gate.weights)?;
         write_f32_slice(w, &self.lin_gate.biases)?;
@@ -344,10 +346,6 @@ impl NnLayer for SLSTMBlock {
 
     fn zero_bptt_state(&mut self) {
         self.cell.zero_bptt_state();
-    }
-
-    fn accumulate_init_grad(&mut self) {
-        self.cell.accumulate_init_grad();
     }
 
     fn apply_grads(&mut self, lr: f32) {

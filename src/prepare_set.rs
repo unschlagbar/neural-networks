@@ -1,4 +1,6 @@
+//! Only for data set extraction
 #![allow(unused)]
+
 use std::{fs, io::Write};
 
 const DIR: &str = "data/political_speeches";

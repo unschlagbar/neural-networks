@@ -1,16 +1,3 @@
-// ── sampling.rs ──────────────────────────────────────────────────────────────
-//
-// Beide Sampling-Modi: normaler Sequential sowie Hierarchical. Die Logik ist
-// in beiden Fällen identisch — Modell laden, Cache für 1 Token allokieren,
-// dann in einer REPL-artigen Schleife Prefix einlesen und streamend Tokens
-// ausgeben.
-//
-// Ich habe hier NICHT versucht mit einer Closure/Trait zu abstrahieren, weil
-// `Sequential::sample` und `HierarchicalSequential::sample` zwar syntaktisch
-// identisch aussehen, aber keine gemeinsame Trait-Schnittstelle haben. Eine
-// Generic-Abstraktion bringt hier mehr Lifetime-Komplexität als sie an
-// Zeilen spart.
-
 use std::io::{Write, stdin, stdout};
 
 use crate::{

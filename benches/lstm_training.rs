@@ -1,5 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use neural_networks::batches::PreparedDataSet;
+use neural_networks::training::TrainingState;
 use std::{rc::Rc, time::Duration};
 
 use neural_networks::nn_layer::SequentialBuilder;
@@ -32,19 +33,12 @@ pub fn train(tokenizer: Rc<Tokenizer>, data: &PreparedDataSet) {
 
     model.make_cache(SEQ_LEN);
 
-    let mut iteration = 0;
-    let mut j = 0;
-    let mut step = 0;
+    let mut state = TrainingState::new();
+    state.lr = LR;
+    state.batch_size = BATCH_SIZE;
+    state.print_interval = 1;
 
-    model.train(
-        data.iter().take(2),
-        LR,
-        &mut iteration,
-        &mut j,
-        BATCH_SIZE,
-        1,
-        &mut step,
-    );
+    model.train(data.iter().take(2), &mut state);
 }
 
 fn benchmark_lstm_behavior(c: &mut Criterion) {
@@ -54,7 +48,8 @@ fn benchmark_lstm_behavior(c: &mut Criterion) {
 
     let tokenizer = Rc::new(Tokenizer::new_vocab(VOCAB, false));
     let boundaries = tokenizer.word_token_ids();
-    let data = PreparedDataSet::from_dir(&tokenizer, "political_speeches/", SEQ_LEN, &boundaries);
+    let data =
+        PreparedDataSet::from_dir(&tokenizer, "data/political_speeches/", SEQ_LEN, &boundaries);
 
     group.bench_function("lstm_training", |b| {
         b.iter(|| train(tokenizer.clone(), &data));

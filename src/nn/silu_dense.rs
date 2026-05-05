@@ -218,9 +218,4 @@ impl NnLayer for SiluDenseLayer {
         self.grads.weights.clear();
         self.grads.biases.fill(0.0);
     }
-
-    fn scale_grads(&mut self, scale: f32) {
-        self.grads.weights.scale(scale);
-        self.grads.biases.iter_mut().for_each(|x| *x *= scale);
-    }
 }

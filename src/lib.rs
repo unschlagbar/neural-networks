@@ -1,7 +1,6 @@
 pub mod adam_optimizer;
 pub mod batches;
 pub mod config;
-pub mod data_set_loading;
 pub mod hierarchical;
 pub mod loading;
 pub mod model;

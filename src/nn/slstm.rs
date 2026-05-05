@@ -495,16 +495,6 @@ impl NnLayer for SLSTMLayer {
         self.grads.c_init_grad.fill(0.0);
     }
 
-    fn scale_grads(&mut self, scale: f32) {
-        self.grads.wz.scale(scale);
-        self.grads.wi.scale(scale);
-        self.grads.wf.scale(scale);
-        self.grads.wo.scale(scale);
-        self.grads.b.scale(scale);
-        self.grads.h_init_grad.iter_mut().for_each(|x| *x *= scale);
-        self.grads.c_init_grad.iter_mut().for_each(|x| *x *= scale);
-    }
-
     fn reset_state(&mut self) {
         self.h.copy_from_slice(&self.h_init);
         self.c.copy_from_slice(&self.c_init);

@@ -173,8 +173,4 @@ impl NnLayer for EmbeddingLayer {
     fn clear_grads(&mut self) {
         self.grads.weights.clear();
     }
-
-    fn scale_grads(&mut self, scale: f32) {
-        self.grads.weights.scale(scale);
-    }
 }

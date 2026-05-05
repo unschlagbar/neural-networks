@@ -6,12 +6,13 @@ use std::{
 };
 
 use crate::{
-    config::{MODEL_LOC, SAVE_EVERY},
+    config::MODEL_LOC,
     loading::{read_u16, read_u32},
     nn::softmax::softmax,
     nn_layer::{DynCache, NnLayer},
     saving::{HIER_MAGIC, write_u16, write_u32},
     sequential::Sequential,
+    training::TrainingState,
 };
 
 pub struct HierarchicalSequential {
@@ -233,7 +234,7 @@ impl HierarchicalSequential {
                 out_len,
             );
 
-            if let Some(_) = boundary {
+            if boundary.is_some() {
                 for layer in &mut self.char2_model.layers {
                     layer.accumulate_init_grad();
                     layer.zero_bptt_state();
@@ -301,60 +302,42 @@ impl HierarchicalSequential {
     pub fn train<'a, I: Iterator<Item = (&'a [u16], &'a [u16])>>(
         &mut self,
         data: I,
-        lr: f32,
-        iteration: &mut usize,
-        j: &mut usize,
-        batch_size: usize,
-        print_every: usize,
-        step: &mut usize,
+        state: &mut TrainingState,
     ) {
-        let mut window_loss = 0.0;
-        let mut window_steps = 0;
-        let mut window_tokens = 0;
-        let mut window_start = Instant::now();
+        let mut tokens = 0;
+        let mut time = Instant::now();
 
         for (inputs, targets) in data {
             self.reset();
             self.forward_over(inputs);
 
             let loss = self.char2_model.seq_loss(targets);
-            window_loss += loss;
-            window_steps += 1;
-            window_tokens += inputs.len();
+            tokens += inputs.len();
 
             self.backwards_sequence(targets);
 
-            *step += 1;
-            *iteration += 1;
-            if *iteration % batch_size == 0 {
-                let lr = lr / batch_size as f32;
-
+            if let Some(lr) = state.step(loss) {
                 self.char_model.sgd_step(lr);
                 self.char2_model.sgd_step(lr);
                 self.word_model.sgd_step(lr);
-
-                *iteration = 0;
-                *j += 1;
             }
 
-            if print_every > 0 && window_steps >= print_every {
-                let avg = window_loss / window_steps as f32;
-                let elapsed = window_start.elapsed();
+            if state.print() {
+                let loss = state.get_loss();
+                let elapsed = time.elapsed();
                 println!(
                     "{} | char loss {:.4} | ppl {:.4} | high ∇ {:.4} | {} tok | {:.1?}",
-                    *step,
-                    avg,
-                    avg.exp(),
+                    state.step,
+                    loss,
+                    loss.exp(),
                     self.last_high_grad_signal,
-                    window_tokens,
+                    tokens,
                     elapsed,
                 );
-                window_loss = 0.0;
-                window_steps = 0;
-                window_tokens = 0;
-                window_start = Instant::now();
+                tokens = 0;
+                time = Instant::now();
             }
-            if *step % SAVE_EVERY == 0 {
+            if state.save() {
                 match self.save(MODEL_LOC) {
                     Ok(()) => println!("saved"),
                     Err(e) => eprintln!("save failed: {e}"),
@@ -411,7 +394,7 @@ impl HierarchicalSequential {
                     Self::forward_sample_step(
                         &mut self.word_model.layers,
                         &mut self.word_model.cache[0],
-                        &char1_out,
+                        char1_out,
                     );
                 }
                 {
@@ -478,7 +461,7 @@ impl HierarchicalSequential {
                     Self::forward_sample_step(
                         &mut self.word_model.layers,
                         &mut self.word_model.cache[0],
-                        &char1_out,
+                        char1_out,
                     );
                 }
                 {
