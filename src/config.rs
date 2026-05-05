@@ -7,7 +7,7 @@
 // ── Model-Pfade ──────────────────────────────────────────────────────────────
 
 /// Pfad für das hierarchische Modell (char- + sentence-level).
-pub const MODEL_LOC: &str = "models/hric";
+pub const MODEL_LOC: &str = "models/hierarchical";
 /// Pfad für das „normale" Char-Level-Sequential-Modell.
 pub const SEQ_LOC: &str = "models/seq";
 
@@ -18,17 +18,7 @@ pub const SEQ_LEN: usize = 1024;
 /// Reserve für den Forward-Cache (unsere BatchIter kann länger werden als SEQ_LEN).
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 
-// ── Optimizer ────────────────────────────────────────────────────────────────
-//
-// Die alte LR = 1e-5 ist für ein Netz mit Residual-Pfaden und RMSNorm einfach
-// zu klein. Deep-RNNs mit Pre-Norm laufen typisch bei 3e-4 – 1e-3. Weil wir
-// SGD (keinen Adam) haben, bleiben wir konservativ am unteren Ende.
-pub const LR: f32 = 5e-5;
-
-/// Gradienten-Akkumulation: wir rufen `apply_grads` erst nach BATCH_SIZE
-/// Sequenzen (Sequential skaliert automatisch mit 1/BATCH_SIZE).
-/// BATCH_SIZE = 1 war ein Hauptgrund für das Rauschen. 8 ist ein guter
-/// Kompromiss zwischen Stabilität und Update-Frequenz.
+pub const LR: f32 = 1e-4;
 pub const BATCH_SIZE: usize = 1;
 
 // ── Training-Schedule ────────────────────────────────────────────────────────
@@ -45,16 +35,16 @@ pub const PRINT_EVERY: usize = 10;
 // ── Sampling ─────────────────────────────────────────────────────────────────
 
 pub const MAX_LEN: usize = 1000;
-pub const TEMPERATURE: f32 = 0.3;
+pub const TEMPERATURE: f32 = 0.2;
 pub const TOP_P: f32 = 1.;
 
 // ── Modell-Dimensionen ───────────────────────────────────────────────────────
 
-pub const CHAR_HIDDEN: usize = 128;
-pub const OUT_HIDDEN: usize = 256;
-pub const WORD_HIDDEN: usize = 128;
+pub const CHAR_HIDDEN: usize = 64;
+pub const OUT_HIDDEN: usize = 128;
+pub const WORD_HIDDEN: usize = 384;
 
 // ── Dataset ──────────────────────────────────────────────────────────────────
 
-pub const DATA_DIR: &str = "data/steel/";
+pub const DATA_DIR: &str = "data/political_speeches/";
 pub const CHARSET: &str = "charset.txt";

@@ -1,4 +1,3 @@
-pub mod adam_optimizer;
 pub mod batches;
 pub mod config;
 pub mod hierarchical;
@@ -6,6 +5,7 @@ pub mod loading;
 pub mod model;
 pub mod nn;
 pub mod nn_layer;
+pub mod opimizers;
 pub mod prepare_set;
 pub mod sampling;
 pub mod saving;
