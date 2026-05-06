@@ -479,8 +479,8 @@ impl NnLayer for SLSTMLayer {
         self.grads.wi.apply_to(&mut self.wi, lr);
         self.grads.wf.apply_to(&mut self.wf, lr);
         self.grads.wo.apply_to(&mut self.wo, lr);
-
         self.grads.b.apply_to(&mut self.b, lr);
+
         self.grads.c_init_grad.apply_to(&mut self.c_init, lr);
         self.grads.h_init_grad.apply_to(&mut self.h_init, lr);
     }

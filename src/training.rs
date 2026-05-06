@@ -14,8 +14,8 @@ use std::{
 use crate::{
     batches::PreparedDataSet,
     config::{
-        self, BATCH_SIZE, DATA_DIR, EPOCHS, LR, MAX_SEQ_LEN, MODEL_LOC, PRINT_EVERY, SAVE_EVERY,
-        SEQ_LEN, SEQ_LOC,
+        self, BATCH_SIZE, DATA_DIR, DATA_FILE, EPOCHS, LR, MAX_SEQ_LEN, MODEL_LOC, PRINT_EVERY,
+        SAVE_EVERY, SEQ_LEN, SEQ_LOC,
     },
     hierarchical::HierarchicalSequential,
     model::{build_hierarchical_model, build_normal_model},
@@ -104,7 +104,8 @@ pub fn train_hierarchical() {
 
     println!("Preparing dataset from '{DATA_DIR}' ...");
     let prep_start = Instant::now();
-    let mut data = PreparedDataSet::from_dir(&tokenizer, DATA_DIR, SEQ_LEN, &word_boundary_ids);
+    let mut data =
+        PreparedDataSet::from_single_file(&tokenizer, DATA_FILE, SEQ_LEN, &word_boundary_ids);
     println!(
         "  {} files → {} windows, {} tokens (prep took {:.1?})",
         data.num_sequences(),

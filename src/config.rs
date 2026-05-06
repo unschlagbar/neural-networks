@@ -18,12 +18,12 @@ pub const SEQ_LEN: usize = 1024;
 /// Reserve für den Forward-Cache (unsere BatchIter kann länger werden als SEQ_LEN).
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 
-pub const LR: f32 = 1e-3;
+pub const LR: f32 = 1e-4;
 pub const BATCH_SIZE: usize = 1;
 
 // ── Training-Schedule ────────────────────────────────────────────────────────
 
-pub const EPOCHS: usize = 100;
+pub const EPOCHS: usize = 1;
 
 /// Save nach jeweils N abgeschlossenen Files (0 = nur am Ende jeder Epoche).
 pub const SAVE_EVERY: usize = 30;
@@ -35,16 +35,17 @@ pub const PRINT_EVERY: usize = 10;
 // ── Sampling ─────────────────────────────────────────────────────────────────
 
 pub const MAX_LEN: usize = 1000;
-pub const TEMPERATURE: f32 = 0.2;
+pub const TEMPERATURE: f32 = 0.3;
 pub const TOP_P: f32 = 1.;
 
 // ── Modell-Dimensionen ───────────────────────────────────────────────────────
 
-pub const CHAR_HIDDEN: usize = 64;
+pub const CHAR_HIDDEN: usize = 128;
 pub const OUT_HIDDEN: usize = 128;
-pub const WORD_HIDDEN: usize = 384;
+pub const WORD_HIDDEN: usize = 256;
 
 // ── Dataset ──────────────────────────────────────────────────────────────────
 
-pub const DATA_DIR: &str = "data/rust-std/";
+pub const DATA_DIR: &str = "data/rust-lib/";
+pub const DATA_FILE: &str = "data/train.txt";
 pub const CHARSET: &str = "charset.txt";

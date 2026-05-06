@@ -33,8 +33,8 @@ fn political() {
 
 #[test]
 fn collect_rs_files_for_training() {
-    let src_dir = std::path::Path::new("/home/unschlagbar/training_data/src");
-    let dst_dir = std::path::Path::new("/home/unschlagbar/Dev/neural-networks/data/rust-std");
+    let src_dir = std::path::Path::new("/home/unschlagbar/Downloads/rust");
+    let dst_dir = std::path::Path::new("/home/unschlagbar/Dev/neural-networks/data/rust-lib");
 
     std::fs::create_dir_all(dst_dir).unwrap();
 

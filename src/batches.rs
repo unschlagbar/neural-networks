@@ -40,6 +40,44 @@ pub struct PreparedDataSet {
 }
 
 impl PreparedDataSet {
+    pub fn from_single_file(
+        tokenizer: &Tokenizer,
+        path: &str,
+        seq_len: usize,
+        boundary_ids: &[u16],
+    ) -> Self {
+        let content =
+            fs::read_to_string(path).unwrap_or_else(|e| panic!("konnte {path:?} nicht lesen: {e}"));
+
+        let mut sequences: Vec<Vec<u16>> = Vec::new();
+        let mut skipped = 0;
+
+        for chunk in content.split("---FILE---") {
+            let chunk = chunk.trim();
+            if chunk.is_empty() {
+                continue;
+            }
+            let toks = tokenizer.to_tokens(chunk);
+            if toks.len() >= 2 {
+                sequences.push(toks);
+            } else {
+                skipped += 1;
+            }
+        }
+
+        if skipped > 0 {
+            eprintln!("PreparedDataSet: {skipped} leere Chunks übersprungen");
+        }
+
+        println!(
+            "  {} Chunks geladen, {} Tokens gesamt",
+            sequences.len(),
+            sequences.iter().map(|s| s.len()).sum::<usize>(),
+        );
+
+        let windows = build_windows(&sequences, seq_len, boundary_ids);
+        Self { sequences, windows }
+    }
     /// Read every file directly inside `dir` (non-recursive), tokenize it, and
     /// pre-compute all windows. Files that fail to read or are too short are
     /// skipped with a warning.
