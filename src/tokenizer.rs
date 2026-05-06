@@ -50,12 +50,12 @@ impl Tokenizer {
         println!("Vocabulary size: {}", itos.len());
 
         let id_space = stoi[&' '];
-        let id_space2 = itos.len() as u16
+        let id_space2 = stoi.len() as u16
             + SPECIAL_TOKENS
                 .iter()
                 .position(|&t| t == "<SPACE2>")
                 .unwrap() as u16;
-        let id_space4 = itos.len() as u16
+        let id_space4 = stoi.len() as u16
             + SPECIAL_TOKENS
                 .iter()
                 .position(|&t| t == "<SPACE4>")
