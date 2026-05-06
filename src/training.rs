@@ -28,7 +28,7 @@ use crate::{
 pub fn train_normal() {
     let tokenizer = Rc::new(Tokenizer::new(crate::config::CHARSET, false));
     let vocab = tokenizer.vocab_size();
-    let word_boundary_ids = tokenizer.word_token_ids();
+    let word_boundary_ids = tokenizer.boundary_tokens();
 
     // Existierendes Modell laden, sonst neu bauen.
     let mut model = match Sequential::load(SEQ_LOC) {
@@ -88,7 +88,7 @@ pub fn train_normal() {
 pub fn train_hierarchical() {
     let tokenizer = Rc::new(Tokenizer::new(config::CHARSET, false));
     let vocab = tokenizer.vocab_size();
-    let word_boundary_ids = tokenizer.word_token_ids();
+    let word_boundary_ids = tokenizer.boundary_tokens();
 
     let mut model = match HierarchicalSequential::load(MODEL_LOC) {
         Ok(m) => {

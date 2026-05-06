@@ -12,7 +12,7 @@ use std::{char, fs};
 pub struct Tokenizer {
     pub lowercase: bool,
     /// char/special-token string → token id
-    pub stoi: HashMap<String, u16>,
+    pub stoi: HashMap<char, u16>,
     /// token id → display string
     pub itos: Vec<String>,
     // Cached ids for the hot encode path
@@ -38,23 +38,28 @@ impl Tokenizer {
         let mut stoi = HashMap::new();
         let mut itos = Vec::new();
 
-        for (i, c) in vocab.iter().enumerate() {
-            let s = c.to_string();
-            stoi.insert(s.clone(), i as u16);
-            itos.push(s);
+        for (i, &c) in vocab.iter().enumerate() {
+            stoi.insert(c, i as u16);
+            itos.push(c.to_string());
         }
 
-        for (i, &token) in SPECIAL_TOKENS.iter().enumerate() {
-            let index = vocab.len() + i;
-            stoi.insert(token.to_string(), index as u16);
+        for token in SPECIAL_TOKENS {
             itos.push(token.to_string());
         }
 
         println!("Vocabulary size: {}", itos.len());
 
-        let id_space = stoi[" "];
-        let id_space2 = stoi["<SPACE2>"];
-        let id_space4 = stoi["<SPACE4>"];
+        let id_space = stoi[&' '];
+        let id_space2 = itos.len() as u16
+            + SPECIAL_TOKENS
+                .iter()
+                .position(|&t| t == "<SPACE2>")
+                .unwrap() as u16;
+        let id_space4 = itos.len() as u16
+            + SPECIAL_TOKENS
+                .iter()
+                .position(|&t| t == "<SPACE4>")
+                .unwrap() as u16;
 
         Tokenizer {
             lowercase,
@@ -116,9 +121,7 @@ impl Tokenizer {
                 c = c.to_ascii_lowercase()
             }
 
-            // ── Non-ASCII slow path ───────────────────────────────────────────
-            let s = c.to_string();
-            if let Some(&id) = self.stoi.get(&s) {
+            if let Some(&id) = self.stoi.get(&c) {
                 tokens.push(id);
             }
         }
@@ -164,18 +167,15 @@ impl Tokenizer {
 
     // ── Lookup ────────────────────────────────────────────────────────────────
 
-    pub fn get_token(&self, s: &str) -> u16 {
-        if let Some(&id) = self.stoi.get(s) {
+    pub fn get_token(&self, c: char) -> u16 {
+        if let Some(&id) = self.stoi.get(&c) {
             return id;
         }
-        // Try single-char em-dash conversion
-        if let Some(c) = s.chars().next() {
-            let mapped = if c == '—' { '-' } else { c };
-            if let Some(&id) = self.stoi.get(&mapped.to_string()) {
-                return id;
-            }
+        let mapped = if c == '—' { '-' } else { c };
+        if let Some(&id) = self.stoi.get(&mapped) {
+            return id;
         }
-        panic!("Char {:?} not in vocabulary", s);
+        panic!("Char {:?} not in vocabulary", c);
     }
 
     // ── Sizes ────────────────────────────────────────────────────────────────
@@ -185,15 +185,17 @@ impl Tokenizer {
         self.itos.len()
     }
 
-    // ── Boundary ids ─────────────────────────────────────────────────────────
+    // ── Boundaries ─────────────────────────────────────────────────────────
+
+    const BOUNDARIES: &[char] = &[
+        '.', '!', '?', ',', ';', ':', '\n', '{', '}', '(', ')', '[', ']', '<', '>', '|', '"', '\'',
+    ];
 
     /// Token ids that count as word/segment boundaries for the hierarchical model.
-    pub fn word_token_ids(&self) -> Vec<u16> {
+    pub fn boundary_tokens(&self) -> Vec<u16> {
         let mut ids = vec![self.id_space, self.id_space2, self.id_space4];
-        for c in [".", "!", "?", ",", ";", ":", "\n"] {
-            if let Some(&id) = self.stoi.get(c) {
-                ids.push(id);
-            }
+        for c in Self::BOUNDARIES {
+            ids.push(self.stoi[c]);
         }
         ids
     }
@@ -201,10 +203,10 @@ impl Tokenizer {
     // ── Boundary ids ─────────────────────────────────────────────────────────
 
     /// Token ids that count as word/segment boundaries for the hierarchical model.
-    pub fn sentence_token_ids(&self) -> Vec<u16> {
+    pub fn sentence_tokens(&self) -> Vec<u16> {
         let mut ids = Vec::with_capacity(4);
         for c in ['.', '!', '?', ';'] {
-            if let Some(&id) = self.stoi.get(&c.to_string()) {
+            if let Some(&id) = self.stoi.get(&c) {
                 ids.push(id);
             }
         }

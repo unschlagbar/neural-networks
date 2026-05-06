@@ -47,7 +47,7 @@ fn benchmark_lstm_behavior(c: &mut Criterion) {
     group.measurement_time(Duration::from_nanos(1));
 
     let tokenizer = Rc::new(Tokenizer::new_vocab(VOCAB, false));
-    let boundaries = tokenizer.word_token_ids();
+    let boundaries = tokenizer.boundary_tokens();
     let data =
         PreparedDataSet::from_dir(&tokenizer, "data/political_speeches/", SEQ_LEN, &boundaries);
 
