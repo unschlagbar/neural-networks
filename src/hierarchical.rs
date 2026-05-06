@@ -97,7 +97,7 @@ impl HierarchicalSequential {
     pub fn make_cache(&mut self, seq_len: usize) {
         self.char_model.make_cache(seq_len);
         self.char2_model.make_cache(seq_len);
-        self.word_model.make_cache((seq_len / 2).max(1));
+        self.word_model.make_cache(seq_len);
     }
 
     // ── State reset ───────────────────────────────────────────────────────────
