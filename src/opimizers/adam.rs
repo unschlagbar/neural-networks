@@ -2,9 +2,9 @@ use iron_oxide::collections::Matrix;
 
 use crate::opimizers::{GradMatrixOps, GradVecOps, OptimizerGradTypes};
 
-const CLIP: f32 = 15.0;
+const CLIP: f32 = 150.0;
 const BETA1: f32 = 0.9;
-const BETA2: f32 = 0.999;
+const BETA2: f32 = 0.98;
 const EPS: f32 = 1e-8;
 
 pub struct Adam;

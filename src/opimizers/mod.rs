@@ -4,7 +4,7 @@ pub mod adam;
 pub mod sgd;
 pub use self::adam::Adam;
 pub use self::sgd::Sgd;
-pub type Optimizer = Sgd;
+pub type Optimizer = Adam;
 
 // ── Optimizer Grad Types (statisch bestimmt zur Compile-Zeit) ────────────────
 

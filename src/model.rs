@@ -41,6 +41,7 @@ pub fn build_hierarchical_model(
     let char2_model = SequentialBuilder::new(CHAR_HIDDEN + WORD_HIDDEN)
         .linear(OUT_HIDDEN)
         .slstm_block(OUT_HIDDEN)
+        .slstm_block(OUT_HIDDEN)
         .rms_norm()
         .linear(vocab)
         .softmax()

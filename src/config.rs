@@ -14,11 +14,11 @@ pub const SEQ_LOC: &str = "models/seq";
 // ── Sequenz-Längen ───────────────────────────────────────────────────────────
 
 /// Trainings-Sequenzlänge (Anzahl Tokens pro BPTT-Chunk).
-pub const SEQ_LEN: usize = 1024;
+pub const SEQ_LEN: usize = 1024 * 1;
 /// Reserve für den Forward-Cache (unsere BatchIter kann länger werden als SEQ_LEN).
-pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
+pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024 * 4;
 
-pub const LR: f32 = 1e-4;
+pub const LR: f32 = 2e-4;
 pub const BATCH_SIZE: usize = 1;
 
 // ── Training-Schedule ────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ pub const PRINT_EVERY: usize = 10;
 
 // ── Sampling ─────────────────────────────────────────────────────────────────
 
-pub const MAX_LEN: usize = 1000;
+pub const MAX_LEN: usize = 2000;
 pub const TEMPERATURE: f32 = 0.3;
 pub const TOP_P: f32 = 1.;
 
