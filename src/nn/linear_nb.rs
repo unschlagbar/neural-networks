@@ -7,8 +7,6 @@ use crate::{
     opimizers::{GradMatrix, GradMatrixOps},
 };
 
-// ── DenseCache ────────────────────────────────────────────────────────────────
-
 pub struct LinearNBCache {
     /// Saved input (for ∂L/∂W = x · δᵀ).
     pub input: Box<[f32]>,
@@ -43,8 +41,6 @@ impl DynCache for LinearNBCache {
     }
 }
 
-// ── DenseGrads (stored inside the layer) ─────────────────────────────────────
-
 pub struct LinearNBGrads {
     pub weights: GradMatrix,
 }
@@ -56,8 +52,6 @@ impl LinearNBGrads {
         }
     }
 }
-
-// ── DenseLayer ────────────────────────────────────────────────────────────────
 
 pub struct LinearNBLayer {
     pub weights: Matrix,
@@ -137,9 +131,8 @@ impl LinearNBLayer {
     }
 }
 
-// ── impl NnLayer for DenseLayer ───────────────────────────────────────────────
-
 impl NnLayer for LinearNBLayer {
+    //type Cache = LinearNBCache;
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()

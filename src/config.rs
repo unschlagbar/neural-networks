@@ -1,50 +1,37 @@
-// ── config.rs ────────────────────────────────────────────────────────────────
-//
-// Zentrale Stelle für alle Hyperparameter.  Ändere sie hier — NICHT verstreut
-// über main.rs. Die Begründungen stehen als Kommentare direkt bei den Werten,
-// damit man beim Tuning weiß, was man verändert.
+// Model-path
 
-// ── Model-Pfade ──────────────────────────────────────────────────────────────
-
-/// Pfad für das hierarchische Modell (char- + sentence-level).
 pub const MODEL_LOC: &str = "models/hierarchical";
-/// Pfad für das „normale" Char-Level-Sequential-Modell.
 pub const SEQ_LOC: &str = "models/seq";
 
-// ── Sequenz-Längen ───────────────────────────────────────────────────────────
-
-/// Trainings-Sequenzlänge (Anzahl Tokens pro BPTT-Chunk).
+// Sequenz-Len
 pub const SEQ_LEN: usize = 1024 * 1;
-/// Reserve für den Forward-Cache (unsere BatchIter kann länger werden als SEQ_LEN).
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024 * 4;
 
-pub const LR: f32 = 2e-4;
+pub const LR: f32 = 10e-4;
+pub const WARMUP_STEPS: usize = 100;
 pub const BATCH_SIZE: usize = 1;
 
-// ── Training-Schedule ────────────────────────────────────────────────────────
+// ── Training-Schedule
 
 pub const EPOCHS: usize = 1;
 
-/// Save nach jeweils N abgeschlossenen Files (0 = nur am Ende jeder Epoche).
 pub const SAVE_EVERY: usize = 30;
 
-/// Loss-Ausgabe alle N Trainings-Steps (= Forward-/Backward-Durchgänge über
-/// ein Window). 0 = nur am Ende jeder Epoche flushen.
 pub const PRINT_EVERY: usize = 10;
 
-// ── Sampling ─────────────────────────────────────────────────────────────────
+// Sampling
 
 pub const MAX_LEN: usize = 2000;
 pub const TEMPERATURE: f32 = 0.3;
 pub const TOP_P: f32 = 1.;
 
-// ── Modell-Dimensionen ───────────────────────────────────────────────────────
+// Modell-Dimensions
 
 pub const CHAR_HIDDEN: usize = 128;
 pub const OUT_HIDDEN: usize = 128;
 pub const WORD_HIDDEN: usize = 256;
 
-// ── Dataset ──────────────────────────────────────────────────────────────────
+// Dataset
 
 pub const DATA_DIR: &str = "data/rust-lib/";
 pub const DATA_FILE: &str = "data/train.txt";

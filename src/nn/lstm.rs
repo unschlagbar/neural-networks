@@ -13,8 +13,6 @@ const I: usize = 1;
 const C: usize = 2;
 const O: usize = 3;
 
-// ── LSTMCache ─────────────────────────────────────────────────────────────────
-
 /// All activations and scratch buffers needed for one LSTM timestep.
 /// Pre-allocated at the start of training; zero dynamic allocation in the hot path.
 pub struct LSTMCache {
@@ -53,8 +51,6 @@ impl DynCache for LSTMCache {
     }
 }
 
-// ── LSTMLayerGrads ────────────────────────────────────────────────────────────
-
 pub struct LSTMLayerGrads {
     pub wf: GradMatrix,
     pub wi: GradMatrix,
@@ -79,8 +75,6 @@ impl LSTMLayerGrads {
     }
 }
 
-// ── LSTMLayer ─────────────────────────────────────────────────────────────────
-
 pub struct LSTMLayer {
     pub input_size: usize,
     pub hidden_size: usize,
@@ -99,7 +93,7 @@ pub struct LSTMLayer {
     /// Gradient accumulators, cleared per batch, applied in `sgd_step`.
     pub grads: LSTMLayerGrads,
 
-    // ── backward scratch (no allocation during backward) ──────────────────────
+    // backward scratch (no allocation during backward)
     pub do_: Box<[f32]>,
     pub df: Box<[f32]>,
     pub di: Box<[f32]>,
@@ -282,9 +276,8 @@ impl LSTMLayer {
     }
 }
 
-// ── impl NnLayer for LSTMLayer ────────────────────────────────────────────────
-
 impl NnLayer for LSTMLayer {
+    //type Cache = LSTMCache;
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()

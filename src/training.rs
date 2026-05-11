@@ -1,11 +1,3 @@
-// ── training.rs ──────────────────────────────────────────────────────────────
-//
-// Training-Loops für beide Modellvarianten. Der Datensatz wird *einmal* am
-// Anfang vollständig geladen, tokenisiert und in Word-Boundary-Windows zerlegt
-// (siehe PreparedDataSet). Pro Epoche shuffeln wir nur die Window-Liste neu —
-// kein Re-Read, keine Re-Tokenisierung. Loss wird alle PRINT_EVERY Steps
-// gemeldet, nicht erst am Ende einer Datei.
-
 use std::{
     rc::Rc,
     time::{Duration, Instant},
@@ -15,15 +7,14 @@ use crate::{
     batches::PreparedDataSet,
     config::{
         self, BATCH_SIZE, DATA_DIR, DATA_FILE, EPOCHS, LR, MAX_SEQ_LEN, MODEL_LOC, PRINT_EVERY,
-        SAVE_EVERY, SEQ_LEN, SEQ_LOC,
+        SAVE_EVERY, SEQ_LEN, SEQ_LOC, WARMUP_STEPS,
     },
     hierarchical::HierarchicalSequential,
     model::{build_hierarchical_model, build_normal_model},
+    opimizers::Optimizer,
     sequential::Sequential,
     tokenizer::Tokenizer,
 };
-
-// ── normales Sequential ──────────────────────────────────────────────────────
 
 pub fn train_normal() {
     let tokenizer = Rc::new(Tokenizer::new(crate::config::CHARSET, false));
@@ -43,7 +34,6 @@ pub fn train_normal() {
     };
     model.make_cache(MAX_SEQ_LEN);
 
-    // ── Dataset einmal vorbereiten ────────────────────────────────────────────
     println!("Preparing dataset from '{DATA_DIR}' ...");
     let prep_start = Instant::now();
     let mut data = PreparedDataSet::from_dir(&tokenizer, DATA_DIR, SEQ_LEN, &word_boundary_ids);
@@ -55,7 +45,8 @@ pub fn train_normal() {
         prep_start.elapsed(),
     );
     println!(
-        "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, log every {PRINT_EVERY} steps"
+        "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, optimizer={:?}, log every {PRINT_EVERY} steps",
+        Optimizer {}
     );
 
     let mut training_state = TrainingState::new();
@@ -82,8 +73,6 @@ pub fn train_normal() {
         }
     }
 }
-
-// ── HM-RNN (Chung, Ahn, Bengio 2016) ─────────────────────────────────────────
 
 pub fn train_hierarchical() {
     let tokenizer = Rc::new(Tokenizer::new(config::CHARSET, false));
@@ -114,10 +103,11 @@ pub fn train_hierarchical() {
         prep_start.elapsed(),
     );
     println!(
-        "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, log every {PRINT_EVERY} steps"
+        "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, optimizer={:?}, log every {PRINT_EVERY} steps",
+        Optimizer {}
     );
 
-    let mut training_state = TrainingState::new();
+    let mut training_state = TrainingState::from_step(model.step);
     let mut total_time = Duration::ZERO;
 
     for epoch in 1..=EPOCHS {
@@ -152,8 +142,12 @@ pub struct TrainingState {
 
 impl TrainingState {
     pub fn new() -> Self {
+        Self::from_step(0)
+    }
+
+    pub fn from_step(step: usize) -> Self {
         Self {
-            step: 0,
+            step,
             lr: LR,
             loss: 0.0,
             loss_steps: 0,
@@ -168,7 +162,9 @@ impl TrainingState {
         self.loss += loss;
         self.loss_steps += 1;
         if self.step.is_multiple_of(self.batch_size) {
-            Some(self.lr / self.batch_size as f32)
+            let batch_num = self.step / self.batch_size;
+            let warmup_scale = (batch_num as f32 / WARMUP_STEPS as f32).min(1.0);
+            Some(self.lr * warmup_scale / self.batch_size as f32)
         } else {
             None
         }

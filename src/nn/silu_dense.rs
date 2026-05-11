@@ -9,8 +9,6 @@ use crate::{
     opimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
 };
 
-// ── SiluDenseCache ────────────────────────────────────────────────────────────
-
 pub struct SiluDenseCache {
     /// Saved input (für ∂L/∂W = x · δᵀ).
     pub input: Box<[f32]>,
@@ -48,8 +46,6 @@ impl DynCache for SiluDenseCache {
     }
 }
 
-// ── SiluDenseGrads ────────────────────────────────────────────────────────────
-
 pub struct SiluDenseGrads {
     pub weights: GradMatrix,
     pub biases: GradVec,
@@ -63,8 +59,6 @@ impl SiluDenseGrads {
         }
     }
 }
-
-// ── SiluDenseLayer ────────────────────────────────────────────────────────────
 
 pub struct SiluDenseLayer {
     pub weights: Matrix,
@@ -170,9 +164,8 @@ impl SiluDenseLayer {
     }
 }
 
-// ── impl NnLayer for SiluDenseLayer ───────────────────────────────────────────
-
 impl NnLayer for SiluDenseLayer {
+    //type Cache = SiluDenseCache;
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()

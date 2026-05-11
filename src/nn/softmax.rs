@@ -1,22 +1,9 @@
-// ── SoftmaxLayer ──────────────────────────────────────────────────────────────
-//
-// Why a separate layer instead of `DenseLayer(Softmax)`?
-//
-//   PyTorch / Keras do the same: the output Dense has no activation, and a
-//   separate Softmax (or fused CrossEntropyLoss) sits on top. This removes the
-//   `is_softmax()` flag hack entirely — backward here receives the fused
-//   cross-entropy gradient ŷ−y directly from `Sequential`, which is exactly
-//   the Jacobian of Softmax·CE collapsed. No further transformation needed,
-//   so dx = delta and there are no learnable parameters.
-
 use std::{any::Any, io};
 
 use crate::{
     nn_layer::{DynCache, NnLayer},
     saving::write_u32,
 };
-
-// ── SoftmaxCache ──────────────────────────────────────────────────────────────
 
 pub struct SoftmaxCache {
     pub output: Vec<f32>,
@@ -46,8 +33,6 @@ impl DynCache for SoftmaxCache {
         &self.dx
     }
 }
-
-// ── helpers ───────────────────────────────────────────────────────────────────
 
 pub fn softmax_inplace(x: &mut [f32]) {
     let max = x.iter().fold(f32::NEG_INFINITY, |x, &y| x.max(y));
@@ -86,6 +71,7 @@ impl SoftmaxLayer {
 }
 
 impl NnLayer for SoftmaxLayer {
+    //type Cache = SoftmaxCache;
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache.as_any_mut().downcast_mut::<SoftmaxCache>().unwrap();
         c.output.copy_from_slice(input);

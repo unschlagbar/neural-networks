@@ -33,8 +33,6 @@ const I: usize = 1; // input gate (ĩ)
 const G_F: usize = 2; // forget gate (f̃)
 const O: usize = 3; // output gate (õ)
 
-// ── SLSTMCache ────────────────────────────────────────────────────────────────
-
 /// All per-timestep activations + scratch needed for backward.
 /// Pre-allocated at the start of training; zero dynamic allocation in the hot path.
 pub struct SLSTMCache {
@@ -89,8 +87,6 @@ impl DynCache for SLSTMCache {
     }
 }
 
-// ── SLSTMLayerGrads ───────────────────────────────────────────────────────────
-
 pub struct SLSTMLayerGrads {
     pub wz: GradMatrix,
     pub wi: GradMatrix,
@@ -116,8 +112,6 @@ impl SLSTMLayerGrads {
     }
 }
 
-// ── SLSTMLayer ────────────────────────────────────────────────────────────────
-
 pub struct SLSTMLayer {
     pub input_size: usize,
     pub hidden_size: usize,
@@ -128,13 +122,13 @@ pub struct SLSTMLayer {
     pub wo: Matrix,
     pub b: Matrix,
 
-    // ── Forward state carried across timesteps ────────────────────────────────
+    // Forward state carried across timesteps
     pub h: Box<[f32]>,
     pub c: Box<[f32]>,
     pub n: Box<[f32]>,
     pub m: Box<[f32]>,
 
-    // ── BPTT gradients flowing t+1 → t ───────────────────────────────────────
+    // BPTT gradients flowing t+1 → t
     dh_bptt: Box<[f32]>,
     dc_bptt: Box<[f32]>,
     dn_bptt: Box<[f32]>,
@@ -145,7 +139,7 @@ pub struct SLSTMLayer {
 
     pub grads: SLSTMLayerGrads,
 
-    // ── backward scratch (no allocation during backward) ──────────────────────
+    // backward scratch (no allocation during backward)
     pub dz: Box<[f32]>,
     pub di_pre: Box<[f32]>,
     pub df_pre: Box<[f32]>,
@@ -235,8 +229,6 @@ impl SLSTMLayer {
         }
     }
 
-    // ── forward ───────────────────────────────────────────────────────────────
-
     pub fn forward(&mut self, input: &[f32], cache: &mut SLSTMCache) {
         let h = self.hidden_size;
 
@@ -297,8 +289,6 @@ impl SLSTMLayer {
         self.m.copy_from_slice(&cache.m);
     }
 
-    // ── backward ──────────────────────────────────────────────────────────────
-    //
     // Incoming `delta` = dL/dh_t (already combined with dh_bptt from t+1 by Sequential).
     //
     // Writes:
@@ -315,7 +305,7 @@ impl SLSTMLayer {
             delta[j] += self.dh_bptt[j];
         }
 
-        // ── 1. Output gate ────────────────────────────────────────────────────
+        // 1. Output gate
         //   h = o · (c / ψ)   →   do/dõ = δh · c/ψ · o·(1-o)
         for j in 0..h {
             self.do_pre[j] =
@@ -339,7 +329,7 @@ impl SLSTMLayer {
             self.dn_scratch[j] = dn_from_h + self.dn_bptt[j];
         }
 
-        // ── 3. Gradients w.r.t. stabilized gates + z, and BPTT for c, n ───────
+        // 3. Gradients w.r.t. stabilized gates + z, and BPTT for c, n
         //   c = f'·c_prev + i'·z
         //   n = f'·n_prev + i'
         for j in 0..h {
@@ -367,7 +357,7 @@ impl SLSTMLayer {
             self.dn_bptt[j] = dn * cache.f_prime[j];
         }
 
-        // ── 4. Weight and bias gradients ──────────────────────────────────────
+        // 4. Weight and bias gradients
         let g = &mut self.grads;
         g.wz.matrix().add_outer(&cache.xh, &self.dz);
         g.wi.matrix().add_outer(&cache.xh, &self.di_pre);
@@ -381,7 +371,7 @@ impl SLSTMLayer {
             g.b.matrix()[O][j] += self.do_pre[j];
         }
 
-        // ── 5. dL/d(xh) for layers below + BPTT to h_{t-1} ────────────────────
+        // 5. dL/d(xh) for layers below + BPTT to h_{t-1}
         for i in 0..r {
             let mut s = 0.0;
             for j in 0..h {
@@ -424,9 +414,8 @@ impl SLSTMLayer {
     }
 }
 
-// ── impl NnLayer for SLSTMLayer ───────────────────────────────────────────────
-
 impl NnLayer for SLSTMLayer {
+    //type Cache = SLSTMCache;
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()
@@ -512,8 +501,6 @@ impl NnLayer for SLSTMLayer {
         add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
     }
 }
-
-// ── numerically stable helpers ────────────────────────────────────────────────
 
 #[inline]
 fn stable_sigmoid(x: f32) -> f32 {

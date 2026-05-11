@@ -1,45 +1,40 @@
-// mlstm.rs ── Multi-head mLSTM aus xLSTM (Beck et al. 2024)
+// mlstm.rs - Multi-head mLSTM based on xLSTM (Beck et al. 2024)
 //
-// Hyperparameter:
-//   d   = hidden_size      (Input == Output)
+// Hyperparameters:
+//   d   = hidden_size      (input == output)
 //   H   = num_heads
-//   dqk = query/key Dim pro Head
-//   dhv = d / H            (value/output Dim pro Head, abgeleitet)
-//   d_qk = H · dqk         (gesamte Q/K-Dimension)
+//   dqk = query/key dim per head
+//   dhv = d / H            (value/output dim per head)
+//   d_qk = H * dqk         (full query/key dimension)
 //
-// Pro Head h existiert ein eigener Cell-State:
-//   C_h ∈ ℝ^{dhv × dqk}    Matrix-Speicher (flach in self.c gepackt)
-//   n_h ∈ ℝ^{dqk}          Normalisierer
-//   m_h ∈ ℝ                Stabilizer (skalar)
+// Each head maintains its own state:
+//   C_h ∈ ℝ^{dhv × dqk}    flattened row-major in self.c
+//   n_h ∈ ℝ^{dqk}          normalizer vector
+//   m_h ∈ ℝ                scalar stabilizer
 //
-// Forward (einmal pro Timestep):
+// Forward pass per timestep:
 //   q   = W_q x + b_q                     ∈ ℝ^{d_qk}
-//   k   = (W_k x + b_k) / √dqk            ∈ ℝ^{d_qk}     (Key-Skalierung)
+//   k   = (W_k x + b_k) / √dqk            ∈ ℝ^{d_qk}
 //   v   = W_v x + b_v                     ∈ ℝ^{d}
 //   o   = σ(W_o x + b_o)                  ∈ ℝ^{d}
-//   ĩ   = W_i x + b_i                     ∈ ℝ^{H}        (Skalar pro Head)
-//   f̃   = W_f x + b_f                     ∈ ℝ^{H}        (Skalar pro Head)
+//   ĩ   = W_i x + b_i                     ∈ ℝ^{H}
+//   f̃   = W_f x + b_f                     ∈ ℝ^{H}
 //
-// Pro Head h, mit q_h = q[h·dqk..(h+1)·dqk]   etc.:
+// Per head h, with q_h = q[h*dqk..(h+1)*dqk]:
 //   log_f_h = log σ(f̃_h)
-//   m_h     = max(log_f_h + m_prev_h, ĩ_h)
-//   i'_h    = exp(ĩ_h − m_h)
-//   f'_h    = exp(log_f_h + m_prev_h − m_h)
-//   C_h     = f'_h · C_prev_h + i'_h · v_h ⊗ k_h
-//   n_h     = f'_h · n_prev_h + i'_h · k_h
-//   ψ_h     = max(|n_h⊤ q_h|, 1)
-//   y_h     = o_h ⊙ (C_h q_h) / ψ_h        ∈ ℝ^{dhv}
+//   m_h     = max(log_f_h + m_prev_h, ĩ_h)
+//   i'_h    = exp(ĩ_h - m_h)
+//   f'_h    = exp(log_f_h + m_prev_h - m_h)
+//   C_h     = f'_h * C_prev_h + i'_h * v_h ⊗ k_h
+//   n_h     = f'_h * n_prev_h + i'_h * k_h
+//   ψ_h     = max(|n_hᵀ q_h|, 1)
+//   y_h     = o_h ⊙ (C_h q_h) / ψ_h          ∈ ℝ^{dhv}
 //
-// Concat aller y_h zu y_concat ∈ ℝ^{d}, dann Output-Projektion:
+// Concatenate y_h into y_concat ∈ ℝ^{d}, then output:
 //   h = W_out · y_concat + b_out           ∈ ℝ^{d}
 //
-// State-Layout (alles flach, row-major):
-//   c[h·dhv·dqk + i·dqk + j] = C_h[i, j]
-//   n[h·dqk + j]              = n_h[j]
-//   m[h]                       = m_h
-//
-// BPTT-Kanäle: dc_bptt (H·dhv·dqk), dn_bptt (H·dqk).
-// Kein dh_bptt — keine h-Rekurrenz.
+// State layout is flat row-major for C_h and n_h.
+// BPTT holds dc_bptt (H·dhv·dqk) and dn_bptt (H·dqk). No dh_bptt is needed.
 
 use iron_oxide::collections::Matrix;
 
@@ -50,8 +45,6 @@ use crate::{
     saving,
 };
 use std::{any::Any, io};
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 #[inline]
 fn stable_sigmoid(x: f32) -> f32 {
@@ -72,8 +65,6 @@ fn log_sigmoid(x: f32) -> f32 {
     }
 }
 
-// ── MLSTMCache ────────────────────────────────────────────────────────────────
-
 pub struct MLSTMCache {
     pub input_size: usize,
     pub hidden_size: usize,
@@ -81,38 +72,41 @@ pub struct MLSTMCache {
     pub dqk: usize,
     pub dhv: usize,
 
-    /// Saved input x_t (für ∂L/∂W = x ⊗ δ).
+    /// Saved input x_t for weight gradient computation.
     pub x: Box<[f32]>,
 
-    // ── Vorzustand (für Backward) ─────────────────────────────────────────────
+    // Previous state values needed for backward pass.
     pub c_prev: Box<[f32]>, // H·dhv·dqk
     pub n_prev: Box<[f32]>, // H·dqk
     pub m_prev: Box<[f32]>, // H
 
-    // ── Forward-Aktivierungen ────────────────────────────────────────────────
-    pub q: Box<[f32]>,       // post-bias                 (H·dqk)
-    pub k: Box<[f32]>,       // post-bias UND /√dqk       (H·dqk)
-    pub v: Box<[f32]>,       // post-bias                 (d)
-    pub o: Box<[f32]>,       // post-sigmoid              (d)
-    pub i_pre: Box<[f32]>,   // post-bias                 (H)
-    pub f_pre: Box<[f32]>,   // post-bias                 (H)
-    pub log_f: Box<[f32]>,   // log σ(f̃)                  (H)
-    pub i_prime: Box<[f32]>, // exp(ĩ - m)                (H)
-    pub f_prime: Box<[f32]>, // exp(log_f + m_prev - m)   (H)
+    // Forward activations.
+    pub q: Box<[f32]>,       // after bias              (H·dqk)
+    pub k: Box<[f32]>,       // after bias and scaling  (H·dqk)
+    pub v: Box<[f32]>,       // after bias              (d)
+    pub o: Box<[f32]>,       // after sigmoid           (d)
+    pub i_pre: Box<[f32]>,   // pre-activation          (H)
+    pub f_pre: Box<[f32]>,   // pre-activation          (H)
+    pub log_f: Box<[f32]>,   // log σ(f̃)               (H)
+    pub i_prime: Box<[f32]>, // exp(ĩ - m)             (H)
+    pub f_prime: Box<[f32]>, // exp(log_f + m_prev - m) (H)
 
-    // ── Zustände bei t ────────────────────────────────────────────────────────
+    // Current state values at timestep t.
+    // TODO make this `Box<[Matrix]>`
     pub c: Box<[f32]>, // H·dhv·dqk
+    // TODO make this `Matrix`
     pub n: Box<[f32]>, // H·dqk
     pub m: Box<[f32]>, // H
 
-    // ── Output-Zwischenstufen ─────────────────────────────────────────────────
+    // Output-Zwischenstufen
     pub cq: Box<[f32]>,      // (d)  Concat aller C_h·q_h
     pub nq: Box<[f32]>,      // (H)
     pub psi: Box<[f32]>,     // (H)
     pub h_tilde: Box<[f32]>, // (d)  cq / psi  (per Head normalisiert)
 
-    /// LinearCache für die Output-Projektion W_out.
-    /// `w_out.input` = h_concat (= o ⊙ h_tilde), `w_out.output` = finale Cell-Output h.
+    /// Linear cache for the output projection W_out.
+    /// `w_out.input` stores h_concat = o ⊙ h_tilde.
+    /// `w_out.output` stores the final cell output h.
     pub w_out: LinearCache,
 
     /// dL/d(input).
@@ -134,8 +128,6 @@ impl DynCache for MLSTMCache {
         &self.dx
     }
 }
-
-// ── MLSTMLayerGrads ──────────────────────────────────────────────────────────
 
 pub struct MLSTMLayerGrads {
     pub wq: GradMatrix, // d × H·dqk
@@ -173,8 +165,6 @@ impl MLSTMLayerGrads {
     }
 }
 
-// ── MLSTMLayer ───────────────────────────────────────────────────────────────
-
 pub struct MLSTMLayer {
     pub input_size: usize,
     pub hidden_size: usize, // d
@@ -183,7 +173,6 @@ pub struct MLSTMLayer {
     pub dhv: usize, // = d / H
     pub inv_sqrt_dqk: f32,
 
-    // ── Gewichte ──────────────────────────────────────────────────────────────
     pub wq: Matrix,
     pub wk: Matrix,
     pub wv: Matrix,
@@ -197,24 +186,23 @@ pub struct MLSTMLayer {
     pub bi: Box<[f32]>,
     pub bf: Box<[f32]>,
 
-    /// Output-Projektion W_out · y_concat + b_out.
+    /// Output projection W_out · y_concat + b_out.
     pub w_out: LinearLayer,
 
-    // ── Forward-State über Timesteps hinweg ───────────────────────────────────
     pub c: Box<[f32]>, // H·dhv·dqk
     pub n: Box<[f32]>, // H·dqk
     pub m: Box<[f32]>, // H
 
-    // ── BPTT-Gradienten (t+1 → t) ─────────────────────────────────────────────
+    // BPTT-Grads (t+1 → t)
     pub dc_bptt: Box<[f32]>, // H·dhv·dqk
     pub dn_bptt: Box<[f32]>, // H·dqk
 
     pub grads: MLSTMLayerGrads,
 
-    // ── Backward-Scratch ──────────────────────────────────────────────────────
+    // Backward-Scratch
     pub dq: Box<[f32]>,        // H·dqk
-    pub dk: Box<[f32]>,        // H·dqk  (vor /√dqk-Reverse)
-    pub dk_pre: Box<[f32]>,    // H·dqk  (nach /√dqk-Reverse, fließt in Wᵀ·dk_pre)
+    pub dk: Box<[f32]>,        // H·dqk  (before /√dqk reverse scaling)
+    pub dk_pre: Box<[f32]>,    // H·dqk  (after /√dqk reverse scaling; flows into Wᵀ·dk_pre)
     pub dv: Box<[f32]>,        // d
     pub do_pre: Box<[f32]>,    // d
     pub di_pre: Box<[f32]>,    // H
@@ -362,8 +350,6 @@ impl MLSTMLayer {
         }
     }
 
-    // ── forward ───────────────────────────────────────────────────────────────
-
     pub fn forward(&mut self, input: &[f32], cache: &mut MLSTMCache) {
         let d = self.hidden_size;
         let h = self.num_heads;
@@ -372,18 +358,17 @@ impl MLSTMLayer {
         let d_qk = h * dqk;
         debug_assert_eq!(input.len(), self.input_size);
 
-        // Vorzustand sichern
+        // Save previous state for backward pass.
         cache.c_prev.copy_from_slice(&self.c);
         cache.n_prev.copy_from_slice(&self.n);
         cache.m_prev.copy_from_slice(&self.m);
         cache.x.copy_from_slice(input);
 
-        // Vektor-Pre-Acts (eine Matmul pro Gate)
+        // Vector pre-activations: one matrix-vector multiply per gate.
         self.wq.row_mul(input, &mut cache.q);
-        self.wk.row_mul(input, &mut cache.k); // schreibt nach k, danach Bias+Scale
+        self.wk.row_mul(input, &mut cache.k); // writes raw k values; bias and scaling applied next
         self.wv.row_mul(input, &mut cache.v);
-        self.wo.row_mul(input, &mut cache.o); // schreibt nach o, danach Bias+Sigmoid
-
+        self.wo.row_mul(input, &mut cache.o); // writes raw o values; sigmoid applied next
         for j in 0..d_qk {
             cache.q[j] += self.bq[j];
             cache.k[j] = (cache.k[j] + self.bk[j]) * self.inv_sqrt_dqk;
@@ -393,7 +378,7 @@ impl MLSTMLayer {
             cache.o[j] = stable_sigmoid(cache.o[j] + self.bo[j]);
         }
 
-        // Skalare Pre-Acts pro Head
+        // Scalar pre-activations per head.
         self.wi.row_mul(input, &mut cache.i_pre);
         self.wf.row_mul(input, &mut cache.f_pre);
         for hd in 0..h {
@@ -434,14 +419,14 @@ impl MLSTMLayer {
             // Cq_h[i] = Σ_j C_h[i,j] · q_h[j]
             for i in 0..dhv {
                 let row_off = c_off + i * dqk;
-                let mut s = 0.0_f32;
+                let mut s = 0.0;
                 for j in 0..dqk {
                     s += cache.c[row_off + j] * cache.q[qk_off + j];
                 }
                 cache.cq[v_off + i] = s;
             }
             // n_h⊤ q_h, ψ_h
-            let mut nq = 0.0_f32;
+            let mut nq = 0.0;
             for j in 0..dqk {
                 nq += cache.n[qk_off + j] * cache.q[qk_off + j];
             }
@@ -456,10 +441,8 @@ impl MLSTMLayer {
             }
         }
 
-        // Output-Projektion: h = W_out · h_concat + b_out
-        // h_concat liegt schon in cache.w_out.input.  Wir füllen output mit den Biases
-        // und addieren den Matrix-Vektor-Anteil — vermeidet einen redundanten Copy
-        // im Vergleich zu w_out.forward (das input nochmal kopieren würde).
+        // Output projection: h = W_out · h_concat + b_out.
+        // h_concat is already stored in cache.w_out.input, so copy biases and accumulate directly.
         cache.w_out.output.copy_from_slice(&self.w_out.biases);
         for (i, &xi) in cache.w_out.input.iter().enumerate() {
             for (j, &w) in self.w_out.weights[i].iter().enumerate() {
@@ -473,9 +456,7 @@ impl MLSTMLayer {
         self.m.copy_from_slice(&cache.m);
     }
 
-    // ── backward ──────────────────────────────────────────────────────────────
-    //
-    // Eingehender `delta` = dL/d(cell-output, size d).
+    // Incoming `delta` = dL/d(cell-output), size d.
     pub fn backward(&mut self, delta: &mut [f32], cache: &mut MLSTMCache) {
         let d = self.hidden_size;
         let h = self.num_heads;
@@ -484,18 +465,16 @@ impl MLSTMLayer {
         let d_qk = h * dqk;
         let inv_sqrt_dqk = self.inv_sqrt_dqk;
 
-        // ── 1. Backward durch W_out → dL/d(h_concat) in cache.w_out.dx ────────
         self.w_out.backward(delta, &mut cache.w_out);
 
-        // ── 2. Per-Head backward ─────────────────────────────────────────────
         for hd in 0..h {
             let qk_off = hd * dqk;
             let v_off = hd * dhv;
             let c_off = hd * dhv * dqk;
 
-            //  h_concat_h_i = o_h_i · h̃_h_i
-            //  → do_pre_h_i = δ_h_i · h̃_h_i · o · (1 - o)
-            //  → d(h̃)_h_i  = δ_h_i · o_h_i
+            // h_concat_h_i = o_h_i * h̃_h_i
+            // → do_pre_h_i = δ_h_i * h̃_h_i * o_i * (1 - o_i)
+            // → d_h_tilde_i = δ_h_i * o_i
             for i in 0..dhv {
                 let o_i = cache.o[v_off + i];
                 let h_tilde_i = cache.h_tilde[v_off + i];
@@ -504,9 +483,9 @@ impl MLSTMLayer {
                 self.d_h_tilde[v_off + i] = dc_h_i * o_i;
             }
 
-            // dψ_h, dnq_h durch ψ_h = max(|nq|, 1)
+            // dψ_h and dnq_h for ψ_h = max(|nq|, 1)
             let psi = cache.psi[hd];
-            let mut dpsi = 0.0_f32;
+            let mut dpsi = 0.0;
             for i in 0..dhv {
                 dpsi += self.d_h_tilde[v_off + i] * (-cache.cq[v_off + i] / (psi * psi));
             }
@@ -516,8 +495,8 @@ impl MLSTMLayer {
                 0.0
             };
 
-            // dC_total_h[i,j] = (d_h_tilde[i] / ψ) · q_h[j]  +  dC_bptt_h[i,j]
-            // dn_total_h[j]   = dnq_h · q_h[j]              +  dn_bptt_h[j]
+            // dC_total_h[i,j] = (d_h_tilde[i] / ψ) * q_h[j] + dC_bptt_h[i,j]
+            // dn_total_h[j] = dnq_h * q_h[j] + dn_bptt_h[j]
             for i in 0..dhv {
                 let dh_over_psi = self.d_h_tilde[v_off + i] / psi;
                 let row_off = c_off + i * dqk;
@@ -530,30 +509,31 @@ impl MLSTMLayer {
                 self.dn_total[qk_off + j] = dnq_h * cache.q[qk_off + j] + self.dn_bptt[qk_off + j];
             }
 
-            // dq_h aus zwei Pfaden:
-            //   dq_h[j] = Σ_i (d_h_tilde[i] / ψ) · C_h[i,j]   +  dnq_h · n_h[j]
+            // dq_h[j] = Σ_i (d_h_tilde[i] / ψ) · C_h[i,j] + dnq_h · n_h[j]
+            let dq_slice = &mut self.dq[qk_off..qk_off + dqk];
             for j in 0..dqk {
-                let mut s = 0.0_f32;
-                for i in 0..dhv {
-                    let dh_over_psi = self.d_h_tilde[v_off + i] / psi;
-                    s += dh_over_psi * cache.c[c_off + i * dqk + j];
+                dq_slice[j] = dnq_h * cache.n[qk_off + j];
+            }
+            for i in 0..dhv {
+                let dh_over_psi = self.d_h_tilde[v_off + i] / psi;
+                let row_off = c_off + i * dqk;
+                let c_row = &cache.c[row_off..row_off + dqk];
+                for j in 0..dqk {
+                    dq_slice[j] += dh_over_psi * c_row[j];
                 }
-                self.dq[qk_off + j] = s + dnq_h * cache.n[qk_off + j];
             }
 
-            // df'_h, di'_h, dv_h, dk_h aus dC_total und dn_total
-            //   C_h = f' · C_prev_h + i' · v_h ⊗ k_h
-            //   n_h = f' · n_prev_h + i' · k_h
+            // C_h = f' * C_prev_h + i' * v_h ⊗ k_h
+            // n_h = f' * n_prev_h + i' * k_h
             let i_prime = cache.i_prime[hd];
             let f_prime = cache.f_prime[hd];
-            let mut df_prime = 0.0_f32;
-            let mut di_prime = 0.0_f32;
+            let mut df_prime = 0.0;
+            let mut di_prime = 0.0;
 
-            // dv und C-Beiträge zu df', di' (Zeilenschleife)
             for i in 0..dhv {
                 let v_i = cache.v[v_off + i];
                 let row_off = c_off + i * dqk;
-                let mut row_dv = 0.0_f32;
+                let mut row_dv = 0.0;
                 for j in 0..dqk {
                     let dct = self.dc_total[row_off + j];
                     df_prime += dct * cache.c_prev[row_off + j];
@@ -562,21 +542,25 @@ impl MLSTMLayer {
                 }
                 self.dv[v_off + i] = i_prime * row_dv;
             }
-            // dk_h: Spaltenakkum aus dC + Beitrag aus dn
+
+            let dk_slice = &mut self.dk[qk_off..qk_off + dqk];
             for j in 0..dqk {
-                let mut col_sum = 0.0_f32;
-                for i in 0..dhv {
-                    col_sum += self.dc_total[c_off + i * dqk + j] * cache.v[v_off + i];
-                }
-                self.dk[qk_off + j] = i_prime * (col_sum + self.dn_total[qk_off + j]);
+                dk_slice[j] = i_prime * self.dn_total[qk_off + j];
             }
-            // n-Beiträge zu df', di'
+            for i in 0..dhv {
+                let v_i = cache.v[v_off + i];
+                let row_off = c_off + i * dqk;
+                let dc_row = &self.dc_total[row_off..row_off + dqk];
+                for j in 0..dqk {
+                    dk_slice[j] += i_prime * dc_row[j] * v_i;
+                }
+            }
+
             for j in 0..dqk {
                 df_prime += self.dn_total[qk_off + j] * cache.n_prev[qk_off + j];
                 di_prime += self.dn_total[qk_off + j] * cache.k[qk_off + j];
             }
 
-            // BPTT-Kanäle für t-1 setzen
             for i in 0..dhv {
                 let row_off = c_off + i * dqk;
                 for j in 0..dqk {
@@ -587,19 +571,15 @@ impl MLSTMLayer {
                 self.dn_bptt[qk_off + j] = f_prime * self.dn_total[qk_off + j];
             }
 
-            // Stabilizer (m als Konstante)  →  dĩ_h, df̃_h
             self.di_pre[hd] = di_prime * i_prime;
-            // sigm_f = exp(log_f) = σ(f̃)
             let sigm_f = cache.log_f[hd].exp();
             self.df_pre[hd] = df_prime * f_prime * (1.0 - sigm_f);
         }
 
-        // ── 3. Key-Skalierung zurück:  k = k_pre / √dqk  →  dk_pre = dk / √dqk ─
         for j in 0..d_qk {
             self.dk_pre[j] = self.dk[j] * inv_sqrt_dqk;
         }
 
-        // ── 4. Gewicht-/Bias-Gradienten akkumulieren ─────────────────────────
         let g = &mut self.grads;
         g.wq.matrix().add_outer(&cache.x, &self.dq);
         g.wk.matrix().add_outer(&cache.x, &self.dk_pre);
@@ -621,18 +601,15 @@ impl MLSTMLayer {
             g.bf.vec()[hd] += self.df_pre[hd];
         }
 
-        // ── 5. dL/dx via Wᵀ · grads, alle Pfade summiert ─────────────────────
         for (idx, dxi) in cache.dx.iter_mut().enumerate() {
-            let mut s = 0.0_f32;
-            // Q/K-Pfad (size d_qk)
+            let mut s = 0.0;
+
             for j in 0..d_qk {
                 s += self.wq[idx][j] * self.dq[j] + self.wk[idx][j] * self.dk_pre[j];
             }
-            // V/O-Pfad (size d)
             for j in 0..d {
                 s += self.wv[idx][j] * self.dv[j] + self.wo[idx][j] * self.do_pre[j];
             }
-            // I/F-Pfad (size H)
             for hd in 0..h {
                 s += self.wi[idx][hd] * self.di_pre[hd] + self.wf[idx][hd] * self.df_pre[hd];
             }
@@ -678,9 +655,8 @@ impl MLSTMLayer {
     }
 }
 
-// ── impl NnLayer ──────────────────────────────────────────────────────────────
-
 impl NnLayer for MLSTMLayer {
+    //type Cache = MLSTMCache;
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()
@@ -717,8 +693,7 @@ impl NnLayer for MLSTMLayer {
         saving::write_f32_slice(w, &self.bi)?;
         saving::write_f32_slice(w, &self.bf)?;
         saving::write_matrix(w, &self.w_out.weights)?;
-        saving::write_f32_slice(w, &self.w_out.biases)?;
-        Ok(())
+        saving::write_f32_slice(w, &self.w_out.biases)
     }
 
     fn make_cache(&self) -> Box<dyn DynCache> {

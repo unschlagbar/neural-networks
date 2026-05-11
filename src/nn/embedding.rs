@@ -7,8 +7,6 @@ use crate::{
     opimizers::{GradMatrix, GradMatrixOps},
 };
 
-// ── DenseCache ────────────────────────────────────────────────────────────────
-
 pub struct EmbeddingCache {
     /// Saved input (for ∂L/∂W = x · δᵀ).
     pub input: Vec<f32>,
@@ -43,8 +41,6 @@ impl DynCache for EmbeddingCache {
     }
 }
 
-// ── DenseGrads (stored inside the layer) ─────────────────────────────────────
-
 pub struct EmbeddingGrads {
     pub weights: GradMatrix,
 }
@@ -56,8 +52,6 @@ impl EmbeddingGrads {
         }
     }
 }
-
-// ── DenseLayer ────────────────────────────────────────────────────────────────
 
 pub struct EmbeddingLayer {
     pub weights: Matrix,
@@ -128,9 +122,8 @@ impl EmbeddingLayer {
     }
 }
 
-// ── impl NnLayer for DenseLayer ───────────────────────────────────────────────
-
 impl NnLayer for EmbeddingLayer {
+    //type Cache = EmbeddingCache;
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()

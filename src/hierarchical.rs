@@ -7,10 +7,10 @@ use std::{
 
 use crate::{
     config::MODEL_LOC,
-    loading::{read_u16, read_u32},
+    loading::{read_u16, read_u32, read_u64},
     nn::softmax::softmax,
     nn_layer::{DynCache, NnLayer},
-    saving::{HIER_MAGIC, write_u16, write_u32},
+    saving::{HIER_MAGIC, write_u16, write_u32, write_u64},
     sequential::Sequential,
     training::TrainingState,
 };
@@ -34,6 +34,7 @@ pub struct HierarchicalSequential {
     d_high_ctx: Box<[f32]>,
 
     pub last_high_grad_signal: f32,
+    pub step: usize,
 }
 
 impl HierarchicalSequential {
@@ -89,18 +90,15 @@ impl HierarchicalSequential {
             char_input,
             d_high_ctx,
             last_high_grad_signal: 0.0,
+            step: 0,
         }
     }
-
-    // ── Cache allocation ──────────────────────────────────────────────────────
 
     pub fn make_cache(&mut self, seq_len: usize) {
         self.char_model.make_cache(seq_len);
         self.char2_model.make_cache(seq_len);
         self.word_model.make_cache(seq_len);
     }
-
-    // ── State reset ───────────────────────────────────────────────────────────
 
     pub fn reset(&mut self) {
         for layer in &mut self.char_model.layers {
@@ -114,8 +112,6 @@ impl HierarchicalSequential {
         }
         self.boundary_timesteps.clear();
     }
-
-    // ── Private forward helpers ───────────────────────────────────────────────
 
     fn forward_step(
         layers: &mut [Box<dyn NnLayer>],
@@ -154,7 +150,6 @@ impl HierarchicalSequential {
         for t in 0..input.len() {
             let token = input[t];
 
-            // ── 1. char1 forward ──────────────────────────────────────────────
             self.char_input.fill(0.0);
             self.char_input[token as usize] = 1.0;
             Self::forward_step(
@@ -187,9 +182,9 @@ impl HierarchicalSequential {
                 let high_out = self.word_model.cache[word_idx].last().unwrap().output();
                 self.assert_no_nan(high_out, "high_output", word_idx);
                 self.char2_input[char_output..].copy_from_slice(high_out);
+                self.char2_input[..char_output].fill(0.0);
             }
 
-            // ── 2. char2 forward ──────────────────────────────────────────────
             Self::forward_step(
                 &mut self.char2_model.layers,
                 &mut self.char2_model.cache[t],
@@ -266,7 +261,7 @@ impl HierarchicalSequential {
 
                 let d_hi = self.word_model.cache[bi][0].input_grad();
                 for i in 0..char_output {
-                    self.delta_buf[i] += d_hi[i];
+                    self.delta_buf[i] = d_hi[i];
                 }
                 self.d_high_ctx.fill(0.0);
             }
@@ -321,6 +316,7 @@ impl HierarchicalSequential {
                 self.char2_model.sgd_step(lr);
                 self.word_model.sgd_step(lr);
             }
+            self.step = state.step;
 
             if state.print() {
                 let loss = state.get_loss();
@@ -374,7 +370,6 @@ impl HierarchicalSequential {
         let mut out = Vec::with_capacity(max_len);
 
         for _ in 0..max_len {
-            // ── 1. char1 forward ──────────────────────────────────────────────
             self.char_input.fill(0.0);
             self.char_input[last_token as usize] = 1.0;
             Self::forward_sample_step(
@@ -400,6 +395,7 @@ impl HierarchicalSequential {
                 {
                     let high_out = self.word_model.cache[0].last().unwrap().output();
                     self.char2_input[char_output..].copy_from_slice(high_out);
+                    self.char2_input[..char_output].fill(0.0);
                 }
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
@@ -409,14 +405,12 @@ impl HierarchicalSequential {
                 }
             }
 
-            // ── 3. char2 → logits ─────────────────────────────────────────────
             Self::forward_sample_step(
                 &mut self.char2_model.layers,
                 &mut self.char2_model.cache[0],
                 &self.char2_input,
             );
 
-            // ── 4. temperature-scaled sampling ────────────────────────────────
             let next_token = {
                 let logits = self.char2_model.cache[0].last().unwrap().output();
                 let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature.max(1e-8)).collect();
@@ -441,7 +435,6 @@ impl HierarchicalSequential {
         for t in 0..prefix.len() {
             let token = prefix[t];
 
-            // ── 1. char1 forward ──────────────────────────────────────────────
             self.char_input.fill(0.0);
             self.char_input[token as usize] = 1.0;
             Self::forward_sample_step(
@@ -454,7 +447,6 @@ impl HierarchicalSequential {
                 self.char2_input[..char_output].copy_from_slice(char1_out);
             }
 
-            // ── 2. boundary: word_model with char1_out only, then reset ───────
             if self.boundary_token_ids.contains(&token) {
                 {
                     let char1_out = self.char_model.cache[0].last().unwrap().output();
@@ -476,7 +468,6 @@ impl HierarchicalSequential {
                 }
             }
 
-            // ── 3. char2 state update (output discarded) ──────────────────────
             Self::forward_sample_step(
                 &mut self.char2_model.layers,
                 &mut self.char2_model.cache[0],
@@ -497,8 +488,6 @@ impl HierarchicalSequential {
         (probs.len() - 1) as u16
     }
 
-    // ── Persistence ───────────────────────────────────────────────────────────
-
     pub fn save(&self, path: &str) -> io::Result<()> {
         let mut buf = Cursor::new(Vec::<u8>::new());
         let w = &mut buf as &mut dyn Write;
@@ -514,6 +503,7 @@ impl HierarchicalSequential {
         self.char_model.write_to(w)?;
         self.char2_model.write_to(w)?;
         self.word_model.write_to(w)?;
+        write_u64(w, self.step as u64)?;
 
         File::create(path)?.write_all(&buf.into_inner())
     }
@@ -551,6 +541,8 @@ impl HierarchicalSequential {
         let delta_buf = vec![0.0; buf_size].into();
         let d_high_ctx = vec![0.0; context_size].into();
 
+        let step = read_u64(r).unwrap_or(0) as usize;
+
         Ok(Self {
             vocab_size,
             context_size,
@@ -564,6 +556,7 @@ impl HierarchicalSequential {
             char_input: char_input_buf,
             d_high_ctx,
             last_high_grad_signal: 0.0,
+            step,
         })
     }
 }

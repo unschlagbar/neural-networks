@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::{char, fs};
 
-// ── Tokenizer ─────────────────────────────────────────────────────────────────
-//
 // Character-level tokenizer with:
 //   - O(1) ASCII lookup via a 128-entry array (no HashMap for common chars)
 //   - Correct space encoding for any count (old code lost spaces when count ≥ 5)
@@ -21,12 +19,9 @@ pub struct Tokenizer {
     id_space4: u16,
 }
 
-// ── Special token names ───────────────────────────────────────────────────────
 pub const SPECIAL_TOKENS: &[&str] = &["<SPACE2>", "<SPACE4>", "<END>", "<QSTART>", "<QEND>"];
 
 impl Tokenizer {
-    // ── Constructors ──────────────────────────────────────────────────────────
-
     pub fn new(charset_path: &str, lowercase: bool) -> Self {
         let chars = fs::read_to_string(charset_path).expect("Charset could not be read");
         let mut vocab: Vec<char> = chars.chars().collect();
@@ -71,8 +66,6 @@ impl Tokenizer {
         }
     }
 
-    // ── Encoding ──────────────────────────────────────────────────────────────
-
     /// Emit the correct token sequence for `count` consecutive spaces.
     /// Correctly handles any count (old code lost the remainder for count ≥ 5).
     #[inline]
@@ -112,7 +105,6 @@ impl Tokenizer {
                 spaces = 0;
             }
 
-            // ── em-dash → hyphen ─────────────────────────────────────────────
             if c == '—' {
                 c = '-'
             };
@@ -133,8 +125,6 @@ impl Tokenizer {
 
         tokens
     }
-
-    // ── Decoding ──────────────────────────────────────────────────────────────
 
     pub fn to_text(&self, tokens: &[u16]) -> String {
         let mut result = String::with_capacity(tokens.len());
@@ -165,8 +155,6 @@ impl Tokenizer {
         self.display(token)
     }
 
-    // ── Lookup ────────────────────────────────────────────────────────────────
-
     pub fn get_token(&self, c: char) -> u16 {
         if let Some(&id) = self.stoi.get(&c) {
             return id;
@@ -178,14 +166,10 @@ impl Tokenizer {
         panic!("Char {:?} not in vocabulary", c);
     }
 
-    // ── Sizes ────────────────────────────────────────────────────────────────
-
     /// Number of tokens including specials (= length of `itos`).
     pub const fn vocab_size(&self) -> usize {
         self.itos.len()
     }
-
-    // ── Boundaries ─────────────────────────────────────────────────────────
 
     const BOUNDARIES: &[char] = &[
         '.', '!', '?', ',', ';', ':', '\n', '{', '}', '(', ')', '[', ']', '<', '>', '|', '"', '\'',
@@ -200,8 +184,6 @@ impl Tokenizer {
         ids
     }
 
-    // ── Boundary ids ─────────────────────────────────────────────────────────
-
     /// Token ids that count as word/segment boundaries for the hierarchical model.
     pub fn sentence_tokens(&self) -> Vec<u16> {
         let mut ids = Vec::with_capacity(4);
@@ -213,8 +195,6 @@ impl Tokenizer {
         ids
     }
 }
-
-// ── Debug / test helpers ──────────────────────────────────────────────────────
 
 impl Tokenizer {
     /// Round-trip a string through encode → decode and check it matches.

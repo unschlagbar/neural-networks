@@ -1,5 +1,3 @@
-// ── loading.rs ────────────────────────────────────────────────────────────────
-
 use std::{
     fs::File,
     io::{self, Read},
@@ -27,8 +25,6 @@ use crate::{
     sequential::Sequential,
 };
 
-// ── Primitive readers ─────────────────────────────────────────────────────────
-
 pub fn read_u8(r: &mut dyn Read) -> io::Result<u8> {
     let mut b = [0u8; 1];
     r.read_exact(&mut b)?;
@@ -43,6 +39,11 @@ pub fn read_u32(r: &mut dyn Read) -> io::Result<u32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
     Ok(u32::from_le_bytes(b))
+}
+pub fn read_u64(r: &mut dyn Read) -> io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
 }
 pub fn read_f32(r: &mut dyn Read) -> io::Result<f32> {
     let mut b = [0u8; 4];
@@ -59,8 +60,6 @@ pub fn read_matrix(r: &mut dyn Read) -> io::Result<Matrix> {
     let flat = read_f32_vec(r)?;
     Ok(Matrix::from_box(flat, rows, cols))
 }
-
-// ── Layer load helpers ────────────────────────────────────────────────────────
 
 pub struct LoadCtx {
     pub input_size: usize,
@@ -319,8 +318,6 @@ pub fn load_mlstm_block(r: &mut dyn Read, hidden_size: usize) -> std::io::Result
     )))
 }
 
-// ── Layer factory ─────────────────────────────────────────────────────────────
-
 fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
     match tag {
         0 => load_lstm(r, ctx),
@@ -345,8 +342,6 @@ fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLa
         )),
     }
 }
-
-// ── Sequential::load ──────────────────────────────────────────────────────────
 
 impl Sequential {
     /// Load from any `Read` source.

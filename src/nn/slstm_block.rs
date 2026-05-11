@@ -2,10 +2,10 @@
 //
 // Per-Timestep Architektur (Paper-konform, zwei getrennte Residuals):
 //
-//     x ──┬─► RMSNorm(pre) ─► sLSTM-Zelle ─┬─► z ──┬─► RMSNorm(post) ─► SwiGLU ─┐
-//         │                                  │       │                             │
-//         └──────────────────────────────────┘       └─────── (+) ◄───────────────┘
-//              1. Residual: z = x + cell(x)               2. Residual: y = z + MLP(z)
+//     x ──┬─► RMSNorm(1) ─► sLSTM-Zelle ─┬─► z ──┬─► RMSNorm(2) ─► SwiGLU ─┬─►
+//         │                              │       │                         │
+//         └──────────────────────────────┘       └─────────────────────────┘
+//           1. Residual: z = x + cell(x)         2. Residual: y = z + MLP(z)
 //
 // SwiGLU-MLP(h) = lin_down · ( SiLU(lin_gate · h) ⊙ (lin_value · h) )
 //
@@ -44,8 +44,6 @@ use crate::{
     saving::{write_f32_slice, write_matrix, write_u32},
 };
 
-// ── SiLU-Helfer ──────────────────────────────────────────────────────────────
-
 #[inline]
 fn stable_sigmoid(x: f32) -> f32 {
     if x >= 0.0 {
@@ -66,8 +64,6 @@ fn silu_prime(pre: f32) -> f32 {
     let s = stable_sigmoid(pre);
     s * (1.0 + pre * (1.0 - s))
 }
-
-// ── Cache ─────────────────────────────────────────────────────────────────────
 
 pub struct SLSTMBlockCache {
     // Pre-Norm
@@ -107,8 +103,6 @@ impl DynCache for SLSTMBlockCache {
         &self.dx
     }
 }
-
-// ── Layer ─────────────────────────────────────────────────────────────────────
 
 pub struct SLSTMBlock {
     pub hidden_size: usize,
@@ -193,8 +187,6 @@ impl SLSTMBlock {
             sc_u3: vec![0.0; u].into(),
         }
     }
-
-    // ── forward ──────────────────────────────────────────────────────────────
 
     pub fn forward(&mut self, input: &[f32], cache: &mut SLSTMBlockCache) {
         let u = self.up_size;
@@ -290,9 +282,8 @@ impl SLSTMBlock {
     }
 }
 
-// ── impl NnLayer ──────────────────────────────────────────────────────────────
-
 impl NnLayer for SLSTMBlock {
+    //type Cache = SLSTMBlockCache;
     fn input_size(&self) -> usize {
         self.hidden_size
     }
@@ -334,8 +325,7 @@ impl NnLayer for SLSTMBlock {
         write_matrix(w, &self.lin_value.weights)?;
         write_f32_slice(w, &self.lin_value.biases)?;
         write_matrix(w, &self.lin_down.weights)?;
-        write_f32_slice(w, &self.lin_down.biases)?;
-        Ok(())
+        write_f32_slice(w, &self.lin_down.biases)
     }
 
     fn reset_state(&mut self) {

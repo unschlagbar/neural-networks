@@ -1,12 +1,12 @@
 use iron_oxide::collections::Matrix;
 
 pub mod adam;
+pub mod adamw;
 pub mod sgd;
 pub use self::adam::Adam;
+pub use self::adamw::AdamW;
 pub use self::sgd::Sgd;
-pub type Optimizer = Adam;
-
-// ── Optimizer Grad Types (statisch bestimmt zur Compile-Zeit) ────────────────
+pub type Optimizer = AdamW;
 
 pub trait OptimizerGradTypes {
     type GradMatrix;
@@ -29,6 +29,5 @@ pub trait GradVecOps {
     fn vec(&mut self) -> &mut [f32];
 }
 
-// Type-Aliase für Layer
 pub type GradMatrix = <Optimizer as OptimizerGradTypes>::GradMatrix;
 pub type GradVec = <Optimizer as OptimizerGradTypes>::GradVec;

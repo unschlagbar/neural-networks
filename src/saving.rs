@@ -1,30 +1,26 @@
-// ── saving.rs ─────────────────────────────────────────────────────────────────
-//
-// File format v2
-// ──────────────
+// File format
 //
 //  ┌─────────────────────────────────────────────────────┐
 //  │  MAGIC      u32   0x4E4E_4657  ("NNFW")             │
-//  │  VERSION    u8    2                                  │
-//  │  N_LAYERS   u32                                      │
+//  │  VERSION    u8                                      │
+//  │  N_LAYERS   u32                                     │
 //  ├─────────────────────────────────────────────────────┤  ← Architecture header
-//  │  for each layer:                                     │
-//  │    tag        u8                                     │
-//  │    input_sz   u32                                    │
-//  │    output_sz  u32                                    │
+//  │  for each layer:                                    │
+//  │    tag        u8                                    │
+//  │    input_sz   u32                                   │
+//  │    output_sz  u32                                   │
 //  ├─────────────────────────────────────────────────────┤
-//  │  for each layer (same order):                        │  ← Weights
-//  │    layer.save(w)  — weights only, no shapes          │
+//  │  for each layer (same order):                       │  ← Weights
+//  │    layer.save(w)  — weights only, no shapes         │
 //  └─────────────────────────────────────────────────────┘
 //
 // Hierarchical format ("HIER")  — written by HierarchicalSequential::save
-// ──────────────────────────────
 //
 //  ┌─────────────────────────────────────────────────────┐
 //  │  HIER_MAGIC   u32   0x4849_4552  ("HIER")           │
-//  │  vocab_size   u32                                    │
-//  │  context_size u32                                    │
-//  │  n_boundaries u32                                    │
+//  │  vocab_size   u32                                   │
+//  │  context_size u32                                   │
+//  │  n_boundaries u32                                   │
 //  │  boundary_ids [u16 × n_boundaries]                  │
 //  │  char_model   <Sequential blob>                     │
 //  │  high_model   <Sequential blob>                     │
@@ -44,8 +40,6 @@ pub const HIER_MAGIC: u32 = 0x4849_4552;
 pub const HM_RNN_MAGIC: u32 = 0x484D_524E; // "HMRN"
 pub const VERSION: u8 = 2;
 
-// ── Primitive writers ─────────────────────────────────────────────────────────
-
 #[inline]
 pub fn write_u8(w: &mut dyn Write, v: u8) -> io::Result<()> {
     w.write_all(&[v])
@@ -56,6 +50,10 @@ pub fn write_u16(w: &mut dyn Write, v: u16) -> io::Result<()> {
 }
 #[inline]
 pub fn write_u32(w: &mut dyn Write, v: u32) -> io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+#[inline]
+pub fn write_u64(w: &mut dyn Write, v: u64) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
 }
 #[inline]
@@ -74,8 +72,6 @@ pub fn write_matrix(w: &mut dyn Write, m: &Matrix) -> io::Result<()> {
     write_u32(w, m.cols() as u32)?;
     write_f32_slice(w, m.as_slice())
 }
-
-// ── Sequential::save ──────────────────────────────────────────────────────────
 
 impl Sequential {
     /// Write the full model (header + weights) to any `Write`.

@@ -17,8 +17,6 @@ pub fn build_normal_model(vocab: usize) -> Sequential {
         .build()
 }
 
-// ── Hierarchisches Modell (HierarchicalSequential) ───────────────────────────
-//
 // Drei gekoppelte Sub-Modelle mit FESTEN (token-basierten) Wortgrenzen:
 pub fn build_hierarchical_model(
     vocab: usize,

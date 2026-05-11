@@ -15,8 +15,6 @@ use crate::nn::slstm_block::SLSTMBlock;
 use crate::nn::softmax::SoftmaxLayer;
 use crate::sequential::Sequential;
 
-// ── DynCache trait ────────────────────────────────────────────────────────────
-
 /// Type-erased per-timestep forward cache.
 /// Concrete types downcast via `as_any_mut()` inside each layer's own backward impl.
 /// Storing `Vec<Box<dyn DynCache>>` lets `Sequential` iterate without any match.
@@ -29,8 +27,6 @@ pub trait DynCache: Send {
     fn input_grad(&self) -> &[f32];
 }
 
-// ── NnLayer trait ─────────────────────────────────────────────────────────────
-
 /// Unified trait for all layer types.
 ///
 /// Caches are type-erased (`dyn DynCache`) but each layer impl downcasts to its
@@ -40,15 +36,11 @@ pub trait DynCache: Send {
 ///   • halves the number of parallel `Vec`s in `Sequential`,
 ///   • keeps related data (weights + their grads) physically adjacent in memory.
 pub trait NnLayer {
-    // ── forward ───────────────────────────────────────────────────────────────
-
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache);
 
     fn forward_sample(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         self.forward(input, cache);
     }
-
-    // ── backward ─────────────────────────────────────────────────────────────
 
     /// Backward for one timestep.
     ///
@@ -60,14 +52,10 @@ pub trait NnLayer {
 
     fn layer_tag(&self) -> u8;
 
-    // ── serialisation ─────────────────────────────────────────────────────────
-
     /// Schreibt NUR die Gewichte.
     /// Shapes, act_id und dropout_rate stehen bereits im Architektur-Header
     /// (Sequential::save), hier kommen sie nicht nochmal vor.
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()>;
-
-    // ── header extras (für Sequential::save) ─────────────────────────────────
 
     /// Activation-ID für den Architektur-Header.
     /// Nur Dense (tag 1), IndRNN (tag 2) und Projection (tag 3) überschreiben das.
@@ -75,21 +63,13 @@ pub trait NnLayer {
         None
     }
 
-    // ── cache ─────────────────────────────────────────────────────────────────
-
     fn make_cache(&self) -> Box<dyn DynCache>;
-
-    // ── shapes ────────────────────────────────────────────────────────────────
 
     fn input_size(&self) -> usize;
     fn output_size(&self) -> usize;
 
-    // ── gradient management ───────────────────────────────────────────────────
-
     fn apply_grads(&mut self, lr: f32);
     fn clear_grads(&mut self);
-
-    // ── recurrent state ───────────────────────────────────────────────────────
 
     /// Clear h, c
     fn reset_state(&mut self) {}
@@ -100,11 +80,8 @@ pub trait NnLayer {
     /// stateless layers.
     fn zero_bptt_state(&mut self) {}
 
-    // ← NEU: Wird von Sequential/Hierarchical nach jeder Sequenz aufgerufen
     fn accumulate_init_grad(&mut self) {}
 }
-
-// ── LayerBuilder ──────────────────────────────────────────────────────────────
 
 pub struct SequentialBuilder {
     input_size: usize,

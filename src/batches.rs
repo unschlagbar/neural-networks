@@ -1,5 +1,3 @@
-// ── batches.rs ───────────────────────────────────────────────────────────────
-//
 // PreparedDataSet — load + tokenize + window the entire corpus *once* up front
 // and reuse it across every epoch. Shuffling reorders only the cheap window
 // index list; the actual token sequences stay put, so we never reread or
@@ -191,8 +189,6 @@ impl<'a> Iterator for PreparedIter<'a> {
 
 impl ExactSizeIterator for PreparedIter<'_> {}
 
-// ── window building ──────────────────────────────────────────────────────────
-//
 // Same semantics as the old WordBoundaryBatches: take `seq_len` tokens, then
 // extend the right edge until the last token is a boundary token. The cut
 // position becomes the start of the next window — no overlap.

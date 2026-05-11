@@ -1,5 +1,3 @@
-// ── DropoutLayer ──────────────────────────────────────────────────────────────
-//
 // Inverted dropout: during training each unit is kept with probability (1 − rate)
 // and scaled by 1/(1 − rate), so the expected value stays the same.
 // At inference time (`training == false`) the layer is a pure pass-through.
@@ -23,8 +21,6 @@ use crate::{
     nn_layer::{DynCache, NnLayer},
     saving::write_f32,
 };
-
-// ── DropoutCache ──────────────────────────────────────────────────────────────
 
 pub struct DropoutCache {
     /// Boolean mask stored as f32 (0.0 or scale) — avoids a second Vec.
@@ -60,8 +56,6 @@ impl DynCache for DropoutCache {
         &self.dx
     }
 }
-
-// ── DropoutLayer ──────────────────────────────────────────────────────────────
 
 pub struct DropoutLayer {
     pub size: usize,
@@ -111,9 +105,8 @@ impl DropoutLayer {
     }
 }
 
-// ── impl NnLayer for DropoutLayer ─────────────────────────────────────────────
-
 impl NnLayer for DropoutLayer {
+    //type Cache = DropoutCache;
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()

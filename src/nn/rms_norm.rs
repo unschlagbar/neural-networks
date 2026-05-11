@@ -33,8 +33,6 @@ use crate::{
 // Larger than f32::EPSILON to avoid denormal blow-up on near-zero vectors at init.
 const EPS: f32 = 1e-6;
 
-// ── Cache ─────────────────────────────────────────────────────────────────────
-
 pub struct RMSNormResidualCache {
     pub inner_cache: Box<dyn DynCache>,
     /// Saved raw input x (residual add + backward).
@@ -123,7 +121,6 @@ impl RMSNormResidual {
         }
     }
 
-    // ── RMSNorm forward kernel ────────────────────────────────────────────────
     //   rms    = sqrt( mean(x²) + ε )
     //   x̂[i]  = x[i] / rms
     //   out[i] = gamma[i] · x̂[i]
@@ -147,11 +144,8 @@ impl RMSNormResidual {
     }
 }
 
-// ── NnLayer impl ─────────────────────────────────────────────────────────────
-
 impl NnLayer for RMSNormResidual {
-    // ── forward ───────────────────────────────────────────────────────────────
-
+    //type Cache = RMSNormResidualCache;
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()
@@ -181,8 +175,6 @@ impl NnLayer for RMSNormResidual {
         self.forward(input, cache);
     }
 
-    // ── backward ──────────────────────────────────────────────────────────────
-    //
     // Notation:
     //   x        = saved input
     //   rms      = sqrt( mean(x²) + ε )
@@ -238,11 +230,9 @@ impl NnLayer for RMSNormResidual {
         }
     }
 
-    // ── bookkeeping ───────────────────────────────────────────────────────────
-
     fn layer_tag(&self) -> u8 {
         8
-    } // TAG_NORM_WRAPPER (unchanged)
+    }
 
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
         write_f32_slice(w, &self.gamma)?; // no beta — RMSNorm only
@@ -310,7 +300,6 @@ impl RMSNorm {
         }
     }
 
-    // ── RMSNorm forward kernel ────────────────────────────────────────────────
     //   rms    = sqrt( mean(x²) + ε )
     //   x̂[i]  = x[i] / rms
     //   out[i] = gamma[i] · x̂[i]
@@ -381,7 +370,7 @@ impl RMSNorm {
     pub fn backward_into(&mut self, delta: &[f32], cache: &mut RMSNormCache) {
         let n = self.norm_size;
         let irms = cache.inv_rms;
-        let mut s = 0.0_f32;
+        let mut s = 0.0;
         for i in 0..n {
             self.grads_gamma.vec()[i] += delta[i] * cache.x_hat[i];
             s += self.gamma[i] * delta[i] * cache.x_hat[i];
@@ -393,11 +382,8 @@ impl RMSNorm {
     }
 }
 
-// ── NnLayer impl ─────────────────────────────────────────────────────────────
-
 impl NnLayer for RMSNorm {
-    // ── forward ───────────────────────────────────────────────────────────────
-
+    //type Cache = RMSNormCache;
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache.as_any_mut().downcast_mut::<RMSNormCache>().unwrap();
 
@@ -438,8 +424,6 @@ impl NnLayer for RMSNorm {
             d_normed[i] = inv_rms * (self.gamma[i] * d_normed[i] - c.x_hat[i] * s_over_n);
         }
     }
-
-    // ── bookkeeping ───────────────────────────────────────────────────────────
 
     fn layer_tag(&self) -> u8 {
         9

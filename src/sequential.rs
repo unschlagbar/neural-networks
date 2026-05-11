@@ -10,8 +10,6 @@ use crate::{
     training::TrainingState,
 };
 
-// ── Sequential ────────────────────────────────────────────────────────────────
-
 pub struct Sequential {
     pub input_size: usize,
     pub output_size: usize,
@@ -30,8 +28,6 @@ impl Sequential {
             .map(|_| self.layers.iter().map(|l| l.make_cache()).collect())
             .collect();
     }
-
-    // ── forward ───────────────────────────────────────────────────────────────
 
     pub fn forward_over(&mut self, input: &[u16]) {
         let Sequential {
@@ -108,8 +104,6 @@ impl Sequential {
         cache[0][out_layer].output()
     }
 
-    // ── backward ──────────────────────────────────────────────────────────────
-
     pub fn backwards_sequence(&mut self, targets: &[u16]) {
         let n = self.layers.len();
 
@@ -130,7 +124,6 @@ impl Sequential {
 
             let mut delta_len = out.len();
 
-            // ── layer loop top → bottom ─────────────────────────────────────
             for l in (0..n).rev() {
                 // backward writes dL/d(input) into cache[t][l].input_grad().
                 layers[l].backward(&mut delta_buf[..delta_len], cache[t][l].as_mut());
@@ -149,7 +142,6 @@ impl Sequential {
         }
     }
 
-    // ── training ──────────────────────────────────────────────────────────────
     pub fn train<'a, I: Iterator<Item = (&'a [u16], &'a [u16])>>(
         &mut self,
         data: I,
@@ -199,8 +191,6 @@ impl Sequential {
             }
         }
     }
-
-    // ── sampling ──────────────────────────────────────────────────────────────
 
     pub fn sample(
         &mut self,
@@ -265,8 +255,6 @@ impl Sequential {
         }
         out
     }
-
-    // ── gradient helpers ──────────────────────────────────────────────────────
 
     pub fn sgd_step(&mut self, lr: f32) {
         for layer in &mut self.layers {

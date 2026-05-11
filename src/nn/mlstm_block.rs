@@ -2,10 +2,10 @@
 //
 // Per-Timestep-Architektur (zwei separate Residuals, Transformer-Stil):
 //
-//     x ──┬─► RMSNorm(pre) ─► mLSTM-Zelle ─┬─► z ──┬─► RMSNorm(post) ─► SwiGLU ─┐
-//         │                                  │       │                            │
-//         └──────────────────────────────────┘       └─────── (+) ◄──────────────┘
-//             1. Residual: z = x + cell(x)              2. Residual: y = z + MLP(z)
+//     x ──┬─► RMSNorm(1) ─► mLSTM-Zelle ─┬─► z ──┬─► RMSNorm(2) ─► SwiGLU ─┬─►
+//         │                              │       │                         │
+//         └──────────────────────────────┘       └─────────────────────────┘
+//           1. Residual: z = x + cell(x)         2. Residual: y = z + MLP(z)
 //
 // SwiGLU-MLP(h) = lin_down · ( SiLU(lin_gate · h) ⊙ (lin_value · h) )
 //
@@ -38,8 +38,6 @@ use crate::{
     saving::{write_f32_slice, write_matrix, write_u32},
 };
 
-// ── SiLU-Helfer ──────────────────────────────────────────────────────────────
-
 #[inline]
 fn stable_sigmoid(x: f32) -> f32 {
     if x >= 0.0 {
@@ -60,8 +58,6 @@ fn silu_prime(pre: f32) -> f32 {
     let s = stable_sigmoid(pre);
     s * (1.0 + pre * (1.0 - s))
 }
-
-// ── Cache ─────────────────────────────────────────────────────────────────────
 
 pub struct MLSTMBlockCache {
     pub pre_norm: RMSNormCache,
@@ -92,8 +88,6 @@ impl DynCache for MLSTMBlockCache {
     }
 }
 
-// ── Layer ─────────────────────────────────────────────────────────────────────
-
 pub struct MLSTMBlock {
     pub hidden_size: usize,
     pub up_size: usize,
@@ -119,7 +113,6 @@ impl MLSTMBlock {
         let scale_up = (6.0 / (h as f32 + u as f32)).sqrt();
         let scale_dn = (6.0 / (u as f32 + h as f32)).sqrt();
 
-        // LinearLayer::new würde zufällige Biases setzen — wir wollen Nullbiases.
         let make_lin = |rows: usize, cols: usize, scale: f32| {
             use iron_oxide::collections::Matrix;
             LinearLayer::from_loaded(
@@ -176,28 +169,20 @@ impl MLSTMBlock {
         }
     }
 
-    // ── forward ──────────────────────────────────────────────────────────────
-
     pub fn forward(&mut self, input: &[f32], cache: &mut MLSTMBlockCache) {
         let h = self.hidden_size;
         let u = self.up_size;
 
-        // 1. Pre-Norm
         self.pre_norm.forward_into(input, &mut cache.pre_norm);
 
-        // 2. mLSTM-Zelle auf normiertem Input
         self.cell.forward(&cache.pre_norm.output, &mut cache.cell);
 
-        // 3. Erstes Residual: z = x + cell.output
-        // (cell-Output liegt in cache.cell.w_out.output)
         for i in 0..h {
             cache.z[i] = input[i] + cache.cell.w_out.output[i];
         }
 
-        // 4. Post-Norm auf z
         self.post_norm.forward_into(&cache.z, &mut cache.post_norm);
 
-        // 5. SwiGLU-MLP
         self.lin_gate
             .forward(&cache.post_norm.output, &mut cache.lin_gate);
         self.lin_value
@@ -210,7 +195,6 @@ impl MLSTMBlock {
 
         self.lin_down.forward(&cache.mixed, &mut cache.lin_down);
 
-        // 6. Zweites Residual: y = z + lin_down.output
         for i in 0..h {
             cache.output[i] = cache.z[i] + cache.lin_down.output[i];
         }
@@ -220,10 +204,8 @@ impl MLSTMBlock {
         let h = self.hidden_size;
         let u = self.up_size;
 
-        // dL/dy hat zwei Pfade:  (a) direkt nach z (residual)   (b) durch SwiGLU → post_norm → z
         cache.dx.copy_from_slice(delta);
 
-        // Backward durch lin_down
         self.lin_down.backward(delta, &mut cache.lin_down);
 
         // mixed = gate_act ⊙ value
@@ -232,41 +214,32 @@ impl MLSTMBlock {
             self.sc_u3[j] = cache.lin_down.dx[j] * cache.gate_act[j]; // d(value)
         }
 
-        // value-Pfad
         self.lin_value
             .backward(&mut self.sc_u3, &mut cache.lin_value);
 
-        // gate-Pfad: durch silu'
         for j in 0..u {
             self.sc_u3[j] = self.sc_u2[j] * silu_prime(cache.lin_gate.output[j]);
         }
         self.lin_gate.backward(&mut self.sc_u3, &mut cache.lin_gate);
 
-        // dL/d(post_normed) = dvalue.dx + dgate.dx
         for i in 0..h {
             self.sc_h1[i] = cache.lin_value.dx[i] + cache.lin_gate.dx[i];
         }
 
-        // Backward durch post_norm → cache.post_norm.dx
         self.post_norm
             .backward_into(&self.sc_h1, &mut cache.post_norm);
 
-        // dL/dz = δ_outer + dL/dz_inner
         for i in 0..h {
             cache.dx[i] += cache.post_norm.dx[i];
         }
 
-        // dL/d(cell.output) = dL/dz  →  cell.backward
         self.sc_h2.copy_from_slice(&cache.dx);
         self.cell.backward(&mut self.sc_h2, &mut cache.cell);
-        // cache.cell.dx hat jetzt dL/d(pre_normed)
 
-        // Backward durch pre_norm
         let d_pre_normed = &cache.cell.dx[..h];
         self.pre_norm
             .backward_into(d_pre_normed, &mut cache.pre_norm);
 
-        // Beide Pfade nach x summieren (pre-norm-Pfad addieren — der Skip-Pfad ist schon drin)
         for i in 0..h {
             cache.dx[i] += cache.pre_norm.dx[i];
         }
@@ -291,9 +264,8 @@ impl MLSTMBlock {
     }
 }
 
-// ── impl NnLayer ──────────────────────────────────────────────────────────────
-
 impl NnLayer for MLSTMBlock {
+    //type Cache = MLSTMBlockCache;
     fn input_size(&self) -> usize {
         self.hidden_size
     }

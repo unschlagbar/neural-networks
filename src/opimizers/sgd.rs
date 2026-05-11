@@ -5,8 +5,9 @@ use crate::{
     opimizers::{GradMatrixOps, GradVecOps, OptimizerGradTypes},
 };
 
-const CLIP: f32 = 15.0;
+const CLIP: f32 = 30.0;
 
+#[derive(Debug)]
 pub struct Sgd;
 
 pub struct SgdGradMatrix {
