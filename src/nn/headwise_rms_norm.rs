@@ -7,7 +7,7 @@
 // gamma is a learnable per-element scale (d elements, init 1).
 // Each head is normalized independently (grouped norm, group size = dhv).
 
-use crate::opimizers::{GradVec, GradVecOps};
+use crate::optimizers::{GradVec, GradVecOps};
 
 const EPS: f32 = 1e-6;
 

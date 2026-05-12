@@ -218,24 +218,30 @@ fn build_windows(sequences: &[Vec<u16>], seq_len: usize, boundary_ids: &[u16]) -
     } else {
         let mut out = Vec::new();
         for (s_idx, seq) in sequences.iter().enumerate() {
-            let mut idx = 0;
-            loop {
-                let remaining = seq.len().saturating_sub(idx);
-                if remaining < 2 {
+            let seq_windows_start = out.len();
+            let mut window_start = 0;
+            'seq: loop {
+                if seq.len().saturating_sub(window_start) < 2 {
                     break;
                 }
 
-                let mut end = (idx + seq_len).min(seq.len());
-                while end < seq.len() && !boundary_ids.contains(&seq[end - 1]) {
-                    end += 1;
+                let mut window_end = (window_start + seq_len).min(seq.len());
+                let boundary_search_start = window_end;
+                while window_end < seq.len() && !boundary_ids.contains(&seq[window_end - 1]) {
+                    window_end += 1;
+                    if window_end - boundary_search_start > 1000 {
+                        // no boundary found — discard all windows from this sequence
+                        out.truncate(seq_windows_start);
+                        break 'seq;
+                    }
                 }
 
                 out.push(Window {
                     seq: s_idx as u32,
-                    start: idx as u32,
-                    end: end as u32,
+                    start: window_start as u32,
+                    end: window_end as u32,
                 });
-                idx = end;
+                window_start = window_end;
             }
         }
         out

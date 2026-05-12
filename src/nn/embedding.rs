@@ -4,7 +4,7 @@ use iron_oxide::collections::Matrix;
 
 use crate::{
     nn_layer::{DynCache, NnLayer},
-    opimizers::{GradMatrix, GradMatrixOps},
+    optimizers::{GradMatrix, GradMatrixOps},
 };
 
 pub struct EmbeddingCache {

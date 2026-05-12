@@ -1,6 +1,6 @@
 use iron_oxide::collections::Matrix;
 
-use crate::opimizers::{GradMatrixOps, GradVecOps, OptimizerGradTypes};
+use crate::optimizers::{GradMatrixOps, GradVecOps, OptimizerGradTypes};
 
 const CLIP: f32 = 150.0;
 const BETA1: f32 = 0.9;

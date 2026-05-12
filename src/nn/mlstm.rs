@@ -46,7 +46,7 @@ use crate::{
         linear::{LinearCache, LinearLayer},
     },
     nn_layer::{DynCache, NnLayer},
-    opimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
+    optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
     saving,
 };
 use std::{any::Any, io};

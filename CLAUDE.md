@@ -54,7 +54,7 @@ do not use `0.0_f32`, always prever the simple mumber: `0.0`
 
 Boundary tokens are determined by `Tokenizer::boundary_tokens()` and passed in at construction. At each boundary the char and char2 models are reset; the word_model accumulates across boundaries.
 
-### Optimizer (`src/opimizers/mod.rs`)
+### Optimizer (`src/optimizers/mod.rs`)
 
 `pub type Optimizer = AdamW` selects the active optimizer. All layers use the type aliases `GradMatrix` / `GradVec` from this module, so swapping optimizers only requires changing that one type alias.
 

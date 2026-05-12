@@ -11,7 +11,7 @@ use crate::{
     },
     hierarchical::HierarchicalSequential,
     model::{build_hierarchical_model, build_normal_model},
-    opimizers::Optimizer,
+    optimizers::Optimizer,
     sequential::Sequential,
     tokenizer::Tokenizer,
 };

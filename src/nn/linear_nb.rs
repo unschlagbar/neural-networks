@@ -4,7 +4,7 @@ use iron_oxide::collections::Matrix;
 
 use crate::{
     nn_layer::{DynCache, NnLayer},
-    opimizers::{GradMatrix, GradMatrixOps},
+    optimizers::{GradMatrix, GradMatrixOps},
 };
 
 pub struct LinearNBCache {
@@ -154,8 +154,7 @@ impl NnLayer for LinearNBLayer {
     }
 
     fn save(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
-        crate::saving::write_matrix(w, &self.weights)?;
-        Ok(())
+        crate::saving::write_matrix(w, &self.weights)
     }
 
     fn make_cache(&self) -> Box<dyn DynCache> {

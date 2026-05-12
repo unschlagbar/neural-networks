@@ -6,7 +6,7 @@ use rand::random_range;
 use crate::{
     nn::add_vec_in_place,
     nn_layer::{DynCache, NnLayer},
-    opimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
+    optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
 };
 
 pub struct SiluDenseCache {

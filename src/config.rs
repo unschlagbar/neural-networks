@@ -6,7 +6,7 @@ pub const SEQ_LOC: &str = "models/seq";
 // Sequenz-Len
 
 pub const SEQ_LEN: usize = 1024 * 1;
-pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024 * 4;
+pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024;
 
 // Training-Schedule
 

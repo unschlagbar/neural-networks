@@ -2,7 +2,7 @@ use iron_oxide::collections::Matrix;
 
 use crate::{
     nn::{sub_in_place, sub_vec_in_place},
-    opimizers::{GradMatrixOps, GradVecOps, OptimizerGradTypes},
+    optimizers::{GradMatrixOps, GradVecOps, OptimizerGradTypes},
 };
 
 const CLIP: f32 = 30.0;

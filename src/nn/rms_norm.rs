@@ -26,7 +26,7 @@ use std::{any::Any, io};
 
 use crate::{
     nn_layer::{DynCache, NnLayer},
-    opimizers::{GradVec, GradVecOps},
+    optimizers::{GradVec, GradVecOps},
     saving::{write_f32_slice, write_u8, write_u32},
 };
 

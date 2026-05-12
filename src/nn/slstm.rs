@@ -22,7 +22,7 @@ use iron_oxide::collections::Matrix;
 use crate::{
     nn::add_vec_in_place,
     nn_layer::{DynCache, NnLayer},
-    opimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
+    optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
     saving,
 };
 use std::{any::Any, io};
