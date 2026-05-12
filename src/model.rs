@@ -1,12 +1,9 @@
 use crate::{
-    config::{CHAR_HIDDEN, OUT_HIDDEN, WORD_HIDDEN},
+    config::{CHAR_HIDDEN, DQK, NUM_HEADS, OUT_HIDDEN, WORD_HIDDEN},
     hierarchical::HierarchicalSequential,
     nn_layer::SequentialBuilder,
     sequential::Sequential,
 };
-
-const NUM_HEADS: usize = 8;
-const DQK: usize = WORD_HIDDEN / NUM_HEADS;
 
 pub fn build_normal_model(vocab: usize) -> Sequential {
     SequentialBuilder::new(vocab)
@@ -25,12 +22,16 @@ pub fn build_hierarchical_model(
     let char_model = SequentialBuilder::new(vocab)
         .embedding(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
+        .slstm_block(CHAR_HIDDEN)
         .build();
 
     let high_model = SequentialBuilder::new(CHAR_HIDDEN)
         .linear(WORD_HIDDEN)
         .mlstm_block(NUM_HEADS, DQK)
         .slstm_block(WORD_HIDDEN)
+        .mlstm_block(NUM_HEADS, DQK)
+        .mlstm_block(NUM_HEADS, DQK)
+        .mlstm_block(NUM_HEADS, DQK)
         .mlstm_block(NUM_HEADS, DQK)
         .mlstm_block(NUM_HEADS, DQK)
         .mlstm_block(NUM_HEADS, DQK)

@@ -9,7 +9,7 @@ const EPS: f32 = 1e-8;
 /// Decoupled weight decay (λ). Applied directly to weights, NOT through gradients.
 /// Typical range for LLM pretraining: 0.01–0.1.
 /// Weight decay is intentionally NOT applied to bias vectors (see AdamWGradVec).
-const WEIGHT_DECAY: f32 = 0.01;
+const WEIGHT_DECAY: f32 = 0.05;
 
 #[derive(Debug)]
 pub struct AdamW;

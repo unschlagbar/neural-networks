@@ -36,7 +36,8 @@ pub fn train_normal() {
 
     println!("Preparing dataset from '{DATA_DIR}' ...");
     let prep_start = Instant::now();
-    let mut data = PreparedDataSet::from_dir(&tokenizer, DATA_DIR, SEQ_LEN, &word_boundary_ids);
+    let mut data =
+        PreparedDataSet::from_single_file(&tokenizer, DATA_FILE, SEQ_LEN, &word_boundary_ids);
     println!(
         "  {} files → {} windows, {} tokens (prep took {:.1?})",
         data.num_sequences(),

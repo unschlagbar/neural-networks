@@ -30,6 +30,10 @@ The binary reads one line from stdin to select its mode:
 | `s` | `sample_normal` — interactive sampling from the flat model |
 | `hs` | `sample_hierarchical` — interactive sampling from the hierarchical model |
 
+## Style 
+
+do not use `0.0_f32`, always prever the simple mumber: `0.0`
+
 ## Architecture
 
 ### Layer abstraction (`src/nn_layer.rs`)

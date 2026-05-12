@@ -35,7 +35,16 @@ pub trait DynCache: Send {
 /// Gradient accumulators live *inside* the layer (not in `Sequential`), which:
 ///   • halves the number of parallel `Vec`s in `Sequential`,
 ///   • keeps related data (weights + their grads) physically adjacent in memory.
-pub trait NnLayer {
+pub trait Dyn: 'static {
+    fn as_any(&self) -> &dyn Any;
+}
+impl<T: 'static> Dyn for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+pub trait NnLayer: Dyn {
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache);
 
     fn forward_sample(&mut self, input: &[f32], cache: &mut dyn DynCache) {

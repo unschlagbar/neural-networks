@@ -18,3 +18,4 @@ criterion = "0.8.2"
 [dependencies]
 iron_oxide = { path = "../iron_oxide", default-features = false }
 rand = "0.10.0"
+openvino = { version = "0.11.0", features = ["runtime-linking"] }

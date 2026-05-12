@@ -123,7 +123,6 @@ impl EmbeddingLayer {
 }
 
 impl NnLayer for EmbeddingLayer {
-    //type Cache = EmbeddingCache;
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache) {
         let c = cache
             .as_any_mut()

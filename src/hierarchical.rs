@@ -459,6 +459,7 @@ impl HierarchicalSequential {
                 {
                     let high_out = self.word_model.cache[0].last().unwrap().output();
                     self.char2_input[char_output..].copy_from_slice(high_out);
+                    self.char2_input[..char_output].fill(0.0);
                 }
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
