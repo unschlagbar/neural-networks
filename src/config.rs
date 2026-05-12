@@ -10,7 +10,7 @@ pub const MAX_SEQ_LEN: usize = SEQ_LEN + 1024 * 4;
 
 // Training-Schedule
 
-pub const LR: f32 = 1e-3;
+pub const LR: f32 = 5e-4;
 pub const WARMUP_STEPS: usize = 100;
 pub const BATCH_SIZE: usize = 1;
 pub const EPOCHS: usize = 1;
@@ -28,11 +28,11 @@ pub const TOP_P: f32 = 1.;
 
 pub const CHAR_HIDDEN: usize = 128;
 pub const OUT_HIDDEN: usize = 128;
-pub const WORD_HIDDEN: usize = 512;
+pub const WORD_HIDDEN: usize = 256;
 
 // Flat-mLSTM-Architektur (abgeleitet aus WORD_HIDDEN)
 
-pub const NUM_HEADS: usize = 8;
+pub const NUM_HEADS: usize = 16;
 pub const DQK: usize = WORD_HIDDEN / NUM_HEADS / 2; // 32 — query/key-Dim pro Head
 pub const DHV: usize = WORD_HIDDEN / NUM_HEADS; // 32 — value/output-Dim pro Head
 pub const C_SIZE: usize = NUM_HEADS * DHV * DQK; // 8192

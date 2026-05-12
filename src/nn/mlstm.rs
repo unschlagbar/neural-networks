@@ -17,18 +17,20 @@
 //   k   = (W_k x + b_k) / √dqk            ∈ ℝ^{d_qk}
 //   v   = W_v x + b_v                     ∈ ℝ^{d}
 //   o   = σ(W_o x + b_o)                  ∈ ℝ^{d}
-//   ĩ   = W_i x + b_i                     ∈ ℝ^{H}
+//   ĩ   = W_i x + b_i                     ∈ ℝ^{H}
 //   f̃   = W_f x + b_f                     ∈ ℝ^{H}
 //
 // Per head h, with q_h = q[h*dqk..(h+1)*dqk]:
 //   log_f_h = log σ(f̃_h)
-//   m_h     = max(log_f_h + m_prev_h, ĩ_h)
-//   i'_h    = exp(ĩ_h - m_h)
+//   m_h     = max(log_f_h + m_prev_h, ĩ_h)
+//   i'_h    = exp(ĩ_h - m_h)
 //   f'_h    = exp(log_f_h + m_prev_h - m_h)
 //   C_h     = f'_h * C_prev_h + i'_h * v_h ⊗ k_h
 //   n_h     = f'_h * n_prev_h + i'_h * k_h
 //   ψ_h     = max(|n_hᵀ q_h|, 1)
-//   y_h     = o_h ⊙ (C_h q_h) / ψ_h          ∈ ℝ^{dhv}
+//   ỹ_h     = C_h q_h / ψ_h               ∈ ℝ^{dhv}   (raw, before norm)
+//   ŷ_h     = HeadwiseRMSNorm(ỹ_h)        ∈ ℝ^{dhv}   (per xLSTM 7B)
+//   y_h     = o_h ⊙ ŷ_h                  ∈ ℝ^{dhv}
 //
 // Concatenate y_h into y_concat ∈ ℝ^{d}, then output:
 //   h = W_out · y_concat + b_out           ∈ ℝ^{d}
@@ -39,7 +41,10 @@
 use iron_oxide::collections::Matrix;
 
 use crate::{
-    nn::linear::{LinearCache, LinearLayer},
+    nn::{
+        headwise_rms_norm::{HeadwiseRMSNorm, HeadwiseRMSNormCache},
+        linear::{LinearCache, LinearLayer},
+    },
     nn_layer::{DynCache, NnLayer},
     opimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
     saving,
@@ -66,12 +71,6 @@ fn log_sigmoid(x: f32) -> f32 {
 }
 
 pub struct MLSTMCache {
-    pub input_size: usize,
-    pub hidden_size: usize,
-    pub num_heads: usize,
-    pub dqk: usize,
-    pub dhv: usize,
-
     /// Saved input x_t for weight gradient computation.
     pub x: Box<[f32]>,
 
@@ -88,7 +87,7 @@ pub struct MLSTMCache {
     pub i_pre: Box<[f32]>,   // pre-activation          (H)
     pub f_pre: Box<[f32]>,   // pre-activation          (H)
     pub log_f: Box<[f32]>,   // log σ(f̃)               (H)
-    pub i_prime: Box<[f32]>, // exp(ĩ - m)             (H)
+    pub i_prime: Box<[f32]>, // exp(ĩ - m)             (H)
     pub f_prime: Box<[f32]>, // exp(log_f + m_prev - m) (H)
 
     // Current state values at timestep t.
@@ -99,13 +98,14 @@ pub struct MLSTMCache {
     pub m: Box<[f32]>, // H
 
     // Output-Zwischenstufen
-    pub cq: Box<[f32]>,      // (d)  Concat aller C_h·q_h
-    pub nq: Box<[f32]>,      // (H)
-    pub psi: Box<[f32]>,     // (H)
-    pub h_tilde: Box<[f32]>, // (d)  cq / psi  (per Head normalisiert)
+    pub cq: Box<[f32]>,                  // (d)  Concat aller C_h·q_h
+    pub nq: Box<[f32]>,                  // (H)
+    pub psi: Box<[f32]>,                 // (H)
+    pub h_tilde: Box<[f32]>,             // (d)  cq / psi  (raw, Eingang in headwise RMS norm)
+    pub head_norm: HeadwiseRMSNormCache, // headwise RMS norm: output = ŷ = gamma ⊙ h_tilde / rms
 
     /// Linear cache for the output projection W_out.
-    /// `w_out.input` stores h_concat = o ⊙ h_tilde.
+    /// `w_out.input` stores h_concat = o ⊙ head_norm.output.
     /// `w_out.output` stores the final cell output h.
     pub w_out: LinearCache,
 
@@ -189,6 +189,9 @@ pub struct MLSTMLayer {
     /// Output projection W_out · y_concat + b_out.
     pub w_out: LinearLayer,
 
+    /// Headwise RMS norm applied to ỹ_h = C_h q_h / ψ_h before the output gate.
+    pub head_norm: HeadwiseRMSNorm,
+
     pub c: Box<[f32]>, // H·dhv·dqk
     pub n: Box<[f32]>, // H·dqk
     pub m: Box<[f32]>, // H
@@ -207,7 +210,7 @@ pub struct MLSTMLayer {
     pub do_pre: Box<[f32]>,    // d
     pub di_pre: Box<[f32]>,    // H
     pub df_pre: Box<[f32]>,    // H
-    pub d_h_tilde: Box<[f32]>, // d
+    pub d_h_tilde: Box<[f32]>, // d  (dL/d(ŷ) → after norm backward: dL/d(ỹ))
     pub dc_total: Box<[f32]>,  // H·dhv·dqk
     pub dn_total: Box<[f32]>,  // H·dqk
 }
@@ -223,23 +226,23 @@ impl MLSTMLayer {
             num_heads,
         );
         let d = hidden_size;
-        let h = num_heads;
-        let dhv = d / h;
-        let d_qk = h * dqk;
+        let heads = num_heads;
+        let dhv = d / heads;
+        let d_qk = heads * dqk;
 
         // Glorot-Skalen
         let scale_q = (6.0 / (input_size as f32 + d_qk as f32)).sqrt();
         let scale_v = (6.0 / (input_size as f32 + d as f32)).sqrt();
-        let scale_g = (6.0 / (input_size as f32 + h as f32)).sqrt();
+        let scale_g = (6.0 / (input_size as f32 + heads as f32)).sqrt();
 
         // Forget-Gate-Bias positiv
-        let bf: Box<[f32]> = vec![1.0; h].into();
-        let bi: Box<[f32]> = vec![-10.0; h].into();
+        let bf: Box<[f32]> = vec![1.0; heads].into();
+        let bi: Box<[f32]> = vec![-10.0; heads].into();
 
         Self {
             input_size,
             hidden_size: d,
-            num_heads: h,
+            num_heads: heads,
             dqk,
             dhv,
             inv_sqrt_dqk: 1.0 / (dqk as f32).sqrt(),
@@ -248,8 +251,8 @@ impl MLSTMLayer {
             wk: Matrix::random(input_size, d_qk, scale_q),
             wv: Matrix::random(input_size, d, scale_v),
             wo: Matrix::random(input_size, d, scale_v),
-            wi: Matrix::random(input_size, h, scale_g),
-            wf: Matrix::random(input_size, h, scale_g),
+            wi: Matrix::random(input_size, heads, scale_g),
+            wf: Matrix::random(input_size, heads, scale_g),
             bq: vec![0.0; d_qk].into(),
             bk: vec![0.0; d_qk].into(),
             bv: vec![0.0; d].into(),
@@ -265,25 +268,27 @@ impl MLSTMLayer {
                 vec![0.0; d].into(),
             ),
 
-            c: vec![0.0; h * dhv * dqk].into(),
-            n: vec![0.0; h * dqk].into(),
-            m: vec![0.0; h].into(),
+            head_norm: HeadwiseRMSNorm::new(d, heads),
 
-            dc_bptt: vec![0.0; h * dhv * dqk].into(),
-            dn_bptt: vec![0.0; h * dqk].into(),
+            c: vec![0.0; heads * dhv * dqk].into(),
+            n: vec![0.0; heads * dqk].into(),
+            m: vec![0.0; heads].into(),
 
-            grads: MLSTMLayerGrads::zeros(input_size, d, h, dqk),
+            dc_bptt: vec![0.0; heads * dhv * dqk].into(),
+            dn_bptt: vec![0.0; heads * dqk].into(),
+
+            grads: MLSTMLayerGrads::zeros(input_size, d, heads, dqk),
 
             dq: vec![0.0; d_qk].into(),
             dk: vec![0.0; d_qk].into(),
             dk_pre: vec![0.0; d_qk].into(),
             dv: vec![0.0; d].into(),
             do_pre: vec![0.0; d].into(),
-            di_pre: vec![0.0; h].into(),
-            df_pre: vec![0.0; h].into(),
+            di_pre: vec![0.0; heads].into(),
+            df_pre: vec![0.0; heads].into(),
             d_h_tilde: vec![0.0; d].into(),
-            dc_total: vec![0.0; h * dhv * dqk].into(),
-            dn_total: vec![0.0; h * dqk].into(),
+            dc_total: vec![0.0; heads * dhv * dqk].into(),
+            dn_total: vec![0.0; heads * dqk].into(),
         }
     }
 
@@ -306,6 +311,7 @@ impl MLSTMLayer {
         bi: Box<[f32]>,
         bf: Box<[f32]>,
         w_out: LinearLayer,
+        head_norm_gamma: Box<[f32]>,
     ) -> Self {
         let d = hidden_size;
         let h = num_heads;
@@ -331,6 +337,7 @@ impl MLSTMLayer {
             bi,
             bf,
             w_out,
+            head_norm: HeadwiseRMSNorm::from_loaded(d, h, head_norm_gamma),
             c: vec![0.0; h * dhv * dqk].into(),
             n: vec![0.0; h * dqk].into(),
             m: vec![0.0; h].into(),
@@ -386,7 +393,7 @@ impl MLSTMLayer {
             cache.f_pre[hd] += self.bf[hd];
         }
 
-        // Per-Head Update
+        // Per-Head Update: C, n, cq, nq, psi, h_tilde (raw)
         for hd in 0..h {
             let qk_off = hd * dqk;
             let v_off = hd * dhv;
@@ -433,16 +440,21 @@ impl MLSTMLayer {
             cache.nq[hd] = nq;
             cache.psi[hd] = nq.abs().max(1.0);
 
-            // h̃_h, h_concat_h = o_h ⊙ h̃_h  (direkt in w_out.input)
+            // Raw ỹ_h = C_h q_h / ψ_h (stored in h_tilde before norm is applied)
             let psi = cache.psi[hd];
             for i in 0..dhv {
                 cache.h_tilde[v_off + i] = cache.cq[v_off + i] / psi;
-                cache.w_out.input[v_off + i] = cache.o[v_off + i] * cache.h_tilde[v_off + i];
             }
         }
 
-        // Output projection: h = W_out · h_concat + b_out.
-        // h_concat is already stored in cache.w_out.input, so copy biases and accumulate directly.
+        // Headwise RMS norm: ŷ = head_norm(ỹ)  →  head_norm.output
+        self.head_norm
+            .forward_into(&cache.h_tilde, &mut cache.head_norm);
+
+        // h_concat = o ⊙ ŷ, then output projection h = W_out · h_concat + b_out.
+        for i in 0..d {
+            cache.w_out.input[i] = cache.o[i] * cache.head_norm.output[i];
+        }
         cache.w_out.output.copy_from_slice(&self.w_out.biases);
         for (i, &xi) in cache.w_out.input.iter().enumerate() {
             for (j, &w) in self.w_out.weights[i].iter().enumerate() {
@@ -467,21 +479,31 @@ impl MLSTMLayer {
 
         self.w_out.backward(delta, &mut cache.w_out);
 
+        // Pass 1: output gate backward → dL/d(ŷ) into d_h_tilde.
+        // h_concat = o ⊙ ŷ  →  do_pre = dL/dh · ŷ · σ'(o_pre)
+        //                        dL/dŷ  = dL/dh · o
+        for hd in 0..h {
+            let v_off = hd * dhv;
+            for i in 0..dhv {
+                let o_i = cache.o[v_off + i];
+                let y_hat_i = cache.head_norm.output[v_off + i];
+                let dc_h_i = cache.w_out.dx[v_off + i];
+                self.do_pre[v_off + i] = dc_h_i * y_hat_i * o_i * (1.0 - o_i);
+                self.d_h_tilde[v_off + i] = dc_h_i * o_i;
+            }
+        }
+
+        // Headwise RMS norm backward: dL/d(ŷ) → dL/d(ỹ)  into head_norm.dx.
+        // NLL borrow checker allows &self.d_h_tilde and &mut self.head_norm simultaneously.
+        self.head_norm
+            .backward_into(&self.d_h_tilde, &mut cache.head_norm);
+        self.d_h_tilde.copy_from_slice(&cache.head_norm.dx);
+
+        // Pass 2: per-head backward through ψ, C, n, q, k, v, i, f gates.
         for hd in 0..h {
             let qk_off = hd * dqk;
             let v_off = hd * dhv;
             let c_off = hd * dhv * dqk;
-
-            // h_concat_h_i = o_h_i * h̃_h_i
-            // → do_pre_h_i = δ_h_i * h̃_h_i * o_i * (1 - o_i)
-            // → d_h_tilde_i = δ_h_i * o_i
-            for i in 0..dhv {
-                let o_i = cache.o[v_off + i];
-                let h_tilde_i = cache.h_tilde[v_off + i];
-                let dc_h_i = cache.w_out.dx[v_off + i];
-                self.do_pre[v_off + i] = dc_h_i * h_tilde_i * o_i * (1.0 - o_i);
-                self.d_h_tilde[v_off + i] = dc_h_i * o_i;
-            }
 
             // dψ_h and dnq_h for ψ_h = max(|nq|, 1)
             let psi = cache.psi[hd];
@@ -624,11 +646,6 @@ impl MLSTMLayer {
         let dhv = self.dhv;
         let d_qk = h * dqk;
         MLSTMCache {
-            input_size: self.input_size,
-            hidden_size: d,
-            num_heads: h,
-            dqk,
-            dhv,
             x: vec![0.0; self.input_size].into(),
             c_prev: vec![0.0; h * dhv * dqk].into(),
             n_prev: vec![0.0; h * dqk].into(),
@@ -649,6 +666,7 @@ impl MLSTMLayer {
             nq: vec![0.0; h].into(),
             psi: vec![1.0; h].into(),
             h_tilde: vec![0.0; d].into(),
+            head_norm: self.head_norm.alloc_cache(),
             w_out: LinearCache::new(d, d),
             dx: vec![0.0; self.input_size].into(),
         }
@@ -693,7 +711,8 @@ impl NnLayer for MLSTMLayer {
         saving::write_f32_slice(w, &self.bi)?;
         saving::write_f32_slice(w, &self.bf)?;
         saving::write_matrix(w, &self.w_out.weights)?;
-        saving::write_f32_slice(w, &self.w_out.biases)
+        saving::write_f32_slice(w, &self.w_out.biases)?;
+        saving::write_f32_slice(w, &self.head_norm.gamma)
     }
 
     fn make_cache(&self) -> Box<dyn DynCache> {
@@ -708,27 +727,12 @@ impl NnLayer for MLSTMLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
-        // Matrizen
-        self.grads.wq.clip();
-        self.grads.wk.clip();
-        self.grads.wv.clip();
-        self.grads.wo.clip();
-        self.grads.wi.clip();
-        self.grads.wf.clip();
-
         self.grads.wq.apply_to(&mut self.wq, lr);
         self.grads.wk.apply_to(&mut self.wk, lr);
         self.grads.wv.apply_to(&mut self.wv, lr);
         self.grads.wo.apply_to(&mut self.wo, lr);
         self.grads.wi.apply_to(&mut self.wi, lr);
         self.grads.wf.apply_to(&mut self.wf, lr);
-
-        self.grads.bq.clip();
-        self.grads.bk.clip();
-        self.grads.bv.clip();
-        self.grads.bo.clip();
-        self.grads.bi.clip();
-        self.grads.bf.clip();
 
         self.grads.bq.apply_to(&mut self.bq, lr);
         self.grads.bk.apply_to(&mut self.bk, lr);
@@ -737,8 +741,8 @@ impl NnLayer for MLSTMLayer {
         self.grads.bi.apply_to(&mut self.bi, lr);
         self.grads.bf.apply_to(&mut self.bf, lr);
 
-        // W_out verwaltet seine Grads selbst
         self.w_out.apply_grads(lr);
+        self.head_norm.apply_grads(lr);
     }
 
     fn clear_grads(&mut self) {
@@ -755,6 +759,7 @@ impl NnLayer for MLSTMLayer {
         self.grads.bi.clear();
         self.grads.bf.clear();
         self.w_out.clear_grads();
+        self.head_norm.clear_grads();
     }
 
     fn reset_state(&mut self) {

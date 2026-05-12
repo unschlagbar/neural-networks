@@ -92,9 +92,9 @@ pub struct MLSTMBlock {
     pub hidden_size: usize,
     pub up_size: usize,
 
-    pub pre_norm: RMSNorm,
+    pub pre_norm1: RMSNorm,
     pub cell: MLSTMLayer,
-    pub post_norm: RMSNorm,
+    pub pre_norm2: RMSNorm,
     pub lin_gate: LinearLayer,
     pub lin_value: LinearLayer,
     pub lin_down: LinearLayer,
@@ -127,9 +127,9 @@ impl MLSTMBlock {
             hidden_size: h,
             up_size: u,
 
-            pre_norm: RMSNorm::new(h),
+            pre_norm1: RMSNorm::new(h),
             cell: MLSTMLayer::new(h, h, num_heads, dqk),
-            post_norm: RMSNorm::new(h),
+            pre_norm2: RMSNorm::new(h),
             lin_gate: make_lin(h, u, scale_up),
             lin_value: make_lin(h, u, scale_up),
             lin_down: make_lin(u, h, scale_dn),
@@ -144,8 +144,8 @@ impl MLSTMBlock {
     pub fn from_loaded(
         hidden_size: usize,
         up_size: usize,
-        pre_norm: RMSNorm,
-        post_norm: RMSNorm,
+        pre_norm1: RMSNorm,
+        pre_norm2: RMSNorm,
         cell: MLSTMLayer,
         lin_gate: LinearLayer,
         lin_value: LinearLayer,
@@ -156,9 +156,9 @@ impl MLSTMBlock {
         Self {
             hidden_size: h,
             up_size: u,
-            pre_norm,
+            pre_norm1,
             cell,
-            post_norm,
+            pre_norm2,
             lin_gate,
             lin_value,
             lin_down,
@@ -173,7 +173,7 @@ impl MLSTMBlock {
         let h = self.hidden_size;
         let u = self.up_size;
 
-        self.pre_norm.forward_into(input, &mut cache.pre_norm);
+        self.pre_norm1.forward_into(input, &mut cache.pre_norm);
 
         self.cell.forward(&cache.pre_norm.output, &mut cache.cell);
 
@@ -181,7 +181,7 @@ impl MLSTMBlock {
             cache.z[i] = input[i] + cache.cell.w_out.output[i];
         }
 
-        self.post_norm.forward_into(&cache.z, &mut cache.post_norm);
+        self.pre_norm2.forward_into(&cache.z, &mut cache.post_norm);
 
         self.lin_gate
             .forward(&cache.post_norm.output, &mut cache.lin_gate);
@@ -226,7 +226,7 @@ impl MLSTMBlock {
             self.sc_h1[i] = cache.lin_value.dx[i] + cache.lin_gate.dx[i];
         }
 
-        self.post_norm
+        self.pre_norm2
             .backward_into(&self.sc_h1, &mut cache.post_norm);
 
         for i in 0..h {
@@ -237,7 +237,7 @@ impl MLSTMBlock {
         self.cell.backward(&mut self.sc_h2, &mut cache.cell);
 
         let d_pre_normed = &cache.cell.dx[..h];
-        self.pre_norm
+        self.pre_norm1
             .backward_into(d_pre_normed, &mut cache.pre_norm);
 
         for i in 0..h {
@@ -249,10 +249,10 @@ impl MLSTMBlock {
         let h = self.hidden_size;
         let u = self.up_size;
         MLSTMBlockCache {
-            pre_norm: self.pre_norm.alloc_cache(),
+            pre_norm: self.pre_norm1.alloc_cache(),
             cell: self.cell.alloc_cache(),
             z: vec![0.0; h].into(),
-            post_norm: self.post_norm.alloc_cache(),
+            post_norm: self.pre_norm2.alloc_cache(),
             lin_gate: LinearCache::new(h, u),
             gate_act: vec![0.0; u].into(),
             lin_value: LinearCache::new(h, u),
@@ -299,8 +299,8 @@ impl NnLayer for MLSTMBlock {
 
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
         write_u32(w, self.up_size as u32)?;
-        write_f32_slice(w, &self.pre_norm.gamma)?;
-        write_f32_slice(w, &self.post_norm.gamma)?;
+        write_f32_slice(w, &self.pre_norm1.gamma)?;
+        write_f32_slice(w, &self.pre_norm2.gamma)?;
         // cell.save schreibt selbst num_heads, dqk + alle Gewichte
         self.cell.save(w)?;
         write_matrix(w, &self.lin_gate.weights)?;
@@ -321,18 +321,18 @@ impl NnLayer for MLSTMBlock {
     }
 
     fn apply_grads(&mut self, lr: f32) {
-        self.pre_norm.apply_grads(lr);
+        self.pre_norm1.apply_grads(lr);
         self.cell.apply_grads(lr);
-        self.post_norm.apply_grads(lr);
+        self.pre_norm2.apply_grads(lr);
         self.lin_gate.apply_grads(lr);
         self.lin_value.apply_grads(lr);
         self.lin_down.apply_grads(lr);
     }
 
     fn clear_grads(&mut self) {
-        self.pre_norm.clear_grads();
+        self.pre_norm1.clear_grads();
         self.cell.clear_grads();
-        self.post_norm.clear_grads();
+        self.pre_norm2.clear_grads();
         self.lin_gate.clear_grads();
         self.lin_value.clear_grads();
         self.lin_down.clear_grads();

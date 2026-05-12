@@ -183,17 +183,11 @@ fn attr_const_value(tensor_proto: &[u8]) -> Vec<u8> {
     let mut a = Pb::new();
     a.string(1, "value");
     a.bytes(5, tensor_proto); // field 5 = t (TensorProto)
-    a.int64(20, 4);           // type = TENSOR
+    a.int64(20, 4); // type = TENSOR
     a.0
 }
 
-fn node(
-    op: &str,
-    inputs: &[&str],
-    outputs: &[&str],
-    name: &str,
-    attrs: &[Vec<u8>],
-) -> Vec<u8> {
+fn node(op: &str, inputs: &[&str], outputs: &[&str], name: &str, attrs: &[Vec<u8>]) -> Vec<u8> {
     let mut n = Pb::new();
     for i in inputs {
         n.string(1, i);
@@ -257,7 +251,8 @@ impl GraphBuilder {
 
     fn op(&mut self, op_type: &str, inputs: &[&str], outputs: &[&str], attrs: &[Vec<u8>]) {
         let name = self.uid(op_type);
-        self.nodes.push(node(op_type, inputs, outputs, &name, attrs));
+        self.nodes
+            .push(node(op_type, inputs, outputs, &name, attrs));
     }
 
     fn add_input_f32(&mut self, name: &str, dims: &[i64]) {
@@ -302,7 +297,12 @@ fn add_rms_norm(g: &mut GraphBuilder, input: &str, gamma_init: &str, p: &str) ->
     g.init_f32(&eps_c, &[], &[1e-6]);
 
     g.op("Mul", &[input, input], &[&sq], &[]);
-    g.op("ReduceMean", &[&sq], &[&msq], &[attr_ints("axes", &[0]), attr_int("keepdims", 0)]);
+    g.op(
+        "ReduceMean",
+        &[&sq],
+        &[&msq],
+        &[attr_ints("axes", &[0]), attr_int("keepdims", 0)],
+    );
     g.op("Add", &[&msq, &eps_c], &[&msq_e], &[]);
     g.op("Sqrt", &[&msq_e], &[&rms], &[]);
     g.op("Div", &[input, &rms], &[&xhat], &[]);
@@ -361,7 +361,11 @@ fn add_mlstm_cell(
 
     let wout_k = format!("{p}_wout");
     let bout_k = format!("{p}_bout");
-    g.init_f32(&wout_k, &[hidden as i64, hidden as i64], &flat(&cell.w_out.weights));
+    g.init_f32(
+        &wout_k,
+        &[hidden as i64, hidden as i64],
+        &flat(&cell.w_out.weights),
+    );
     g.init_f32(&bout_k, &[hidden as i64], &cell.w_out.biases);
 
     // Form-Konstanten für Reshape/Unsqueeze
@@ -482,7 +486,7 @@ fn add_mlstm_cell(
     let outer = format!("{p}_outer");
     g.op("Reshape", &[&v_h, &sh_h_dhv_1], &[&v_uu], &[]); // [H,dhv,1]
     g.op("Reshape", &[&k_h, &sh_h_1_dqk], &[&k_uu], &[]); // [H,1,dqk]
-    g.op("MatMul", &[&v_uu, &k_uu], &[&outer], &[]);  // [H,dhv,dqk]
+    g.op("MatMul", &[&v_uu, &k_uu], &[&outer], &[]); // [H,dhv,dqk]
 
     // C-State-Update
     let fc = format!("{p}_fc");
@@ -505,8 +509,8 @@ fn add_mlstm_cell(
     let cq3 = format!("{p}_cq3");
     let cq = format!("{p}_cq");
     g.op("Reshape", &[&q_h, &sh_h_dqk_1], &[&q_uu], &[]); // [H,dqk,1]
-    g.op("MatMul", &[&c_new_h, &q_uu], &[&cq3], &[]);     // [H,dhv,1]
-    g.op("Reshape", &[&cq3, &sh_h_dhv], &[&cq], &[]);     // [H,dhv]
+    g.op("MatMul", &[&c_new_h, &q_uu], &[&cq3], &[]); // [H,dhv,1]
+    g.op("Reshape", &[&cq3, &sh_h_dhv], &[&cq], &[]); // [H,dhv]
 
     // nq = n_new · q (batched dot)
     let nq_prod = format!("{p}_nq_prod");
@@ -533,8 +537,8 @@ fn add_mlstm_cell(
     let h_out = format!("{p}_h_out");
     let h_flat = format!("{p}_h_flat");
     g.op("Reshape", &[&psi, &sh_h_1], &[&psi2], &[]); // [H,1]
-    g.op("Div", &[&cq, &psi2], &[&h_tilde], &[]);     // [H,dhv]
-    g.op("Mul", &[&o_h, &h_tilde], &[&h_out], &[]);   // [H,dhv]
+    g.op("Div", &[&cq, &psi2], &[&h_tilde], &[]); // [H,dhv]
+    g.op("Mul", &[&o_h, &h_tilde], &[&h_out], &[]); // [H,dhv]
     g.op("Reshape", &[&h_out, &sh_hidden], &[&h_flat], &[]); // [hidden]
 
     // Ausgabeprojektion
@@ -568,12 +572,19 @@ fn add_mlstm_block(
 
     // Pre-RMSNorm
     let pre_gamma = format!("{p}_pre_gamma");
-    g.init_f32(&pre_gamma, &[hidden as i64], &block.pre_norm.gamma);
+    g.init_f32(&pre_gamma, &[hidden as i64], &block.pre_norm1.gamma);
     let pre_normed = add_rms_norm(g, input, &pre_gamma, &format!("{p}_prn"));
 
     // mLSTM-Zelle
-    let (cell_out, c_new, n_new, m_new) =
-        add_mlstm_cell(g, &pre_normed, c_state, n_state, m_state, &block.cell, &format!("{p}_cell"));
+    let (cell_out, c_new, n_new, m_new) = add_mlstm_cell(
+        g,
+        &pre_normed,
+        c_state,
+        n_state,
+        m_state,
+        &block.cell,
+        &format!("{p}_cell"),
+    );
 
     // Residual 1: z = input + cell_out
     let z = format!("{p}_z");
@@ -581,7 +592,7 @@ fn add_mlstm_block(
 
     // Post-RMSNorm
     let post_gamma = format!("{p}_post_gamma");
-    g.init_f32(&post_gamma, &[hidden as i64], &block.post_norm.gamma);
+    g.init_f32(&post_gamma, &[hidden as i64], &block.pre_norm2.gamma);
     let post_normed = add_rms_norm(g, &z, &post_gamma, &format!("{p}_pon"));
 
     // SwiGLU-MLP: gate = SiLU(Wg·z), val = Wv·z, mixed = gate⊙val, down = Wd·mixed
@@ -598,9 +609,30 @@ fn add_mlstm_block(
     let bv = format!("{p}_bval");
     let wd = format!("{p}_wdown");
     let bd = format!("{p}_bdown");
-    mlp_layer!(wg, bg, hidden, up, block.lin_gate.weights, block.lin_gate.biases);
-    mlp_layer!(wv, bv, hidden, up, block.lin_value.weights, block.lin_value.biases);
-    mlp_layer!(wd, bd, up, hidden, block.lin_down.weights, block.lin_down.biases);
+    mlp_layer!(
+        wg,
+        bg,
+        hidden,
+        up,
+        block.lin_gate.weights,
+        block.lin_gate.biases
+    );
+    mlp_layer!(
+        wv,
+        bv,
+        hidden,
+        up,
+        block.lin_value.weights,
+        block.lin_value.biases
+    );
+    mlp_layer!(
+        wd,
+        bd,
+        up,
+        hidden,
+        block.lin_down.weights,
+        block.lin_down.biases
+    );
 
     let gp_r = format!("{p}_gp_r");
     let gp = format!("{p}_gp");
@@ -683,7 +715,12 @@ pub fn export_flat_model(model: &Sequential, path: &str) -> io::Result<()> {
 
     // 1. Embedding-Lookup: emb_w[token_id] → [1, hidden], dann Reshape → [hidden]
     g.init_i64("tok_sh_hidden", &[1], &[hidden]);
-    g.op("Gather", &["emb_w", "token_id"], &["x_raw"], &[attr_int("axis", 0)]);
+    g.op(
+        "Gather",
+        &["emb_w", "token_id"],
+        &["x_raw"],
+        &[attr_int("axis", 0)],
+    );
     g.op("Reshape", &["x_raw", "tok_sh_hidden"], &["x"], &[]);
 
     // 2. mLSTMBlock

@@ -2,6 +2,7 @@ use iron_oxide::collections::Matrix;
 
 pub mod dropout;
 pub mod embedding;
+pub mod headwise_rms_norm;
 pub mod linear;
 pub mod linear_nb;
 pub mod lstm;

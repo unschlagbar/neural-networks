@@ -67,7 +67,7 @@ fn silu_prime(pre: f32) -> f32 {
 
 pub struct SLSTMBlockCache {
     // Pre-Norm
-    pub pre_norm: RMSNormCache, // .output = pre_normed (H)
+    pub pre_norm1: RMSNormCache, // .output = pre_normed (H)
 
     // sLSTM-Zelle
     pub cell: SLSTMCache,
@@ -76,7 +76,7 @@ pub struct SLSTMBlockCache {
     pub z: Box<[f32]>, // (H)
 
     // Post-Norm (auf z angewendet)
-    pub post_norm: RMSNormCache, // .output = post_normed (H)
+    pub pre_norm2: RMSNormCache, // .output = post_normed (H)
 
     // SwiGLU
     pub lin_gate: LinearCache,  // .output = gate_pre  (U)
@@ -191,20 +191,20 @@ impl SLSTMBlock {
     pub fn forward(&mut self, input: &[f32], cache: &mut SLSTMBlockCache) {
         let u = self.up_size;
 
-        self.pre_norm.forward_into(input, &mut cache.pre_norm);
+        self.pre_norm.forward_into(input, &mut cache.pre_norm1);
 
-        self.cell.forward(&cache.pre_norm.output, &mut cache.cell);
+        self.cell.forward(&cache.pre_norm1.output, &mut cache.cell);
 
         for i in 0..self.hidden_size {
             cache.z[i] = input[i] + cache.cell.h[i];
         }
 
-        self.post_norm.forward_into(&cache.z, &mut cache.post_norm);
+        self.post_norm.forward_into(&cache.z, &mut cache.pre_norm2);
 
         self.lin_gate
-            .forward(&cache.post_norm.output, &mut cache.lin_gate);
+            .forward(&cache.pre_norm2.output, &mut cache.lin_gate);
         self.lin_value
-            .forward(&cache.post_norm.output, &mut cache.lin_value);
+            .forward(&cache.pre_norm2.output, &mut cache.lin_value);
 
         for j in 0..u {
             cache.gate_act[j] = silu(cache.lin_gate.output[j]);
@@ -245,10 +245,10 @@ impl SLSTMBlock {
         }
 
         self.post_norm
-            .backward_into(&self.sc_h1, &mut cache.post_norm);
+            .backward_into(&self.sc_h1, &mut cache.pre_norm2);
 
         for i in 0..h {
-            cache.dx[i] += cache.post_norm.dx[i];
+            cache.dx[i] += cache.pre_norm2.dx[i];
         }
 
         self.sc_h2.copy_from_slice(&cache.dx);
@@ -256,10 +256,10 @@ impl SLSTMBlock {
 
         let d_pre_normed: &[f32] = &cache.cell.dconcat[..h];
         self.pre_norm
-            .backward_into(d_pre_normed, &mut cache.pre_norm);
+            .backward_into(d_pre_normed, &mut cache.pre_norm1);
 
         for i in 0..h {
-            cache.dx[i] += cache.pre_norm.dx[i];
+            cache.dx[i] += cache.pre_norm1.dx[i];
         }
     }
 
@@ -267,10 +267,10 @@ impl SLSTMBlock {
         let h = self.hidden_size;
         let u = self.up_size;
         SLSTMBlockCache {
-            pre_norm: self.pre_norm.alloc_cache(),
+            pre_norm1: self.pre_norm.alloc_cache(),
             cell: self.cell.alloc_cache(),
             z: vec![0.0; h].into(),
-            post_norm: self.post_norm.alloc_cache(),
+            pre_norm2: self.post_norm.alloc_cache(),
             lin_gate: LinearCache::new(h, u),
             gate_act: vec![0.0; u].into(),
             lin_value: LinearCache::new(h, u),

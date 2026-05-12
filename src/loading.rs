@@ -264,6 +264,7 @@ pub fn load_mlstm(
     let w_out_weights = read_matrix(r)?;
     let w_out_biases: Box<[f32]> = read_f32_vec(r)?.into();
     let w_out = LinearLayer::from_loaded(output_size, output_size, w_out_weights, w_out_biases);
+    let head_norm_gamma: Box<[f32]> = read_f32_vec(r)?.into();
 
     Ok(MLSTMLayer::from_loaded(
         input_size,
@@ -283,6 +284,7 @@ pub fn load_mlstm(
         bi,
         bf,
         w_out,
+        head_norm_gamma,
     ))
 }
 
