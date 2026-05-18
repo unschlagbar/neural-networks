@@ -5,7 +5,7 @@ use rand::random_range;
 
 use crate::{
     config::SEQ_LOC,
-    nn::{one_hot, softmax::softmax},
+    nn::softmax::softmax,
     nn_layer::{DynCache, NnLayer},
     training::TrainingState,
 };
@@ -18,6 +18,8 @@ pub struct Sequential {
     pub cache: Vec<Vec<Box<dyn DynCache>>>,
     /// Reusable scratch buffer for the backward delta — no heap alloc per step.
     pub delta_buf: Box<[f32]>,
+    /// Reusable one-hot input buffer — avoids per-timestep heap allocation.
+    pub input_buf: Box<[f32]>,
 }
 
 impl Sequential {
@@ -31,14 +33,16 @@ impl Sequential {
 
     pub fn forward_over(&mut self, input: &[u16]) {
         let Sequential {
-            output_size,
             layers,
             cache,
+            input_buf,
             ..
         } = self;
         for t in 0..input.len() {
-            let input = one_hot(input[t] as usize, *output_size);
-            Self::forward_step(layers, &mut cache[t], &input);
+            let tok = input[t] as usize;
+            input_buf[tok] = 1.0;
+            Self::forward_step(layers, &mut cache[t], input_buf);
+            input_buf[tok] = 0.0;
         }
     }
 
@@ -68,40 +72,27 @@ impl Sequential {
 
     /// Forward returning raw logits (softmax layer is skipped so temperature scaling works).
     pub fn forward_sample(&mut self, input: &[u16]) -> Matrix {
-        let n = self.layers.len();
-        let out_layer = n - 1;
-
+        let out_layer = self.layers.len() - 1;
         let mut logits = Matrix::uninit(input.len(), self.output_size);
-
-        let Sequential {
-            output_size,
-            layers,
-            cache,
-            ..
-        } = self;
-
         for t in 0..input.len() {
-            let input_vec = one_hot(input[t] as usize, *output_size);
-            Self::forward_sample_step(&mut layers[..], &mut cache[0], &input_vec);
-            logits[t].copy_from_slice(cache[0][out_layer].output());
+            let tok = input[t] as usize;
+            self.input_buf[tok] = 1.0;
+            let Sequential { layers, cache, input_buf, .. } = self;
+            Self::forward_sample_step(layers, &mut cache[0], input_buf);
+            logits[t].copy_from_slice(self.cache[0][out_layer].output());
+            self.input_buf[tok] = 0.0;
         }
         logits
     }
 
     pub fn forward(&mut self, input: u16) -> &[f32] {
-        let n = self.layers.len();
-        let out_layer = n - 1;
-
-        let Sequential {
-            output_size,
-            layers,
-            cache,
-            ..
-        } = self;
-
-        let input_vec = one_hot(input as usize, *output_size);
-        Self::forward_sample_step(&mut layers[..], &mut cache[0], &input_vec);
-        cache[0][out_layer].output()
+        let out_layer = self.layers.len() - 1;
+        let tok = input as usize;
+        self.input_buf[tok] = 1.0;
+        let Sequential { layers, cache, input_buf, .. } = self;
+        Self::forward_sample_step(layers, &mut cache[0], input_buf);
+        self.input_buf[tok] = 0.0;
+        self.cache[0][out_layer].output()
     }
 
     pub fn backwards_sequence(&mut self, targets: &[u16]) {

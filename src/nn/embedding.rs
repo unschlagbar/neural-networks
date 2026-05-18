@@ -8,18 +8,18 @@ use crate::{
 };
 
 pub struct EmbeddingCache {
-    /// Saved input (for ∂L/∂W = x · δᵀ).
-    pub input: Vec<f32>,
+    /// Token index of the one-hot input — used in backward to update one row.
+    pub token_idx: usize,
     /// Post-activation output; activation derivative is applied in-place during backward.
     pub output: Vec<f32>,
-    /// dL/d(input), populated in backward.
+    /// dL/d(input), kept for interface compatibility (embedding is always the first layer).
     pub dx: Vec<f32>,
 }
 
 impl EmbeddingCache {
     pub fn new(input_size: usize, output_size: usize) -> Self {
         Self {
-            input: vec![0.0; input_size],
+            token_idx: 0,
             output: vec![0.0; output_size],
             dx: vec![0.0; input_size],
         }
@@ -79,39 +79,20 @@ impl EmbeddingLayer {
         }
     }
 
-    /// matmul + bias into a pre-allocated output buffer.
-    #[inline]
-    fn matmul_add_bias(&self, input: &[f32], out: &mut [f32]) {
-        out.fill(0.0);
-        for (i, &x) in input.iter().enumerate() {
-            for (j, &w) in self.weights[i].iter().enumerate() {
-                out[j] += x * w;
-            }
-        }
-    }
-
-    /// Standard forward: z = Wx+b → activation(z).
+    /// Forward: one-hot input → row lookup, O(hidden) instead of O(vocab × hidden).
     pub fn forward(&self, input: &[f32], cache: &mut EmbeddingCache) {
-        cache.input.copy_from_slice(input);
-        self.matmul_add_bias(input, &mut cache.output);
+        let tok = input.iter().position(|&x| x != 0.0).unwrap_or(0);
+        cache.token_idx = tok;
+        cache.output.copy_from_slice(&self.weights[tok]);
     }
 
-    /// Backward.
-    ///
-    /// `delta` (dL/d output) is modified in-place:
-    ///   - Non-softmax: element-wise multiplied by the activation derivative.
-    ///   - Softmax output layer: caller passes the fused cross-entropy gradient ŷ−y.
-    ///
-    /// `cache.dx` ← dL/d(input) = Wᵀ · delta.
+    /// Backward: only the one active row of the grad matrix needs updating.
     pub fn backward(&mut self, delta: &mut [f32], cache: &mut EmbeddingCache) {
-        self.grads.weights.matrix().add_outer(&cache.input, delta);
-
-        cache.dx.fill(0.0);
-        for (i, dx) in cache.dx.iter_mut().enumerate() {
-            for (&dy, &w) in delta.iter().zip(&self.weights[i]) {
-                *dx += dy * w;
-            }
+        let row = &mut self.grads.weights.matrix()[cache.token_idx];
+        for (g, &d) in row.iter_mut().zip(delta.iter()) {
+            *g += d;
         }
+        cache.dx.fill(0.0);
     }
 
     pub fn input_size(&self) -> usize {

@@ -229,7 +229,7 @@ fn build_windows(sequences: &[Vec<u16>], seq_len: usize, boundary_ids: &[u16]) -
                 let boundary_search_start = window_end;
                 while window_end < seq.len() && !boundary_ids.contains(&seq[window_end - 1]) {
                     window_end += 1;
-                    if window_end - boundary_search_start > 1000 {
+                    if window_end - boundary_search_start > 127 {
                         // no boundary found — discard all windows from this sequence
                         out.truncate(seq_windows_start);
                         break 'seq;

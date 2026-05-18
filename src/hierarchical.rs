@@ -150,13 +150,13 @@ impl HierarchicalSequential {
         for t in 0..input.len() {
             let token = input[t];
 
-            self.char_input.fill(0.0);
             self.char_input[token as usize] = 1.0;
             Self::forward_step(
                 &mut self.char_model.layers,
                 &mut self.char_model.cache[t],
                 &self.char_input,
             );
+            self.char_input[token as usize] = 0.0;
             {
                 let char1_out = self.char_model.cache[t].last().unwrap().output();
                 self.char2_input[..char_output].copy_from_slice(char1_out);
@@ -370,13 +370,13 @@ impl HierarchicalSequential {
         let mut out = Vec::with_capacity(max_len);
 
         for _ in 0..max_len {
-            self.char_input.fill(0.0);
             self.char_input[last_token as usize] = 1.0;
             Self::forward_sample_step(
                 &mut self.char_model.layers,
                 &mut self.char_model.cache[0],
                 &self.char_input,
             );
+            self.char_input[last_token as usize] = 0.0;
             {
                 let char1_out = self.char_model.cache[0].last().unwrap().output();
                 self.char2_input[..char_output].copy_from_slice(char1_out);
@@ -435,13 +435,13 @@ impl HierarchicalSequential {
         for t in 0..prefix.len() {
             let token = prefix[t];
 
-            self.char_input.fill(0.0);
             self.char_input[token as usize] = 1.0;
             Self::forward_sample_step(
                 &mut self.char_model.layers,
                 &mut self.char_model.cache[0],
                 &self.char_input,
             );
+            self.char_input[token as usize] = 0.0;
             {
                 let char1_out = self.char_model.cache[0].last().unwrap().output();
                 self.char2_input[..char_output].copy_from_slice(char1_out);

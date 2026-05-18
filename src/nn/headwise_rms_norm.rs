@@ -85,12 +85,12 @@ impl HeadwiseRMSNorm {
         for hd in 0..self.num_heads {
             let off = hd * dhv;
             let inv_rms = cache.inv_rms[hd];
+            let grads_gamma = self.grads_gamma.vec();
             let mut s = 0.0;
             for i in 0..dhv {
-                let dy = delta[off + i];
-                let xh = cache.x_hat[off + i];
-                self.grads_gamma.vec()[off + i] += dy * xh;
-                s += self.gamma[off + i] * dy * xh;
+                let dyxh = delta[off + i] * cache.x_hat[off + i];
+                grads_gamma[off + i] += dyxh;
+                s += self.gamma[off + i] * dyxh;
             }
             let s_n = s / dhv as f32;
             for i in 0..dhv {

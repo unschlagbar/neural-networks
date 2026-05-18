@@ -8,7 +8,7 @@ use crate::nn::linear_nb::LinearNBLayer;
 use crate::nn::lstm::LSTMLayer;
 use crate::nn::mlstm::MLSTMLayer;
 use crate::nn::mlstm_block::MLSTMBlock;
-use crate::nn::rms_norm::{RMSNorm, RMSNormResidual};
+use crate::nn::rms_norm::RMSNorm;
 use crate::nn::silu_dense::SiluDenseLayer;
 use crate::nn::slstm::SLSTMLayer;
 use crate::nn::slstm_block::SLSTMBlock;
@@ -202,20 +202,6 @@ impl SequentialBuilder {
         self.layer(Box::new(layer), self.output_size);
         self
     }
-    // In nn_layer.rs → impl SequentialBuilder
-    pub fn res_rms_norm(mut self) -> Self {
-        let inner = if let Some(layer) = self.layers.pop() {
-            layer
-        } else {
-            unreachable!("normed closure muss genau einen inneren Layer bauen!")
-        };
-
-        let wrapper = RMSNormResidual::new(inner);
-
-        self.output_size = wrapper.input_size();
-        self.layers.push(Box::new(wrapper));
-        self
-    }
 
     // In nn_layer.rs → impl SequentialBuilder
     pub fn rms_norm(mut self) -> Self {
@@ -253,6 +239,7 @@ impl SequentialBuilder {
             layers: self.layers,
             cache: Vec::new(),
             delta_buf: vec![0.0; max_size].into(),
+            input_buf: vec![0.0; self.input_size].into(),
         }
     }
 }

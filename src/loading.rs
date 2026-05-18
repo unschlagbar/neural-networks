@@ -7,17 +7,9 @@ use iron_oxide::collections::Matrix;
 
 use crate::{
     nn::{
-        dropout::DropoutLayer,
-        embedding::EmbeddingLayer,
-        linear::LinearLayer,
-        linear_nb::LinearNBLayer,
-        lstm::LSTMLayer,
-        mlstm::MLSTMLayer,
-        mlstm_block::MLSTMBlock,
-        rms_norm::{RMSNorm, RMSNormResidual},
-        silu_dense::SiluDenseLayer,
-        slstm::SLSTMLayer,
-        slstm_block::SLSTMBlock,
+        dropout::DropoutLayer, embedding::EmbeddingLayer, linear::LinearLayer,
+        linear_nb::LinearNBLayer, lstm::LSTMLayer, mlstm::MLSTMLayer, mlstm_block::MLSTMBlock,
+        rms_norm::RMSNorm, silu_dense::SiluDenseLayer, slstm::SLSTMLayer, slstm_block::SLSTMBlock,
         softmax::SoftmaxLayer,
     },
     nn_layer::NnLayer,
@@ -124,24 +116,6 @@ pub fn load_lstm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>>
         h_init,
         c_init,
     )))
-}
-
-pub fn load_res_norm(r: &mut dyn Read, _ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
-    let gamma = read_f32_vec(r)?;
-
-    let inner_tag = read_u8(r)?;
-    let inner_input = read_u32(r)? as usize;
-    let inner_output = read_u32(r)? as usize;
-
-    let ctx = LoadCtx {
-        input_size: inner_input,
-        output_size: inner_output,
-    };
-    let inner = new_layer(r, inner_tag, ctx)?;
-
-    let mut wrapper = RMSNormResidual::new(inner);
-    wrapper.gamma = gamma;
-    Ok(Box::new(wrapper))
 }
 
 pub fn load_norm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
@@ -328,7 +302,6 @@ fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLa
         5 => load_slstm(r, ctx),
         6 => load_dropout(r, ctx),
         7 => load_embedding(r),
-        8 => load_res_norm(r, ctx),
         9 => load_norm(r, ctx),
         10 => load_silu_dense(r, ctx),
         11 => load_slstm_block(r, ctx),
@@ -401,6 +374,7 @@ impl Sequential {
             layers,
             cache: Vec::new(),
             delta_buf: vec![0.0; max_size].into(),
+            input_buf: vec![0.0; input_size].into(),
         })
     }
 
