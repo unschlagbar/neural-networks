@@ -269,6 +269,12 @@ impl HierarchicalSequential {
                     self.delta_buf[i] = d_hi[i];
                 }
                 self.d_high_ctx.fill(0.0);
+            } else {
+                char1_grad_accum += self.delta_buf[..char_output]
+                    .iter()
+                    .map(|x| x.abs())
+                    .sum::<f32>()
+                    / char_output as f32;
             }
 
             backward_through_layers(
@@ -297,7 +303,8 @@ impl HierarchicalSequential {
         }
 
         self.last_high_grad_signal = high_grad_accum / self.boundary_timesteps.len() as f32;
-        self.last_char1_grad_signal = char1_grad_accum / targets.len() as f32;
+        self.last_char1_grad_signal =
+            char1_grad_accum / (targets.len() - self.boundary_timesteps.len()) as f32;
     }
 
     pub fn train<'a, I: Iterator<Item = (&'a [u16], &'a [u16])>>(
