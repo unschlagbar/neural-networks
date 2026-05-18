@@ -351,7 +351,7 @@ impl NnLayer for LSTMLayer {
         self.h.copy_from_slice(&self.h_init);
     }
 
-    fn zero_bptt_state(&mut self) {
+    fn reset_bptt_state(&mut self) {
         self.dh_bptt.fill(0.0);
         self.dc_bptt.fill(0.0);
     }

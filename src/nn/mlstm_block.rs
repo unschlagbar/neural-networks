@@ -316,8 +316,8 @@ impl NnLayer for MLSTMBlock {
         self.cell.reset_state();
     }
 
-    fn zero_bptt_state(&mut self) {
-        self.cell.zero_bptt_state();
+    fn reset_bptt_state(&mut self) {
+        self.cell.reset_bptt_state();
     }
 
     fn apply_grads(&mut self, lr: f32) {

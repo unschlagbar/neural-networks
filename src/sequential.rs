@@ -77,7 +77,12 @@ impl Sequential {
         for t in 0..input.len() {
             let tok = input[t] as usize;
             self.input_buf[tok] = 1.0;
-            let Sequential { layers, cache, input_buf, .. } = self;
+            let Sequential {
+                layers,
+                cache,
+                input_buf,
+                ..
+            } = self;
             Self::forward_sample_step(layers, &mut cache[0], input_buf);
             logits[t].copy_from_slice(self.cache[0][out_layer].output());
             self.input_buf[tok] = 0.0;
@@ -89,7 +94,12 @@ impl Sequential {
         let out_layer = self.layers.len() - 1;
         let tok = input as usize;
         self.input_buf[tok] = 1.0;
-        let Sequential { layers, cache, input_buf, .. } = self;
+        let Sequential {
+            layers,
+            cache,
+            input_buf,
+            ..
+        } = self;
         Self::forward_sample_step(layers, &mut cache[0], input_buf);
         self.input_buf[tok] = 0.0;
         self.cache[0][out_layer].output()
@@ -152,7 +162,7 @@ impl Sequential {
             self.backwards_sequence(targets);
             for layer in &mut self.layers {
                 layer.accumulate_init_grad();
-                layer.zero_bptt_state();
+                layer.reset_bptt_state();
             }
 
             if let Some(lr) = state.step(loss) {

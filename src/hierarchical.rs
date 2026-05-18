@@ -34,6 +34,7 @@ pub struct HierarchicalSequential {
     d_high_ctx: Box<[f32]>,
 
     pub last_high_grad_signal: f32,
+    pub last_char1_grad_signal: f32,
     pub step: usize,
 }
 
@@ -90,6 +91,7 @@ impl HierarchicalSequential {
             char_input,
             d_high_ctx,
             last_high_grad_signal: 0.0,
+            last_char1_grad_signal: 0.0,
             step: 0,
         }
     }
@@ -207,6 +209,7 @@ impl HierarchicalSequential {
         let context_size = self.context_size;
 
         let mut high_grad_accum = 0.0;
+        let mut char1_grad_accum = 0.0;
         self.d_high_ctx.fill(0.0);
 
         let mut boundary_i: Option<usize> = self.boundary_timesteps.len().checked_sub(1);
@@ -232,11 +235,11 @@ impl HierarchicalSequential {
             if boundary.is_some() {
                 for layer in &mut self.char2_model.layers {
                     layer.accumulate_init_grad();
-                    layer.zero_bptt_state();
+                    layer.reset_bptt_state();
                 }
                 for layer in &mut self.char_model.layers {
                     layer.accumulate_init_grad();
-                    layer.zero_bptt_state();
+                    layer.reset_bptt_state();
                 }
             }
 
@@ -245,6 +248,8 @@ impl HierarchicalSequential {
                 for i in 0..context_size {
                     self.d_high_ctx[i] += dx2[char_output + i];
                 }
+                char1_grad_accum +=
+                    dx2[..char_output].iter().map(|x| x.abs()).sum::<f32>() / char_output as f32;
                 self.delta_buf[..char_output].copy_from_slice(&dx2[..char_output]);
             }
 
@@ -280,18 +285,19 @@ impl HierarchicalSequential {
 
         for layer in &mut self.char_model.layers {
             layer.accumulate_init_grad();
-            layer.zero_bptt_state();
+            layer.reset_bptt_state();
         }
         for layer in &mut self.char2_model.layers {
             layer.accumulate_init_grad();
-            layer.zero_bptt_state();
+            layer.reset_bptt_state();
         }
         for layer in &mut self.word_model.layers {
             layer.accumulate_init_grad();
-            layer.zero_bptt_state();
+            layer.reset_bptt_state();
         }
 
         self.last_high_grad_signal = high_grad_accum / self.boundary_timesteps.len() as f32;
+        self.last_char1_grad_signal = char1_grad_accum / targets.len() as f32;
     }
 
     pub fn train<'a, I: Iterator<Item = (&'a [u16], &'a [u16])>>(
@@ -322,11 +328,12 @@ impl HierarchicalSequential {
                 let loss = state.get_loss();
                 let elapsed = time.elapsed();
                 println!(
-                    "{} | char loss {:.4} | ppl {:.4} | high ∇ {:.4} | {} tok | {:.1?}",
+                    "{} | char loss {:.4} | ppl {:.4} | high ∇ {:.4} | char1 ∇ {:.4} | {} tok | {:.1?}",
                     state.step,
                     loss,
                     loss.exp(),
                     self.last_high_grad_signal,
+                    self.last_char1_grad_signal,
                     tokens,
                     elapsed,
                 );
@@ -557,6 +564,7 @@ impl HierarchicalSequential {
             char_input: char_input_buf,
             d_high_ctx,
             last_high_grad_signal: 0.0,
+            last_char1_grad_signal: 0.0,
             step,
         })
     }

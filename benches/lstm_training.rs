@@ -27,6 +27,8 @@ pub fn train(tokenizer: Rc<Tokenizer>, data: &PreparedDataSet) {
         .embedding(HIDDEN_SIZE)
         .slstm(HIDDEN_SIZE)
         .slstm(HIDDEN_SIZE)
+        .mlstm(4, HIDDEN_SIZE / 4)
+        .mlstm(4, HIDDEN_SIZE / 4)
         .linear(vocab)
         .softmax()
         .build();

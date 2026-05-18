@@ -27,6 +27,7 @@ pub fn build_hierarchical_model(
         .embedding(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
+        .rms_norm()
         .build();
 
     let high_model = SequentialBuilder::new(CHAR_HIDDEN)

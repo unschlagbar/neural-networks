@@ -441,9 +441,9 @@ impl MLSTMLayer {
             cache.psi[hd] = nq.abs().max(1.0);
 
             // Raw ỹ_h = C_h q_h / ψ_h (stored in h_tilde before norm is applied)
-            let psi = cache.psi[hd];
+            let psi = 1.0 / cache.psi[hd];
             for i in 0..dhv {
-                cache.h_tilde[v_off + i] = cache.cq[v_off + i] / psi;
+                cache.h_tilde[v_off + i] = cache.cq[v_off + i] * psi;
             }
         }
 
@@ -506,10 +506,11 @@ impl MLSTMLayer {
             let c_off = hd * dhv * dqk;
 
             // dψ_h and dnq_h for ψ_h = max(|nq|, 1)
-            let psi = cache.psi[hd];
+            let inv_psi = cache.psi[hd];
+            let psi_sq = inv_psi * inv_psi;
             let mut dpsi = 0.0;
             for i in 0..dhv {
-                dpsi += self.d_h_tilde[v_off + i] * (-cache.cq[v_off + i] / (psi * psi));
+                dpsi += self.d_h_tilde[v_off + i] * (-cache.cq[v_off + i] * psi_sq);
             }
             let dnq_h = if cache.nq[hd].abs() > 1.0 {
                 cache.nq[hd].signum() * dpsi
@@ -520,7 +521,7 @@ impl MLSTMLayer {
             // dC_total_h[i,j] = (d_h_tilde[i] / ψ) * q_h[j] + dC_bptt_h[i,j]
             // dn_total_h[j] = dnq_h * q_h[j] + dn_bptt_h[j]
             for i in 0..dhv {
-                let dh_over_psi = self.d_h_tilde[v_off + i] / psi;
+                let dh_over_psi = self.d_h_tilde[v_off + i] * inv_psi;
                 let row_off = c_off + i * dqk;
                 for j in 0..dqk {
                     self.dc_total[row_off + j] =
@@ -537,7 +538,7 @@ impl MLSTMLayer {
                 dq_slice[j] = dnq_h * cache.n[qk_off + j];
             }
             for i in 0..dhv {
-                let dh_over_psi = self.d_h_tilde[v_off + i] / psi;
+                let dh_over_psi = self.d_h_tilde[v_off + i] * inv_psi;
                 let row_off = c_off + i * dqk;
                 let c_row = &cache.c[row_off..row_off + dqk];
                 for j in 0..dqk {
@@ -768,7 +769,7 @@ impl NnLayer for MLSTMLayer {
         self.m.fill(0.0);
     }
 
-    fn zero_bptt_state(&mut self) {
+    fn reset_bptt_state(&mut self) {
         self.dc_bptt.fill(0.0);
         self.dn_bptt.fill(0.0);
     }

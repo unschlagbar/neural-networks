@@ -87,7 +87,7 @@ pub trait NnLayer: Dyn {
     /// the forward hidden state (h, c).  Called at HM-RNN FLUSH boundaries so
     /// that gradients do not leak across a char-model reset.  No-op for
     /// stateless layers.
-    fn zero_bptt_state(&mut self) {}
+    fn reset_bptt_state(&mut self) {}
 
     fn accumulate_init_grad(&mut self) {}
 }

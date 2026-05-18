@@ -1,9 +1,12 @@
 //! Only for data set extraction
 #![allow(unused)]
 
-use std::{fs, io::Write};
+use std::{
+    fs::{self, File},
+    io::Write,
+};
 
-const DIR: &str = "data/political_speeches";
+const FILE: &str = "data/political_speeches.txt";
 
 #[test]
 fn political() {
@@ -16,10 +19,15 @@ fn political() {
         speeches.push(speech);
     }
 
-    fs::create_dir(DIR).unwrap();
+    let mut file = File::create(FILE).unwrap();
+    let mut first = true;
 
     for (i, speech) in speeches.into_iter().enumerate() {
-        let mut file = fs::File::create(format!("{DIR}/{i}.txt")).unwrap();
+        if !first {
+            file.write_all(b"\n\n---FILE---\n\n").unwrap();
+        } else {
+            first = false;
+        }
 
         for part in speech.split("&amp;") {
             for part in part.split("apos;") {
