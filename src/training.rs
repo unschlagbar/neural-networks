@@ -165,7 +165,7 @@ impl TrainingState {
         if self.step.is_multiple_of(self.batch_size) {
             let batch_num = self.step / self.batch_size;
             let warmup_scale = (batch_num as f32 / WARMUP_STEPS as f32).min(1.0);
-            Some(self.lr * warmup_scale / self.batch_size as f32)
+            Some(self.lr * warmup_scale)
         } else {
             None
         }

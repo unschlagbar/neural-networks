@@ -506,7 +506,7 @@ impl MLSTMLayer {
             let c_off = hd * dhv * dqk;
 
             // dψ_h and dnq_h for ψ_h = max(|nq|, 1)
-            let inv_psi = cache.psi[hd];
+            let inv_psi = 1.0 / cache.psi[hd];
             let psi_sq = inv_psi * inv_psi;
             let mut dpsi = 0.0;
             for i in 0..dhv {
