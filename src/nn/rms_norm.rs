@@ -150,8 +150,10 @@ impl RMSNorm {
         let n = self.norm_size;
         let irms = cache.inv_rms;
         let mut s = 0.0;
+
+        let gamma_grads = self.grads_gamma.vec();
         for i in 0..n {
-            self.grads_gamma.vec()[i] += delta[i] * cache.x_hat[i];
+            gamma_grads[i] += delta[i] * cache.x_hat[i];
             s += self.gamma[i] * delta[i] * cache.x_hat[i];
         }
         let s_n = s / n as f32;

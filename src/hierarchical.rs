@@ -177,14 +177,14 @@ impl HierarchicalSequential {
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
-                for layer in &mut self.char2_model.layers {
-                    layer.reset_state();
-                }
+                //for layer in &mut self.char2_model.layers {
+                //    layer.reset_state();
+                //}
 
                 let high_out = self.word_model.cache[word_idx].last().unwrap().output();
                 self.assert_no_nan(high_out, "high_output", word_idx);
                 self.char2_input[char_output..].copy_from_slice(high_out);
-                self.char2_input[..char_output].fill(0.0);
+                //self.char2_input[..char_output].fill(0.0);
             }
 
             Self::forward_step(
@@ -233,14 +233,14 @@ impl HierarchicalSequential {
             );
 
             if boundary.is_some() {
-                for layer in &mut self.char2_model.layers {
-                    layer.accumulate_init_grad();
-                    layer.reset_bptt_state();
-                }
                 for layer in &mut self.char_model.layers {
                     layer.accumulate_init_grad();
                     layer.reset_bptt_state();
                 }
+                //for layer in &mut self.char2_model.layers {
+                //    layer.accumulate_init_grad();
+                //    layer.reset_bptt_state();
+                //}
             }
 
             {
@@ -251,6 +251,12 @@ impl HierarchicalSequential {
                 char1_grad_accum +=
                     dx2[..char_output].iter().map(|x| x.abs()).sum::<f32>() / char_output as f32;
                 self.delta_buf[..char_output].copy_from_slice(&dx2[..char_output]);
+
+                char1_grad_accum += self.delta_buf[..char_output]
+                    .iter()
+                    .map(|x| x.abs())
+                    .sum::<f32>()
+                    / char_output as f32;
             }
 
             if let Some(bi) = boundary {
@@ -266,15 +272,9 @@ impl HierarchicalSequential {
 
                 let d_hi = self.word_model.cache[bi][0].input_grad();
                 for i in 0..char_output {
-                    self.delta_buf[i] = d_hi[i];
+                    self.delta_buf[i] += d_hi[i];
                 }
                 self.d_high_ctx.fill(0.0);
-            } else {
-                char1_grad_accum += self.delta_buf[..char_output]
-                    .iter()
-                    .map(|x| x.abs())
-                    .sum::<f32>()
-                    / char_output as f32;
             }
 
             backward_through_layers(
@@ -303,8 +303,7 @@ impl HierarchicalSequential {
         }
 
         self.last_high_grad_signal = high_grad_accum / self.boundary_timesteps.len() as f32;
-        self.last_char1_grad_signal =
-            char1_grad_accum / (targets.len() - self.boundary_timesteps.len()) as f32;
+        self.last_char1_grad_signal = char1_grad_accum / targets.len() as f32;
     }
 
     pub fn train<'a, I: Iterator<Item = (&'a [u16], &'a [u16])>>(
@@ -409,14 +408,14 @@ impl HierarchicalSequential {
                 {
                     let high_out = self.word_model.cache[0].last().unwrap().output();
                     self.char2_input[char_output..].copy_from_slice(high_out);
-                    self.char2_input[..char_output].fill(0.0);
+                    //self.char2_input[..char_output].fill(0.0);
                 }
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
-                for layer in &mut self.char2_model.layers {
-                    layer.reset_state();
-                }
+                //for layer in &mut self.char2_model.layers {
+                //    layer.reset_state();
+                //}
             }
 
             Self::forward_sample_step(
@@ -473,14 +472,14 @@ impl HierarchicalSequential {
                 {
                     let high_out = self.word_model.cache[0].last().unwrap().output();
                     self.char2_input[char_output..].copy_from_slice(high_out);
-                    self.char2_input[..char_output].fill(0.0);
+                    //self.char2_input[..char_output].fill(0.0);
                 }
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
-                for layer in &mut self.char2_model.layers {
-                    layer.reset_state();
-                }
+                //for layer in &mut self.char2_model.layers {
+                //    layer.reset_state();
+                //}
             }
 
             Self::forward_sample_step(

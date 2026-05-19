@@ -1,6 +1,6 @@
 // Model-path
 
-pub const MODEL_LOC: &str = "models/hierarchical_pol";
+pub const MODEL_LOC: &str = "models/hierarchical_pol1";
 pub const SEQ_LOC: &str = "models/seq";
 
 // Sequenz-Len
@@ -28,7 +28,7 @@ pub const TOP_P: f32 = 1.;
 
 pub const CHAR_HIDDEN: usize = 128;
 pub const OUT_HIDDEN: usize = 128;
-pub const WORD_HIDDEN: usize = 384;
+pub const WORD_HIDDEN: usize = 256;
 
 // Flat-mLSTM-Architektur (abgeleitet aus WORD_HIDDEN)
 
