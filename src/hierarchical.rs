@@ -202,6 +202,15 @@ impl HierarchicalSequential {
 
     pub fn backwards_sequence(&mut self, targets: &[u16]) {
         if self.boundary_timesteps.is_empty() {
+            for layer in &mut self.char_model.layers {
+                layer.reset_bptt_state();
+            }
+            for layer in &mut self.char2_model.layers {
+                layer.reset_bptt_state();
+            }
+            for layer in &mut self.word_model.layers {
+                layer.reset_bptt_state();
+            }
             return;
         }
 
@@ -248,15 +257,7 @@ impl HierarchicalSequential {
                 for i in 0..context_size {
                     self.d_high_ctx[i] += dx2[char_output + i];
                 }
-                char1_grad_accum +=
-                    dx2[..char_output].iter().map(|x| x.abs()).sum::<f32>() / char_output as f32;
                 self.delta_buf[..char_output].copy_from_slice(&dx2[..char_output]);
-
-                char1_grad_accum += self.delta_buf[..char_output]
-                    .iter()
-                    .map(|x| x.abs())
-                    .sum::<f32>()
-                    / char_output as f32;
             }
 
             if let Some(bi) = boundary {
@@ -276,6 +277,11 @@ impl HierarchicalSequential {
                 }
                 self.d_high_ctx.fill(0.0);
             }
+            char1_grad_accum += self.delta_buf[..char_output]
+                .iter()
+                .map(|x| x.abs())
+                .sum::<f32>()
+                / char_output as f32;
 
             backward_through_layers(
                 &mut self.char_model.layers,

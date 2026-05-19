@@ -130,19 +130,18 @@ pub fn load_slstm(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>
     let wi = read_matrix(r)?;
     let wf = read_matrix(r)?;
     let wo = read_matrix(r)?;
-    let b = read_matrix(r)?;
+    let bz = read_f32_vec(r)?;
+    let bi = read_f32_vec(r)?;
+    let bf = read_f32_vec(r)?;
+    let bo = read_f32_vec(r)?;
     let h_init = read_f32_vec(r)?;
     let c_init = read_f32_vec(r)?;
     Ok(Box::new(SLSTMLayer::from_loaded(
         ctx.input_size,
         ctx.output_size,
-        wz,
-        wi,
-        wf,
-        wo,
-        b,
-        h_init,
-        c_init,
+        wz, wi, wf, wo,
+        bz, bi, bf, bo,
+        h_init, c_init,
     )))
 }
 
@@ -162,7 +161,7 @@ pub fn load_silu_dense(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnL
 /// Danach in dieser Reihenfolge:
 ///   - up_size: u32
 ///   - pre_gamma, post_gamma: f32_vec(H)
-///   - cell-Matrizen: wz, wi, wf, wo, b, h_init, c_init  (wie `SLSTMLayer::save`)
+///   - cell-Gewichte: wz, wi, wf, wo, bz, bi, bf, bo, h_init, c_init  (wie `SLSTMLayer::save`)
 ///   - SwiGLU: w_gate, b_gate, w_value, b_value, w_down, b_down
 pub fn load_slstm_block(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
     if ctx.input_size != ctx.output_size {
@@ -188,10 +187,13 @@ pub fn load_slstm_block(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn Nn
     let wi = read_matrix(r)?;
     let wf = read_matrix(r)?;
     let wo = read_matrix(r)?;
-    let b = read_matrix(r)?;
+    let bz: Box<[f32]> = read_f32_vec(r)?;
+    let bi: Box<[f32]> = read_f32_vec(r)?;
+    let bf: Box<[f32]> = read_f32_vec(r)?;
+    let bo: Box<[f32]> = read_f32_vec(r)?;
     let h_init: Box<[f32]> = read_f32_vec(r)?;
     let c_init: Box<[f32]> = read_f32_vec(r)?;
-    let cell = SLSTMLayer::from_loaded(hidden_size, hidden_size, wz, wi, wf, wo, b, h_init, c_init);
+    let cell = SLSTMLayer::from_loaded(hidden_size, hidden_size, wz, wi, wf, wo, bz, bi, bf, bo, h_init, c_init);
 
     // SwiGLU-Projektionen
     let lin_gate =

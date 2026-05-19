@@ -27,11 +27,6 @@ use crate::{
 };
 use std::{any::Any, io};
 
-// Gate row indices inside the bias matrix `b` of shape (4, hidden_size).
-const Z: usize = 0; // cell input (z̃)
-const I: usize = 1; // input gate (ĩ)
-const G_F: usize = 2; // forget gate (f̃)
-const O: usize = 3; // output gate (õ)
 
 /// All per-timestep activations + scratch needed for backward.
 /// Pre-allocated at the start of training; zero dynamic allocation in the hot path.
@@ -92,7 +87,10 @@ pub struct SLSTMLayerGrads {
     pub wi: GradMatrix,
     pub wf: GradMatrix,
     pub wo: GradMatrix,
-    pub b: GradMatrix, // (4, h)
+    pub bz: GradVec,
+    pub bi: GradVec,
+    pub bf: GradVec,
+    pub bo: GradVec,
 
     pub h_init_grad: GradVec,
     pub c_init_grad: GradVec,
@@ -105,7 +103,10 @@ impl SLSTMLayerGrads {
             wi: GradMatrix::zeros(rows, h),
             wf: GradMatrix::zeros(rows, h),
             wo: GradMatrix::zeros(rows, h),
-            b: GradMatrix::zeros(4, h),
+            bz: GradVec::zeros(h),
+            bi: GradVec::zeros(h),
+            bf: GradVec::zeros(h),
+            bo: GradVec::zeros(h),
             h_init_grad: GradVec::zeros(h),
             c_init_grad: GradVec::zeros(h),
         }
@@ -120,7 +121,10 @@ pub struct SLSTMLayer {
     pub wi: Matrix,
     pub wf: Matrix,
     pub wo: Matrix,
-    pub b: Matrix,
+    pub bz: Box<[f32]>,
+    pub bi: Box<[f32]>,
+    pub bf: Box<[f32]>,
+    pub bo: Box<[f32]>,
 
     // Forward state carried across timesteps
     pub h: Box<[f32]>,
@@ -155,10 +159,6 @@ impl SLSTMLayer {
 
         // Forget-gate bias init to a positive value (Jozefowicz et al. 2015;
         // xLSTM paper keeps this convention to avoid very small f_t at start).
-        let mut b = Matrix::zeros(4, hidden_size);
-        b[G_F].fill(1.0);
-        //b[I].fill(-10.0);
-
         let h_init: Box<[f32]> = vec![0.0; hidden_size].into();
         let c_init: Box<[f32]> = vec![0.0; hidden_size].into();
 
@@ -169,7 +169,10 @@ impl SLSTMLayer {
             wi: Matrix::random(rows, hidden_size, scale),
             wf: Matrix::random(rows, hidden_size, scale),
             wo: Matrix::random(rows, hidden_size, scale),
-            b,
+            bz: vec![0.0; hidden_size].into(),
+            bi: vec![0.0; hidden_size].into(),
+            bf: vec![1.0; hidden_size].into(),
+            bo: vec![0.0; hidden_size].into(),
             h: h_init.clone(),
             c: c_init.clone(),
             n: vec![0.0; hidden_size].into(),
@@ -197,7 +200,10 @@ impl SLSTMLayer {
         wi: Matrix,
         wf: Matrix,
         wo: Matrix,
-        b: Matrix,
+        bz: Box<[f32]>,
+        bi: Box<[f32]>,
+        bf: Box<[f32]>,
+        bo: Box<[f32]>,
         h_init: Box<[f32]>,
         c_init: Box<[f32]>,
     ) -> Self {
@@ -209,7 +215,10 @@ impl SLSTMLayer {
             wi,
             wf,
             wo,
-            b,
+            bz,
+            bi,
+            bf,
+            bo,
             h: h_init.clone(),
             c: c_init.clone(),
             n: vec![0.0; hidden_size].into(),
@@ -248,10 +257,10 @@ impl SLSTMLayer {
         self.wo.row_mul(&cache.xh, &mut cache.ot_pre);
 
         for j in 0..h {
-            cache.zt_pre[j] += self.b[Z][j];
-            cache.it_pre[j] += self.b[I][j];
-            cache.ft_pre[j] += self.b[G_F][j];
-            cache.ot_pre[j] += self.b[O][j];
+            cache.zt_pre[j] += self.bz[j];
+            cache.it_pre[j] += self.bi[j];
+            cache.ft_pre[j] += self.bf[j];
+            cache.ot_pre[j] += self.bo[j];
         }
 
         // Activations
@@ -365,10 +374,10 @@ impl SLSTMLayer {
         g.wo.matrix().add_outer(&cache.xh, &self.do_pre);
 
         for j in 0..h {
-            g.b.matrix()[Z][j] += self.dz[j];
-            g.b.matrix()[I][j] += self.di_pre[j];
-            g.b.matrix()[G_F][j] += self.df_pre[j];
-            g.b.matrix()[O][j] += self.do_pre[j];
+            g.bz.vec()[j] += self.dz[j];
+            g.bi.vec()[j] += self.di_pre[j];
+            g.bf.vec()[j] += self.df_pre[j];
+            g.bo.vec()[j] += self.do_pre[j];
         }
 
         // 5. dL/d(xh) for layers below + BPTT to h_{t-1}
@@ -441,7 +450,10 @@ impl NnLayer for SLSTMLayer {
         saving::write_matrix(w, &self.wi)?;
         saving::write_matrix(w, &self.wf)?;
         saving::write_matrix(w, &self.wo)?;
-        saving::write_matrix(w, &self.b)?;
+        saving::write_f32_slice(w, &self.bz)?;
+        saving::write_f32_slice(w, &self.bi)?;
+        saving::write_f32_slice(w, &self.bf)?;
+        saving::write_f32_slice(w, &self.bo)?;
         saving::write_f32_slice(w, &self.h_init)?;
         saving::write_f32_slice(w, &self.c_init)
     }
@@ -468,7 +480,10 @@ impl NnLayer for SLSTMLayer {
         self.grads.wi.apply_to(&mut self.wi, lr);
         self.grads.wf.apply_to(&mut self.wf, lr);
         self.grads.wo.apply_to(&mut self.wo, lr);
-        self.grads.b.apply_to(&mut self.b, lr);
+        self.grads.bz.apply_to(&mut self.bz, lr);
+        self.grads.bi.apply_to(&mut self.bi, lr);
+        self.grads.bf.apply_to(&mut self.bf, lr);
+        self.grads.bo.apply_to(&mut self.bo, lr);
 
         self.grads.c_init_grad.apply_to(&mut self.c_init, lr);
         self.grads.h_init_grad.apply_to(&mut self.h_init, lr);
@@ -479,7 +494,10 @@ impl NnLayer for SLSTMLayer {
         self.grads.wi.clear();
         self.grads.wf.clear();
         self.grads.wo.clear();
-        self.grads.b.clear();
+        self.grads.bz.clear();
+        self.grads.bi.clear();
+        self.grads.bf.clear();
+        self.grads.bo.clear();
         self.grads.h_init_grad.clear();
         self.grads.c_init_grad.clear();
     }
