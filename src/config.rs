@@ -12,7 +12,7 @@ pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 
 pub const LR: f32 = 3e-4;
 pub const MIN_LR: f32 = 3e-5;
-pub const WARMUP_STEPS: usize = 200;
+pub const WARMUP_STEPS: usize = 100;
 pub const DECAY_STEPS: usize = 50_000;
 pub const BATCH_SIZE: usize = 1;
 pub const EPOCHS: usize = 1;

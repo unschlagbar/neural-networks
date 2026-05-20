@@ -168,7 +168,7 @@ impl TrainingState {
             let warmup_lr = self.lr * (batch_num as f32 / WARMUP_STEPS as f32).min(1.0);
             let t = (batch_num as f32 / DECAY_STEPS as f32).min(1.0);
             let decay_lr = MIN_LR + 0.5 * (self.lr - MIN_LR) * (1.0 + (PI * t).cos());
-            Some(warmup_lr.max(decay_lr))
+            Some(warmup_lr.min(decay_lr))
         } else {
             None
         }

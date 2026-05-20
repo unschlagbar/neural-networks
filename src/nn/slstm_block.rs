@@ -195,9 +195,9 @@ impl SLSTMBlock {
         let u = self.up_size;
 
         self.pre_norm1.forward_into(input, &mut cache.pre_norm1);
-
         self.cell.forward(&cache.pre_norm1.output, &mut cache.cell);
-        self.post_cell_norm.forward_into(&cache.cell.h, &mut cache.post_cell_norm);
+        self.post_cell_norm
+            .forward_into(&cache.cell.h, &mut cache.post_cell_norm);
 
         for i in 0..self.hidden_size {
             cache.z[i] = input[i] + cache.post_cell_norm.output[i];
