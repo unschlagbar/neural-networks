@@ -71,5 +71,6 @@ impl GradVecOps for SgdGradVec {
 
 impl OptimizerGradTypes for Sgd {
     type GradMatrix = SgdGradMatrix;
+    type GradMatrixNoDecay = SgdGradMatrix;
     type GradVec = SgdGradVec;
 }

@@ -12,7 +12,7 @@
 // Bausteine:
 //   pre_norm  : RMSNorm   (H_dim)
 //   cell      : MLSTMLayer  (multi-head, H_dim → H_dim)
-//   post_norm : RMSNorm   (H_dim)
+//   pre_norm2 : RMSNorm   (H_dim)
 //   lin_gate  : LinearLayer (H_dim → U)
 //   lin_value : LinearLayer (H_dim → U)
 //   lin_down  : LinearLayer (U → H_dim)
@@ -22,7 +22,7 @@
 //
 // Save-Format (Tag 14):
 //   up_size : u32
-//   pre_norm.gamma, post_norm.gamma : f32_vec(H_dim)
+//   pre_norm.gamma, pre_norm2.gamma : f32_vec(H_dim)
 //   cell-Daten   (mit num_heads, dqk vorne — siehe MLSTMLayer::save)
 //   lin_gate, lin_value, lin_down  (jeweils Matrix + Bias)
 
@@ -60,10 +60,10 @@ fn silu_prime(pre: f32) -> f32 {
 }
 
 pub struct MLSTMBlockCache {
-    pub pre_norm: RMSNormCache,
+    pub pre_norm1: RMSNormCache,
     pub cell: MLSTMCache,
     pub z: Box<[f32]>, // (H_dim) z = x + cell.h
-    pub post_norm: RMSNormCache,
+    pub pre_norm2: RMSNormCache,
     pub lin_gate: LinearCache,
     pub gate_act: Box<[f32]>, // (U) SiLU(gate_pre)
     pub lin_value: LinearCache,
@@ -173,20 +173,20 @@ impl MLSTMBlock {
         let h = self.hidden_size;
         let u = self.up_size;
 
-        self.pre_norm1.forward_into(input, &mut cache.pre_norm);
+        self.pre_norm1.forward_into(input, &mut cache.pre_norm1);
 
-        self.cell.forward(&cache.pre_norm.output, &mut cache.cell);
+        self.cell.forward(&cache.pre_norm1.output, &mut cache.cell);
 
         for i in 0..h {
             cache.z[i] = input[i] + cache.cell.w_out.output[i];
         }
 
-        self.pre_norm2.forward_into(&cache.z, &mut cache.post_norm);
+        self.pre_norm2.forward_into(&cache.z, &mut cache.pre_norm2);
 
         self.lin_gate
-            .forward(&cache.post_norm.output, &mut cache.lin_gate);
+            .forward(&cache.pre_norm2.output, &mut cache.lin_gate);
         self.lin_value
-            .forward(&cache.post_norm.output, &mut cache.lin_value);
+            .forward(&cache.pre_norm2.output, &mut cache.lin_value);
 
         for j in 0..u {
             cache.gate_act[j] = silu(cache.lin_gate.output[j]);
@@ -227,10 +227,10 @@ impl MLSTMBlock {
         }
 
         self.pre_norm2
-            .backward_into(&self.sc_h1, &mut cache.post_norm);
+            .backward_into(&self.sc_h1, &mut cache.pre_norm2);
 
         for i in 0..h {
-            cache.dx[i] += cache.post_norm.dx[i];
+            cache.dx[i] += cache.pre_norm2.dx[i];
         }
 
         self.sc_h2.copy_from_slice(&cache.dx);
@@ -238,10 +238,10 @@ impl MLSTMBlock {
 
         let d_pre_normed = &cache.cell.dx[..h];
         self.pre_norm1
-            .backward_into(d_pre_normed, &mut cache.pre_norm);
+            .backward_into(d_pre_normed, &mut cache.pre_norm1);
 
         for i in 0..h {
-            cache.dx[i] += cache.pre_norm.dx[i];
+            cache.dx[i] += cache.pre_norm1.dx[i];
         }
     }
 
@@ -249,10 +249,10 @@ impl MLSTMBlock {
         let h = self.hidden_size;
         let u = self.up_size;
         MLSTMBlockCache {
-            pre_norm: self.pre_norm1.alloc_cache(),
+            pre_norm1: self.pre_norm1.alloc_cache(),
             cell: self.cell.alloc_cache(),
             z: vec![0.0; h].into(),
-            post_norm: self.pre_norm2.alloc_cache(),
+            pre_norm2: self.pre_norm2.alloc_cache(),
             lin_gate: LinearCache::new(h, u),
             gate_act: vec![0.0; u].into(),
             lin_value: LinearCache::new(h, u),

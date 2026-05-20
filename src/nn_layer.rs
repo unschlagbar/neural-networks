@@ -12,7 +12,6 @@ use crate::nn::rms_norm::RMSNorm;
 use crate::nn::silu_dense::SiluDenseLayer;
 use crate::nn::slstm::SLSTMLayer;
 use crate::nn::slstm_block::SLSTMBlock;
-use crate::nn::softmax::SoftmaxLayer;
 use crate::sequential::Sequential;
 
 /// Type-erased per-timestep forward cache.
@@ -65,12 +64,6 @@ pub trait NnLayer: Dyn {
     /// Shapes, act_id und dropout_rate stehen bereits im Architektur-Header
     /// (Sequential::save), hier kommen sie nicht nochmal vor.
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()>;
-
-    /// Activation-ID für den Architektur-Header.
-    /// Nur Dense (tag 1), IndRNN (tag 2) und Projection (tag 3) überschreiben das.
-    fn activation_id(&self) -> Option<u8> {
-        None
-    }
 
     fn make_cache(&self) -> Box<dyn DynCache>;
 
@@ -142,12 +135,6 @@ impl SequentialBuilder {
         self
     }
 
-    pub fn softmax(mut self) -> Self {
-        let layer = SoftmaxLayer::new(self.output_size);
-        self.layer(Box::new(layer), self.output_size);
-        self
-    }
-
     pub fn lstm(mut self, hidden: usize) -> Self {
         let layer = LSTMLayer::new(self.output_size, hidden);
         self.layer(Box::new(layer), hidden);
@@ -179,11 +166,11 @@ impl SequentialBuilder {
     }
 
     /// xLSTM-style sLSTM-Block:
-    ///   Pre-RMSNorm → sLSTM-Zelle → Post-RMSNorm → SwiGLU-MLP → Residual.
+    ///   RMSNorm1 → sLSTM-Zelle → RMSNorm2 → SwiGLU-MLP → Residual.
     ///
     /// Ein-/Ausgang ist jeweils `hidden` (das ist der Sinn des Residuals — man
     /// kann den Block einfach stapeln). Die interne SwiGLU-Weite (`up_size`)
-    /// wird als `4·hidden/3` gewählt (MLP-Parameter ≈ 8·H², analog zu GPT-NeoX
+    /// wird als `8·hidden / 3` gewählt (MLP-Parameter ≈ 8·H², analog zu GPT-NeoX
     /// / LLaMA-Style-Blöcken).
     pub fn slstm_block(mut self, hidden: usize) -> Self {
         assert_eq!(

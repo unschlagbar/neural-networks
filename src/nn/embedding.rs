@@ -4,7 +4,7 @@ use iron_oxide::collections::Matrix;
 
 use crate::{
     nn_layer::{DynCache, NnLayer},
-    optimizers::{GradMatrix, GradMatrixOps},
+    optimizers::{GradMatrixNoDecay, GradMatrixOps},
 };
 
 pub struct EmbeddingCache {
@@ -42,13 +42,13 @@ impl DynCache for EmbeddingCache {
 }
 
 pub struct EmbeddingGrads {
-    pub weights: GradMatrix,
+    pub weights: GradMatrixNoDecay,
 }
 
 impl EmbeddingGrads {
     pub fn zeros(input_size: usize, output_size: usize) -> Self {
         Self {
-            weights: GradMatrix::zeros(input_size, output_size),
+            weights: GradMatrixNoDecay::zeros(input_size, output_size),
         }
     }
 }

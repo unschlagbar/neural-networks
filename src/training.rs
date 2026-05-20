@@ -1,4 +1,5 @@
 use std::{
+    f32::consts::PI,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -6,8 +7,8 @@ use std::{
 use crate::{
     batches::PreparedDataSet,
     config::{
-        self, BATCH_SIZE, DATA_DIR, DATA_FILE, EPOCHS, LR, MAX_SEQ_LEN, MODEL_LOC, PRINT_EVERY,
-        SAVE_EVERY, SEQ_LEN, SEQ_LOC, WARMUP_STEPS,
+        self, BATCH_SIZE, DATA_DIR, DATA_FILE, DECAY_STEPS, EPOCHS, LR, MAX_SEQ_LEN, MIN_LR,
+        MODEL_LOC, PRINT_EVERY, SAVE_EVERY, SEQ_LEN, SEQ_LOC, WARMUP_STEPS,
     },
     hierarchical::HierarchicalSequential,
     model::{build_hierarchical_model, build_normal_model},
@@ -164,8 +165,10 @@ impl TrainingState {
         self.loss_steps += 1;
         if self.step.is_multiple_of(self.batch_size) {
             let batch_num = self.step / self.batch_size;
-            let warmup_scale = (batch_num as f32 / WARMUP_STEPS as f32).min(1.0);
-            Some(self.lr * warmup_scale)
+            let warmup_lr = self.lr * (batch_num as f32 / WARMUP_STEPS as f32).min(1.0);
+            let t = (batch_num as f32 / DECAY_STEPS as f32).min(1.0);
+            let decay_lr = MIN_LR + 0.5 * (self.lr - MIN_LR) * (1.0 + (PI * t).cos());
+            Some(warmup_lr.max(decay_lr))
         } else {
             None
         }

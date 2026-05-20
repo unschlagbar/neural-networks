@@ -5,13 +5,15 @@ pub const SEQ_LOC: &str = "models/seq";
 
 // Sequenz-Len
 
-pub const SEQ_LEN: usize = 1024;
+pub const SEQ_LEN: usize = 512;
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 
 // Training-Schedule
 
 pub const LR: f32 = 3e-4;
+pub const MIN_LR: f32 = 3e-5;
 pub const WARMUP_STEPS: usize = 200;
+pub const DECAY_STEPS: usize = 50_000;
 pub const BATCH_SIZE: usize = 1;
 pub const EPOCHS: usize = 1;
 
@@ -28,7 +30,7 @@ pub const TOP_P: f32 = 1.;
 
 pub const CHAR_HIDDEN: usize = 256;
 pub const OUT_HIDDEN: usize = 256;
-pub const WORD_HIDDEN: usize = 512;
+pub const WORD_HIDDEN: usize = 384;
 
 // Flat-mLSTM-Architektur (abgeleitet aus WORD_HIDDEN)
 

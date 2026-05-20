@@ -10,9 +10,9 @@
 // SwiGLU-MLP(h) = lin_down · ( SiLU(lin_gate · h) ⊙ (lin_value · h) )
 //
 // Bausteine (alle statisch, kein dyn):
-//   pre_norm  : RMSNorm  (H)
+//   pre_norm1  : RMSNorm  (H)
 //   cell      : SLSTMLayer  (H→H)
-//   post_norm : RMSNorm  (H)
+//   pre_norm2 : RMSNorm  (H)
 //   lin_gate  : LinearLayer  (H→U)
 //   lin_value : LinearLayer  (H→U)
 //   lin_down  : LinearLayer  (U→H)
@@ -20,13 +20,13 @@
 // Shape-Konvention:  H = hidden_size,  U = up_size  (typisch U = 8·H/3).
 //
 // BPTT-Protokoll:
-//   cell.dh_bptt wird intern verwaltet — nach der Post-Norm-Rückwärtsphase
+//   cell.dh_bptt wird intern verwaltet — nach der Pre-Norm2-Rückwärtsphase
 //   addieren wir es zu dh, bevor cell.backward aufgerufen wird.
 //   Nach außen gibt der Block `bptt_hidden_grad() = None` zurück.
 //
 // Binär-Format (`save`) identisch zum alten Layout — kein Checkpoint-Bruch:
 //   up_size : u32
-//   pre_norm.gamma, post_norm.gamma : f32_vec(H)
+//   pre_norm1.gamma, pre_norm2.gamma : f32_vec(H)
 //   cell: wz, wi, wf, wo, b, h_init, c_init
 //   lin_gate:  weights (H×U), biases (U)
 //   lin_value: weights (H×U), biases (U)
@@ -75,8 +75,8 @@ pub struct SLSTMBlockCache {
     // Erstes Residual: z = x + cell.h
     pub z: Box<[f32]>, // (H)
 
-    // Post-Norm (auf z angewendet)
-    pub pre_norm2: RMSNormCache, // .output = post_normed (H)
+    // Pre-Norm2 (auf z angewendet)
+    pub pre_norm2: RMSNormCache, // .output = pre_normed2 (H)
 
     // SwiGLU
     pub lin_gate: LinearCache,  // .output = gate_pre  (U)
@@ -108,15 +108,15 @@ pub struct SLSTMBlock {
     pub hidden_size: usize,
     pub up_size: usize,
 
-    pub pre_norm: RMSNorm,
+    pub pre_norm1: RMSNorm,
     pub cell: SLSTMLayer,
-    pub post_norm: RMSNorm,
+    pub pre_norm2: RMSNorm,
     pub lin_gate: LinearLayer,
     pub lin_value: LinearLayer,
     pub lin_down: LinearLayer,
 
     // Backward-Scratch (keine Allokation im Hot Path)
-    pub sc_h1: Box<[f32]>, // (H)  d_post_normed
+    pub sc_h1: Box<[f32]>, // (H)  d_pre_normed2
     pub sc_h2: Box<[f32]>, // (H)  dz + bptt, Input für cell.backward
     pub sc_u2: Box<[f32]>, // (U)  d_gate_act
     pub sc_u3: Box<[f32]>, // (U)  d_value  →  d_gate_pre
@@ -145,9 +145,9 @@ impl SLSTMBlock {
             hidden_size: h,
             up_size: u,
 
-            pre_norm: RMSNorm::new(h),
+            pre_norm1: RMSNorm::new(h),
             cell: SLSTMLayer::new(h, h),
-            post_norm: RMSNorm::new(h),
+            pre_norm2: RMSNorm::new(h),
             lin_gate: make_lin(h, u, scale_up),
             lin_value: make_lin(h, u, scale_up),
             // Down-Projektion kleiner init → Block startet nahe Identität.
@@ -163,8 +163,8 @@ impl SLSTMBlock {
     pub fn from_loaded(
         hidden_size: usize,
         up_size: usize,
-        pre_norm: RMSNorm,
-        post_norm: RMSNorm,
+        pre_norm1: RMSNorm,
+        pre_norm2: RMSNorm,
         cell: SLSTMLayer,
         lin_gate: LinearLayer,
         lin_value: LinearLayer,
@@ -175,9 +175,9 @@ impl SLSTMBlock {
         Self {
             hidden_size: h,
             up_size: u,
-            pre_norm,
+            pre_norm1,
             cell,
-            post_norm,
+            pre_norm2,
             lin_gate,
             lin_value,
             lin_down,
@@ -191,7 +191,7 @@ impl SLSTMBlock {
     pub fn forward(&mut self, input: &[f32], cache: &mut SLSTMBlockCache) {
         let u = self.up_size;
 
-        self.pre_norm.forward_into(input, &mut cache.pre_norm1);
+        self.pre_norm1.forward_into(input, &mut cache.pre_norm1);
 
         self.cell.forward(&cache.pre_norm1.output, &mut cache.cell);
 
@@ -199,7 +199,7 @@ impl SLSTMBlock {
             cache.z[i] = input[i] + cache.cell.h[i];
         }
 
-        self.post_norm.forward_into(&cache.z, &mut cache.pre_norm2);
+        self.pre_norm2.forward_into(&cache.z, &mut cache.pre_norm2);
 
         self.lin_gate
             .forward(&cache.pre_norm2.output, &mut cache.lin_gate);
@@ -244,7 +244,7 @@ impl SLSTMBlock {
             self.sc_h1[i] = cache.lin_value.dx[i] + cache.lin_gate.dx[i];
         }
 
-        self.post_norm
+        self.pre_norm2
             .backward_into(&self.sc_h1, &mut cache.pre_norm2);
 
         for i in 0..h {
@@ -255,7 +255,7 @@ impl SLSTMBlock {
         self.cell.backward(&mut self.sc_h2, &mut cache.cell);
 
         let d_pre_normed: &[f32] = &cache.cell.dconcat[..h];
-        self.pre_norm
+        self.pre_norm1
             .backward_into(d_pre_normed, &mut cache.pre_norm1);
 
         for i in 0..h {
@@ -267,10 +267,10 @@ impl SLSTMBlock {
         let h = self.hidden_size;
         let u = self.up_size;
         SLSTMBlockCache {
-            pre_norm1: self.pre_norm.alloc_cache(),
+            pre_norm1: self.pre_norm1.alloc_cache(),
             cell: self.cell.alloc_cache(),
             z: vec![0.0; h].into(),
-            pre_norm2: self.post_norm.alloc_cache(),
+            pre_norm2: self.pre_norm2.alloc_cache(),
             lin_gate: LinearCache::new(h, u),
             gate_act: vec![0.0; u].into(),
             lin_value: LinearCache::new(h, u),
@@ -317,8 +317,8 @@ impl NnLayer for SLSTMBlock {
 
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
         write_u32(w, self.up_size as u32)?;
-        write_f32_slice(w, &self.pre_norm.gamma)?;
-        write_f32_slice(w, &self.post_norm.gamma)?;
+        write_f32_slice(w, &self.pre_norm1.gamma)?;
+        write_f32_slice(w, &self.pre_norm2.gamma)?;
         self.cell.save(w)?;
         write_matrix(w, &self.lin_gate.weights)?;
         write_f32_slice(w, &self.lin_gate.biases)?;
@@ -341,18 +341,18 @@ impl NnLayer for SLSTMBlock {
     }
 
     fn apply_grads(&mut self, lr: f32) {
-        self.pre_norm.apply_grads(lr);
+        self.pre_norm1.apply_grads(lr);
         self.cell.apply_grads(lr);
-        self.post_norm.apply_grads(lr);
+        self.pre_norm2.apply_grads(lr);
         self.lin_gate.apply_grads(lr);
         self.lin_value.apply_grads(lr);
         self.lin_down.apply_grads(lr);
     }
 
     fn clear_grads(&mut self) {
-        self.pre_norm.clear_grads();
+        self.pre_norm1.clear_grads();
         self.cell.clear_grads();
-        self.post_norm.clear_grads();
+        self.pre_norm2.clear_grads();
         self.lin_gate.clear_grads();
         self.lin_value.clear_grads();
         self.lin_down.clear_grads();

@@ -30,7 +30,6 @@ pub fn train(tokenizer: Rc<Tokenizer>, data: &PreparedDataSet) {
         .mlstm(4, HIDDEN_SIZE / 4)
         .mlstm(4, HIDDEN_SIZE / 4)
         .linear(vocab)
-        .softmax()
         .build();
 
     model.make_cache(SEQ_LEN);

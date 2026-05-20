@@ -8,7 +8,7 @@ use std::{
 use crate::{
     config::MODEL_LOC,
     loading::{read_u16, read_u32, read_u64},
-    nn::softmax::softmax,
+    nn::softmax::{softmax, softmax_inplace},
     nn_layer::{DynCache, NnLayer},
     saving::{HIER_MAGIC, write_u16, write_u32, write_u64},
     sequential::Sequential,
@@ -232,6 +232,7 @@ impl HierarchicalSequential {
                 self.delta_buf[..len].copy_from_slice(out);
                 len
             };
+            softmax_inplace(&mut self.delta_buf[..out_len]);
             self.delta_buf[targets[t] as usize] -= 1.0;
 
             backward_through_layers(

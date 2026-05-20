@@ -9,12 +9,10 @@ pub fn build_normal_model(vocab: usize) -> Sequential {
     SequentialBuilder::new(vocab)
         .embedding(WORD_HIDDEN)
         .mlstm_block(NUM_HEADS, DQK)
-        .slstm_block(WORD_HIDDEN)
         .mlstm_block(NUM_HEADS, DQK)
         .mlstm_block(NUM_HEADS, DQK)
         .rms_norm()
         .linear(vocab)
-        .softmax()
         .build()
 }
 
@@ -49,7 +47,6 @@ pub fn build_hierarchical_model(
         .slstm_block(OUT_HIDDEN)
         .rms_norm()
         .linear(vocab)
-        .softmax()
         .build();
 
     HierarchicalSequential::new(

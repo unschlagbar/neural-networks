@@ -39,6 +39,7 @@
 // BPTT holds dc_bptt (H·dhv·dqk) and dn_bptt (H·dqk). No dh_bptt is needed.
 
 use iron_oxide::collections::Matrix;
+use rand::random_range;
 
 use crate::{
     nn::{
@@ -233,10 +234,9 @@ impl MLSTMLayer {
         // Glorot-Skalen
         let scale_q = (6.0 / (input_size as f32 + d_qk as f32)).sqrt();
         let scale_v = (6.0 / (input_size as f32 + d as f32)).sqrt();
-        let scale_g = (6.0 / (input_size as f32 + heads as f32)).sqrt();
 
         // Forget-Gate-Bias positiv
-        let bf: Box<[f32]> = vec![1.0; heads].into();
+        let bf: Box<[f32]> = (0..heads).map(|_| random_range(3.0..6.0)).collect();
         let bi: Box<[f32]> = vec![-10.0; heads].into();
 
         Self {
@@ -251,8 +251,8 @@ impl MLSTMLayer {
             wk: Matrix::random(input_size, d_qk, scale_q),
             wv: Matrix::random(input_size, d, scale_v),
             wo: Matrix::random(input_size, d, scale_v),
-            wi: Matrix::random(input_size, heads, scale_g),
-            wf: Matrix::random(input_size, heads, scale_g),
+            wi: Matrix::zeros(input_size, heads),
+            wf: Matrix::zeros(input_size, heads),
             bq: vec![0.0; d_qk].into(),
             bk: vec![0.0; d_qk].into(),
             bv: vec![0.0; d].into(),

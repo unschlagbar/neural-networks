@@ -5,7 +5,7 @@ use rand::random_range;
 
 use crate::{
     config::SEQ_LOC,
-    nn::softmax::softmax,
+    nn::softmax::{softmax, softmax_inplace},
     nn_layer::{DynCache, NnLayer},
     training::TrainingState,
 };
@@ -120,10 +120,10 @@ impl Sequential {
 
         for t in (0..targets.len()).rev() {
             let out = cache[t].last().unwrap().output();
-            delta_buf[..out.len()].copy_from_slice(out);
-            delta_buf[targets[t] as usize] -= 1.0;
-
             let mut delta_len = out.len();
+            delta_buf[..delta_len].copy_from_slice(out);
+            softmax_inplace(&mut delta_buf[..delta_len]);
+            delta_buf[targets[t] as usize] -= 1.0;
 
             for l in (0..n).rev() {
                 // backward writes dL/d(input) into cache[t][l].input_grad().
@@ -274,7 +274,8 @@ impl Sequential {
         let last = self.layers.len() - 1;
         let mut l = 0.0;
         for (t, target) in targets.iter().enumerate() {
-            let p = self.cache[t][last].output()[*target as usize] + 1e-12;
+            let probs = softmax(self.cache[t][last].output());
+            let p = probs[*target as usize] + 1e-12;
             l -= p.ln();
         }
         l / targets.len() as f32

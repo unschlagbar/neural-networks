@@ -27,7 +27,6 @@ use crate::{
 };
 use std::{any::Any, io};
 
-
 /// All per-timestep activations + scratch needed for backward.
 /// Pre-allocated at the start of training; zero dynamic allocation in the hot path.
 pub struct SLSTMCache {
@@ -121,6 +120,7 @@ pub struct SLSTMLayer {
     pub wi: Matrix,
     pub wf: Matrix,
     pub wo: Matrix,
+
     pub bz: Box<[f32]>,
     pub bi: Box<[f32]>,
     pub bf: Box<[f32]>,
@@ -156,23 +156,25 @@ impl SLSTMLayer {
     pub fn new(input_size: usize, hidden_size: usize) -> Self {
         let rows = input_size + hidden_size;
         let scale = (6.0 / rows as f32).sqrt();
-
-        // Forget-gate bias init to a positive value (Jozefowicz et al. 2015;
-        // xLSTM paper keeps this convention to avoid very small f_t at start).
         let h_init: Box<[f32]> = vec![0.0; hidden_size].into();
         let c_init: Box<[f32]> = vec![0.0; hidden_size].into();
 
         Self {
             input_size,
             hidden_size,
+
             wz: Matrix::random(rows, hidden_size, scale),
             wi: Matrix::random(rows, hidden_size, scale),
             wf: Matrix::random(rows, hidden_size, scale),
             wo: Matrix::random(rows, hidden_size, scale),
+
             bz: vec![0.0; hidden_size].into(),
             bi: vec![0.0; hidden_size].into(),
+            // Forget-gate bias init to a positive value (Jozefowicz et al. 2015;
+            // xLSTM paper keeps this convention to avoid very small f_t at start).
             bf: vec![1.0; hidden_size].into(),
             bo: vec![0.0; hidden_size].into(),
+
             h: h_init.clone(),
             c: c_init.clone(),
             n: vec![0.0; hidden_size].into(),
@@ -450,10 +452,12 @@ impl NnLayer for SLSTMLayer {
         saving::write_matrix(w, &self.wi)?;
         saving::write_matrix(w, &self.wf)?;
         saving::write_matrix(w, &self.wo)?;
+
         saving::write_f32_slice(w, &self.bz)?;
         saving::write_f32_slice(w, &self.bi)?;
         saving::write_f32_slice(w, &self.bf)?;
         saving::write_f32_slice(w, &self.bo)?;
+
         saving::write_f32_slice(w, &self.h_init)?;
         saving::write_f32_slice(w, &self.c_init)
     }

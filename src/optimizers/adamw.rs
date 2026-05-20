@@ -1,6 +1,8 @@
 use iron_oxide::collections::Matrix;
 
-use crate::optimizers::{GradMatrixOps, OptimizerGradTypes, adam::AdamGradVec};
+use crate::optimizers::{
+    GradMatrixOps, OptimizerGradTypes, adam::AdamGradMatrix, adam::AdamGradVec,
+};
 
 const CLIP: f32 = 30.0;
 const BETA1: f32 = 0.9;
@@ -9,7 +11,7 @@ const EPS: f32 = 1e-8;
 /// Decoupled weight decay (λ). Applied directly to weights, NOT through gradients.
 /// Typical range for LLM pretraining: 0.01–0.1.
 /// Weight decay is intentionally NOT applied to bias vectors (see AdamWGradVec).
-const WEIGHT_DECAY: f32 = 0.05;
+const WEIGHT_DECAY: f32 = 0.02;
 
 #[derive(Debug)]
 pub struct AdamW;
@@ -85,5 +87,6 @@ impl GradMatrixOps for AdamWGradMatrix {
 
 impl OptimizerGradTypes for AdamW {
     type GradMatrix = AdamWGradMatrix;
+    type GradMatrixNoDecay = AdamGradMatrix;
     type GradVec = AdamGradVec;
 }

@@ -10,6 +10,7 @@ pub type Optimizer = AdamW;
 
 pub trait OptimizerGradTypes {
     type GradMatrix;
+    type GradMatrixNoDecay;
     type GradVec;
 }
 
@@ -30,4 +31,5 @@ pub trait GradVecOps {
 }
 
 pub type GradMatrix = <Optimizer as OptimizerGradTypes>::GradMatrix;
+pub type GradMatrixNoDecay = <Optimizer as OptimizerGradTypes>::GradMatrixNoDecay;
 pub type GradVec = <Optimizer as OptimizerGradTypes>::GradVec;

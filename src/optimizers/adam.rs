@@ -4,7 +4,7 @@ use crate::optimizers::{GradMatrixOps, GradVecOps, OptimizerGradTypes};
 
 const CLIP: f32 = 150.0;
 const BETA1: f32 = 0.9;
-const BETA2: f32 = 0.98;
+const BETA2: f32 = 0.95;
 const EPS: f32 = 1e-8;
 
 #[derive(Debug)]
@@ -124,5 +124,6 @@ impl GradVecOps for AdamGradVec {
 
 impl OptimizerGradTypes for Adam {
     type GradMatrix = AdamGradMatrix;
+    type GradMatrixNoDecay = AdamGradMatrix;
     type GradVec = AdamGradVec;
 }

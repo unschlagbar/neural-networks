@@ -10,7 +10,6 @@ use crate::{
         dropout::DropoutLayer, embedding::EmbeddingLayer, linear::LinearLayer,
         linear_nb::LinearNBLayer, lstm::LSTMLayer, mlstm::MLSTMLayer, mlstm_block::MLSTMBlock,
         rms_norm::RMSNorm, silu_dense::SiluDenseLayer, slstm::SLSTMLayer, slstm_block::SLSTMBlock,
-        softmax::SoftmaxLayer,
     },
     nn_layer::NnLayer,
     saving::{MAGIC, VERSION},
@@ -85,11 +84,6 @@ pub fn load_linear_nb(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLa
 
     let layer: Box<dyn NnLayer> = Box::new(LinearNBLayer::from_loaded(input, output, weights));
     Ok(layer)
-}
-
-pub fn load_softmax(r: &mut dyn Read) -> io::Result<Box<dyn NnLayer>> {
-    let size = read_u32(r)? as usize;
-    Ok(Box::new(SoftmaxLayer::new(size)))
 }
 
 pub fn load_dropout(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
@@ -296,28 +290,29 @@ pub fn load_mlstm_block(r: &mut dyn Read, hidden_size: usize) -> std::io::Result
     )))
 }
 
-fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
-    match tag {
-        0 => load_lstm(r, ctx),
-        3 => load_linear_nb(r, ctx),
-        4 => load_softmax(r),
-        5 => load_slstm(r, ctx),
-        6 => load_dropout(r, ctx),
-        7 => load_embedding(r),
-        9 => load_norm(r, ctx),
-        10 => load_silu_dense(r, ctx),
-        11 => load_slstm_block(r, ctx),
-        12 => load_linear(r),
-        13 => Ok(Box::new(
-            load_mlstm(r, ctx.input_size, ctx.output_size).unwrap(),
-        )),
-        14 => load_mlstm_block(r, ctx.output_size),
-
-        o => Err(io::Error::new(
+fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Option<Box<dyn NnLayer>>> {
+    if tag == 4 {
+        read_u32(r)?; // legacy softmax — consume size field and skip
+        return Ok(None);
+    }
+    let layer: Box<dyn NnLayer> = match tag {
+        0 => load_lstm(r, ctx)?,
+        3 => load_linear_nb(r, ctx)?,
+        5 => load_slstm(r, ctx)?,
+        6 => load_dropout(r, ctx)?,
+        7 => load_embedding(r)?,
+        9 => load_norm(r, ctx)?,
+        10 => load_silu_dense(r, ctx)?,
+        11 => load_slstm_block(r, ctx)?,
+        12 => load_linear(r)?,
+        13 => Box::new(load_mlstm(r, ctx.input_size, ctx.output_size).unwrap()),
+        14 => load_mlstm_block(r, ctx.output_size)?,
+        o => return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unknown layer tag {o}"),
         )),
-    }
+    };
+    Ok(Some(layer))
 }
 
 impl Sequential {
@@ -359,11 +354,10 @@ impl Sequential {
 
         let mut layers: Vec<Box<dyn NnLayer>> = Vec::with_capacity(n);
         for e in arch {
-            let ctx = LoadCtx {
-                input_size: e.input_size,
-                output_size: e.out_size,
-            };
-            layers.push(new_layer(r, e.tag, ctx)?);
+            let ctx = LoadCtx { input_size: e.input_size, output_size: e.out_size };
+            if let Some(layer) = new_layer(r, e.tag, ctx)? {
+                layers.push(layer);
+            }
         }
 
         let input_size = layers.first().map(|l| l.input_size()).unwrap_or(0);
