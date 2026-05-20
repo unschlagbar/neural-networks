@@ -43,5 +43,5 @@ pub const N_SIZE: usize = NUM_HEADS * DQK;
 // Dataset
 
 pub const DATA_DIR: &str = "data/rust-lib/";
-pub const DATA_FILE: &str = "data/political_speeches.txt";
+pub const DATA_FILE: &str = "../../training_data/political_speeches.txt";
 pub const CHARSET: &str = "charset.txt";

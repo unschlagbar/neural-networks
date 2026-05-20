@@ -2,31 +2,27 @@
 //
 // Per-Timestep Architektur (Paper-konform, zwei getrennte Residuals):
 //
-//     x ──┬─► RMSNorm(1) ─► sLSTM-Zelle ─┬─► z ──┬─► RMSNorm(2) ─► SwiGLU ─┬─►
-//         │                              │       │                         │
-//         └──────────────────────────────┘       └─────────────────────────┘
-//           1. Residual: z = x + cell(x)         2. Residual: y = z + MLP(z)
+//     x ──┬─► RMSNorm(1) ─► sLSTM-Zelle ─► RMSNorm(post) ─┬─► z ──┬─► RMSNorm(2) ─► SwiGLU ─┬─►
+//         │                                               │       │                         │
+//         └───────────────────────────────────────────────┘       └─────────────────────────┘
+//           1. Residual: z = x + post_norm(cell(x))               2. Residual: y = z + MLP(z)
 //
 // SwiGLU-MLP(h) = lin_down · ( SiLU(lin_gate · h) ⊙ (lin_value · h) )
 //
 // Bausteine (alle statisch, kein dyn):
-//   pre_norm1  : RMSNorm  (H)
-//   cell      : SLSTMLayer  (H→H)
-//   pre_norm2 : RMSNorm  (H)
-//   lin_gate  : LinearLayer  (H→U)
-//   lin_value : LinearLayer  (H→U)
-//   lin_down  : LinearLayer  (U→H)
+//   pre_norm1      : RMSNorm  (H)
+//   cell           : SLSTMLayer  (H→H)
+//   post_cell_norm : RMSNorm  (H)   ← stabilisiert cell-Output vor Residual (Paper §3)
+//   pre_norm2      : RMSNorm  (H)
+//   lin_gate       : LinearLayer  (H→U)
+//   lin_value      : LinearLayer  (H→U)
+//   lin_down       : LinearLayer  (U→H)
 //
 // Shape-Konvention:  H = hidden_size,  U = up_size  (typisch U = 8·H/3).
 //
-// BPTT-Protokoll:
-//   cell.dh_bptt wird intern verwaltet — nach der Pre-Norm2-Rückwärtsphase
-//   addieren wir es zu dh, bevor cell.backward aufgerufen wird.
-//   Nach außen gibt der Block `bptt_hidden_grad() = None` zurück.
-//
-// Binär-Format (`save`) identisch zum alten Layout — kein Checkpoint-Bruch:
+// Binär-Format (`save`):
 //   up_size : u32
-//   pre_norm1.gamma, pre_norm2.gamma : f32_vec(H)
+//   pre_norm1.gamma, post_cell_norm.gamma, pre_norm2.gamma : f32_vec(H)
 //   cell: wz, wi, wf, wo, b, h_init, c_init
 //   lin_gate:  weights (H×U), biases (U)
 //   lin_value: weights (H×U), biases (U)
@@ -72,7 +68,10 @@ pub struct SLSTMBlockCache {
     // sLSTM-Zelle
     pub cell: SLSTMCache,
 
-    // Erstes Residual: z = x + cell.h
+    // Post-Cell-Norm: normalisiert cell.h vor dem Residual
+    pub post_cell_norm: RMSNormCache, // .output = normed cell.h (H)
+
+    // Erstes Residual: z = x + post_cell_norm.output
     pub z: Box<[f32]>, // (H)
 
     // Pre-Norm2 (auf z angewendet)
@@ -110,6 +109,7 @@ pub struct SLSTMBlock {
 
     pub pre_norm1: RMSNorm,
     pub cell: SLSTMLayer,
+    pub post_cell_norm: RMSNorm,
     pub pre_norm2: RMSNorm,
     pub lin_gate: LinearLayer,
     pub lin_value: LinearLayer,
@@ -147,6 +147,7 @@ impl SLSTMBlock {
 
             pre_norm1: RMSNorm::new(h),
             cell: SLSTMLayer::new(h, h),
+            post_cell_norm: RMSNorm::new(h),
             pre_norm2: RMSNorm::new(h),
             lin_gate: make_lin(h, u, scale_up),
             lin_value: make_lin(h, u, scale_up),
@@ -164,6 +165,7 @@ impl SLSTMBlock {
         hidden_size: usize,
         up_size: usize,
         pre_norm1: RMSNorm,
+        post_cell_norm: RMSNorm,
         pre_norm2: RMSNorm,
         cell: SLSTMLayer,
         lin_gate: LinearLayer,
@@ -177,6 +179,7 @@ impl SLSTMBlock {
             up_size: u,
             pre_norm1,
             cell,
+            post_cell_norm,
             pre_norm2,
             lin_gate,
             lin_value,
@@ -194,9 +197,10 @@ impl SLSTMBlock {
         self.pre_norm1.forward_into(input, &mut cache.pre_norm1);
 
         self.cell.forward(&cache.pre_norm1.output, &mut cache.cell);
+        self.post_cell_norm.forward_into(&cache.cell.h, &mut cache.post_cell_norm);
 
         for i in 0..self.hidden_size {
-            cache.z[i] = input[i] + cache.cell.h[i];
+            cache.z[i] = input[i] + cache.post_cell_norm.output[i];
         }
 
         self.pre_norm2.forward_into(&cache.z, &mut cache.pre_norm2);
@@ -251,7 +255,9 @@ impl SLSTMBlock {
             cache.dx[i] += cache.pre_norm2.dx[i];
         }
 
-        self.sc_h2.copy_from_slice(&cache.dx);
+        self.post_cell_norm
+            .backward_into(&cache.dx, &mut cache.post_cell_norm);
+        self.sc_h2.copy_from_slice(&cache.post_cell_norm.dx);
         self.cell.backward(&mut self.sc_h2, &mut cache.cell);
 
         let d_pre_normed: &[f32] = &cache.cell.dconcat[..h];
@@ -269,6 +275,7 @@ impl SLSTMBlock {
         SLSTMBlockCache {
             pre_norm1: self.pre_norm1.alloc_cache(),
             cell: self.cell.alloc_cache(),
+            post_cell_norm: self.post_cell_norm.alloc_cache(),
             z: vec![0.0; h].into(),
             pre_norm2: self.pre_norm2.alloc_cache(),
             lin_gate: LinearCache::new(h, u),
@@ -318,6 +325,7 @@ impl NnLayer for SLSTMBlock {
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
         write_u32(w, self.up_size as u32)?;
         write_f32_slice(w, &self.pre_norm1.gamma)?;
+        write_f32_slice(w, &self.post_cell_norm.gamma)?;
         write_f32_slice(w, &self.pre_norm2.gamma)?;
         self.cell.save(w)?;
         write_matrix(w, &self.lin_gate.weights)?;
@@ -343,6 +351,7 @@ impl NnLayer for SLSTMBlock {
     fn apply_grads(&mut self, lr: f32) {
         self.pre_norm1.apply_grads(lr);
         self.cell.apply_grads(lr);
+        self.post_cell_norm.apply_grads(lr);
         self.pre_norm2.apply_grads(lr);
         self.lin_gate.apply_grads(lr);
         self.lin_value.apply_grads(lr);
@@ -352,6 +361,7 @@ impl NnLayer for SLSTMBlock {
     fn clear_grads(&mut self) {
         self.pre_norm1.clear_grads();
         self.cell.clear_grads();
+        self.post_cell_norm.clear_grads();
         self.pre_norm2.clear_grads();
         self.lin_gate.clear_grads();
         self.lin_value.clear_grads();
