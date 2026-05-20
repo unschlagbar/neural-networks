@@ -7,10 +7,13 @@ use std::{
 
 use crate::{
     config::MODEL_LOC,
-    loading::{read_u16, read_u32, read_u64},
-    nn::softmax::{softmax, softmax_inplace},
+    loading::{read_f32_vec, read_matrix, read_u16, read_u32, read_u64},
+    nn::{
+        linear::{LinearCache, LinearLayer},
+        softmax::{softmax, softmax_inplace},
+    },
     nn_layer::{DynCache, NnLayer},
-    saving::{HIER_MAGIC, write_u16, write_u32, write_u64},
+    saving::{HIER_MAGIC, write_f32_slice, write_matrix, write_u16, write_u32, write_u64},
     sequential::Sequential,
     training::TrainingState,
 };
@@ -19,6 +22,13 @@ pub struct HierarchicalSequential {
     pub char_model: Sequential,
     pub char2_model: Sequential,
     pub word_model: Sequential,
+
+    /// Projects word_model output → char2 sLSTM h+c states (zeroed init).
+    state_head: LinearLayer,
+    state_head_caches: Vec<LinearCache>,
+    char2_state_size: usize,
+    /// Scratch: holds predicted or collected h+c states for state_head forward/backward.
+    state_grad_buf: Box<[f32]>,
 
     pub vocab_size: usize,
     pub context_size: usize,
@@ -78,10 +88,18 @@ impl HierarchicalSequential {
         let delta_buf = vec![0.0; buf_size].into();
         let d_high_ctx = vec![0.0; context_size].into();
 
+        let char2_state_size: usize = char2_model.layers.iter().map(|l| l.state_size()).sum();
+        let state_head = LinearLayer::zeroed(word_model.output_size, char2_state_size);
+        let state_grad_buf = vec![0.0; char2_state_size].into();
+
         Self {
             char_model,
             char2_model,
             word_model,
+            state_head,
+            state_head_caches: vec![],
+            char2_state_size,
+            state_grad_buf,
             vocab_size,
             context_size,
             boundary_token_ids,
@@ -100,6 +118,9 @@ impl HierarchicalSequential {
         self.char_model.make_cache(seq_len);
         self.char2_model.make_cache(seq_len);
         self.word_model.make_cache(seq_len);
+        self.state_head_caches = (0..seq_len)
+            .map(|_| LinearCache::new(self.context_size, self.char2_state_size))
+            .collect();
     }
 
     pub fn reset(&mut self) {
@@ -177,14 +198,28 @@ impl HierarchicalSequential {
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
-                //for layer in &mut self.char2_model.layers {
-                //    layer.reset_state();
-                //}
 
-                let high_out = self.word_model.cache[word_idx].last().unwrap().output();
-                self.assert_no_nan(high_out, "high_output", word_idx);
-                self.char2_input[char_output..].copy_from_slice(high_out);
-                //self.char2_input[..char_output].fill(0.0);
+                {
+                    let high_out = self.word_model.cache[word_idx].last().unwrap().output();
+                    self.assert_no_nan(high_out, "high_output", word_idx);
+                    self.char2_input[char_output..].copy_from_slice(high_out);
+                }
+
+                // Project word output → char2 h+c states and inject them.
+                {
+                    let c = &mut self.state_head_caches[word_idx];
+                    LinearLayer::forward(&self.state_head, &self.char2_input[char_output..], c);
+                }
+                {
+                    let predicted = self.state_head_caches[word_idx].output();
+                    self.state_grad_buf.copy_from_slice(predicted);
+                }
+                {
+                    let mut offset = 0;
+                    for layer in &mut self.char2_model.layers {
+                        offset = layer.inject_state(&self.state_grad_buf, offset);
+                    }
+                }
             }
 
             Self::forward_step(
@@ -262,6 +297,37 @@ impl HierarchicalSequential {
             }
 
             if let Some(bi) = boundary {
+                // Backprop through state_head: grad from char2 recurrent state.
+                {
+                    self.state_grad_buf.fill(0.0);
+                    let mut offset = 0;
+                    for layer in &self.char2_model.layers {
+                        offset = layer.collect_bptt_grad(&mut self.state_grad_buf, offset);
+                    }
+                }
+                {
+                    let state_size = self.char2_state_size;
+                    let c = self.state_head_caches[bi]
+                        .as_any_mut()
+                        .downcast_mut::<LinearCache>()
+                        .unwrap();
+                    LinearLayer::backward(
+                        &mut self.state_head,
+                        &mut self.state_grad_buf[..state_size],
+                        c,
+                    );
+                }
+                {
+                    let dx = self.state_head_caches[bi].input_grad();
+                    for i in 0..context_size {
+                        self.d_high_ctx[i] += dx[i];
+                    }
+                }
+                // Grad was propagated; sever BPTT across this injection point.
+                for layer in &mut self.char2_model.layers {
+                    layer.reset_bptt_state();
+                }
+
                 high_grad_accum +=
                     self.d_high_ctx.iter().map(|x| x.abs()).sum::<f32>() / context_size as f32;
 
@@ -334,6 +400,8 @@ impl HierarchicalSequential {
                 self.char_model.sgd_step(lr);
                 self.char2_model.sgd_step(lr);
                 self.word_model.sgd_step(lr);
+                self.state_head.apply_grads(lr);
+                self.state_head.clear_grads();
             }
             self.step = state.step;
 
@@ -415,14 +483,24 @@ impl HierarchicalSequential {
                 {
                     let high_out = self.word_model.cache[0].last().unwrap().output();
                     self.char2_input[char_output..].copy_from_slice(high_out);
-                    //self.char2_input[..char_output].fill(0.0);
                 }
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
-                //for layer in &mut self.char2_model.layers {
-                //    layer.reset_state();
-                //}
+                {
+                    let c = &mut self.state_head_caches[0];
+                    LinearLayer::forward(&self.state_head, &self.char2_input[char_output..], c);
+                }
+                {
+                    let predicted = self.state_head_caches[0].output();
+                    self.state_grad_buf.copy_from_slice(predicted);
+                }
+                {
+                    let mut offset = 0;
+                    for layer in &mut self.char2_model.layers {
+                        offset = layer.inject_state(&self.state_grad_buf, offset);
+                    }
+                }
             }
 
             Self::forward_sample_step(
@@ -479,14 +557,24 @@ impl HierarchicalSequential {
                 {
                     let high_out = self.word_model.cache[0].last().unwrap().output();
                     self.char2_input[char_output..].copy_from_slice(high_out);
-                    //self.char2_input[..char_output].fill(0.0);
                 }
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
-                //for layer in &mut self.char2_model.layers {
-                //    layer.reset_state();
-                //}
+                {
+                    let c = &mut self.state_head_caches[0];
+                    LinearLayer::forward(&self.state_head, &self.char2_input[char_output..], c);
+                }
+                {
+                    let predicted = self.state_head_caches[0].output();
+                    self.state_grad_buf.copy_from_slice(predicted);
+                }
+                {
+                    let mut offset = 0;
+                    for layer in &mut self.char2_model.layers {
+                        offset = layer.inject_state(&self.state_grad_buf, offset);
+                    }
+                }
             }
 
             Self::forward_sample_step(
@@ -524,6 +612,8 @@ impl HierarchicalSequential {
         self.char_model.write_to(w)?;
         self.char2_model.write_to(w)?;
         self.word_model.write_to(w)?;
+        write_matrix(w, &self.state_head.weights)?;
+        write_f32_slice(w, &self.state_head.biases)?;
         write_u64(w, self.step as u64)?;
 
         File::create(path)?.write_all(&buf.into_inner())
@@ -552,6 +642,17 @@ impl HierarchicalSequential {
         let char2_model = Sequential::load_from(r)?;
         let high_model = Sequential::load_from(r)?;
 
+        let char2_state_size: usize = char2_model.layers.iter().map(|l| l.state_size()).sum();
+        let state_head_weights = read_matrix(r)?;
+        let state_head_biases: Box<[f32]> = read_f32_vec(r)?;
+        let state_head = LinearLayer::from_loaded(
+            high_model.output_size,
+            char2_state_size,
+            state_head_weights,
+            state_head_biases,
+        );
+        let state_grad_buf = vec![0.0; char2_state_size].into();
+
         let char_input_buf = vec![0.0; vocab_size].into();
         let char2_input = vec![0.0; char_model.output_size + context_size].into();
 
@@ -571,6 +672,10 @@ impl HierarchicalSequential {
             char_model,
             char2_model,
             word_model: high_model,
+            state_head,
+            state_head_caches: vec![],
+            char2_state_size,
+            state_grad_buf,
             char2_input,
             delta_buf,
             boundary_timesteps: vec![],

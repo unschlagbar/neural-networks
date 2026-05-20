@@ -83,6 +83,15 @@ pub trait NnLayer: Dyn {
     fn reset_bptt_state(&mut self) {}
 
     fn accumulate_init_grad(&mut self) {}
+
+    /// Total h+c state size (0 for stateless layers, 2*hidden for sLSTM layers).
+    fn state_size(&self) -> usize { 0 }
+
+    /// Overwrite the layer's h and c from `buf[offset..]`; returns the new offset.
+    fn inject_state(&mut self, _buf: &[f32], offset: usize) -> usize { offset }
+
+    /// Copy dh_bptt then dc_bptt into `buf[offset..]`; returns the new offset.
+    fn collect_bptt_grad(&self, _buf: &mut [f32], offset: usize) -> usize { offset }
 }
 
 pub struct SequentialBuilder {

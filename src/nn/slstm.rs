@@ -18,6 +18,7 @@
 // gradient accumulators inside the layer, scratch buffers pre-allocated.
 
 use iron_oxide::collections::Matrix;
+use rand::random_range;
 
 use crate::{
     nn::add_vec_in_place,
@@ -172,7 +173,7 @@ impl SLSTMLayer {
             bi: vec![0.0; hidden_size].into(),
             // Forget-gate bias init to a positive value (Jozefowicz et al. 2015;
             // xLSTM paper keeps this convention to avoid very small f_t at start).
-            bf: vec![1.0; hidden_size].into(),
+            bf: (0..hidden_size).map(|_| random_range(3.0..6.0)).collect(),
             bo: vec![0.0; hidden_size].into(),
 
             h: h_init.clone(),
@@ -521,6 +522,26 @@ impl NnLayer for SLSTMLayer {
     fn accumulate_init_grad(&mut self) {
         add_vec_in_place(&mut self.grads.h_init_grad.vec(), &self.dh_bptt);
         add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
+    }
+
+    fn state_size(&self) -> usize { 2 * self.hidden_size }
+
+    fn inject_state(&mut self, buf: &[f32], offset: usize) -> usize {
+        let h = self.hidden_size;
+        self.h.copy_from_slice(&buf[offset..offset + h]);
+        self.c.copy_from_slice(&buf[offset + h..offset + 2 * h]);
+        // n and m are normalizer/stabilizer; reset to zero so the injected (h, c)
+        // are internally consistent from the first step of the new segment.
+        self.n.fill(0.0);
+        self.m.fill(0.0);
+        offset + 2 * h
+    }
+
+    fn collect_bptt_grad(&self, buf: &mut [f32], offset: usize) -> usize {
+        let h = self.hidden_size;
+        buf[offset..offset + h].copy_from_slice(&self.dh_bptt);
+        buf[offset + h..offset + 2 * h].copy_from_slice(&self.dc_bptt);
+        offset + 2 * h
     }
 }
 
