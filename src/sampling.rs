@@ -21,7 +21,7 @@ pub fn sample_normal() {
         }
     };
 
-    // Für Einzelschritt-Sampling reicht cache[0].
+    // For single-step sampling, cache[0] is sufficient.
     model.make_cache(1);
 
     loop {

@@ -149,13 +149,13 @@ pub fn load_silu_dense(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnL
     )))
 }
 
-/// xLSTM-style sLSTM-Block. Layout muss 1:1 zu `SLSTMBlock::save` passen.
+/// xLSTM-style sLSTM-Block. Layout must match `SLSTMBlock::save` exactly.
 ///
 /// Sequential-Header liefert uns hidden_size (= ctx.input_size == ctx.output_size).
 /// Danach in dieser Reihenfolge:
 ///   - up_size: u32
 ///   - pre_norm1.gamma, post_cell_norm.gamma, pre_norm2.gamma: f32_vec(H)
-///   - cell-Gewichte: wz, wi, wf, wo, bz, bi, bf, bo, h_init, c_init  (wie `SLSTMLayer::save`)
+///   - cell weights: wz, wi, wf, wo, bz, bi, bf, bo, h_init, c_init  (as in `SLSTMLayer::save`)
 ///   - SwiGLU: w_gate, b_gate, w_value, b_value, w_down, b_down
 pub fn load_slstm_block(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
     if ctx.input_size != ctx.output_size {
@@ -170,12 +170,12 @@ pub fn load_slstm_block(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn Nn
     let hidden_size = ctx.input_size;
     let up_size = read_u32(r)? as usize;
 
-    // Norm-Gewichte
+    // Norm weights
     let pre_norm1 = RMSNorm::from_loaded(hidden_size, read_f32_vec(r)?);
     let post_cell_norm = RMSNorm::from_loaded(hidden_size, read_f32_vec(r)?);
     let pre_norm2 = RMSNorm::from_loaded(hidden_size, read_f32_vec(r)?);
 
-    // Zell-Gewichte (identische Reihenfolge wie in load_slstm)
+    // Cell weights (identical order to load_slstm)
     let wz = read_matrix(r)?;
     let wi = read_matrix(r)?;
     let wf = read_matrix(r)?;

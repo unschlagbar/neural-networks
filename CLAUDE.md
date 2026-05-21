@@ -33,6 +33,7 @@ The binary reads one line from stdin to select its mode:
 ## Style 
 
 do not use `0.0_f32`, always prever the simple mumber: `0.0`
+All comments need to be in englisch not in german
 
 ## Architecture
 

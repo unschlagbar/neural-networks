@@ -2,14 +2,14 @@
 //
 // Per-Timestep-Architektur (zwei separate Residuals, Transformer-Stil):
 //
-//     x ──┬─► RMSNorm(1) ─► mLSTM-Zelle ─┬─► z ──┬─► RMSNorm(2) ─► SwiGLU ─┬─►
+//     x ──┬─► RMSNorm(1) ─► mLSTM cell ─┬─► z ──┬─► RMSNorm(2) ─► SwiGLU ─┬─►
 //         │                              │       │                         │
 //         └──────────────────────────────┘       └─────────────────────────┘
 //           1. Residual: z = x + cell(x)         2. Residual: y = z + MLP(z)
 //
 // SwiGLU-MLP(h) = lin_down · ( SiLU(lin_gate · h) ⊙ (lin_value · h) )
 //
-// Bausteine:
+// Components:
 //   pre_norm  : RMSNorm   (H_dim)
 //   cell      : MLSTMLayer  (multi-head, H_dim → H_dim)
 //   pre_norm2 : RMSNorm   (H_dim)
@@ -17,8 +17,8 @@
 //   lin_value : LinearLayer (H_dim → U)
 //   lin_down  : LinearLayer (U → H_dim)
 //
-// (Hier benutzt H_dim als hidden_size / Block-Dim und H_n für num_heads,
-//  um die Verwechslung zwischen "hidden" und "num heads" zu vermeiden.)
+// (H_dim is used for hidden_size / block dim and H_n for num_heads,
+//  to avoid confusion between "hidden" and "num heads".)
 //
 // Save-Format (Tag 14):
 //   up_size : u32
@@ -99,7 +99,7 @@ pub struct MLSTMBlock {
     pub lin_value: LinearLayer,
     pub lin_down: LinearLayer,
 
-    // Backward-Scratch (keine Allokation im Hot Path)
+    // Backward scratch buffers (no allocation in the hot path)
     pub sc_h1: Box<[f32]>, // (H_dim)
     pub sc_h2: Box<[f32]>, // (H_dim)
     pub sc_u2: Box<[f32]>, // (U)
@@ -301,7 +301,7 @@ impl NnLayer for MLSTMBlock {
         write_u32(w, self.up_size as u32)?;
         write_f32_slice(w, &self.pre_norm1.gamma)?;
         write_f32_slice(w, &self.pre_norm2.gamma)?;
-        // cell.save schreibt selbst num_heads, dqk + alle Gewichte
+        // cell.save writes num_heads, dqk + all weights itself
         self.cell.save(w)?;
         write_matrix(w, &self.lin_gate.weights)?;
         write_f32_slice(w, &self.lin_gate.biases)?;
@@ -318,6 +318,18 @@ impl NnLayer for MLSTMBlock {
 
     fn reset_bptt_state(&mut self) {
         self.cell.reset_bptt_state();
+    }
+
+    fn state_size(&self) -> usize {
+        self.cell.state_size()
+    }
+
+    fn inject_state(&mut self, buf: &[f32], offset: usize) -> usize {
+        self.cell.inject_state(buf, offset)
+    }
+
+    fn collect_bptt_grad(&self, buf: &mut [f32], offset: usize) -> usize {
+        self.cell.collect_bptt_grad(buf, offset)
     }
 
     fn apply_grads(&mut self, lr: f32) {

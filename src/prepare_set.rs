@@ -58,7 +58,7 @@ fn collect_rs_files_for_training() {
             } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
                 let file_name = path.file_name().unwrap().to_string_lossy().to_string();
 
-                // Namenskollisionen auflösen
+                // Resolve name collisions
                 let mut dst = dst_dir.join(&file_name);
                 if dst.exists() {
                     let stem = path.file_stem().unwrap().to_string_lossy().to_string();

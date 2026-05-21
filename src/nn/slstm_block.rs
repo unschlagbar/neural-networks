@@ -2,25 +2,25 @@
 //
 // Per-Timestep Architektur (Paper-konform, zwei getrennte Residuals):
 //
-//     x ──┬─► RMSNorm(1) ─► sLSTM-Zelle ─► RMSNorm(post) ─┬─► z ──┬─► RMSNorm(2) ─► SwiGLU ─┬─►
+//     x ──┬─► RMSNorm(1) ─► sLSTM cell ─► RMSNorm(post) ─┬─► z ──┬─► RMSNorm(2) ─► SwiGLU ─┬─►
 //         │                                               │       │                         │
 //         └───────────────────────────────────────────────┘       └─────────────────────────┘
 //           1. Residual: z = x + post_norm(cell(x))               2. Residual: y = z + MLP(z)
 //
 // SwiGLU-MLP(h) = lin_down · ( SiLU(lin_gate · h) ⊙ (lin_value · h) )
 //
-// Bausteine (alle statisch, kein dyn):
+// Components (all static, no dyn):
 //   pre_norm1      : RMSNorm  (H)
 //   cell           : SLSTMLayer  (H→H)
-//   post_cell_norm : RMSNorm  (H)   ← stabilisiert cell-Output vor Residual (Paper §3)
+//   post_cell_norm : RMSNorm  (H)   ← stabilises cell output before residual (Paper §3)
 //   pre_norm2      : RMSNorm  (H)
 //   lin_gate       : LinearLayer  (H→U)
 //   lin_value      : LinearLayer  (H→U)
 //   lin_down       : LinearLayer  (U→H)
 //
-// Shape-Konvention:  H = hidden_size,  U = up_size  (typisch U = 8·H/3).
+// Shape convention:  H = hidden_size,  U = up_size  (typically U = 8·H/3).
 //
-// Binär-Format (`save`):
+// Binary format (`save`):
 //   up_size : u32
 //   pre_norm1.gamma, post_cell_norm.gamma, pre_norm2.gamma : f32_vec(H)
 //   cell: wz, wi, wf, wo, b, h_init, c_init
@@ -65,16 +65,16 @@ pub struct SLSTMBlockCache {
     // Pre-Norm
     pub pre_norm1: RMSNormCache, // .output = pre_normed (H)
 
-    // sLSTM-Zelle
+    // sLSTM cell
     pub cell: SLSTMCache,
 
-    // Post-Cell-Norm: normalisiert cell.h vor dem Residual
+    // Post-cell norm: normalises cell.h before the residual
     pub post_cell_norm: RMSNormCache, // .output = normed cell.h (H)
 
-    // Erstes Residual: z = x + post_cell_norm.output
+    // First residual: z = x + post_cell_norm.output
     pub z: Box<[f32]>, // (H)
 
-    // Pre-Norm2 (auf z angewendet)
+    // Pre-norm2 (applied to z)
     pub pre_norm2: RMSNormCache, // .output = pre_normed2 (H)
 
     // SwiGLU
@@ -115,9 +115,9 @@ pub struct SLSTMBlock {
     pub lin_value: LinearLayer,
     pub lin_down: LinearLayer,
 
-    // Backward-Scratch (keine Allokation im Hot Path)
+    // Backward scratch buffers (no allocation in the hot path)
     pub sc_h1: Box<[f32]>, // (H)  d_pre_normed2
-    pub sc_h2: Box<[f32]>, // (H)  dz + bptt, Input für cell.backward
+    pub sc_h2: Box<[f32]>, // (H)  dz + bptt, input to cell.backward
     pub sc_u2: Box<[f32]>, // (U)  d_gate_act
     pub sc_u3: Box<[f32]>, // (U)  d_value  →  d_gate_pre
 }
@@ -126,11 +126,11 @@ impl SLSTMBlock {
     pub fn new(hidden_size: usize, up_size: usize) -> Self {
         let h = hidden_size;
         let u = up_size;
-        // Xavier-ähnliche Skalierung, identisch zur alten Initialisierung.
+        // Xavier-like scaling, identical to the previous initialisation.
         let scale_up = (6.0 / (h as f32 + u as f32)).sqrt();
-        let scale_dn = (6.0 / (u as f32 + h as f32)).sqrt(); // gleich, aber explizit
+        let scale_dn = (6.0 / (u as f32 + h as f32)).sqrt(); // same, but explicit
 
-        // LinearLayer::new würde zufällige Biases erzeugen — wir wollen Nullbiases.
+        // LinearLayer::new would produce random biases — we want zero biases.
         let make_lin = |rows: usize, cols: usize, scale: f32| {
             use iron_oxide::collections::Matrix;
             LinearLayer::from_loaded(
@@ -151,7 +151,7 @@ impl SLSTMBlock {
             pre_norm2: RMSNorm::new(h),
             lin_gate: make_lin(h, u, scale_up),
             lin_value: make_lin(h, u, scale_up),
-            // Down-Projektion kleiner init → Block startet nahe Identität.
+            // Small init for down-projection → block starts near identity.
             lin_down: make_lin(u, h, scale_dn),
 
             sc_h1: vec![0.0; h].into(),

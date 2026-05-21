@@ -1,13 +1,13 @@
-// NPU-Inferenz für das flache Sequential-Modell via OpenVINO.
+// NPU inference for the flat Sequential model via OpenVINO.
 //
-// Voraussetzungen:
-//   sudo pacman -S openvino          (oder Intel-Repo / AUR)
-//   intel-npu-acceleration-library   (NPU-Treiber, AUR: intel-npu-driver)
+// Requirements:
+//   sudo pacman -S openvino          (or Intel-Repo / AUR)
+//   intel-npu-acceleration-library   (NPU driver, AUR: intel-npu-driver)
 //
-// Ablauf: NpuSampler::new lädt das ONNX-File, kompiliert es für "NPU" und
-// hält einen einzelnen InferRequest bereit. step() läuft einen Token-Schritt
-// und gibt neue States zurück. sample() schließt die komplette Sampling-
-// Schleife ein (Temperature + Top-p, identisch zu Sequential::sample).
+// Flow: NpuSampler::new loads the ONNX file, compiles it for "NPU" and
+// keeps a single InferRequest ready. step() runs one token step
+// and returns new states. sample() wraps the full sampling
+// loop (temperature + top-p, identical to Sequential::sample).
 
 use std::io::{Write, stdin, stdout};
 
@@ -38,13 +38,13 @@ fn raw_to_f32s(raw: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-// ─── Zustandsvektor ──────────────────────────────────────────────────────────
+// ─── State vector ────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct NpuState {
     pub c: Vec<f32>, // H·dhv·dqk
     pub n: Vec<f32>, // H·dqk
-    pub m: Vec<f32>, // H  (Stabilizer-Log)
+    pub m: Vec<f32>, // H  (stabiliser log)
 }
 
 impl NpuState {
@@ -57,7 +57,7 @@ impl NpuState {
     }
 }
 
-// ─── NPU-Sampler ─────────────────────────────────────────────────────────────
+// ─── NPU sampler ─────────────────────────────────────────────────────────────
 
 pub struct NpuSampler {
     request: openvino::InferRequest,
@@ -65,9 +65,9 @@ pub struct NpuSampler {
 }
 
 impl NpuSampler {
-    /// Lädt `onnx_path` über OpenVINO und kompiliert für die NPU.
-    /// `device` ist typischerweise `"NPU"`, `"CPU"` zum Testen oder
-    /// `"AUTO:NPU,CPU"` für automatisches Fallback.
+    /// Loads `onnx_path` via OpenVINO and compiles for the NPU.
+    /// `device` is typically `"NPU"`, `"CPU"` for testing or
+    /// `"AUTO:NPU,CPU"` for automatic fallback.
     pub fn new(onnx_path: &str, vocab: usize, device: &str) -> Result<Self, BoxErr> {
         let mut core = Core::new()?;
         let onnx_bytes = std::fs::read(onnx_path)?;
@@ -77,9 +77,9 @@ impl NpuSampler {
         Ok(Self { request, vocab })
     }
 
-    /// Führt einen einzelnen Token-Schritt aus und gibt (logits, new_state) zurück.
+    /// Runs a single token step and returns (logits, new_state).
     pub fn step(&mut self, token: i64, state: &NpuState) -> Result<(Vec<f32>, NpuState), BoxErr> {
-        // get_data/get_data_mut paniken bei Alignment-Mismatch → immer get_raw_data* nutzen
+        // get_data/get_data_mut panic on alignment mismatch → always use get_raw_data*
         let mut tok = Tensor::new(ElementType::I64, &Shape::new(&[1])?)?;
         tok.get_raw_data_mut()?
             .copy_from_slice(&token.to_le_bytes());
@@ -112,8 +112,8 @@ impl NpuSampler {
         Ok((logits, new_state))
     }
 
-    /// Vollständige Sampling-Schleife (identisch zu Sequential::sample).
-    /// Gibt die erzeugten Token zurück; bricht ab wenn `callback` false zurückgibt.
+    /// Full sampling loop (identical to Sequential::sample).
+    /// Returns the generated tokens; stops when `callback` returns false.
     pub fn sample(
         &mut self,
         prefix: &[u16],
@@ -141,7 +141,7 @@ impl NpuSampler {
             let (logits, new_state) = self.step(last as i64, &state)?;
             state = new_state;
 
-            // Temperature-Scaling + Softmax
+            // Temperature scaling + softmax
             let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature.max(1e-8)).collect();
             println!(
                 "Logits (scaled): {:?}",
@@ -149,7 +149,7 @@ impl NpuSampler {
             );
             let probs = softmax(&scaled);
 
-            // Top-p-Sampling
+            // Top-p sampling
             let mut idx: Vec<usize> = (0..probs.len()).collect();
             idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
 
@@ -189,16 +189,16 @@ impl NpuSampler {
     }
 }
 
-// ─── Einstiegspunkt ──────────────────────────────────────────────────────────
+// ─── Entry point ─────────────────────────────────────────────────────────────
 
-/// Interaktiver NPU-Sampling-Modus.
-/// Exportiert das Modell automatisch nach ONNX falls noch nicht vorhanden,
-/// dann läuft die Schleife wie `sample_normal()`, aber auf der NPU.
+/// Interactive NPU sampling mode.
+/// Automatically exports the model to ONNX if not already present,
+/// then runs the loop like `sample_normal()` but on the NPU.
 pub fn sample_npu() {
     let tokenizer = Tokenizer::new(CHARSET, false);
     let vocab = tokenizer.vocab_size();
 
-    // ONNX erzeugen falls nötig
+    // Generate ONNX if needed
     if !std::path::Path::new(ONNX_PATH).exists() {
         println!("Exportiere Modell nach {ONNX_PATH} ...");
         let model = match Sequential::load(SEQ_LOC) {
@@ -215,7 +215,7 @@ pub fn sample_npu() {
         println!("Fertig.");
     }
 
-    // NPU-Sampler — versucht zuerst NPU, fällt dann auf CPU zurück
+    // NPU sampler — tries NPU first, falls back to CPU
     let device = std::env::var("OV_DEVICE").unwrap_or_else(|_| "NPU".into());
     let mut sampler = match NpuSampler::new(ONNX_PATH, vocab, &device) {
         Ok(s) => {

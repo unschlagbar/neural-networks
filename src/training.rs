@@ -57,8 +57,8 @@ pub fn train_normal() {
     for epoch in 1..=EPOCHS {
         println!("── Epoch {epoch} ───────────────────────────────────────");
 
-        // Shuffeln verändert nur die Reihenfolge der Windows — die tokenisierten
-        // Sequenzen selbst bleiben unverändert im Speicher.
+        // Shuffling only changes the order of windows — the tokenised
+        // sequences themselves remain unchanged in memory.
         data.shuffle();
 
         let start = Instant::now();

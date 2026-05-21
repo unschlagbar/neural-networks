@@ -5,7 +5,7 @@ pub const SEQ_LOC: &str = "models/seq";
 
 // Sequenz-Len
 
-pub const SEQ_LEN: usize = 512;
+pub const SEQ_LEN: usize = 512 * 2;
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 
 // Training-Schedule
@@ -13,7 +13,7 @@ pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 pub const LR: f32 = 3e-4;
 pub const MIN_LR: f32 = 3e-5;
 pub const WARMUP_STEPS: usize = 200;
-pub const DECAY_STEPS: usize = 50_000;
+pub const DECAY_STEPS: usize = 20_000;
 pub const BATCH_SIZE: usize = 1;
 pub const EPOCHS: usize = 1;
 
@@ -23,7 +23,7 @@ pub const PRINT_EVERY: usize = 10;
 // Sampling
 
 pub const MAX_LEN: usize = 2000;
-pub const TEMPERATURE: f32 = 0.3;
+pub const TEMPERATURE: f32 = 0.4;
 pub const TOP_P: f32 = 1.;
 
 // Modell-Dimensions

@@ -60,9 +60,9 @@ pub trait NnLayer: Dyn {
 
     fn layer_tag(&self) -> u8;
 
-    /// Schreibt NUR die Gewichte.
-    /// Shapes, act_id und dropout_rate stehen bereits im Architektur-Header
-    /// (Sequential::save), hier kommen sie nicht nochmal vor.
+    /// Writes ONLY the weights.
+    /// Shapes, act_id and dropout_rate are already in the architecture header
+    /// (Sequential::save) and are not repeated here.
     fn save(&self, w: &mut dyn io::Write) -> io::Result<()>;
 
     fn make_cache(&self) -> Box<dyn DynCache>;
@@ -175,12 +175,12 @@ impl SequentialBuilder {
     }
 
     /// xLSTM-style sLSTM-Block:
-    ///   RMSNorm1 → sLSTM-Zelle → RMSNorm2 → SwiGLU-MLP → Residual.
+    ///   RMSNorm1 → sLSTM cell → RMSNorm2 → SwiGLU-MLP → Residual.
     ///
-    /// Ein-/Ausgang ist jeweils `hidden` (das ist der Sinn des Residuals — man
-    /// kann den Block einfach stapeln). Die interne SwiGLU-Weite (`up_size`)
-    /// wird als `8·hidden / 3` gewählt (MLP-Parameter ≈ 8·H², analog zu GPT-NeoX
-    /// / LLaMA-Style-Blöcken).
+    /// Input and output are both `hidden` (that is the purpose of the residual —
+    /// the block can be stacked freely). The internal SwiGLU width (`up_size`)
+    /// is chosen as `8·hidden / 3` (MLP params ≈ 8·H², analogous to GPT-NeoX
+    /// / LLaMA-style blocks).
     pub fn slstm_block(mut self, hidden: usize) -> Self {
         assert_eq!(
             self.output_size, hidden,

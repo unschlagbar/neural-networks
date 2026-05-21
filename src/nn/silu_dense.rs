@@ -10,9 +10,9 @@ use crate::{
 };
 
 pub struct SiluDenseCache {
-    /// Saved input (für ∂L/∂W = x · δᵀ).
+    /// Saved input (for ∂L/∂W = x · δᵀ).
     pub input: Box<[f32]>,
-    /// Pre-activation z = Wx + b — im Backward für silu'(z) benötigt.
+    /// Pre-activation z = Wx + b — needed in backward for silu'(z).
     pub pre_activation: Box<[f32]>,
     /// Post-activation output y = silu(z) = z · σ(z).
     pub output: Box<[f32]>,
@@ -63,13 +63,13 @@ impl SiluDenseGrads {
 pub struct SiluDenseLayer {
     pub weights: Matrix,
     pub biases: Box<[f32]>,
-    /// Gradient-Akkumulatoren — pro Batch geleert, in `apply_grads` angewendet.
+    /// Gradient accumulators — cleared per batch, applied in `apply_grads`.
     pub grads: SiluDenseGrads,
 }
 
 #[inline]
 fn sigmoid(x: f32) -> f32 {
-    // numerisch stabile Variante
+    // numerically stable variant
     if x >= 0.0 {
         1.0 / (1.0 + (-x).exp())
     } else {
@@ -80,7 +80,7 @@ fn sigmoid(x: f32) -> f32 {
 
 impl SiluDenseLayer {
     pub fn new(input_size: usize, hidden_size: usize) -> Self {
-        // Glorot-artige Initialisierung (identisch zu DenseLayer::new)
+        // Glorot-like initialisation (identical to DenseLayer::new)
         let scale = (6.0 / (input_size as f32 + hidden_size as f32)).sqrt();
         let weights = Matrix::random(input_size, hidden_size, scale);
         let biases = (0..hidden_size).map(|_| random_range(-0.5..0.5)).collect();
@@ -108,7 +108,7 @@ impl SiluDenseLayer {
         }
     }
 
-    /// matmul + bias in einen vorallokierten Puffer.
+    /// matmul + bias into a pre-allocated buffer.
     #[inline]
     fn matmul_add_bias(&self, input: &[f32], out: &mut [f32]) {
         out.copy_from_slice(&self.biases);
@@ -135,7 +135,7 @@ impl SiluDenseLayer {
     /// `delta` (dL/d output) wird in-place mit silu'(z) multipliziert:
     ///     silu'(z) = σ(z) · (1 + z · (1 − σ(z)))
     ///
-    /// Anschließend:
+    /// Then:
     ///     grads.W += x · deltaᵀ
     ///     grads.b += delta
     ///     cache.dx = Wᵀ · delta

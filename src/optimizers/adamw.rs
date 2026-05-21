@@ -50,10 +50,10 @@ impl GradMatrixOps for AdamWGradMatrix {
 
         // AdamW: Decoupled weight decay.
         //
-        // Statt L2-Regularisierung durch den Gradienten (klassisches Adam+L2):
-        //   g_t ← g_t + λ·w          (falsch: decay geht durch Momentum)
+        // Instead of L2 regularisation through the gradient (classic Adam+L2):
+        //   g_t ← g_t + λ·w          (wrong: decay passes through momentum)
         //
-        // wird weight decay direkt auf die Gewichte angewendet:
+        // weight decay is applied directly to the weights:
         //   w ← w · (1 - lr·λ) − lr · m̂ / (√v̂ + ε)
         //
         // Referenz: Loshchilov & Hutter, "Decoupled Weight Decay Regularization" (2019)

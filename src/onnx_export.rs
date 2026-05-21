@@ -1,12 +1,12 @@
-// ONNX-Export für das flache Sequential-Modell (Embedding → mLSTMBlock → LinearNoBias).
+// ONNX export for the flat Sequential model (Embedding → mLSTMBlock → LinearNoBias).
 //
-// Exportiert einen einzelnen Zeitschritt mit explizitem State-I/O:
+// Exports a single timestep with explicit state I/O:
 //
 //   Inputs:  token_id []int64,  c_state [H·dhv·dqk]f32,
 //            n_state [H·dqk]f32,  m_state [H]f32
 //   Outputs: logits [vocab]f32,  c_new, n_new, m_new (gleiche Shapes wie Inputs)
 //
-// Das erzeugte .onnx-File kann mit OpenVINO direkt auf der NPU/iGPU ausgeführt werden.
+// The generated .onnx file can be run directly on the NPU/iGPU via OpenVINO.
 // Keine externen Dependencies — der Protobuf-Encoder ist von Hand geschrieben.
 
 use std::io;
@@ -18,7 +18,7 @@ use crate::{
     sequential::Sequential,
 };
 
-// ─── Minimaler Protobuf-Encoder ───────────────────────────────────────────────
+// ─── Minimal Protobuf encoder ─────────────────────────────────────────────────
 // Feldnummern und Wire-Typen folgen dem ONNX-Proto-Schema (onnx-ml.proto).
 
 struct Pb(Vec<u8>);
@@ -61,14 +61,14 @@ impl Pb {
         self.bytes(field, &m.0);
     }
 
-    // Repeated non-packed int64 (jeder Wert bekommt eigenen Tag — so schreibt ONNX dims)
+    // Repeated non-packed int64 (each value gets its own tag — that's how ONNX writes dims)
     fn rep_i64(&mut self, field: u32, vals: &[i64]) {
         for &v in vals {
             self.int64(field, v);
         }
     }
 
-    // Rohe f32-Bytes für raw_data-Felder im TensorProto
+    // Raw f32 bytes for raw_data fields in TensorProto
     fn raw_f32s(&mut self, field: u32, vals: &[f32]) {
         let mut bytes = Vec::with_capacity(vals.len() * 4);
         for &v in vals {
@@ -77,7 +77,7 @@ impl Pb {
         self.bytes(field, &bytes);
     }
 
-    // Rohe i64-Bytes für raw_data-Felder im TensorProto
+    // Raw i64 bytes for raw_data fields in TensorProto
     fn raw_i64s(&mut self, field: u32, vals: &[i64]) {
         let mut bytes = Vec::with_capacity(vals.len() * 8);
         for &v in vals {
@@ -87,7 +87,7 @@ impl Pb {
     }
 }
 
-// ─── ONNX-Proto-Bausteine ─────────────────────────────────────────────────────
+// ─── ONNX proto building blocks ───────────────────────────────────────────────
 //
 // Feldnummern aus onnx-ml.proto (opset 13):
 //   TensorProto: dims=1, data_type=2, name=8, raw_data=9
@@ -208,8 +208,8 @@ fn node(op: &str, inputs: &[&str], outputs: &[&str], name: &str, attrs: &[Vec<u8
 struct GraphBuilder {
     nodes: Vec<Vec<u8>>,
     inits: Vec<Vec<u8>>,
-    // init_inputs: Initializer-Shapes auch als graph.input eintragen.
-    // OpenVINO erwartet dass alle Tensoren in graph.input stehen — auch Gewichte.
+    // init_inputs: also register initialiser shapes as graph.input.
+    // OpenVINO requires all tensors to appear in graph.input — including weights.
     init_inputs: Vec<Vec<u8>>,
     inputs: Vec<Vec<u8>>,
     outputs: Vec<Vec<u8>>,
@@ -278,12 +278,12 @@ fn flat(m: &Matrix) -> Vec<f32> {
     out
 }
 
-// ─── RMSNorm-Teilgraph ────────────────────────────────────────────────────────
+// ─── RMSNorm subgraph ─────────────────────────────────────────────────────────
 //
-// Formel: rms = sqrt(mean(x²) + ε)  |  out[i] = gamma[i] · x[i]/rms
+// Formula: rms = sqrt(mean(x²) + ε)  |  out[i] = gamma[i] · x[i]/rms
 //
-// input:  Tensorname [n], gamma_init: Name des Gewichts-Initializers
-// Rückgabe: Name des Output-Tensors
+// input:  tensor name [n], gamma_init: name of the weight initialiser
+// Returns: name of the output tensor
 
 fn add_rms_norm(g: &mut GraphBuilder, input: &str, gamma_init: &str, p: &str) -> String {
     let sq = format!("{p}_sq");
@@ -311,9 +311,9 @@ fn add_rms_norm(g: &mut GraphBuilder, input: &str, gamma_init: &str, p: &str) ->
     out
 }
 
-// ─── mLSTM-Cell-Teilgraph ─────────────────────────────────────────────────────
+// ─── mLSTM cell subgraph ──────────────────────────────────────────────────────
 //
-// Gibt (cell_out, c_new, n_new, m_new) als Tensornamen zurück.
+// Returns (cell_out, c_new, n_new, m_new) as tensor names.
 
 fn add_mlstm_cell(
     g: &mut GraphBuilder,
@@ -332,7 +332,7 @@ fn add_mlstm_cell(
     let c_flat = (cell.num_heads * cell.dhv * cell.dqk) as i64;
     let n_flat = d_qk;
 
-    // Gewichte als Initializer
+    // Weights as initialisers
     macro_rules! wi {
         ($name:ident, $rows:expr, $cols:expr) => {
             let key = format!("{p}_{}", stringify!($name));
@@ -368,7 +368,7 @@ fn add_mlstm_cell(
     );
     g.init_f32(&bout_k, &[hidden as i64], &cell.w_out.biases);
 
-    // Form-Konstanten für Reshape/Unsqueeze
+    // Shape constants for Reshape/Unsqueeze
     let sh_h_dqk = format!("{p}_sh_H_dqk");
     let sh_h_dhv = format!("{p}_sh_H_dhv");
     let sh_h_dhv_dqk = format!("{p}_sh_H_dhv_dqk");
@@ -470,7 +470,7 @@ fn add_mlstm_cell(
     g.op("Reshape", &[c_state, &sh_h_dhv_dqk], &[&c_h], &[]);
     g.op("Reshape", &[n_state, &sh_h_dqk], &[&n_h], &[]);
 
-    // Skalare für Broadcast: [H] → [H,1,1] und [H,1]
+    // Scalars for broadcast: [H] → [H,1,1] and [H,1]
     let ip3 = format!("{p}_ip3");
     let fp3 = format!("{p}_fp3");
     let ip2 = format!("{p}_ip2");
@@ -480,7 +480,7 @@ fn add_mlstm_cell(
     g.op("Reshape", &[&i_prime, &sh_h_1], &[&ip2], &[]);
     g.op("Reshape", &[&f_prime, &sh_h_1], &[&fp2], &[]);
 
-    // Äußeres Produkt v_h ⊗ k_h → [H, dhv, dqk]
+    // Outer product v_h ⊗ k_h → [H, dhv, dqk]
     let v_uu = format!("{p}_v_uu");
     let k_uu = format!("{p}_k_uu");
     let outer = format!("{p}_outer");
@@ -541,13 +541,13 @@ fn add_mlstm_cell(
     g.op("Mul", &[&o_h, &h_tilde], &[&h_out], &[]); // [H,dhv]
     g.op("Reshape", &[&h_out, &sh_hidden], &[&h_flat], &[]); // [hidden]
 
-    // Ausgabeprojektion
+    // Output projection
     let cell_proj = format!("{p}_proj");
     let cell_out = format!("{p}_cell_out");
     g.op("MatMul", &[&h_flat, &wout_k], &[&cell_proj], &[]);
     g.op("Add", &[&cell_proj, &bout_k], &[&cell_out], &[]);
 
-    // States zurück auf flache Form bringen
+    // Flatten states back to 1-D
     let c_new = format!("{p}_c_new");
     let n_new = format!("{p}_n_new");
     g.op("Reshape", &[&c_new_h, &sh_c_flat], &[&c_new], &[]);
@@ -556,7 +556,7 @@ fn add_mlstm_cell(
     (cell_out, c_new, n_new, m_new)
 }
 
-// ─── mLSTMBlock-Teilgraph ─────────────────────────────────────────────────────
+// ─── mLSTMBlock subgraph ──────────────────────────────────────────────────────
 
 fn add_mlstm_block(
     g: &mut GraphBuilder,
@@ -575,7 +575,7 @@ fn add_mlstm_block(
     g.init_f32(&pre_gamma, &[hidden as i64], &block.pre_norm1.gamma);
     let pre_normed = add_rms_norm(g, input, &pre_gamma, &format!("{p}_prn"));
 
-    // mLSTM-Zelle
+    // mLSTM cell
     let (cell_out, c_new, n_new, m_new) = add_mlstm_cell(
         g,
         &pre_normed,
@@ -661,13 +661,13 @@ fn add_mlstm_block(
     (out, c_new, n_new, m_new)
 }
 
-// ─── Vollständiger ONNX-Graph-Export ──────────────────────────────────────────
+// ─── Full ONNX graph export ───────────────────────────────────────────────────
 
-/// Exportiert das flache `Sequential`-Modell als ONNX-File.
+/// Exports the flat `Sequential` model as an ONNX file.
 ///
-/// Erwartet genau 4 Layer: `EmbeddingLayer → MLSTMBlock → LinearNBLayer → Softmax`.
-/// Das erzeugte ONNX-Modell macht einen Schritt pro Aufruf und gibt die
-/// neuen States zurück. Inference-Schleife:
+/// Expects exactly 4 layers: `EmbeddingLayer → MLSTMBlock → LinearNBLayer → Softmax`.
+/// The generated ONNX model runs one step per call and returns
+/// the new states. Inference loop:
 ///
 /// ```rust
 /// let mut c = vec![0.0f32; c_size];
@@ -703,17 +703,17 @@ pub fn export_flat_model(model: &Sequential, path: &str) -> io::Result<()> {
 
     let mut g = GraphBuilder::new();
 
-    // Laufzeit-Inputs
-    // token_id als [1] — OpenVINO ov_tensor_create unterstützt keine 0-D Tensoren
+    // Runtime inputs
+    // token_id as [1] — OpenVINO ov_tensor_create does not support 0-D tensors
     g.add_input_i64("token_id", &[1]);
     g.add_input_f32("c_state", &[c_size]);
     g.add_input_f32("n_state", &[n_size]);
     g.add_input_f32("m_state", &[h_i]);
 
-    // Embedding-Gewichte
+    // Embedding weights
     g.init_f32("emb_w", &[vocab, hidden], &flat(&emb.weights));
 
-    // 1. Embedding-Lookup: emb_w[token_id] → [1, hidden], dann Reshape → [hidden]
+    // 1. Embedding lookup: emb_w[token_id] → [1, hidden], then Reshape → [hidden]
     g.init_i64("tok_sh_hidden", &[1], &[hidden]);
     g.op(
         "Gather",
@@ -731,7 +731,7 @@ pub fn export_flat_model(model: &Sequential, path: &str) -> io::Result<()> {
     g.init_f32("lm_w", &[hidden, vocab], &flat(&lm_head.weights));
     g.op("MatMul", &[&block_out, "lm_w"], &["logits"], &[]);
 
-    // Fixe Output-Namen für States (erleichtert Inferenz-Code)
+    // Fixed output names for states (simplifies inference code)
     g.op("Identity", &[&c_new], &["c_new"], &[]);
     g.op("Identity", &[&n_new], &["n_new"], &[]);
     g.op("Identity", &[&m_new], &["m_new"], &[]);
@@ -742,7 +742,7 @@ pub fn export_flat_model(model: &Sequential, path: &str) -> io::Result<()> {
     g.add_output_f32("n_new", &[n_size]);
     g.add_output_f32("m_new", &[h_i]);
 
-    // ONNX-Modell serialisieren und schreiben
+    // Serialise and write the ONNX model
     std::fs::write(path, build_model(g))
 }
 
