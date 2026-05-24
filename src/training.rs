@@ -1,5 +1,7 @@
 use std::{
     f32::consts::PI,
+    fs::File,
+    io::{BufWriter, Write},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -52,6 +54,7 @@ pub fn train_normal() {
     );
 
     let mut training_state = TrainingState::new();
+    training_state.init_log(SEQ_LOC, &[]);
     let mut total_time = Duration::ZERO;
 
     for epoch in 1..=EPOCHS {
@@ -95,7 +98,7 @@ pub fn train_hierarchical() {
 
     println!("Preparing dataset from '{DATA_DIR}' ...");
     let prep_start = Instant::now();
-    let mut data =
+    let data =
         PreparedDataSet::from_single_file(&tokenizer, DATA_FILE, SEQ_LEN, &word_boundary_ids);
     println!(
         "  {} files → {} windows, {} tokens (prep took {:.1?})",
@@ -110,12 +113,13 @@ pub fn train_hierarchical() {
     );
 
     let mut training_state = TrainingState::from_step(model.step);
+    training_state.init_log(MODEL_LOC, &["delta_word", "delta_char1"]);
     let mut total_time = Duration::ZERO;
 
     for epoch in 1..=EPOCHS {
         println!("── Epoch {epoch} ───────────────────────────────────────");
 
-        data.shuffle();
+        //data.shuffle();
 
         let start = Instant::now();
         model.train(data.iter(), &mut training_state);
@@ -136,10 +140,19 @@ pub struct TrainingState {
     pub step: usize,
     pub batch_size: usize,
     pub lr: f32,
+    current_lr: f32,
+    warmup_lr: f32,
+    decay_lr: f32,
     loss: f32,
     loss_steps: usize,
     pub print_interval: usize,
     pub save_interval: usize,
+    log_writer: Option<BufWriter<File>>,
+    last_log: Instant,
+    steps_since_log: usize,
+    tokens_since_log: usize,
+    extra_cols: Vec<String>,
+    extra_vals: Vec<(f32, usize)>,
 }
 
 impl TrainingState {
@@ -151,11 +164,65 @@ impl TrainingState {
         Self {
             step,
             lr: LR,
+            current_lr: LR,
+            warmup_lr: LR,
+            decay_lr: LR,
             loss: 0.0,
             loss_steps: 0,
             batch_size: BATCH_SIZE,
             print_interval: PRINT_EVERY,
             save_interval: SAVE_EVERY,
+            log_writer: None,
+            last_log: Instant::now(),
+            steps_since_log: 0,
+            tokens_since_log: 0,
+            extra_cols: Vec::new(),
+            extra_vals: Vec::new(),
+        }
+    }
+
+    pub fn init_log(&mut self, model_path: &str, extra_cols: &[&str]) {
+        std::fs::create_dir_all("logs").ok();
+        let name = std::path::Path::new(model_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model");
+        let path = format!("logs/{name}.csv");
+        self.extra_cols = extra_cols.iter().map(|s| s.to_string()).collect();
+        self.extra_vals = vec![(0.0, 0); extra_cols.len()];
+        let is_new = !std::path::Path::new(&path).exists()
+            || std::fs::metadata(&path)
+                .map(|m| m.len() == 0)
+                .unwrap_or(true);
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(f) => {
+                let mut writer = BufWriter::new(f);
+                if is_new {
+                    let extra_header: String = extra_cols.iter().map(|c| format!(",{c}")).collect();
+                    let _ = writeln!(
+                        writer,
+                        "step,batch,lr,loss,perplexity,ms_per_step,s_per_norm_seq{extra_header}"
+                    );
+                }
+                self.log_writer = Some(writer);
+                println!("Logging to '{path}'");
+            }
+            Err(e) => eprintln!("Could not open log file '{path}': {e}"),
+        }
+    }
+
+    pub fn log_tokens(&mut self, n: usize) {
+        self.tokens_since_log += n;
+    }
+
+    pub fn log_metric(&mut self, name: &str, val: f32) {
+        if let Some(i) = self.extra_cols.iter().position(|c| c == name) {
+            self.extra_vals[i].0 += val;
+            self.extra_vals[i].1 += 1;
         }
     }
 
@@ -163,12 +230,14 @@ impl TrainingState {
         self.step += 1;
         self.loss += loss;
         self.loss_steps += 1;
+        self.steps_since_log += 1;
         if self.step.is_multiple_of(self.batch_size) {
             let batch_num = self.step / self.batch_size;
-            let warmup_lr = self.lr * (batch_num as f32 / WARMUP_STEPS as f32).min(1.0);
+            self.warmup_lr = self.lr * (batch_num as f32 / WARMUP_STEPS as f32).min(1.0);
             let t = (batch_num as f32 / DECAY_STEPS as f32).min(1.0);
-            let decay_lr = MIN_LR + 0.5 * (self.lr - MIN_LR) * (1.0 + (PI * t).cos());
-            Some(warmup_lr.min(decay_lr))
+            self.decay_lr = MIN_LR + 0.5 * (self.lr - MIN_LR) * (1.0 + (PI * t).cos());
+            self.current_lr = self.warmup_lr.min(self.decay_lr);
+            Some(self.current_lr)
         } else {
             None
         }
@@ -182,6 +251,41 @@ impl TrainingState {
         let loss = self.loss / self.loss_steps as f32;
         self.loss = 0.0;
         self.loss_steps = 0;
+        if let Some(writer) = &mut self.log_writer {
+            let batch_num = self.step / self.batch_size;
+            let elapsed_ms = self.last_log.elapsed().as_secs_f32() * 1000.0;
+            let ms_per_step = elapsed_ms / self.steps_since_log.max(1) as f32;
+            let s_per_norm = if self.tokens_since_log > 0 {
+                (elapsed_ms / 1000.0 / self.tokens_since_log as f32) * SEQ_LEN as f32
+            } else {
+                0.0
+            };
+            let extra: String = self
+                .extra_vals
+                .iter()
+                .map(|(sum, count)| {
+                    format!(",{:.6}", if *count > 0 { sum / *count as f32 } else { 0.0 })
+                })
+                .collect();
+            let _ = writeln!(
+                writer,
+                "{},{},{:e},{:.6},{:.4},{:.2},{:.4}{extra}",
+                self.step,
+                batch_num,
+                self.current_lr,
+                loss,
+                loss.exp(),
+                ms_per_step,
+                s_per_norm,
+            );
+            let _ = writer.flush();
+            for v in &mut self.extra_vals {
+                *v = (0.0, 0);
+            }
+        }
+        self.last_log = Instant::now();
+        self.steps_since_log = 0;
+        self.tokens_since_log = 0;
         loss
     }
 

@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::io;
 
+use crate::nn::causal_conv1d::CausalConv1dLayer;
 use crate::nn::dropout::DropoutLayer;
 use crate::nn::embedding::EmbeddingLayer;
 use crate::nn::linear::LinearLayer;
@@ -190,6 +191,13 @@ impl SequentialBuilder {
         let up = (hidden * 8) / 3;
         let layer = SLSTMBlock::new(hidden, up);
         self.layer(Box::new(layer), hidden);
+        self
+    }
+
+    pub fn causal_conv1d(mut self, kernel_size: usize) -> Self {
+        let channels = self.output_size;
+        let layer = CausalConv1dLayer::new(channels, kernel_size);
+        self.layer(Box::new(layer), channels);
         self
     }
 

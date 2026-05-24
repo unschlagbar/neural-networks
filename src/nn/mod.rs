@@ -1,5 +1,6 @@
 use iron_oxide::collections::Matrix;
 
+pub mod causal_conv1d;
 pub mod dropout;
 pub mod embedding;
 pub mod headwise_rms_norm;

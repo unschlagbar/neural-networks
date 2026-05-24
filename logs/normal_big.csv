@@ -1,0 +1,2 @@
+step,batch,lr,loss,perplexity,ms_per_step,s_per_norm_seq,delta_word,delta_char1
+10,10,1e-5,5.310745,202.5010,10418.37,10.3296,0.134163,0.057337

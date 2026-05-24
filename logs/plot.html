@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Training Log</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0b0b0d;
+    color: #b8b8c0;
+    font-family: system-ui, monospace;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  body.drag-over::after {
+    content: 'Drop CSV';
+    position: fixed; inset: 0;
+    background: #0b0b0dcc;
+    border: 2px dashed #c8a96e;
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px; color: #c8a96e; letter-spacing: .1em;
+    pointer-events: none; z-index: 99;
+  }
+
+  header {
+    flex-shrink: 0;
+    background: #101014;
+    border-bottom: 1px solid #1c1c22;
+    padding: 10px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  header h1 {
+    font-size: 12px;
+    font-weight: 500;
+    color: #ffffff;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    flex: 1;
+  }
+
+  .btn {
+    background: #18181e;
+    border: 1px solid #2a2a34;
+    color: #909098;
+    padding: 5px 14px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 12px;
+    font-family: inherit;
+    transition: border-color .15s, color .15s;
+  }
+  .btn:hover { border-color: #c8a96e; color: #c8a96e; }
+  .btn:disabled { opacity: .3; cursor: default; }
+
+  #status {
+    font-size: 11px;
+    color: #3a3a45;
+    min-width: 260px;
+    text-align: right;
+  }
+  #status.live  { color: #7dab6e; }
+  #status.error { color: #b06060; }
+
+  #empty {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    color: #2e2e38;
+    font-size: 13px;
+    pointer-events: none;
+    user-select: none;
+  }
+  #empty svg { opacity: .18; }
+  #empty p { letter-spacing: .04em; }
+
+  #charts {
+    display: none;
+    flex: 1;
+    flex-direction: column;
+    padding: 12px 16px;
+    gap: 10px;
+    overflow: hidden;
+  }
+
+  .row {
+    display: flex;
+    flex: 1;
+    gap: 10px;
+    min-height: 0;
+  }
+
+  .chart-wrap {
+    flex: 1;
+    background: #101014;
+    border: 1px solid #1c1c22;
+    border-radius: 7px;
+    padding: 10px 14px 6px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+  }
+
+  .chart-label {
+    font-size: 10px;
+    color: #ffffff;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+    flex-shrink: 0;
+  }
+
+  .chart-wrap canvas {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .stat-card {
+    background: #101014;
+    border: 1px solid #1c1c22;
+    border-radius: 7px;
+    padding: 10px 16px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 10px;
+    min-width: 130px;
+    flex-shrink: 0;
+  }
+
+  .stat-entry { display: flex; flex-direction: column; gap: 3px; }
+  .stat-label { font-size: 10px; color: #ffffff; letter-spacing: .08em; text-transform: uppercase; }
+  .stat-value { font-size: 18px; font-weight: 600; color: #c8a96e; font-variant-numeric: tabular-nums; }
+
+  input[type=file] { display: none; }
+
+  .smooth-wrap {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    flex-shrink: 0;
+  }
+  .smooth-wrap label {
+    font-size: 11px;
+    color: #909098;
+    letter-spacing: .06em;
+    white-space: nowrap;
+  }
+  #smooth-val {
+    font-size: 11px;
+    color: #ffffff;
+    min-width: 28px;
+    font-variant-numeric: tabular-nums;
+  }
+  input[type=range] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 110px;
+    height: 3px;
+    border-radius: 2px;
+    background: #2a2a34;
+    outline: none;
+    cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 13px; height: 13px;
+    border-radius: 50%;
+    background: #bf00ff;
+    cursor: pointer;
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 13px; height: 13px;
+    border-radius: 50%;
+    background: #bf00ff;
+    border: none;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Training Log</h1>
+  <button class="btn" id="open-btn">Open CSV</button>
+  <button class="btn" id="reload-btn" disabled>Reload</button>
+  <div class="smooth-wrap">
+    <label for="smooth-slider">Conv W</label>
+    <input type="range" id="smooth-slider" min="1" max="51" step="2" value="1">
+    <span id="smooth-val">1</span>
+  </div>
+  <span id="status">drop a CSV anywhere or click open</span>
+  <input type="file" id="file-input" accept=".csv" multiple>
+</header>
+
+<div id="empty">
+  <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#c8a96e" stroke-width="1.2">
+    <path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M12 3v13M8 8l4-4 4 4"/>
+  </svg>
+  <p>Drop CSV files anywhere</p>
+</div>
+
+<div id="charts">
+  <div class="chart-wrap"><div class="chart-label">Loss</div><canvas id="c-loss"></canvas></div>
+  <div class="row">
+    <div class="chart-wrap"><div class="chart-label">Delta Word</div><canvas id="c-dw"></canvas></div>
+    <div class="chart-wrap"><div class="chart-label">Delta Char1</div><canvas id="c-dc"></canvas></div>
+  </div>
+  <div class="row">
+    <div class="stat-card" id="stat-card">
+      <div class="stat-label">s / norm seq</div>
+      <div id="stat-entries"></div>
+    </div>
+    <div class="chart-wrap"><div class="chart-label">Learning rate</div><canvas id="c-lr"></canvas></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script>
+const POLL_MS = 3000;
+
+let _colorIdx = 0;
+function nextColor() {
+  const hue = (_colorIdx++ * 137.508) % 360;
+  return `hsl(${hue.toFixed(0)},100%,62%)`;
+}
+
+// stable dataset registry: name → { name, rows, color }
+const registry = new Map();
+
+// live handles: name → FileSystemFileHandle
+const handleMap = new Map();
+let pollTimer = null;
+
+let lossChart, dwChart, dcChart, lrChart;
+
+let convWindow = 1;
+
+function smooth(rows, key) {
+  if (convWindow <= 1) return rows.map(r => ({ x: +r.step, y: +r[key] }));
+  // causal box filter: each point averages only its own past [i-W+1, i]
+  return rows.map((r, i) => {
+    const lo = Math.max(0, i - convWindow + 1);
+    let sum = 0;
+    for (let j = lo; j <= i; j++) sum += +rows[j][key];
+    return { x: +r.step, y: sum / (i - lo + 1) };
+  });
+}
+
+function parseCSV(text) {
+  const lines = text.trim().split('\n');
+  const headers = lines[0].split(',').map(h => h.trim());
+  return lines.slice(1).filter(l => l.trim()).map(l => {
+    const v = l.split(',');
+    return Object.fromEntries(headers.map((h, i) => [h, v[i]]));
+  });
+}
+
+function mergeData(name, rows) {
+  if (!registry.has(name)) {
+    registry.set(name, { name, rows, color: nextColor() });
+  } else {
+    registry.get(name).rows = rows;
+  }
+}
+
+function getDatasets() { return [...registry.values()]; }
+
+// ── chart config ─────────────────────────────────────────────────────────────
+
+const gridColor = '#1e1e28';
+
+function withAlpha(color, alpha) {
+  return color.replace(/^hsl\(/, 'hsla(').replace(/\)$/, `,${alpha})`);
+}
+
+const gradientPlugin = {
+  id: 'gradientFill',
+  afterLayout(chart) {
+    const { ctx, chartArea, data } = chart;
+    if (!chartArea) return;
+    data.datasets.forEach((ds) => {
+      const grad = ctx.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+      grad.addColorStop(0, withAlpha(ds.borderColor, 0.27));
+      grad.addColorStop(1, withAlpha(ds.borderColor, 0));
+      ds.backgroundColor = grad;
+    });
+  }
+};
+
+const chartCfg = (label, key, datasets) => {
+  const allSteps = datasets.flatMap(d => d.rows.map(r => +r.step)).filter(v => !isNaN(v));
+  const minStep  = allSteps.length ? Math.min(...allSteps) : undefined;
+  return ({
+  type: 'line',
+  data: {
+    datasets: datasets.map(d => ({
+      label: d.name,
+      data: smooth(d.rows, key),
+      borderColor: d.color,
+      backgroundColor: 'transparent',
+      borderWidth: 1.4,
+      pointRadius: 0,
+      tension: 0,
+      fill: true,
+    }))
+  },
+  options: {
+    animation: false,
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      gradientFill: {},
+      legend: { labels: { font: { size: 16 }, boxWidth: 0, boxHeight: 0, padding: 16,
+        generateLabels(chart) {
+          return chart.data.datasets.map((ds, i) => ({
+            text: ds.label, datasetIndex: i,
+            fontColor: ds.borderColor, strokeStyle: 'transparent', fillStyle: 'transparent',
+            hidden: !chart.isDatasetVisible(i),
+          }));
+        }
+      } },
+      tooltip: {
+        backgroundColor: '#0e0e12', borderColor: '#25252e', borderWidth: 1,
+        titleColor: '#fff', bodyColor: '#fff', padding: 10,
+      }
+    },
+    scales: {
+      x: {
+        type: 'linear',
+        min: minStep,
+        ticks: { color: '#fff', maxTicksLimit: 8, font: { size: 10 } },
+        grid: { color: gridColor },
+        border: { color: '#555566' },
+        title: { display: label === 'Learning rate', text: 'step', color: '#fff', font: { size: 10 } }
+      },
+      y: {
+        ticks: { color: '#fff', font: { size: 10 } },
+        grid: { color: gridColor },
+        border: { color: '#555566' },
+      }
+    }
+  },
+  plugins: [gradientPlugin],
+})};
+
+// ── render ────────────────────────────────────────────────────────────────────
+
+function updateStatCard(datasets) {
+  const el = document.getElementById('stat-entries');
+  el.innerHTML = datasets.map(d => {
+    const last = d.rows.at(-1);
+    const val = (last && last.s_per_norm_seq !== undefined) ? (+last.s_per_norm_seq).toFixed(3) + ' s' : '—';
+    return `<div class="stat-entry">
+      <span class="stat-label" style="color:${d.color}">${d.name}</span>
+      <span class="stat-value" style="color:${d.color}">${val}</span>
+    </div>`;
+  }).join('');
+}
+
+function buildCharts(datasets) {
+  document.getElementById('empty').style.display  = 'none';
+  document.getElementById('charts').style.display = 'flex';
+
+  ['c-loss','c-dw','c-dc','c-lr'].forEach(id => {
+    const existing = Chart.getChart(id);
+    if (existing) existing.destroy();
+  });
+  lossChart = dwChart = dcChart = lrChart = null;
+
+  lossChart = new Chart(document.getElementById('c-loss'), chartCfg('Loss',          'loss',        datasets));
+  dwChart   = new Chart(document.getElementById('c-dw'),   chartCfg('Delta Word',    'delta_word',  datasets));
+  dcChart   = new Chart(document.getElementById('c-dc'),   chartCfg('Delta Char1',   'delta_char1', datasets));
+  lrChart   = new Chart(document.getElementById('c-lr'),   chartCfg('Learning rate', 'lr',          datasets));
+  updateStatCard(datasets);
+}
+
+function refreshCharts(datasets) {
+  updateStatCard(datasets);
+  [[lossChart,'loss'],[dwChart,'delta_word'],[dcChart,'delta_char1'],[lrChart,'lr']].forEach(([chart, key]) => {
+    if (!chart) return;
+    datasets.forEach((d, i) => {
+      if (chart.data.datasets[i])
+        chart.data.datasets[i].data = smooth(d.rows, key);
+    });
+    chart.update('none');
+  });
+}
+
+function setStatus(msg, cls = '') {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = cls;
+}
+
+// ── live polling ──────────────────────────────────────────────────────────────
+
+async function poll() {
+  try {
+    for (const [name, handle] of handleMap) {
+      const file = await handle.getFile();
+      mergeData(name, parseCSV(await file.text()));
+    }
+    const datasets = getDatasets();
+    refreshCharts(datasets);
+    const last = datasets[0]?.rows.at(-1);
+    const info = last ? `step ${last.step} · loss ${(+last.loss).toFixed(4)}` : '';
+    setStatus(`live  ${info}  (${registry.size} file${registry.size > 1 ? 's' : ''})`, 'live');
+  } catch (e) {
+    setStatus(`poll error: ${e.message}`, 'error');
+  }
+}
+
+// ── file loading ──────────────────────────────────────────────────────────────
+
+function loadStaticFiles(files) {
+  let pending = files.length;
+  [...files].forEach(file => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      mergeData(file.name.replace('.csv',''), parseCSV(e.target.result));
+      if (--pending === 0) {
+        const datasets = getDatasets();
+        buildCharts(datasets);
+        document.getElementById('reload-btn').disabled = false;
+        setStatus(`${registry.size} file${registry.size > 1 ? 's' : ''} loaded`);
+      }
+    };
+    reader.readAsText(file);
+  });
+}
+
+// ── open button ───────────────────────────────────────────────────────────────
+
+document.getElementById('open-btn').onclick = async () => {
+  if (window.showOpenFilePicker) {
+    try {
+      const picked = await window.showOpenFilePicker({
+        multiple: true,
+        types: [{ description: 'CSV', accept: { 'text/csv': ['.csv'] } }]
+      });
+      for (const h of picked) {
+        const name = h.name.replace('.csv','');
+        handleMap.set(name, h);
+        const file = await h.getFile();
+        mergeData(name, parseCSV(await file.text()));
+      }
+      buildCharts(getDatasets());
+      setStatus(`live · polling every ${POLL_MS / 1000} s  (${registry.size} file${registry.size > 1 ? 's' : ''})`, 'live');
+      if (!pollTimer) pollTimer = setInterval(poll, POLL_MS);
+      document.getElementById('reload-btn').disabled = true;
+    } catch (e) {
+      if (e.name !== 'AbortError') setStatus(`error: ${e.message}`, 'error');
+    }
+  } else {
+    document.getElementById('file-input').click();
+  }
+};
+
+document.getElementById('file-input').onchange = e => loadStaticFiles(e.target.files);
+document.getElementById('reload-btn').onclick   = () => registry.size && buildCharts(getDatasets());
+
+document.getElementById('smooth-slider').oninput = e => {
+  convWindow = +e.target.value;
+  document.getElementById('smooth-val').textContent = convWindow;
+  if (registry.size) refreshCharts(getDatasets());
+};
+
+// ── drag & drop (whole page) ──────────────────────────────────────────────────
+
+let dragCounter = 0;
+document.addEventListener('dragenter', e => { e.preventDefault(); dragCounter++; document.body.classList.add('drag-over'); });
+document.addEventListener('dragleave', ()  => { if (--dragCounter <= 0) { dragCounter = 0; document.body.classList.remove('drag-over'); } });
+document.addEventListener('dragover',  e  => e.preventDefault());
+document.addEventListener('drop', e => {
+  e.preventDefault(); dragCounter = 0; document.body.classList.remove('drag-over');
+  if (e.dataTransfer.files.length) loadStaticFiles(e.dataTransfer.files);
+});
+</script>
+</body>
+</html>

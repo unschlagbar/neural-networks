@@ -192,8 +192,6 @@ impl NnLayer for LinearLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
-        self.grads.weights.clip();
-        self.grads.biases.clip();
         self.grads.weights.apply_to(&mut self.weights, lr);
         self.grads.biases.apply_to(&mut self.biases, lr);
     }

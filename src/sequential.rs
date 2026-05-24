@@ -164,6 +164,7 @@ impl Sequential {
                 layer.accumulate_init_grad();
                 layer.reset_bptt_state();
             }
+            state.log_tokens(inputs.len());
 
             if let Some(lr) = state.step(loss) {
                 self.sgd_step(lr);

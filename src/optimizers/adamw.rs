@@ -4,7 +4,7 @@ use crate::optimizers::{
     GradMatrixOps, OptimizerGradTypes, adam::AdamGradMatrix, adam::AdamGradVec,
 };
 
-const CLIP: f32 = 30.0;
+const CLIP: f32 = 50.0;
 const BETA1: f32 = 0.9;
 const BETA2: f32 = 0.98;
 const EPS: f32 = 1e-8;

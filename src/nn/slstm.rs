@@ -476,9 +476,6 @@ impl NnLayer for SLSTMLayer {
 
     fn apply_grads(&mut self, lr: f32) {
         self.grads.wi.clip();
-        self.grads.wf.clip();
-
-        self.grads.wz.clip();
         self.grads.wo.clip();
 
         self.grads.wz.apply_to(&mut self.wz, lr);
@@ -524,7 +521,9 @@ impl NnLayer for SLSTMLayer {
         add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
     }
 
-    fn state_size(&self) -> usize { 2 * self.hidden_size }
+    fn state_size(&self) -> usize {
+        2 * self.hidden_size
+    }
 
     fn inject_state(&mut self, buf: &[f32], offset: usize) -> usize {
         let h = self.hidden_size;

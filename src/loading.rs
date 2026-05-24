@@ -7,6 +7,7 @@ use iron_oxide::collections::Matrix;
 
 use crate::{
     nn::{
+        causal_conv1d::CausalConv1dLayer,
         dropout::DropoutLayer, embedding::EmbeddingLayer, linear::LinearLayer,
         linear_nb::LinearNBLayer, lstm::LSTMLayer, mlstm::MLSTMLayer, mlstm_block::MLSTMBlock,
         rms_norm::RMSNorm, silu_dense::SiluDenseLayer, slstm::SLSTMLayer, slstm_block::SLSTMBlock,
@@ -290,6 +291,14 @@ pub fn load_mlstm_block(r: &mut dyn Read, hidden_size: usize) -> std::io::Result
     )))
 }
 
+pub fn load_causal_conv1d(r: &mut dyn Read, ctx: LoadCtx) -> io::Result<Box<dyn NnLayer>> {
+    let channels = ctx.input_size;
+    let kernel_size = read_u32(r)? as usize;
+    let weights = read_matrix(r)?;
+    let bias = read_f32_vec(r)?;
+    Ok(Box::new(CausalConv1dLayer::from_loaded(channels, kernel_size, weights, bias)))
+}
+
 fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Option<Box<dyn NnLayer>>> {
     if tag == 4 {
         read_u32(r)?; // legacy softmax — consume size field and skip
@@ -307,6 +316,7 @@ fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Option<Box<d
         12 => load_linear(r)?,
         13 => Box::new(load_mlstm(r, ctx.input_size, ctx.output_size).unwrap()),
         14 => load_mlstm_block(r, ctx.output_size)?,
+        15 => load_causal_conv1d(r, ctx)?,
         o => return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unknown layer tag {o}"),

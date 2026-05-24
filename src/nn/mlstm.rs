@@ -89,10 +89,10 @@ pub struct MLSTMCache {
     pub f_prime: Box<[f32]>, // H  exp(log_f + m_prev - m)
 
     // Output intermediates.
-    pub cq: Box<[f32]>,                  // d
-    pub nq: Box<[f32]>,                  // H
-    pub psi: Box<[f32]>,                 // H
-    pub h_tilde: Box<[f32]>,             // d
+    pub cq: Box<[f32]>,      // d
+    pub nq: Box<[f32]>,      // H
+    pub psi: Box<[f32]>,     // H
+    pub h_tilde: Box<[f32]>, // d
     pub head_norm: HeadwiseRMSNormCache,
 
     /// `w_out.input` = o ⊙ ŷ,  `w_out.output` = final cell output.
@@ -102,10 +102,18 @@ pub struct MLSTMCache {
 }
 
 impl DynCache for MLSTMCache {
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
-    fn as_any(&self) -> &dyn Any { self }
-    fn output(&self) -> &[f32] { &self.w_out.output }
-    fn input_grad(&self) -> &[f32] { &self.dx }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn output(&self) -> &[f32] {
+        &self.w_out.output
+    }
+    fn input_grad(&self) -> &[f32] {
+        &self.dx
+    }
 }
 
 pub struct MLSTMLayerGrads {
@@ -289,7 +297,18 @@ impl MLSTMLayer {
             dqk,
             dhv,
             inv_sqrt_dqk: 1.0 / (dqk as f32).sqrt(),
-            wq, wk, wv, wo, wi, wf, bq, bk, bv, bo, bi, bf,
+            wq,
+            wk,
+            wv,
+            wo,
+            wi,
+            wf,
+            bq,
+            bk,
+            bv,
+            bo,
+            bi,
+            bf,
             w_out,
             head_norm: HeadwiseRMSNorm::from_loaded(d, h, head_norm_gamma),
             c: (0..h).map(|_| Matrix::zeros(dhv, dqk)).collect(),
@@ -379,8 +398,7 @@ impl MLSTMLayer {
                 let iprime_vi = i_prime * v_i;
                 let mut s = 0.0;
                 for j in 0..dqk {
-                    let c_ij = f_prime * cache.c_prev[hd][i][j]
-                        + iprime_vi * cache.k[qk_off + j];
+                    let c_ij = f_prime * cache.c_prev[hd][i][j] + iprime_vi * cache.k[qk_off + j];
                     self.c[hd][i][j] = c_ij;
                     s += c_ij * cache.q[qk_off + j];
                 }
@@ -390,7 +408,8 @@ impl MLSTMLayer {
         }
 
         // Headwise RMS norm: ŷ = head_norm(h_tilde)
-        self.head_norm.forward_into(&cache.h_tilde, &mut cache.head_norm);
+        self.head_norm
+            .forward_into(&cache.h_tilde, &mut cache.head_norm);
 
         // h_concat = o ⊙ ŷ,  output h = W_out · h_concat + b_out
         for i in 0..d {
@@ -422,7 +441,8 @@ impl MLSTMLayer {
             self.d_h_tilde[i] = dc_h_i * o_i;
         }
 
-        self.head_norm.backward_into(&self.d_h_tilde, &mut cache.head_norm);
+        self.head_norm
+            .backward_into(&self.d_h_tilde, &mut cache.head_norm);
         self.d_h_tilde.copy_from_slice(&cache.head_norm.dx);
 
         for hd in 0..h {
@@ -435,7 +455,11 @@ impl MLSTMLayer {
             for i in 0..dhv {
                 dpsi += self.d_h_tilde[v_off + i] * (-cache.cq[v_off + i] * psi_sq);
             }
-            let dnq_h = if cache.nq[hd].abs() > 1.0 { cache.nq[hd].signum() * dpsi } else { 0.0 };
+            let dnq_h = if cache.nq[hd].abs() > 1.0 {
+                cache.nq[hd].signum() * dpsi
+            } else {
+                0.0
+            };
 
             let i_prime = cache.i_prime[hd];
             let f_prime = cache.f_prime[hd];
@@ -521,21 +545,21 @@ impl MLSTMLayer {
             let gwo = self.grads.wo.matrix().as_slice_mut();
             let gwi = self.grads.wi.matrix().as_slice_mut();
             let gwf = self.grads.wf.matrix().as_slice_mut();
-            let dq  = &*self.dq;
-            let dk  = &*self.dk_pre;
-            let dv  = &*self.dv;
+            let dq = &*self.dq;
+            let dk = &*self.dk_pre;
+            let dv = &*self.dv;
             let doo = &*self.do_pre;
-            let di  = &*self.di_pre;
-            let df  = &*self.df_pre;
-            let x   = &*cache.x;
-            let dx  = &mut *cache.dx;
+            let di = &*self.di_pre;
+            let df = &*self.df_pre;
+            let x = &*cache.x;
+            let dx = &mut *cache.dx;
 
             for idx in 0..self.input_size {
                 let xi = x[idx];
                 let mut s = 0.0;
                 let qk_off = idx * d_qk;
-                let d_off  = idx * d;
-                let h_off  = idx * h;
+                let d_off = idx * d;
+                let h_off = idx * h;
                 for j in 0..d_qk {
                     let dq_j = dq[j];
                     let dk_j = dk[j];
@@ -595,7 +619,6 @@ impl MLSTMLayer {
             dx: vec![0.0; self.input_size].into(),
         }
     }
-
 }
 
 impl NnLayer for MLSTMLayer {
@@ -643,22 +666,34 @@ impl NnLayer for MLSTMLayer {
         Box::new(MLSTMLayer::alloc_cache(self))
     }
 
-    fn input_size(&self) -> usize { self.input_size }
-    fn output_size(&self) -> usize { self.hidden_size }
+    fn input_size(&self) -> usize {
+        self.input_size
+    }
+    fn output_size(&self) -> usize {
+        self.hidden_size
+    }
 
     fn apply_grads(&mut self, lr: f32) {
+        self.grads.wo.clip();
+        self.grads.wi.clip();
+
+        self.grads.bo.clip();
+        self.grads.bi.clip();
+
         self.grads.wq.apply_to(&mut self.wq, lr);
         self.grads.wk.apply_to(&mut self.wk, lr);
         self.grads.wv.apply_to(&mut self.wv, lr);
         self.grads.wo.apply_to(&mut self.wo, lr);
         self.grads.wi.apply_to(&mut self.wi, lr);
         self.grads.wf.apply_to(&mut self.wf, lr);
+
         self.grads.bq.apply_to(&mut self.bq, lr);
         self.grads.bk.apply_to(&mut self.bk, lr);
         self.grads.bv.apply_to(&mut self.bv, lr);
         self.grads.bo.apply_to(&mut self.bo, lr);
         self.grads.bi.apply_to(&mut self.bi, lr);
         self.grads.bf.apply_to(&mut self.bf, lr);
+
         self.w_out.apply_grads(lr);
         self.head_norm.apply_grads(lr);
     }
@@ -681,13 +716,17 @@ impl NnLayer for MLSTMLayer {
     }
 
     fn reset_state(&mut self) {
-        for mat in self.c.iter_mut() { mat.clear(); }
+        for mat in self.c.iter_mut() {
+            mat.clear();
+        }
         self.n.clear();
         self.m.fill(0.0);
     }
 
     fn reset_bptt_state(&mut self) {
-        for mat in self.dc_bptt.iter_mut() { mat.clear(); }
+        for mat in self.dc_bptt.iter_mut() {
+            mat.clear();
+        }
         self.dn_bptt.clear();
     }
 
@@ -701,10 +740,14 @@ impl NnLayer for MLSTMLayer {
         let head_size = self.dhv * self.dqk;
         let mut off = offset;
         for hd in 0..self.num_heads {
-            self.c[hd].as_slice_mut().copy_from_slice(&buf[off..off + head_size]);
+            self.c[hd]
+                .as_slice_mut()
+                .copy_from_slice(&buf[off..off + head_size]);
             off += head_size;
         }
-        self.n.as_slice_mut().copy_from_slice(&buf[offset + c_size..offset + c_size + n_size]);
+        self.n
+            .as_slice_mut()
+            .copy_from_slice(&buf[offset + c_size..offset + c_size + n_size]);
         self.m.fill(0.0);
         offset + c_size + n_size
     }
