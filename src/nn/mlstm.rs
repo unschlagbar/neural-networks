@@ -752,7 +752,7 @@ impl NnLayer for MLSTMLayer {
         offset + c_size + n_size
     }
 
-    fn collect_bptt_grad(&self, buf: &mut [f32], offset: usize) -> usize {
+    fn collect_bptt_grad(&mut self, buf: &mut [f32], offset: usize) -> usize {
         let c_size = self.num_heads * self.dhv * self.dqk;
         let n_size = self.num_heads * self.dqk;
         let head_size = self.dhv * self.dqk;

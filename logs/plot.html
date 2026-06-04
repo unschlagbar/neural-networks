@@ -187,6 +187,34 @@
     border: none;
     cursor: pointer;
   }
+
+  .offset-wrap {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    flex-shrink: 0;
+  }
+  .offset-wrap label {
+    font-size: 11px;
+    color: #909098;
+    letter-spacing: .06em;
+    white-space: nowrap;
+  }
+  #offset-input {
+    -webkit-appearance: none;
+    appearance: none;
+    background: #18181e;
+    border: 1px solid #2a2a34;
+    color: #ffffff;
+    font-size: 11px;
+    font-family: inherit;
+    font-variant-numeric: tabular-nums;
+    width: 72px;
+    padding: 3px 7px;
+    border-radius: 5px;
+    outline: none;
+  }
+  #offset-input:focus { border-color: #c8a96e; }
 </style>
 </head>
 <body>
@@ -200,6 +228,10 @@
     <input type="range" id="smooth-slider" min="1" max="51" step="2" value="1">
     <span id="smooth-val">1</span>
   </div>
+  <div class="offset-wrap">
+    <label for="offset-input">Start</label>
+    <input type="number" id="offset-input" min="0" step="100" value="0">
+  </div>
   <span id="status">drop a CSV anywhere or click open</span>
   <input type="file" id="file-input" accept=".csv" multiple>
 </header>
@@ -212,7 +244,10 @@
 </div>
 
 <div id="charts">
-  <div class="chart-wrap"><div class="chart-label">Loss</div><canvas id="c-loss"></canvas></div>
+  <div class="row">
+    <div class="chart-wrap"><div class="chart-label">Loss</div><canvas id="c-loss"></canvas></div>
+    <div class="chart-wrap"><div class="chart-label">Word Loss</div><canvas id="c-wl"></canvas></div>
+  </div>
   <div class="row">
     <div class="chart-wrap"><div class="chart-label">Delta Word</div><canvas id="c-dw"></canvas></div>
     <div class="chart-wrap"><div class="chart-label">Delta Char1</div><canvas id="c-dc"></canvas></div>
@@ -243,17 +278,19 @@ const registry = new Map();
 const handleMap = new Map();
 let pollTimer = null;
 
-let lossChart, dwChart, dcChart, lrChart;
+let lossChart, wlChart, dwChart, dcChart, lrChart;
 
 let convWindow = 1;
+let startOffset = 0;
 
 function smooth(rows, key) {
-  if (convWindow <= 1) return rows.map(r => ({ x: +r.step, y: +r[key] }));
+  const filtered = rows.filter(r => +r.step >= startOffset);
+  if (convWindow <= 1) return filtered.map(r => ({ x: +r.step, y: +r[key] }));
   // causal box filter: each point averages only its own past [i-W+1, i]
-  return rows.map((r, i) => {
+  return filtered.map((r, i) => {
     const lo = Math.max(0, i - convWindow + 1);
     let sum = 0;
-    for (let j = lo; j <= i; j++) sum += +rows[j][key];
+    for (let j = lo; j <= i; j++) sum += +filtered[j][key];
     return { x: +r.step, y: sum / (i - lo + 1) };
   });
 }
@@ -300,7 +337,7 @@ const gradientPlugin = {
 };
 
 const chartCfg = (label, key, datasets) => {
-  const allSteps = datasets.flatMap(d => d.rows.map(r => +r.step)).filter(v => !isNaN(v));
+  const allSteps = datasets.flatMap(d => d.rows.filter(r => +r.step >= startOffset).map(r => +r.step)).filter(v => !isNaN(v));
   const minStep  = allSteps.length ? Math.min(...allSteps) : undefined;
   return ({
   type: 'line',
@@ -374,13 +411,14 @@ function buildCharts(datasets) {
   document.getElementById('empty').style.display  = 'none';
   document.getElementById('charts').style.display = 'flex';
 
-  ['c-loss','c-dw','c-dc','c-lr'].forEach(id => {
+  ['c-loss','c-wl','c-dw','c-dc','c-lr'].forEach(id => {
     const existing = Chart.getChart(id);
     if (existing) existing.destroy();
   });
-  lossChart = dwChart = dcChart = lrChart = null;
+  lossChart = wlChart = dwChart = dcChart = lrChart = null;
 
   lossChart = new Chart(document.getElementById('c-loss'), chartCfg('Loss',          'loss',        datasets));
+  wlChart   = new Chart(document.getElementById('c-wl'),   chartCfg('Word Loss',     'word_loss',   datasets));
   dwChart   = new Chart(document.getElementById('c-dw'),   chartCfg('Delta Word',    'delta_word',  datasets));
   dcChart   = new Chart(document.getElementById('c-dc'),   chartCfg('Delta Char1',   'delta_char1', datasets));
   lrChart   = new Chart(document.getElementById('c-lr'),   chartCfg('Learning rate', 'lr',          datasets));
@@ -389,7 +427,7 @@ function buildCharts(datasets) {
 
 function refreshCharts(datasets) {
   updateStatCard(datasets);
-  [[lossChart,'loss'],[dwChart,'delta_word'],[dcChart,'delta_char1'],[lrChart,'lr']].forEach(([chart, key]) => {
+  [[lossChart,'loss'],[wlChart,'word_loss'],[dwChart,'delta_word'],[dcChart,'delta_char1'],[lrChart,'lr']].forEach(([chart, key]) => {
     if (!chart) return;
     datasets.forEach((d, i) => {
       if (chart.data.datasets[i])
@@ -476,6 +514,11 @@ document.getElementById('smooth-slider').oninput = e => {
   convWindow = +e.target.value;
   document.getElementById('smooth-val').textContent = convWindow;
   if (registry.size) refreshCharts(getDatasets());
+};
+
+document.getElementById('offset-input').oninput = e => {
+  startOffset = Math.max(0, +e.target.value || 0);
+  if (registry.size) buildCharts(getDatasets());
 };
 
 // ── drag & drop (whole page) ──────────────────────────────────────────────────

@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    config::{MODEL_LOC, STOP_CHAR1_AT_BOUNDARY, STOP_WORD_DIRECT_FEED, USE_STATE_INJECT},
+    config::{INJECT_C, INJECT_H, MODEL_LOC, STOP_WORD_DIRECT_FEED},
     loading::{read_f32_vec, read_matrix, read_u16, read_u32, read_u64},
     nn::{
         linear::{LinearCache, LinearLayer},
@@ -18,7 +18,7 @@ use crate::{
     training::TrainingState,
 };
 
-pub struct HierarchicalSequential {
+pub struct Hierarchical {
     pub char_model: Sequential,
     pub char2_model: Sequential,
     pub word_model: Sequential,
@@ -45,10 +45,11 @@ pub struct HierarchicalSequential {
 
     pub last_high_grad_signal: f32,
     pub last_char1_grad_signal: f32,
+    pub last_word_loss: f32,
     pub step: usize,
 }
 
-impl HierarchicalSequential {
+impl Hierarchical {
     /// `boundary_token_ids` — from `tokenizer.boundary_token_ids()`.
     pub fn new(
         char_model: Sequential,
@@ -110,6 +111,7 @@ impl HierarchicalSequential {
             d_high_ctx,
             last_high_grad_signal: 0.0,
             last_char1_grad_signal: 0.0,
+            last_word_loss: 0.0,
             step: 0,
         }
     }
@@ -203,13 +205,10 @@ impl HierarchicalSequential {
                     let high_out = self.word_model.cache[word_idx].last().unwrap().output();
                     self.assert_no_nan(high_out, "high_output", word_idx);
                     self.char2_input[char_output..].copy_from_slice(high_out);
-                    if STOP_CHAR1_AT_BOUNDARY {
-                        self.char2_input[..char_output].fill(0.0);
-                    }
+                    self.char2_input[..char_output].fill(0.0);
                 }
 
-                if USE_STATE_INJECT {
-                    // Project word output → char2 h+c states and inject them.
+                if INJECT_C || INJECT_H {
                     {
                         let c = &mut self.state_head_caches[word_idx];
                         LinearLayer::forward(&self.state_head, &self.char2_input[char_output..], c);
@@ -314,16 +313,12 @@ impl HierarchicalSequential {
             }
 
             if let Some(bi) = boundary {
-                if STOP_CHAR1_AT_BOUNDARY {
-                    // char1 was zeroed out before char2 ran — stop gradient flow back to char1.
-                    self.delta_buf[..char_output].fill(0.0);
-                }
-                if USE_STATE_INJECT {
-                    // Backprop through state_head: grad from char2 recurrent state.
+                self.delta_buf[..char_output].fill(0.0);
+                if INJECT_C || INJECT_H {
                     {
                         self.state_grad_buf.fill(0.0);
                         let mut offset = 0;
-                        for layer in &self.char2_model.layers {
+                        for layer in &mut self.char2_model.layers {
                             offset = layer.collect_bptt_grad(&mut self.state_grad_buf, offset);
                         }
                     }
@@ -399,6 +394,44 @@ impl HierarchicalSequential {
         self.last_char1_grad_signal = char1_grad_accum / targets.len() as f32;
     }
 
+    /// Average NLL per word-segment (chars between boundaries summed, then averaged over words).
+    fn compute_word_loss(&self, targets: &[u16]) -> f32 {
+        let last_layer = self.char2_model.layers.len() - 1;
+        let mut total = 0.0;
+        let mut word_count = 0;
+        let mut prev_end = 0;
+
+        for &bt in &self.boundary_timesteps {
+            let end = bt + 1;
+            let mut word_nll = 0.0;
+            for t in prev_end..end.min(targets.len()) {
+                let out = self.char2_model.cache[t][last_layer].output();
+                let probs = softmax(out);
+                word_nll -= (probs[targets[t] as usize] + 1e-12).ln();
+            }
+            total += word_nll;
+            word_count += 1;
+            prev_end = end;
+        }
+
+        // Remaining chars after the last boundary (partial word at sequence end)
+        if prev_end < targets.len() {
+            let mut word_nll = 0.0;
+            for t in prev_end..targets.len() {
+                let out = self.char2_model.cache[t][last_layer].output();
+                let probs = softmax(out);
+                word_nll -= (probs[targets[t] as usize] + 1e-12).ln();
+            }
+            total += word_nll;
+            word_count += 1;
+        }
+
+        if word_count == 0 {
+            return 0.0;
+        }
+        total / word_count as f32
+    }
+
     pub fn train<'a, I: Iterator<Item = (&'a [u16], &'a [u16])>>(
         &mut self,
         data: I,
@@ -412,18 +445,21 @@ impl HierarchicalSequential {
             self.forward_over(inputs);
 
             let loss = self.char2_model.seq_loss(targets);
+            let word_loss = self.compute_word_loss(targets);
+            self.last_word_loss = word_loss;
             tokens += inputs.len();
 
             self.backwards_sequence(targets);
             state.log_tokens(inputs.len());
             state.log_metric("delta_word", self.last_high_grad_signal);
             state.log_metric("delta_char1", self.last_char1_grad_signal);
+            state.log_metric("word_loss", word_loss);
 
             if let Some(lr) = state.step(loss) {
                 self.char_model.sgd_step(lr);
                 self.char2_model.sgd_step(lr);
                 self.word_model.sgd_step(lr);
-                if USE_STATE_INJECT {
+                if INJECT_C || INJECT_H {
                     self.state_head.apply_grads(lr);
                     self.state_head.clear_grads();
                 }
@@ -434,10 +470,12 @@ impl HierarchicalSequential {
                 let loss = state.get_loss();
                 let elapsed = time.elapsed();
                 println!(
-                    "{} | char loss {:.4} | ppl {:.4} | high ∇ {:.4} | char1 ∇ {:.4} | {} tok | {:.1?}",
+                    "{} | char loss {:.4} | ppl {:.4} | word loss {:.4} | word ppl {:.1} | high ∇ {:.4} | char1 ∇ {:.4} | {} tok | {:.1?}",
                     state.step,
                     loss,
                     loss.exp(),
+                    self.last_word_loss,
+                    self.last_word_loss.exp(),
                     self.last_high_grad_signal,
                     self.last_char1_grad_signal,
                     tokens,
@@ -512,7 +550,9 @@ impl HierarchicalSequential {
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
-                if USE_STATE_INJECT {
+                self.char2_input[..char_output].fill(0.0);
+
+                if INJECT_C || INJECT_H {
                     {
                         let c = &mut self.state_head_caches[0];
                         LinearLayer::forward(&self.state_head, &self.char2_input[char_output..], c);
@@ -598,7 +638,9 @@ impl HierarchicalSequential {
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
-                if USE_STATE_INJECT {
+                self.char2_input[..char_output].fill(0.0);
+
+                if INJECT_C || INJECT_H {
                     {
                         let c = &mut self.state_head_caches[0];
                         LinearLayer::forward(&self.state_head, &self.char2_input[char_output..], c);
@@ -732,6 +774,7 @@ impl HierarchicalSequential {
             d_high_ctx,
             last_high_grad_signal: 0.0,
             last_char1_grad_signal: 0.0,
+            last_word_loss: 0.0,
             step,
         })
     }

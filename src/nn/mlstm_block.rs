@@ -328,7 +328,7 @@ impl NnLayer for MLSTMBlock {
         self.cell.inject_state(buf, offset)
     }
 
-    fn collect_bptt_grad(&self, buf: &mut [f32], offset: usize) -> usize {
+    fn collect_bptt_grad(&mut self, buf: &mut [f32], offset: usize) -> usize {
         self.cell.collect_bptt_grad(buf, offset)
     }
 

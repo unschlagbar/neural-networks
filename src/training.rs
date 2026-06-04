@@ -9,10 +9,10 @@ use std::{
 use crate::{
     batches::PreparedDataSet,
     config::{
-        self, BATCH_SIZE, DATA_DIR, DATA_FILE, DECAY_STEPS, EPOCHS, LR, MAX_SEQ_LEN, MIN_LR,
-        MODEL_LOC, PRINT_EVERY, SAVE_EVERY, SEQ_LEN, SEQ_LOC, WARMUP_STEPS,
+        self, BATCH_SIZE, DATA_DIR, DATA_FILE, DECAY_STEPS, EPOCHS, LOG_EVERY, LR, MAX_SEQ_LEN,
+        MIN_LR, MODEL_LOC, SAVE_EVERY, SEQ_LEN, SEQ_LOC, WARMUP_STEPS,
     },
-    hierarchical::HierarchicalSequential,
+    hierarchical::Hierarchical,
     model::{build_hierarchical_model, build_normal_model},
     optimizers::Optimizer,
     sequential::Sequential,
@@ -49,7 +49,7 @@ pub fn train_normal() {
         prep_start.elapsed(),
     );
     println!(
-        "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, optimizer={:?}, log every {PRINT_EVERY} steps",
+        "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, optimizer={:?}, log every {LOG_EVERY} steps",
         Optimizer {}
     );
 
@@ -84,7 +84,7 @@ pub fn train_hierarchical() {
     let vocab = tokenizer.vocab_size();
     let word_boundary_ids = tokenizer.boundary_tokens();
 
-    let mut model = match HierarchicalSequential::load(MODEL_LOC) {
+    let mut model = match Hierarchical::load(MODEL_LOC) {
         Ok(m) => {
             println!("Loaded HM-RNN from '{MODEL_LOC}'.");
             m
@@ -108,12 +108,12 @@ pub fn train_hierarchical() {
         prep_start.elapsed(),
     );
     println!(
-        "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, optimizer={:?}, log every {PRINT_EVERY} steps",
+        "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, optimizer={:?}, log every {LOG_EVERY} steps",
         Optimizer {}
     );
 
     let mut training_state = TrainingState::from_step(model.step);
-    training_state.init_log(MODEL_LOC, &["delta_word", "delta_char1"]);
+    training_state.init_log(MODEL_LOC, &["delta_word", "delta_char1", "word_loss"]);
     let mut total_time = Duration::ZERO;
 
     for epoch in 1..=EPOCHS {
@@ -121,8 +121,21 @@ pub fn train_hierarchical() {
 
         //data.shuffle();
 
+        let resume_at = if epoch == 1 {
+            model.step % data.len()
+        } else {
+            0
+        };
+        if resume_at > 0 {
+            println!(
+                "  Resuming from window {resume_at} / {} (step {})",
+                data.len(),
+                model.step
+            );
+        }
+
         let start = Instant::now();
-        model.train(data.iter(), &mut training_state);
+        model.train(data.iter().skip(resume_at), &mut training_state);
 
         let epoch_time = start.elapsed();
         total_time += epoch_time;
@@ -170,7 +183,7 @@ impl TrainingState {
             loss: 0.0,
             loss_steps: 0,
             batch_size: BATCH_SIZE,
-            print_interval: PRINT_EVERY,
+            print_interval: LOG_EVERY,
             save_interval: SAVE_EVERY,
             log_writer: None,
             last_log: Instant::now(),

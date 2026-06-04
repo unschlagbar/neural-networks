@@ -258,6 +258,62 @@ impl Sequential {
         out
     }
 
+    /// Single inference step with a raw f32 input (no embedding lookup).
+    /// Requires `make_cache(1)` to have been called first.
+    pub fn forward_raw(&mut self, input: &[f32]) -> &[f32] {
+        let out_layer = self.layers.len() - 1;
+        let Sequential { layers, cache, .. } = self;
+        Self::forward_sample_step(layers, &mut cache[0], input);
+        self.cache[0][out_layer].output()
+    }
+
+    /// Forward pass over a sequence of raw f32 frames (training mode, dropout active).
+    /// Returns the scalar output of the last layer at the last timestep.
+    /// The cache is grown if it is too small; reset state before calling.
+    pub fn forward_raw_seq<F: AsRef<[f32]>>(&mut self, features: &[F]) -> f32 {
+        let n = features.len();
+        if self.cache.len() < n {
+            self.make_cache(n);
+        }
+        let out_layer = self.layers.len() - 1;
+        let Sequential { layers, cache, .. } = self;
+        for (t, frame) in features.iter().enumerate() {
+            Self::forward_step(layers, &mut cache[t], frame.as_ref());
+        }
+        self.cache[n - 1][out_layer].output()[0]
+    }
+
+    /// Backward for binary BCE classification with dense per-frame loss.
+    /// Intermediate frames use label=0; only the final frame uses the sequence label.
+    /// All frames contribute gradients (BPTT through the full sequence).
+    pub fn backwards_wake_bce(&mut self, n_frames: usize, label: f32, p: f32, pos_weight: f32) {
+        let n_neg = if label > 0.5 { n_frames - 1 } else { n_frames };
+        let w_neg = 1.0 / n_neg.max(1) as f32;
+        let w_final = if label > 0.5 { pos_weight } else { w_neg };
+        let n_layers = self.layers.len();
+        let last = n_layers - 1;
+        let Sequential { layers, cache, delta_buf, .. } = self;
+        for t in (0..n_frames).rev() {
+            delta_buf[0] = if t == n_frames - 1 {
+                w_final * (p - label)
+            } else {
+                let logit = cache[t][last].output()[0];
+                w_neg * crate::wake_word::mfcc::sigmoid(logit)
+            };
+            let mut delta_len = 1usize;
+            for l in (0..n_layers).rev() {
+                layers[l].backward(&mut delta_buf[..delta_len], cache[t][l].as_mut());
+                if l == 0 {
+                    break;
+                }
+                let dx = cache[t][l].input_grad();
+                let new_len = dx.len();
+                delta_buf[..new_len].copy_from_slice(dx);
+                delta_len = new_len;
+            }
+        }
+    }
+
     pub fn sgd_step(&mut self, lr: f32) {
         for layer in &mut self.layers {
             layer.apply_grads(lr);

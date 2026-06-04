@@ -92,7 +92,7 @@ pub trait NnLayer: Dyn {
     fn inject_state(&mut self, _buf: &[f32], offset: usize) -> usize { offset }
 
     /// Copy dh_bptt then dc_bptt into `buf[offset..]`; returns the new offset.
-    fn collect_bptt_grad(&self, _buf: &mut [f32], offset: usize) -> usize { offset }
+    fn collect_bptt_grad(&mut self, _buf: &mut [f32], offset: usize) -> usize { offset }
 }
 
 pub struct SequentialBuilder {
