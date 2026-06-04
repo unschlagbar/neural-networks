@@ -29,8 +29,8 @@ pub fn record_samples() {
         .expect("no input device available");
     let config = crate::wake_word::preferred_input_config(&device);
 
-    println!("input device: {}", device.name().unwrap_or_default());
-    println!("sample rate:  {} Hz", config.sample_rate().0);
+    println!("input device: {}", device.description().unwrap().name());
+    println!("sample rate:  {} Hz", config.sample_rate());
     println!("silence stop: {SILENCE_SECS}s  threshold: {VOICE_THRESHOLD}");
     println!();
     println!("commands: [p] positive  [n] negative  [q] quit");
@@ -51,7 +51,7 @@ pub fn record_samples() {
 }
 
 fn record_one(device: &cpal::Device, config: &cpal::SupportedStreamConfig, dir: &str) {
-    let sr = config.sample_rate().0 as usize;
+    let sr = config.sample_rate() as usize;
     let channels = config.channels() as usize;
 
     let vad_chunk = ((VAD_CHUNK_MS / 1000.0) * sr as f32) as usize;
@@ -140,7 +140,7 @@ fn record_one(device: &cpal::Device, config: &cpal::SupportedStreamConfig, dir: 
     }
 
     let final_samples = if sr != WAKE_SR {
-        resample(&trimmed, sr as u32, WAKE_SR as u32)
+        resample(&trimmed, sr, WAKE_SR)
     } else {
         trimmed
     };

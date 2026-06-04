@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -17,9 +17,7 @@ pub fn run_detector() {
     let mut model = match crate::sequential::Sequential::load(WAKE_MODEL_LOC) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("failed to load wake-word model from {WAKE_MODEL_LOC}: {e}");
-            eprintln!("train a model first with 'wt'");
-            std::process::exit(1);
+            panic!("failed to load wake-word model from {WAKE_MODEL_LOC}: {e}");
         }
     };
     model.make_cache(1);
@@ -32,26 +30,22 @@ pub fn run_detector() {
         .expect("no input device available");
     let config = crate::wake_word::preferred_input_config(&device);
 
-    let native_sr = config.sample_rate().0;
+    let native_sr = config.sample_rate() as usize;
     let channels = config.channels() as usize;
 
     // Frame sizes at native sample rate
-    let frame_len_native =
-        (WAKE_FRAME_LEN as f32 * native_sr as f32 / WAKE_SR as f32).round() as usize;
-    let frame_shift_native =
-        (WAKE_FRAME_SHIFT as f32 * native_sr as f32 / WAKE_SR as f32).round() as usize;
+    let frame_len_native = WAKE_FRAME_LEN * native_sr / WAKE_SR;
+    let frame_shift_native = WAKE_FRAME_SHIFT * native_sr / WAKE_SR;
 
-    let ring = Arc::new(Mutex::new(RingBuffer::new(native_sr as usize * 3)));
-    let ring_cb = ring.clone();
-    let ring_cb2 = ring.clone();
+    let (audio_sender, audio_receiver) = mpsc::sync_channel(native_sr as usize * 3);
 
     let stream: cpal::Stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device
             .build_input_stream(
-                &config.into(),
+                &config.config(),
                 move |data: &[f32], _| {
                     let mono = to_mono_f32(data, channels);
-                    ring_cb.lock().unwrap().push(&mono);
+                    audio_sender.send(mono).unwrap();
                 },
                 |e| eprintln!("stream error: {e}"),
                 None,
@@ -59,11 +53,11 @@ pub fn run_detector() {
             .expect("failed to build stream"),
         cpal::SampleFormat::I16 => device
             .build_input_stream(
-                &config.into(),
+                &config.config(),
                 move |data: &[i16], _| {
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
                     let mono = to_mono_f32(&f, channels);
-                    ring_cb2.lock().unwrap().push(&mono);
+                    audio_sender.send(mono).unwrap();
                 },
                 |e| eprintln!("stream error: {e}"),
                 None,
@@ -74,49 +68,45 @@ pub fn run_detector() {
 
     stream.play().expect("stream play failed");
 
+    // Local ring buffer fed from the channel: fixed allocation, O(1) push and indexed reads.
+    let mut ring = RingBuffer::new(native_sr as usize * 3);
+
     // Start from the current write position — don't process stale data.
-    let mut next_sample = ring.lock().unwrap().total_written();
+    let mut next_sample = 0;
 
     // Model state runs continuously; only reset on a positive detection.
     for layer in &mut model.layers {
         layer.reset_state();
     }
-    println!("listening for 'Jarvis'…  (Ctrl+C to stop)");
+    println!("listening for 'Jarvis'…");
 
-    let mut frame_buf = vec![0.0; WAKE_FRAME_LEN];
+    let mut frame_buf = [0.0; WAKE_FRAME_LEN];
     let mut last_trigger = Instant::now();
     const COOLDOWN: Duration = Duration::from_millis(1000);
 
     loop {
-        // Sleep approximately one MFCC frame shift (10 ms at 16 kHz).
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Drain the channel into the local ring buffer.
+        while let Ok(chunk) = audio_receiver.try_recv() {
+            ring.push(&chunk);
+        }
 
         // If too far behind (e.g. process was paused), skip ahead.
-        {
-            let head = ring.lock().unwrap().total_written();
-            let safe = head.saturating_sub(native_sr as usize * 2);
-            if next_sample < safe {
-                next_sample = safe;
-            }
+        let head = ring.total_written();
+        let safe = head.saturating_sub(native_sr as usize * 2);
+        if next_sample < safe {
+            next_sample = safe;
         }
 
         // Drain all fully-available frames in one burst.
-        loop {
-            let maybe_frame = {
-                let rb = ring.lock().unwrap();
-                rb.get_range(next_sample, frame_len_native)
-            };
-
-            let frame_native = match maybe_frame {
-                Some(f) => f,
-                None => break,
-            };
-
+        while let Some(frame) = ring.get_range(next_sample, frame_len_native) {
             // Resample to WAKE_SR if device couldn't do 16 kHz natively.
-            let frame_ws = if native_sr != WAKE_SR as u32 {
-                resample(&frame_native, native_sr, WAKE_SR as u32)
+            let frame_ws = if native_sr != WAKE_SR {
+                print!("resampling from {native_sr} Hz… ");
+                resample(&frame, native_sr, WAKE_SR)
             } else {
-                frame_native
+                frame
             };
 
             // Copy into fixed-size buffer (trim or zero-pad to WAKE_FRAME_LEN).

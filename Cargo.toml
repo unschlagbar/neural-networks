@@ -18,5 +18,5 @@ criterion = "0.8.2"
 [dependencies]
 iron_oxide = { path = "../iron_oxide", default-features = false }
 rand = "0.10.0"
-cpal = "0.15"
+cpal = "0.17.3"
 hound = "3"

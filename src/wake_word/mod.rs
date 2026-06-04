@@ -10,7 +10,7 @@ use cpal::traits::DeviceTrait;
 /// Try to open an input config at exactly WAKE_SR (16 kHz).
 /// Falls back to the device default if 16 kHz is not supported.
 pub(crate) fn preferred_input_config(device: &cpal::Device) -> cpal::SupportedStreamConfig {
-    let target = cpal::SampleRate(crate::config::WAKE_SR as u32);
+    let target = crate::config::WAKE_SR as u32;
     if let Ok(configs) = device.supported_input_configs() {
         for range in configs {
             let fmt = range.sample_format();

@@ -160,17 +160,16 @@ fn bit_reverse(mut x: usize, bits: usize) -> usize {
 // ── Linear resampler ─────────────────────────────────────────────────────────
 
 /// Resample `samples` from `from_sr` to `to_sr` using linear interpolation.
-pub fn resample(samples: &[f32], from_sr: u32, to_sr: u32) -> Vec<f32> {
-    if from_sr == to_sr {
-        return samples.to_vec();
-    }
-    let ratio = from_sr as f64 / to_sr as f64;
-    let out_len = (samples.len() as f64 / ratio) as usize;
+pub fn resample(samples: &[f32], from_sr: usize, to_sr: usize) -> Vec<f32> {
+    debug_assert_ne!(from_sr, to_sr, "cannot resample to same sample rate");
+
+    let ratio = from_sr as f32 / to_sr as f32;
+    let out_len = (samples.len() as f32 / ratio) as usize;
     (0..out_len)
         .map(|i| {
-            let pos = i as f64 * ratio;
+            let pos = i as f32 * ratio;
             let idx = pos as usize;
-            let frac = (pos - idx as f64) as f32;
+            let frac = pos - idx as f32;
             let a = samples[idx];
             let b = samples.get(idx + 1).copied().unwrap_or(a);
             a + frac * (b - a)

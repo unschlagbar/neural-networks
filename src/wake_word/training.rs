@@ -273,7 +273,7 @@ fn load_wav(path: &str) -> Option<Vec<f32>> {
     };
 
     if spec.sample_rate != WAKE_SR as u32 {
-        Some(resample(&mono, spec.sample_rate, WAKE_SR as u32))
+        Some(resample(&mono, spec.sample_rate as usize, WAKE_SR))
     } else {
         Some(mono)
     }
