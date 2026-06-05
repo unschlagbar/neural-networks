@@ -15,7 +15,7 @@ use crate::{
 
 const SILENCE_SECS: f32 = 0.75;
 const MAX_RECORD_SECS: f32 = 10.0;
-const VOICE_THRESHOLD: f32 = 0.025; // RMS energy; raise if mic is loud
+const VOICE_THRESHOLD: f32 = 0.02; // RMS energy; raise if mic is loud
 const VAD_CHUNK_MS: f32 = 20.0; // VAD frame size in ms
 const TAIL_SECS: f32 = 0.30; // keep 50ms after last speech frame
 

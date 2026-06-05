@@ -5,7 +5,7 @@ use rand::random_range;
 use crate::{
     config::{
         WAKE_DATA_NEG, WAKE_DATA_POS, WAKE_EPOCHS, WAKE_FRAME_LEN, WAKE_FRAME_SHIFT, WAKE_LR,
-        WAKE_MODEL_LOC, WAKE_POS_WEIGHT, WAKE_SR,
+        WAKE_MODEL_LOC, WAKE_SR,
     },
     wake_word::{
         mfcc::{MelExtractor, resample, sigmoid},
@@ -15,11 +15,21 @@ use crate::{
 
 const AUG_PER_POS: usize = 4;
 const PREFIX_MIN_S: f32 = 0.3;
-const PREFIX_MAX_S: f32 = 15.0;
+const PREFIX_MAX_S: f32 = 25.0;
 
-struct Sequence {
-    features: Vec<Vec<f32>>,
-    label: f32,
+pub struct Frame {
+    pub features: Vec<f32>,
+    pub label: f32,
+}
+
+impl AsRef<[f32]> for Frame {
+    fn as_ref(&self) -> &[f32] {
+        &self.features
+    }
+}
+
+pub struct Sequence {
+    pub frames: Vec<Frame>,
 }
 
 pub fn train_wake() {
@@ -35,8 +45,8 @@ pub fn train_wake() {
         return;
     }
 
-    // Pre-allocate cache large enough for the longest possible sequence.
-    // Sequences are: [neg prefix 0.3–2s] + [positive word].
+    // Pre-allocate cache large enough for the longest possible sequence:
+    // up to PREFIX_MAX_S of neg audio (split into prefix + suffix) plus the positive clip.
     let max_pos_samples = pos_raw.iter().map(|a| a.len()).max().unwrap_or(0);
     let max_seq_samples =
         (PREFIX_MAX_S * WAKE_SR as f32) as usize + max_pos_samples + WAKE_FRAME_LEN;
@@ -74,10 +84,10 @@ pub fn train_wake() {
         for s in &seqs {
             // State carries from the previous sequence — no reset here.
             // Grow cache if a sequence is somehow longer than pre-allocated.
-            if model.cache.len() < s.features.len() {
+            if model.cache.len() < s.frames.len() {
                 panic!(
                     "sequence with {} frames exceeds model cache of {} frames",
-                    s.features.len(),
+                    s.frames.len(),
                     model.cache.len()
                 );
             }
@@ -85,45 +95,46 @@ pub fn train_wake() {
             // Full forward pass through all frames (neg prefix + word).
             // BPTT will flow back through every frame so the model learns
             // "Jarvis" as a multi-frame temporal pattern (~20-30 frames).
-            let logit = model.forward_raw_seq(&s.features);
-            let p = sigmoid(logit);
+            model.forward_raw_seq(&s.frames);
 
-            let n_frames = s.features.len();
-            let last_layer = model.layers.len() - 1;
-            let n_neg = if s.label > 0.5 {
-                n_frames - 1
-            } else {
-                n_frames
-            };
-            let w_neg = 1.0 / n_neg.max(1) as f32;
-            let w_final = if s.label > 0.5 {
-                WAKE_POS_WEIGHT
-            } else {
-                w_neg
-            };
+            let n_frames = s.frames.len();
+
+            let mut num_neg = 0;
+            let mut num_pos = 0;
+
+            s.frames.iter().for_each(|f| {
+                if f.label == 0.0 {
+                    num_neg += 1
+                } else {
+                    num_pos += 1
+                }
+            });
+
+            let weight_neg = 1.0 / num_neg as f32;
+            let weight_pos = 1.0 / num_pos as f32;
 
             for t in 0..n_frames {
-                let (p_t, label_t, w_t) = if t == n_frames - 1 {
-                    (p, s.label, w_final)
-                } else {
-                    (sigmoid(model.cache[t][last_layer].output()[0]), 0.0, w_neg)
-                };
+                let p = sigmoid(model.output(t)[0]);
+                let label = s.frames[t].label;
+                let weight = if label > 0.5 { weight_pos } else { weight_neg };
+
                 total_loss -=
-                    w_t * (label_t * (p_t + 1e-9).ln() + (1.0 - label_t) * (1.0 - p_t + 1e-9).ln());
-                if (p_t > 0.5) == (label_t > 0.5) {
+                    weight * (label * (p + 1e-9).ln() + (1.0 - label) * (1.0 - p + 1e-9).ln());
+
+                if (p > 0.5) == (label > 0.5) {
                     correct += 1;
                 }
                 total_frames += 1;
             }
 
-            // BPTT through the full sequence; loss gradient only at the last frame
-            // (end of Jarvis for positives, end of background for negatives).
-            model.backwards_wake_bce(s.features.len(), s.label, p, WAKE_POS_WEIGHT);
+            model.backwards_wake_bce(s, weight_pos, weight_neg);
+
             for layer in &mut model.layers {
                 layer.accumulate_init_grad();
                 layer.reset_bptt_state();
                 layer.reset_state();
             }
+
             model.sgd_step(lr);
         }
 
@@ -151,22 +162,26 @@ fn build_sequences(
     extractor: &MelExtractor,
 ) -> Vec<Sequence> {
     let mut out = Vec::new();
-
-    // Each positive gets a matching negative of the SAME total length so the
-    // model cannot use sequence length as a discriminant.
     for pos in pos_raw {
         for _ in 0..AUG_PER_POS {
-            let prefix_len = random_prefix_len();
-            let mut pos_audio = build_prefix(neg_raw, prefix_len);
-            pos_audio.extend_from_slice(pos);
-            augment(&mut pos_audio);
+            let total_neg = random_prefix_len();
+            let prefix_len = random_range(0..=total_neg);
+            let suffix_len = total_neg - prefix_len;
+
+            let mut audio = build_prefix(neg_raw, prefix_len);
+            audio.extend_from_slice(pos);
+            let pos_end = audio.len();
+            audio.extend(build_prefix(neg_raw, suffix_len));
+
+            if random_range(0..4) != 0 {
+                augment(&mut audio);
+            }
+
             out.push(Sequence {
-                features: extract_seq(extractor, &pos_audio),
-                label: 1.0,
+                frames: extract_seq(extractor, &audio, pos_end),
             });
         }
     }
-
     out
 }
 
@@ -203,16 +218,21 @@ fn build_prefix(neg_raw: &[Vec<f32>], target_len: usize) -> Vec<f32> {
     out
 }
 
-fn extract_seq(extractor: &MelExtractor, audio: &[f32]) -> Vec<Vec<f32>> {
+fn extract_seq(extractor: &MelExtractor, audio: &[f32], pos_end: usize) -> Vec<Frame> {
     let n = 1 + (audio.len().saturating_sub(WAKE_FRAME_LEN)) / WAKE_FRAME_SHIFT;
-    let mut buf = vec![0.0; WAKE_FRAME_LEN];
+    let pos_trigger = pos_end.saturating_sub(1) / WAKE_FRAME_SHIFT;
+    let mut buf = [0.0; WAKE_FRAME_LEN];
     (0..n)
         .map(|i| {
             let start = i * WAKE_FRAME_SHIFT;
             let end = (start + WAKE_FRAME_LEN).min(audio.len());
             buf.fill(0.0);
             buf[..end - start].copy_from_slice(&audio[start..end]);
-            extractor.extract_frame(&buf)
+            let features = extractor.extract_frame(&buf);
+            Frame {
+                features,
+                label: if i == pos_trigger { 1.0 } else { 0.0 },
+            }
         })
         .collect()
 }

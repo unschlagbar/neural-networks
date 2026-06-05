@@ -5,9 +5,13 @@ use rand::random_range;
 
 use crate::{
     config::SEQ_LOC,
-    nn::softmax::{softmax, softmax_inplace},
+    nn::{
+        lstm::sigmoid,
+        softmax::{softmax, softmax_inplace},
+    },
     nn_layer::{DynCache, NnLayer},
     training::TrainingState,
+    wake_word::training::Sequence,
 };
 
 pub struct Sequential {
@@ -270,37 +274,39 @@ impl Sequential {
     /// Forward pass over a sequence of raw f32 frames (training mode, dropout active).
     /// Returns the scalar output of the last layer at the last timestep.
     /// The cache is grown if it is too small; reset state before calling.
-    pub fn forward_raw_seq<F: AsRef<[f32]>>(&mut self, features: &[F]) -> f32 {
+    pub fn forward_raw_seq<F: AsRef<[f32]>>(&mut self, features: &[F]) {
         let n = features.len();
         if self.cache.len() < n {
             self.make_cache(n);
         }
-        let out_layer = self.layers.len() - 1;
         let Sequential { layers, cache, .. } = self;
         for (t, frame) in features.iter().enumerate() {
             Self::forward_step(layers, &mut cache[t], frame.as_ref());
         }
-        self.cache[n - 1][out_layer].output()[0]
     }
 
     /// Backward for binary BCE classification with dense per-frame loss.
     /// Intermediate frames use label=0; only the final frame uses the sequence label.
     /// All frames contribute gradients (BPTT through the full sequence).
-    pub fn backwards_wake_bce(&mut self, n_frames: usize, label: f32, p: f32, pos_weight: f32) {
-        let n_neg = if label > 0.5 { n_frames - 1 } else { n_frames };
-        let w_neg = 1.0 / n_neg.max(1) as f32;
-        let w_final = if label > 0.5 { pos_weight } else { w_neg };
+    pub fn backwards_wake_bce(&mut self, seq: &Sequence, weight_pos: f32, weight_neg: f32) {
+        let n_frames = seq.frames.len();
         let n_layers = self.layers.len();
         let last = n_layers - 1;
-        let Sequential { layers, cache, delta_buf, .. } = self;
+
+        let Sequential {
+            layers,
+            cache,
+            delta_buf,
+            ..
+        } = self;
         for t in (0..n_frames).rev() {
-            delta_buf[0] = if t == n_frames - 1 {
-                w_final * (p - label)
-            } else {
-                let logit = cache[t][last].output()[0];
-                w_neg * crate::wake_word::mfcc::sigmoid(logit)
-            };
-            let mut delta_len = 1usize;
+            let label = seq.frames[t].label;
+            let weight = if label > 0.5 { weight_pos } else { weight_neg };
+
+            let logit = cache[t][last].output()[0];
+            delta_buf[0] = weight * (sigmoid(logit) - label);
+
+            let mut delta_len = 1;
             for l in (0..n_layers).rev() {
                 layers[l].backward(&mut delta_buf[..delta_len], cache[t][l].as_mut());
                 if l == 0 {
@@ -336,5 +342,10 @@ impl Sequential {
             l -= p.ln();
         }
         l / targets.len() as f32
+    }
+
+    pub fn output(&self, t: usize) -> &[f32] {
+        let last_layer = self.layers.len() - 1;
+        self.cache[t][last_layer].output()
     }
 }
