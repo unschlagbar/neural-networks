@@ -2,7 +2,7 @@ use std::{
     fs,
     io::{self, BufRead, Write},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 
@@ -86,13 +86,26 @@ fn record_one(device: &cpal::Device, config: &cpal::SupportedStreamConfig, dir: 
     };
 
     stream.play().expect("stream play failed");
-    println!("ready — speak now…");
+    println!("ready — speak now… (Enter = stop immediately)");
+
+    let (tx, rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        io::stdin().lock().read_line(&mut buf).ok();
+        tx.send(()).ok();
+    });
 
     let mut processed = 0;
     let mut speech_started = false;
     let mut silence_accum = 0;
+    let mut enter_stopped = false;
 
     'vad: loop {
+        if rx.try_recv().is_ok() {
+            enter_stopped = true;
+            break 'vad;
+        }
+
         std::thread::sleep(Duration::from_millis(10));
         let current_len = buffer.lock().unwrap().len();
 
@@ -124,7 +137,7 @@ fn record_one(device: &cpal::Device, config: &cpal::SupportedStreamConfig, dir: 
 
     drop(stream);
 
-    if !speech_started {
+    if !enter_stopped && !speech_started {
         println!("no speech detected — discarding");
         return;
     }
@@ -177,7 +190,7 @@ fn rms_energy(samples: &[f32]) -> f32 {
 /// Keep audio up to (last voiced frame + TAIL_SECS), discard everything after.
 fn trim_trailing_silence(samples: &[f32], chunk: usize, sr: usize) -> Vec<f32> {
     let tail = (TAIL_SECS * sr as f32) as usize;
-    let mut last_speech_end = 0usize;
+    let mut last_speech_end = 0;
 
     let mut i = 0;
     while i + chunk <= samples.len() {

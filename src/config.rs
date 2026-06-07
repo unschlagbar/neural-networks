@@ -1,6 +1,6 @@
 // Model-path
 
-pub const MODEL_LOC: &str = "models/no_feed_inject_c";
+pub const MODEL_LOC: &str = "models/word_large";
 pub const SEQ_LOC: &str = "models/seq";
 
 // Sequenz-Len
@@ -23,7 +23,7 @@ pub const LOG_EVERY: usize = 10;
 // Sampling
 
 pub const MAX_LEN: usize = 2000;
-pub const TEMPERATURE: f32 = 0.1;
+pub const TEMPERATURE: f32 = 0.5;
 pub const TOP_P: f32 = 1.;
 
 // Modell-Dimensions
