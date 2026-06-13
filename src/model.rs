@@ -30,19 +30,16 @@ pub fn build_hierarchical_model(vocab: usize, boundary_token_ids: Vec<u16>) -> H
     let dqk: usize = WORD_HIDDEN / heads / 2;
 
     let mut high_model = SequentialBuilder::new(CHAR_HIDDEN).linear(WORD_HIDDEN);
-    for _ in 0..1 {
-        high_model = high_model.mlstm_block(heads, dqk)
-    }
-    high_model = high_model.slstm_block(WORD_HIDDEN);
-
-    for _ in 0..4 {
+    for _ in 0..0 {
         high_model = high_model.mlstm_block(heads, dqk)
     }
     let high_model = high_model.rms_norm().build();
 
-    let char2_model = SequentialBuilder::new(WORD_HIDDEN + CHAR_HIDDEN)
+    let char2_model = SequentialBuilder::new(WORD_HIDDEN + vocab)
         .linear(OUT_HIDDEN)
         .slstm_block(OUT_HIDDEN)
+        .slstm_block(OUT_HIDDEN)
+        .linear(OUT_HIDDEN)
         .rms_norm()
         .linear_no_bias(vocab)
         .build();

@@ -29,6 +29,7 @@ The binary reads one line from stdin to select its mode:
 | `h` | `train_hierarchical` — trains the three-part hierarchical model |
 | `s` | `sample_normal` — interactive sampling from the flat model |
 | `hs` | `sample_hierarchical` — interactive sampling from the hierarchical model |
+| `i` | `inspect_model` — prompts for a model name, looks it up in `models/` and prints all layers with their settings |
 
 ## Style 
 

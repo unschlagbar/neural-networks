@@ -1,6 +1,7 @@
 pub mod batches;
 pub mod config;
 pub mod hierarchical;
+pub mod inspect;
 pub mod loading;
 pub mod model;
 pub mod nn;
@@ -34,13 +35,14 @@ pub fn run() {
         "h" => training::train_hierarchical(),
         "s" => sampling::sample_normal(),
         "hs" => sampling::sample_hierarchical(),
+        "i" => inspect::inspect_model(),
         "wr" => wake_word::record::record_samples(),
         "wt" => wake_word::training::train_wake(),
         "w" => wake_word::detector::run_detector(),
         other => {
             eprintln!(
                 "Unknown mode {other:?}. Modes: '' train_normal | 'h' train_hierarchical | \
-                 's' sample_normal | 'hs' sample_hierarchical | \
+                 's' sample_normal | 'hs' sample_hierarchical | 'i' inspect model | \
                  'wr' record wake-word samples | 'wt' train wake-word | 'w' run detector",
             );
             std::process::exit(2);

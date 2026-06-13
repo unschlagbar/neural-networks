@@ -10,6 +10,7 @@ pub fn build_wake_model() -> Sequential {
     SequentialBuilder::new(WAKE_INPUT_DIM)
         .silu_dense(128)
         .slstm(WAKE_HIDDEN)
+        .rms_norm()
         .slstm(WAKE_HIDDEN)
         .rms_norm()
         .linear_no_bias(1)

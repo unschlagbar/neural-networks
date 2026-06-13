@@ -200,7 +200,7 @@
     letter-spacing: .06em;
     white-space: nowrap;
   }
-  #offset-input {
+  .offset-wrap input[type=number] {
     -webkit-appearance: none;
     appearance: none;
     background: #18181e;
@@ -214,7 +214,7 @@
     border-radius: 5px;
     outline: none;
   }
-  #offset-input:focus { border-color: #c8a96e; }
+  .offset-wrap input[type=number]:focus { border-color: #c8a96e; }
 </style>
 </head>
 <body>
@@ -231,6 +231,10 @@
   <div class="offset-wrap">
     <label for="offset-input">Start</label>
     <input type="number" id="offset-input" min="0" step="100" value="0">
+  </div>
+  <div class="offset-wrap">
+    <label for="end-input">End</label>
+    <input type="number" id="end-input" min="0" step="100" placeholder="max">
   </div>
   <span id="status">drop a CSV anywhere or click open</span>
   <input type="file" id="file-input" accept=".csv" multiple>
@@ -282,9 +286,10 @@ let lossChart, wlChart, dwChart, dcChart, lrChart;
 
 let convWindow = 1;
 let startOffset = 0;
+let endOffset = Infinity;
 
 function smooth(rows, key) {
-  const filtered = rows.filter(r => +r.step >= startOffset);
+  const filtered = rows.filter(r => +r.step >= startOffset && +r.step <= endOffset);
   if (convWindow <= 1) return filtered.map(r => ({ x: +r.step, y: +r[key] }));
   // causal box filter: each point averages only its own past [i-W+1, i]
   return filtered.map((r, i) => {
@@ -337,7 +342,7 @@ const gradientPlugin = {
 };
 
 const chartCfg = (label, key, datasets) => {
-  const allSteps = datasets.flatMap(d => d.rows.filter(r => +r.step >= startOffset).map(r => +r.step)).filter(v => !isNaN(v));
+  const allSteps = datasets.flatMap(d => d.rows.filter(r => +r.step >= startOffset && +r.step <= endOffset).map(r => +r.step)).filter(v => !isNaN(v));
   const minStep  = allSteps.length ? Math.min(...allSteps) : undefined;
   return ({
   type: 'line',
@@ -518,6 +523,12 @@ document.getElementById('smooth-slider').oninput = e => {
 
 document.getElementById('offset-input').oninput = e => {
   startOffset = Math.max(0, +e.target.value || 0);
+  if (registry.size) buildCharts(getDatasets());
+};
+
+document.getElementById('end-input').oninput = e => {
+  const v = e.target.value.trim();
+  endOffset = v === '' ? Infinity : Math.max(0, +v || 0);
   if (registry.size) buildCharts(getDatasets());
 };
 

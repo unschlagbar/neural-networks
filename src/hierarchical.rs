@@ -75,12 +75,12 @@ impl Hierarchical {
         );
         assert_eq!(
             char2_model.input_size,
-            word_model.output_size + char_model.output_size,
-            "char2_model.input_size must equal word_model.output_size + char_model.output_size"
+            word_model.output_size + vocab_size,
+            "char2_model.input_size must equal word_model.output_size + vocab_size"
         );
 
         let char_input = vec![0.0; vocab_size].into();
-        let char2_input = vec![0.0; char_model.output_size + context_size].into();
+        let char2_input = vec![0.0; vocab_size + context_size].into();
 
         let buf_size = vocab_size
             .max(char2_model.input_size)
@@ -170,7 +170,7 @@ impl Hierarchical {
 
     pub fn forward_over(&mut self, input: &[u16]) {
         self.char2_input.fill(0.0);
-        let char_output = self.char_model.output_size;
+        let vocab_size = self.vocab_size;
 
         for t in 0..input.len() {
             let token = input[t];
@@ -182,20 +182,21 @@ impl Hierarchical {
                 &self.char_input,
             );
             self.char_input[token as usize] = 0.0;
-            {
-                let char1_out = self.char_model.cache[t].last().unwrap().output();
-                self.char2_input[..char_output].copy_from_slice(char1_out);
-            }
+
+            self.char2_input[token as usize] = 1.0;
 
             if self.boundary_token_ids.contains(&token) {
                 self.boundary_timesteps.push(t);
                 let word_idx = self.boundary_timesteps.len() - 1;
 
-                Self::forward_step(
-                    &mut self.word_model.layers,
-                    &mut self.word_model.cache[word_idx],
-                    &self.char2_input[..char_output],
-                );
+                {
+                    let char1_out = self.char_model.cache[t].last().unwrap().output();
+                    Self::forward_step(
+                        &mut self.word_model.layers,
+                        &mut self.word_model.cache[word_idx],
+                        char1_out,
+                    );
+                }
 
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
@@ -204,17 +205,17 @@ impl Hierarchical {
                 {
                     let high_out = self.word_model.cache[word_idx].last().unwrap().output();
                     self.assert_no_nan(high_out, "high_output", word_idx);
-                    self.char2_input[char_output..].copy_from_slice(high_out);
-                    self.char2_input[..char_output].fill(0.0);
+                    self.char2_input[vocab_size..].copy_from_slice(high_out);
+                    self.char2_input[..vocab_size].fill(0.0);
                 }
 
                 if INJECT_C || INJECT_H {
                     {
                         let c = &mut self.state_head_caches[word_idx];
-                        LinearLayer::forward(&self.state_head, &self.char2_input[char_output..], c);
+                        LinearLayer::forward(&self.state_head, &self.char2_input[vocab_size..], c);
                     }
                     if STOP_WORD_DIRECT_FEED {
-                        self.char2_input[char_output..].fill(0.0);
+                        self.char2_input[vocab_size..].fill(0.0);
                     }
                     {
                         let predicted = self.state_head_caches[word_idx].output();
@@ -228,7 +229,7 @@ impl Hierarchical {
                     }
                 } else {
                     if STOP_WORD_DIRECT_FEED {
-                        self.char2_input[char_output..].fill(0.0);
+                        self.char2_input[vocab_size..].fill(0.0);
                     }
                     for layer in &mut self.char2_model.layers {
                         layer.reset_state();
@@ -241,6 +242,7 @@ impl Hierarchical {
                 &mut self.char2_model.cache[t],
                 &self.char2_input,
             );
+            self.char2_input[token as usize] = 0.0;
             self.assert_no_nan(
                 self.char2_model.cache[t].last().unwrap().output(),
                 "char2_output",
@@ -296,20 +298,16 @@ impl Hierarchical {
                     layer.accumulate_init_grad();
                     layer.reset_bptt_state();
                 }
-                //for layer in &mut self.char2_model.layers {
-                //    layer.accumulate_init_grad();
-                //    layer.reset_bptt_state();
-                //}
             }
 
             {
                 let dx2 = self.char2_model.cache[t][0].input_grad();
                 if !STOP_WORD_DIRECT_FEED {
                     for i in 0..context_size {
-                        self.d_high_ctx[i] += dx2[char_output + i];
+                        self.d_high_ctx[i] += dx2[self.vocab_size + i];
                     }
                 }
-                self.delta_buf[..char_output].copy_from_slice(&dx2[..char_output]);
+                self.delta_buf[..char_output].fill(0.0);
             }
 
             if let Some(bi) = boundary {
@@ -336,6 +334,14 @@ impl Hierarchical {
                         for i in 0..context_size {
                             self.d_high_ctx[i] += dx[i];
                         }
+                    }
+                } else {
+                    // char2 was reset from h_init/c_init at this boundary in
+                    // forward — the BPTT grads belong to the learnable initial
+                    // states. (In the inject branch, collect_bptt_grad already
+                    // routes the non-injected halves there.)
+                    for layer in &mut self.char2_model.layers {
+                        layer.accumulate_init_grad();
                     }
                 }
                 // Sever BPTT across this boundary.
@@ -507,7 +513,7 @@ impl Hierarchical {
         self.reset();
         self.char2_input.fill(0.0);
 
-        let char_output = self.char_model.output_size;
+        let vocab_size = self.vocab_size;
 
         let mut last_token = if prefix.is_empty() {
             rand::random_range(0..self.vocab_size) as u16
@@ -528,12 +534,9 @@ impl Hierarchical {
                 &self.char_input,
             );
             self.char_input[last_token as usize] = 0.0;
-            {
-                let char1_out = self.char_model.cache[0].last().unwrap().output();
-                self.char2_input[..char_output].copy_from_slice(char1_out);
-            }
 
-            // ── 2. boundary: word_model with char1_out only, then reset ───────
+            self.char2_input[last_token as usize] = 1.0;
+
             if self.boundary_token_ids.contains(&last_token) {
                 {
                     let char1_out = self.char_model.cache[0].last().unwrap().output();
@@ -545,20 +548,20 @@ impl Hierarchical {
                 }
                 {
                     let high_out = self.word_model.cache[0].last().unwrap().output();
-                    self.char2_input[char_output..].copy_from_slice(high_out);
+                    self.char2_input[vocab_size..].copy_from_slice(high_out);
                 }
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
-                self.char2_input[..char_output].fill(0.0);
+                self.char2_input[..vocab_size].fill(0.0);
 
                 if INJECT_C || INJECT_H {
                     {
                         let c = &mut self.state_head_caches[0];
-                        LinearLayer::forward(&self.state_head, &self.char2_input[char_output..], c);
+                        LinearLayer::forward(&self.state_head, &self.char2_input[vocab_size..], c);
                     }
                     if STOP_WORD_DIRECT_FEED {
-                        self.char2_input[char_output..].fill(0.0);
+                        self.char2_input[vocab_size..].fill(0.0);
                     }
                     {
                         let predicted = self.state_head_caches[0].output();
@@ -572,7 +575,7 @@ impl Hierarchical {
                     }
                 } else {
                     if STOP_WORD_DIRECT_FEED {
-                        self.char2_input[char_output..].fill(0.0);
+                        self.char2_input[vocab_size..].fill(0.0);
                     }
                     for layer in &mut self.char2_model.layers {
                         layer.reset_state();
@@ -585,6 +588,7 @@ impl Hierarchical {
                 &mut self.char2_model.cache[0],
                 &self.char2_input,
             );
+            self.char2_input[last_token as usize] = 0.0;
 
             let next_token = {
                 let logits = self.char2_model.cache[0].last().unwrap().output();
@@ -604,7 +608,7 @@ impl Hierarchical {
     }
 
     fn forward_sample_prefix(&mut self, prefix: &[u16]) {
-        let char_output = self.char_model.output_size;
+        let vocab_size = self.vocab_size;
         self.char2_input.fill(0.0);
 
         for t in 0..prefix.len() {
@@ -617,10 +621,8 @@ impl Hierarchical {
                 &self.char_input,
             );
             self.char_input[token as usize] = 0.0;
-            {
-                let char1_out = self.char_model.cache[0].last().unwrap().output();
-                self.char2_input[..char_output].copy_from_slice(char1_out);
-            }
+
+            self.char2_input[token as usize] = 1.0;
 
             if self.boundary_token_ids.contains(&token) {
                 {
@@ -633,20 +635,20 @@ impl Hierarchical {
                 }
                 {
                     let high_out = self.word_model.cache[0].last().unwrap().output();
-                    self.char2_input[char_output..].copy_from_slice(high_out);
+                    self.char2_input[vocab_size..].copy_from_slice(high_out);
                 }
                 for layer in &mut self.char_model.layers {
                     layer.reset_state();
                 }
-                self.char2_input[..char_output].fill(0.0);
+                self.char2_input[..vocab_size].fill(0.0);
 
                 if INJECT_C || INJECT_H {
                     {
                         let c = &mut self.state_head_caches[0];
-                        LinearLayer::forward(&self.state_head, &self.char2_input[char_output..], c);
+                        LinearLayer::forward(&self.state_head, &self.char2_input[vocab_size..], c);
                     }
                     if STOP_WORD_DIRECT_FEED {
-                        self.char2_input[char_output..].fill(0.0);
+                        self.char2_input[vocab_size..].fill(0.0);
                     }
                     {
                         let predicted = self.state_head_caches[0].output();
@@ -660,7 +662,7 @@ impl Hierarchical {
                     }
                 } else {
                     if STOP_WORD_DIRECT_FEED {
-                        self.char2_input[char_output..].fill(0.0);
+                        self.char2_input[vocab_size..].fill(0.0);
                     }
                     for layer in &mut self.char2_model.layers {
                         layer.reset_state();
@@ -673,6 +675,7 @@ impl Hierarchical {
                 &mut self.char2_model.cache[0],
                 &self.char2_input,
             );
+            self.char2_input[token as usize] = 0.0;
         }
     }
 
@@ -745,7 +748,7 @@ impl Hierarchical {
         let state_grad_buf = vec![0.0; char2_state_size].into();
 
         let char_input_buf = vec![0.0; vocab_size].into();
-        let char2_input = vec![0.0; char_model.output_size + context_size].into();
+        let char2_input = vec![0.0; vocab_size + context_size].into();
 
         let buf_size = vocab_size
             .max(char2_model.input_size)
