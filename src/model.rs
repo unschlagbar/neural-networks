@@ -40,7 +40,6 @@ pub fn build_hierarchical_model(
         .slstm_block(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
         .linear(CHAR_HIDDEN)
-        .rms_norm()
         .build();
 
     let heads: usize = 8;
@@ -50,9 +49,9 @@ pub fn build_hierarchical_model(
     for _ in 0..WORD_BLOCKS {
         word_model = word_model.mlstm_block(heads, dqk)
     }
-    let word_model = word_model.linear(WORD_HIDDEN).rms_norm().build();
+    let word_model = word_model.linear(OUT_HIDDEN).build();
 
-    let char2_builder = SequentialBuilder::new(WORD_HIDDEN + vocab);
+    let char2_builder = SequentialBuilder::new(OUT_HIDDEN + vocab);
     let char2_model = char2_builder
         .linear(OUT_HIDDEN)
         .slstm_block(OUT_HIDDEN)

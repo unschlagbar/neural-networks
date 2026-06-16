@@ -1,6 +1,6 @@
 // Model-path
 
-pub const MODEL_LOC: &str = "models/my_take_large";
+pub const MODEL_LOC: &str = "models/main_igh_lr";
 pub const SEQ_LOC: &str = "models/seq";
 
 // Sequenz-Len
@@ -14,9 +14,9 @@ pub const MIN_WORDS_PER_SEQ: usize = 8; // keep a trailing window only if >= thi
 
 // Training-Schedule
 
-pub const LR: f32 = 1e-4;
+pub const LR: f32 = 2e-4;
 pub const MIN_LR: f32 = 2e-5;
-pub const WARMUP_STEPS: usize = 5000;
+pub const WARMUP_STEPS: usize = 500;
 pub const DECAY_STEPS: usize = 50_000;
 pub const BATCH_SIZE: usize = 1;
 pub const EPOCHS: usize = 2;
@@ -32,12 +32,12 @@ pub const TOP_P: f32 = 1.;
 
 // Modell-Dimensions
 
-pub const CHAR_HIDDEN: usize = 96;
-pub const OUT_HIDDEN: usize = 96;
-pub const WORD_HIDDEN: usize = 256;
+pub const CHAR_HIDDEN: usize = 128;
+pub const OUT_HIDDEN: usize = 128;
+pub const WORD_HIDDEN: usize = 512;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 6;
+pub const WORD_BLOCKS: usize = 16;
 
 // Experiments
 

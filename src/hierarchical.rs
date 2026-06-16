@@ -107,10 +107,21 @@ impl Hierarchical {
         let char_input = vec![0.0; vocab_size].into();
         let char2_input = vec![0.0; vocab_size + context_size].into();
 
-        let buf_size = vocab_size
-            .max(char2_model.input_size)
-            .max(char_model.output_size)
-            .max(context_size);
+        // delta_buf is scratch for the backward delta as it flows down a layer
+        // stack: at each step it holds a layer's input_grad, whose length is that
+        // layer's input dimension. So it must be sized to the LARGEST layer
+        // dimension across all three sub-models — not just their output sizes,
+        // which would be too small whenever an internal hidden layer is wider.
+        let max_layer_dim = |m: &Sequential| {
+            m.layers
+                .iter()
+                .map(|l| l.output_size().max(l.input_size()))
+                .max()
+                .unwrap_or(0)
+        };
+        let buf_size = max_layer_dim(&char_model)
+            .max(max_layer_dim(&word_model))
+            .max(max_layer_dim(&char2_model));
         let delta_buf = vec![0.0; buf_size].into();
         let d_e_buf = vec![0.0; char_model.output_size].into();
 
@@ -274,14 +285,25 @@ impl Hierarchical {
             self.condition_decoder(w + 1);
 
             for t in next_word {
-                let tok = tokens[t - 1] as usize;
-                self.char2_input[tok] = 1.0;
+                // First decoder step is conditioned ONLY on the word context o
+                // (no input char): it must not see the previous word's trailing
+                // boundary token. Later steps feed the previous char of THIS word.
+                let tok = if t > next_word.start {
+                    Some(tokens[t - 1] as usize)
+                } else {
+                    None
+                };
+                if let Some(tok) = tok {
+                    self.char2_input[tok] = 1.0;
+                }
                 Self::forward_step(
                     &mut self.char2_model.layers,
                     &mut self.char2_model.cache[t],
                     &self.char2_input,
                 );
-                self.char2_input[tok] = 0.0;
+                if let Some(tok) = tok {
+                    self.char2_input[tok] = 0.0;
+                }
             }
         }
     }
@@ -559,57 +581,81 @@ impl Hierarchical {
         self.reset();
         let vocab = self.vocab_size;
 
-        // Start with the learnable initial context.
-        self.char2_input.fill(0.0);
-        self.condition_decoder(0);
+        // --- Bootstrap the backbone from the prefix --------------------------
+        // Encode each COMPLETE word of the prefix (boundary-terminated) to advance
+        // the backbone, exactly like the encode-only words in training. The decoder
+        // is reset per word and never runs on these prefix words — it only ever
+        // decodes the word currently being generated.
+        let mut enc_buf: Vec<u16> = Vec::new();
+        let mut context_ready = false;
+        for &tok in prefix {
+            enc_buf.push(tok);
+            if self.boundary_token_ids.contains(&tok) {
+                self.encode_word_advance(&enc_buf);
+                enc_buf.clear();
+                context_ready = true;
+            }
+        }
 
-        // `last_token` is the decoder input (the previously produced char). The
-        // first one is the prefix's head, or a random seed.
-        let mut last_token = if prefix.is_empty() {
-            rand::random_range(0..vocab) as u16
-        } else {
-            prefix[0]
-        };
-        let mut prefix_pos = 1;
+        // No complete word in the prefix → treat the whole prefix (or a random seed
+        // when empty) as the first encode-only word, so a word context exists.
+        if !context_ready {
+            if enc_buf.is_empty() {
+                enc_buf.push(rand::random_range(0..vocab) as u16);
+            }
+            self.encode_word_advance(&enc_buf);
+            enc_buf.clear();
+        }
 
-        let mut word_chars: Vec<u16> = Vec::new();
+        // Whatever trailed the last boundary is the teacher-forced start of the
+        // word we are about to generate (empty unless the prefix ended mid-word).
+        let mut forced = enc_buf.into_iter();
+
+        // --- Generation ------------------------------------------------------
         let mut out = Vec::with_capacity(max_len);
+        let mut word_chars: Vec<u16> = Vec::new();
+        let mut first_of_word = true;
+        let mut last_token: u16 = 0;
 
         loop {
-            // The previous char closes the current word when it is a boundary:
-            // encode that word and advance the backbone before decoding the next.
-            word_chars.push(last_token);
-            if self.boundary_token_ids.contains(&last_token) {
-                self.encode_word_advance(&word_chars);
-                word_chars.clear();
+            // Decode one step. The first char of each word is conditioned on the
+            // word context ONLY (no input char); later chars feed the previous one.
+            if !first_of_word {
+                self.char2_input[last_token as usize] = 1.0;
             }
-
-            // Decode one step conditioned on the current context.
-            self.char2_input[last_token as usize] = 1.0;
             Self::forward_sample_step(
                 &mut self.char2_model.layers,
                 &mut self.char2_model.cache[0],
                 &self.char2_input,
             );
-            self.char2_input[last_token as usize] = 0.0;
+            if !first_of_word {
+                self.char2_input[last_token as usize] = 0.0;
+            }
 
-            let forced = prefix_pos < prefix.len();
-            let next = if forced {
-                let t = prefix[prefix_pos];
-                prefix_pos += 1;
-                t
+            // Teacher-force the known start of the word, then sample the rest.
+            let next = if let Some(tok) = forced.next() {
+                tok
             } else {
                 let logits = self.char2_model.cache[0].last().unwrap().output();
                 let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature.max(1e-8)).collect();
                 let probs = softmax(&scaled);
-                self.sample_from_probs(&probs)
-            };
-
-            if !forced {
-                out.push(next);
-                if out.len() >= max_len || !callback(next) {
+                let tok = self.sample_from_probs(&probs);
+                out.push(tok);
+                if out.len() >= max_len || !callback(tok) {
                     break;
                 }
+                tok
+            };
+
+            // Accumulate the current word; on a boundary, encode it to advance the
+            // backbone and start the next word from context only.
+            word_chars.push(next);
+            if self.boundary_token_ids.contains(&next) {
+                self.encode_word_advance(&word_chars);
+                word_chars.clear();
+                first_of_word = true;
+            } else {
+                first_of_word = false;
             }
             last_token = next;
         }
