@@ -1,4 +1,7 @@
-use std::io::{Write, stdin, stdout};
+use std::{
+    io::{Write, stdin, stdout},
+    rc::Rc,
+};
 
 use crate::{
     config::{CHARSET, MAX_LEN, MODEL_LOC, SEQ_LOC, TEMPERATURE, TOP_P},
@@ -59,7 +62,7 @@ pub fn sample_normal() {
 pub fn sample_hierarchical() {
     let tokenizer = Tokenizer::new(CHARSET, false);
 
-    let mut model = Hierarchical::load(MODEL_LOC).unwrap();
+    let mut model = Hierarchical::load(MODEL_LOC, Rc::new(tokenizer.clone())).unwrap();
 
     model.make_cache(1);
 

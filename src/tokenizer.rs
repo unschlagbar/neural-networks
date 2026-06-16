@@ -6,7 +6,7 @@ use std::{char, fs};
 //   - Correct space encoding for any count (old code lost spaces when count ≥ 5)
 //   - Clean separation of vocab_size (real chars) vs full itos length (incl. specials)
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Tokenizer {
     pub lowercase: bool,
     /// char/special-token string → token id

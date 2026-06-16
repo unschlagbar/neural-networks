@@ -1,6 +1,6 @@
 // Model-path
 
-pub const MODEL_LOC: &str = "models/zero";
+pub const MODEL_LOC: &str = "models/my_take_large";
 pub const SEQ_LOC: &str = "models/seq";
 
 // Sequenz-Len
@@ -8,12 +8,16 @@ pub const SEQ_LOC: &str = "models/seq";
 pub const SEQ_LEN: usize = 512 * 1;
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 
+// Hierarchical word-grouped training
+pub const WORDS_PER_SEQ: usize = 512; // K — backbone unroll length per sample
+pub const MIN_WORDS_PER_SEQ: usize = 8; // keep a trailing window only if >= this
+
 // Training-Schedule
 
-pub const LR: f32 = 2e-4;
+pub const LR: f32 = 1e-4;
 pub const MIN_LR: f32 = 2e-5;
-pub const WARMUP_STEPS: usize = 200;
-pub const DECAY_STEPS: usize = 20_000;
+pub const WARMUP_STEPS: usize = 5000;
+pub const DECAY_STEPS: usize = 50_000;
 pub const BATCH_SIZE: usize = 1;
 pub const EPOCHS: usize = 2;
 
@@ -28,15 +32,18 @@ pub const TOP_P: f32 = 1.;
 
 // Modell-Dimensions
 
-pub const CHAR_HIDDEN: usize = 256;
-pub const OUT_HIDDEN: usize = 256;
+pub const CHAR_HIDDEN: usize = 96;
+pub const OUT_HIDDEN: usize = 96;
 pub const WORD_HIDDEN: usize = 256;
+
+/// Number of mLSTM backbone blocks in the hierarchical word model.
+pub const WORD_BLOCKS: usize = 6;
 
 // Experiments
 
-pub const STOP_WORD_DIRECT_FEED: bool = true;
+pub const STOP_WORD_DIRECT_FEED: bool = false;
 pub const INJECT_H: bool = false;
-pub const INJECT_C: bool = true;
+pub const INJECT_C: bool = false;
 
 // Dataset
 

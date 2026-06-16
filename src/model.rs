@@ -1,8 +1,11 @@
+use std::rc::Rc;
+
 use crate::{
-    config::{CHAR_HIDDEN, OUT_HIDDEN, WORD_HIDDEN},
+    config::{CHAR_HIDDEN, OUT_HIDDEN, WORD_BLOCKS, WORD_HIDDEN},
     hierarchical::Hierarchical,
     nn_layer::SequentialBuilder,
     sequential::Sequential,
+    tokenizer::Tokenizer,
 };
 
 pub fn build_normal_model(vocab: usize) -> Sequential {
@@ -18,24 +21,39 @@ pub fn build_normal_model(vocab: usize) -> Sequential {
         .build()
 }
 
-// Drei gekoppelte Sub-Modelle mit FESTEN (token-basierten) Wortgrenzen:
-pub fn build_hierarchical_model(vocab: usize, boundary_token_ids: Vec<u16>) -> Hierarchical {
+// Hierarchical Autoregressive Transformer (HAT)-style three-part model.
+//
+//   encoder  (char_model)  — embeds the complete characters of one word into a
+//                            single CHAR_HIDDEN vector (final hidden state).
+//   backbone (word_model)  — autoregressive over word embeddings; its output is
+//                            the model-space prediction for the *next* word.
+//   decoder  (char2_model) — generates the characters of a word one at a time,
+//                            conditioned (per step) on the backbone context that
+//                            was concatenated onto its input. Reset per word.
+pub fn build_hierarchical_model(
+    vocab: usize,
+    boundary_token_ids: Vec<u16>,
+    tokenizer: Rc<Tokenizer>,
+) -> Hierarchical {
     let char_model = SequentialBuilder::new(vocab)
         .embedding(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
+        .slstm_block(CHAR_HIDDEN)
+        .linear(CHAR_HIDDEN)
         .rms_norm()
         .build();
 
-    let heads: usize = 16;
-    let dqk: usize = WORD_HIDDEN / heads / 2;
+    let heads: usize = 8;
+    let dqk: usize = WORD_HIDDEN / heads;
 
-    let mut high_model = SequentialBuilder::new(CHAR_HIDDEN).linear(WORD_HIDDEN);
-    for _ in 0..0 {
-        high_model = high_model.mlstm_block(heads, dqk)
+    let mut word_model = SequentialBuilder::new(CHAR_HIDDEN).linear(WORD_HIDDEN);
+    for _ in 0..WORD_BLOCKS {
+        word_model = word_model.mlstm_block(heads, dqk)
     }
-    let high_model = high_model.rms_norm().build();
+    let word_model = word_model.linear(WORD_HIDDEN).rms_norm().build();
 
-    let char2_model = SequentialBuilder::new(WORD_HIDDEN + vocab)
+    let char2_builder = SequentialBuilder::new(WORD_HIDDEN + vocab);
+    let char2_model = char2_builder
         .linear(OUT_HIDDEN)
         .slstm_block(OUT_HIDDEN)
         .slstm_block(OUT_HIDDEN)
@@ -47,8 +65,9 @@ pub fn build_hierarchical_model(vocab: usize, boundary_token_ids: Vec<u16>) -> H
     Hierarchical::new(
         char_model,
         char2_model,
-        high_model,
+        word_model,
         vocab,
         boundary_token_ids,
+        tokenizer,
     )
 }

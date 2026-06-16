@@ -344,6 +344,19 @@ impl Sequential {
         l / targets.len() as f32
     }
 
+    /// Average cross-entropy over `targets[start..]`, reading `cache[start..]`.
+    /// Used when the leading positions were not decoded (e.g. a given prefix word).
+    pub fn seq_loss_from(&self, targets: &[u16], start: usize) -> f32 {
+        let last = self.layers.len() - 1;
+        let mut l = 0.0;
+        for t in start..targets.len() {
+            let probs = softmax(self.cache[t][last].output());
+            let p = probs[targets[t] as usize] + 1e-12;
+            l -= p.ln();
+        }
+        l / (targets.len() - start).max(1) as f32
+    }
+
     pub fn output(&self, t: usize) -> &[f32] {
         let last_layer = self.layers.len() - 1;
         self.cache[t][last_layer].output()

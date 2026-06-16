@@ -7,10 +7,11 @@ use std::{
 };
 
 use crate::{
-    batches::PreparedDataSet,
+    batches::{PreparedDataSet, WordDataSet},
     config::{
         self, BATCH_SIZE, DATA_DIR, DATA_FILE, DECAY_STEPS, EPOCHS, LOG_EVERY, LR, MAX_SEQ_LEN,
-        MIN_LR, MODEL_LOC, SAVE_EVERY, SEQ_LEN, SEQ_LOC, WARMUP_STEPS,
+        MIN_LR, MIN_WORDS_PER_SEQ, MODEL_LOC, SAVE_EVERY, SEQ_LEN, SEQ_LOC, WARMUP_STEPS,
+        WORDS_PER_SEQ,
     },
     hierarchical::Hierarchical,
     model::{build_hierarchical_model, build_normal_model},
@@ -84,29 +85,29 @@ pub fn train_hierarchical() {
     let vocab = tokenizer.vocab_size();
     let word_boundary_ids = tokenizer.boundary_tokens();
 
-    let mut model = match Hierarchical::load(MODEL_LOC) {
+    let mut model = match Hierarchical::load(MODEL_LOC, tokenizer.clone()) {
         Ok(m) => {
             println!("Loaded HM-RNN from '{MODEL_LOC}'.");
             m
         }
         Err(e) => {
             println!("Could not load '{MODEL_LOC}' ({e}) — creating new HM-RNN.");
-            build_hierarchical_model(vocab, word_boundary_ids.clone())
+            build_hierarchical_model(vocab, word_boundary_ids.clone(), tokenizer.clone())
         }
     };
-    model.make_cache(MAX_SEQ_LEN);
+    model.make_cache(WORDS_PER_SEQ);
 
-    println!("Preparing dataset from '{DATA_DIR}' ...");
+    println!("Preparing dataset from '{DATA_FILE}' ...");
     let prep_start = Instant::now();
-    let data =
-        PreparedDataSet::from_single_file(&tokenizer, DATA_FILE, SEQ_LEN, &word_boundary_ids);
-    println!(
-        "  {} files → {} windows, {} tokens (prep took {:.1?})",
-        data.num_sequences(),
-        data.len(),
-        data.total_tokens(),
-        prep_start.elapsed(),
+    let data = WordDataSet::from_single_file(
+        &tokenizer,
+        DATA_FILE,
+        WORDS_PER_SEQ,
+        MIN_WORDS_PER_SEQ,
+        MAX_SEQ_LEN,
+        &word_boundary_ids,
     );
+    println!("  prep took {:.1?}", prep_start.elapsed());
     println!(
         "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, optimizer={:?}, log every {LOG_EVERY} steps",
         Optimizer {}

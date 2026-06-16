@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::{BufRead, stdin},
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 use crate::{
@@ -10,12 +11,13 @@ use crate::{
     nn::{
         causal_conv1d::CausalConv1dLayer, dropout::DropoutLayer, embedding::EmbeddingLayer,
         linear::LinearLayer, linear_nb::LinearNBLayer, lstm::LSTMLayer, mlstm::MLSTMLayer,
-        mlstm_block::MLSTMBlock, rms_norm::RMSNorm, silu_dense::SiluDenseLayer,
-        slstm::SLSTMLayer, slstm_block::SLSTMBlock,
+        mlstm_block::MLSTMBlock, rms_norm::RMSNorm, silu_dense::SiluDenseLayer, slstm::SLSTMLayer,
+        slstm_block::SLSTMBlock,
     },
     nn_layer::NnLayer,
     saving::{HIER_MAGIC, MAGIC},
     sequential::Sequential,
+    tokenizer::Tokenizer,
 };
 
 /// Interactive mode: reads a model name from stdin, looks it up (as given,
@@ -41,7 +43,7 @@ pub fn inspect_model() {
             print_sequential(&model);
         }
         HIER_MAGIC => {
-            let model = Hierarchical::load(&path).unwrap();
+            let model = Hierarchical::load(&path, Rc::new(Tokenizer::default())).unwrap();
             println!("\n{path}  (HIER, hierarchical)");
             println!(
                 "vocab_size = {}, context_size = {}, boundary tokens = {:?}",

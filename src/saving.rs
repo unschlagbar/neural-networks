@@ -14,16 +14,20 @@
 //  │    layer.save(w)  — weights only, no shapes         │
 //  └─────────────────────────────────────────────────────┘
 //
-// Hierarchical format ("HIER")  — written by HierarchicalSequential::save
+// Hierarchical (HAT) format ("HIE2")  — written by Hierarchical::save
 //
 //  ┌─────────────────────────────────────────────────────┐
-//  │  HIER_MAGIC   u32   0x4849_4552  ("HIER")           │
+//  │  HIER_MAGIC   u32   0x4849_4532  ("HIE2")           │
 //  │  vocab_size   u32                                   │
 //  │  context_size u32                                   │
 //  │  n_boundaries u32                                   │
 //  │  boundary_ids [u16 × n_boundaries]                  │
-//  │  char_model   <Sequential blob>                     │
-//  │  high_model   <Sequential blob>                     │
+//  │  char_model   <Sequential blob>   (encoder)         │
+//  │  char2_model  <Sequential blob>   (decoder)         │
+//  │  word_model   <Sequential blob>   (backbone)        │
+//  │  state_head   matrix + f32_slice  (context→h/c proj)│
+//  │  o_init       f32_slice           (initial context) │
+//  │  step         u64                                   │
 //  └─────────────────────────────────────────────────────┘
 
 use std::{
@@ -36,7 +40,7 @@ use iron_oxide::collections::Matrix;
 use crate::sequential::Sequential;
 
 pub const MAGIC: u32 = 0x4E4E_4657;
-pub const HIER_MAGIC: u32 = 0x4849_4552;
+pub const HIER_MAGIC: u32 = 0x4849_4532;
 pub const HM_RNN_MAGIC: u32 = 0x484D_524E; // "HMRN"
 pub const VERSION: u8 = 2;
 

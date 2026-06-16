@@ -37,9 +37,13 @@ pub trait DynCache: Send {
 ///   • keeps related data (weights + their grads) physically adjacent in memory.
 pub trait Dyn: 'static {
     fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 impl<T: 'static> Dyn for T {
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 }
