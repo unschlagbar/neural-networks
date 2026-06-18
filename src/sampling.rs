@@ -4,22 +4,22 @@ use std::{
 };
 
 use crate::{
-    config::{CHARSET, MAX_LEN, MODEL_LOC, SEQ_LOC, TEMPERATURE, TOP_P},
+    config::{CHARSET, MAX_LEN, MAX_SEQ_LEN, TEMPERATURE, TOP_P},
     hierarchical::Hierarchical,
     sequential::Sequential,
     tokenizer::Tokenizer,
 };
 
-pub fn sample_normal() {
+pub fn sample_normal(model_path: &str) {
     let tokenizer = Tokenizer::new(CHARSET, false);
 
-    let mut model = match Sequential::load(SEQ_LOC) {
+    let mut model = match Sequential::load(model_path) {
         Ok(m) => {
-            println!("Loaded sequential model from '{SEQ_LOC}'.");
+            println!("Loaded sequential model from '{model_path}'.");
             m
         }
         Err(e) => {
-            eprintln!("Failed to load '{SEQ_LOC}': {e}");
+            eprintln!("Failed to load '{model_path}': {e}");
             std::process::exit(1);
         }
     };
@@ -59,12 +59,12 @@ pub fn sample_normal() {
     }
 }
 
-pub fn sample_hierarchical() {
+pub fn sample_hierarchical(model_path: &str) {
     let tokenizer = Tokenizer::new(CHARSET, false);
 
-    let mut model = Hierarchical::load(MODEL_LOC, Rc::new(tokenizer.clone())).unwrap();
+    let mut model = Hierarchical::load(model_path, Rc::new(tokenizer.clone())).unwrap();
 
-    model.make_cache(1);
+    model.make_cache(1, MAX_SEQ_LEN);
 
     loop {
         println!("\nSample mode — type a prefix (empty = random start, Ctrl+D = quit):");

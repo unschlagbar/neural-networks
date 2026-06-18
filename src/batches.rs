@@ -291,6 +291,9 @@ pub struct WordDataSet {
     segments: Vec<Vec<Range<usize>>>,
     /// Every K-word window across the corpus. `shuffle()` reorders this list.
     windows: Vec<WordWindow>,
+    /// Token span of the longest window. Callers size their caches to exactly
+    /// this — no guessing, no waste.
+    max_window_tokens: usize,
 }
 
 impl WordDataSet {
@@ -336,22 +339,33 @@ impl WordDataSet {
             .map(|seq| segment_words(seq, boundary_ids))
             .collect();
 
-        let windows = build_word_windows(&segments, words_per_seq, min_words, max_tokens);
+        let (windows, max_window_tokens) =
+            build_word_windows(&segments, words_per_seq, min_words, max_tokens);
 
+        let total_words: usize = windows.iter().map(|w| w.word_count as usize).sum();
+        let avg_words = total_words as f32 / windows.len().max(1) as f32;
         println!(
-            "  {} Chunks, {} Tokens, {} Wörter, {} {}-Wort-Fenster geladen",
+            "  {} Chunks, {} Tokens, {} Wörter, {} Fenster (Ziel {} Wörter, Ø {:.0} Wörter / max {} Tokens je Fenster)",
             sequences.len(),
             sequences.iter().map(|s| s.len()).sum::<usize>(),
             segments.iter().map(|s| s.len()).sum::<usize>(),
             windows.len(),
             words_per_seq,
+            avg_words,
+            max_window_tokens,
         );
 
         Self {
             sequences,
             segments,
             windows,
+            max_window_tokens,
         }
+    }
+
+    /// Token span of the longest window — size training caches to this.
+    pub fn max_window_tokens(&self) -> usize {
+        self.max_window_tokens
     }
 
     /// Reorder the window list in place. Sequences themselves are untouched.
@@ -422,8 +436,9 @@ fn build_word_windows(
     words_per_seq: usize,
     min_words: usize,
     max_tokens: usize,
-) -> Vec<WordWindow> {
+) -> (Vec<WordWindow>, usize) {
     let mut out = Vec::new();
+    let mut max_span = 0;
     for (s_idx, segs) in segments.iter().enumerate() {
         let n = segs.len();
         let mut wi = 0;
@@ -438,6 +453,8 @@ fn build_word_windows(
                 count += 1;
             }
             if count >= min_words {
+                let span = segs[wi + count - 1].end - start_tok;
+                max_span = max_span.max(span);
                 out.push(WordWindow {
                     seq: s_idx as u32,
                     word_start: wi as u32,
@@ -447,5 +464,5 @@ fn build_word_windows(
             wi += count;
         }
     }
-    out
+    (out, max_span)
 }

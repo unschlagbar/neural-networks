@@ -49,8 +49,10 @@ pub fn inspect_model() {
                 "vocab_size = {}, context_size = {}, boundary tokens = {:?}",
                 model.vocab_size, model.context_size, model.boundary_token_ids,
             );
-            println!("\nchar_model:");
-            print_sequential(&model.char_model);
+            println!("\nchar_fwd (encoder, forward):");
+            print_sequential(&model.encoder.char_fwd);
+            println!("\nchar_bwd (encoder, backward):");
+            print_sequential(&model.encoder.char_bwd);
             println!("\nword_model:");
             print_sequential(&model.word_model);
             println!("\nchar2_model:");

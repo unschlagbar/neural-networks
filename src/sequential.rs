@@ -3,8 +3,10 @@ use std::time::Instant;
 use iron_oxide::collections::Matrix;
 use rand::random_range;
 
+use std::range::Range;
+
 use crate::{
-    config::SEQ_LOC,
+    batches::WordBatch,
     nn::{
         lstm::sigmoid,
         softmax::{softmax, softmax_inplace},
@@ -175,7 +177,7 @@ impl Sequential {
             }
 
             if state.save() {
-                match self.save(SEQ_LOC) {
+                match self.save(state.save_path()) {
                     Ok(()) => println!("saved"),
                     Err(e) => eprintln!("save failed: {e}"),
                 }
@@ -189,6 +191,89 @@ impl Sequential {
                     state.step,
                     loss,
                     loss.exp(),
+                    tokens,
+                    elapsed,
+                );
+                tokens = 0;
+                time = Instant::now();
+            }
+        }
+    }
+
+    /// Word-grouped training, mirroring `Hierarchical::train` for a fair
+    /// head-to-head comparison: the flat model sees exactly the same X-word
+    /// windows (`WordDataSet`) the hierarchical model does, and the reported
+    /// loss is measured over the same token span.
+    ///
+    /// Word 0 of every window is the encode-only prefix in the hierarchical
+    /// model — it is never decoded there. To compare like-for-like we backprop
+    /// over the whole window (full training signal) but only *report* the loss
+    /// over words `1..K`, exactly the tokens the hierarchical decoder scores.
+    pub fn train_words<'a, I: Iterator<Item = WordBatch<'a>>>(
+        &mut self,
+        data: I,
+        state: &mut TrainingState,
+    ) {
+        let mut tokens = 0;
+        let mut time = Instant::now();
+
+        for batch in data {
+            let WordBatch {
+                tokens: window,
+                words,
+            } = batch;
+
+            // Need a prefix word plus at least one decoded word.
+            if window.len() < 2 || words.len() < 2 {
+                continue;
+            }
+
+            let inputs = &window[..window.len() - 1];
+            let targets = &window[1..];
+
+            for layer in &mut self.layers {
+                layer.reset_state();
+            }
+            self.forward_over(inputs);
+
+            // Score only words 1..K: skip the prefix word (= the encode-only
+            // word 0 in the hierarchical model). The prediction for token at
+            // window position `t` lives at cache slot `t - 1`, i.e. target
+            // index `t - 1`, so the first scored target is `words[1].start - 1`.
+            let scored_from = words[0].end - 1;
+            let loss = self.seq_loss_from(targets, scored_from);
+            let word_loss = self.word_loss(window, &words[1..]);
+            tokens += inputs.len();
+
+            self.backwards_sequence(targets);
+            for layer in &mut self.layers {
+                layer.accumulate_init_grad();
+                layer.reset_bptt_state();
+            }
+            state.log_tokens(inputs.len());
+            state.log_metric("word_loss", word_loss);
+
+            if let Some(lr) = state.step(loss) {
+                self.sgd_step(lr);
+            }
+
+            if state.save() {
+                match self.save(state.save_path()) {
+                    Ok(()) => println!("saved"),
+                    Err(e) => eprintln!("save failed: {e}"),
+                }
+            }
+
+            if state.print() {
+                let loss = state.get_loss();
+                let elapsed = time.elapsed();
+                println!(
+                    "{} | char loss {:.4} | ppl {:.4} | word loss {:.4} | word ppl {:.1} | {} tok | {:.1?}",
+                    state.step,
+                    loss,
+                    loss.exp(),
+                    word_loss,
+                    word_loss.exp(),
                     tokens,
                     elapsed,
                 );
@@ -355,6 +440,25 @@ impl Sequential {
             l -= p.ln();
         }
         l / (targets.len() - start).max(1) as f32
+    }
+
+    /// Average NLL per word over `words` (ranges into `window`), the flat-model
+    /// counterpart to `Hierarchical::compute_word_loss`. For each word it sums
+    /// the per-token NLL of predicting that word's tokens — the prediction for
+    /// `window[t]` is read from cache slot `t - 1` — then averages over words.
+    /// Token at position 0 has no preceding context and is never scored.
+    pub fn word_loss(&self, window: &[u16], words: &[Range<usize>]) -> f32 {
+        let last = self.layers.len() - 1;
+        let mut total = 0.0;
+        for r in words {
+            let mut word_nll = 0.0;
+            for t in r.start.max(1)..r.end {
+                let probs = softmax(self.cache[t - 1][last].output());
+                word_nll -= (probs[window[t] as usize] + 1e-12).ln();
+            }
+            total += word_nll;
+        }
+        total / words.len().max(1) as f32
     }
 
     pub fn output(&self, t: usize) -> &[f32] {

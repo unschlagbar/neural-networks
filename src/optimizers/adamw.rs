@@ -6,7 +6,7 @@ use crate::optimizers::{
 
 const CLIP: f32 = 10.0;
 const BETA1: f32 = 0.9;
-const BETA2: f32 = 0.98;
+const BETA2: f32 = 0.95;
 const EPS: f32 = 1e-8;
 /// Decoupled weight decay (λ). Applied directly to weights, NOT through gradients.
 /// Typical range for LLM pretraining: 0.01–0.1.

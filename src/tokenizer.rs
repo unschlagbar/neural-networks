@@ -17,9 +17,13 @@ pub struct Tokenizer {
     id_space: u16,
     id_space2: u16,
     id_space4: u16,
+    /// Word-boundary marker `[W]` (HAT): prepended at the encoder, appended as the
+    /// decoder's end-of-word target. Model-internal — never a word boundary.
+    id_w: u16,
 }
 
-pub const SPECIAL_TOKENS: &[&str] = &["<SPACE2>", "<SPACE4>", "<END>", "<QSTART>", "<QEND>"];
+pub const SPECIAL_TOKENS: &[&str] =
+    &["<SPACE2>", "<SPACE4>", "<END>", "<QSTART>", "<QEND>", "<W>"];
 
 impl Tokenizer {
     pub fn new(charset_path: &str, lowercase: bool) -> Self {
@@ -55,6 +59,8 @@ impl Tokenizer {
                 .iter()
                 .position(|&t| t == "<SPACE4>")
                 .unwrap() as u16;
+        let id_w = stoi.len() as u16
+            + SPECIAL_TOKENS.iter().position(|&t| t == "<W>").unwrap() as u16;
 
         Tokenizer {
             lowercase,
@@ -63,6 +69,7 @@ impl Tokenizer {
             id_space,
             id_space2,
             id_space4,
+            id_w,
         }
     }
 
@@ -169,6 +176,11 @@ impl Tokenizer {
     /// Number of tokens including specials (= length of `itos`).
     pub const fn vocab_size(&self) -> usize {
         self.itos.len()
+    }
+
+    /// The `[W]` word-boundary marker id (HAT encoder prefix / decoder EOS target).
+    pub const fn w_token(&self) -> u16 {
+        self.id_w
     }
 
     const BOUNDARIES: &[char] = &[

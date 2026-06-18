@@ -1,22 +1,24 @@
-// Model-path
-
-pub const MODEL_LOC: &str = "models/main_igh_lr";
-pub const SEQ_LOC: &str = "models/seq";
-
 // Sequenz-Len
 
 pub const SEQ_LEN: usize = 512 * 1;
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 
-// Hierarchical word-grouped training
-pub const WORDS_PER_SEQ: usize = 512; // K — backbone unroll length per sample
+// Word-grouped training (both the flat and the hierarchical model train on
+// these K-word windows, so WORDS_PER_SEQ is the one binding knob).
+pub const WORDS_PER_SEQ: usize = 512; // K — words per window / backbone unroll length
 pub const MIN_WORDS_PER_SEQ: usize = 8; // keep a trailing window only if >= this
+
+/// Safety cap on tokens per word-window. Deliberately generous: WORDS_PER_SEQ
+/// is meant to bind first — this only guards against a pathological run with no
+/// boundary token. Caches are sized to the *actual* longest window
+/// (`WordDataSet::max_window_tokens`), never to this cap, so raising it is free.
+pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 10;
 
 // Training-Schedule
 
 pub const LR: f32 = 2e-4;
 pub const MIN_LR: f32 = 2e-5;
-pub const WARMUP_STEPS: usize = 500;
+pub const WARMUP_STEPS: usize = 1000;
 pub const DECAY_STEPS: usize = 50_000;
 pub const BATCH_SIZE: usize = 1;
 pub const EPOCHS: usize = 2;
@@ -34,16 +36,10 @@ pub const TOP_P: f32 = 1.;
 
 pub const CHAR_HIDDEN: usize = 128;
 pub const OUT_HIDDEN: usize = 128;
-pub const WORD_HIDDEN: usize = 512;
+pub const WORD_HIDDEN: usize = 256;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 16;
-
-// Experiments
-
-pub const STOP_WORD_DIRECT_FEED: bool = false;
-pub const INJECT_H: bool = false;
-pub const INJECT_C: bool = false;
+pub const WORD_BLOCKS: usize = 6;
 
 // Dataset
 
@@ -60,7 +56,7 @@ pub const WAKE_FRAME_SHIFT: usize = 320;
 pub const WAKE_N_FFT: usize = 512;
 pub const WAKE_N_MELS: usize = 80;
 pub const WAKE_INPUT_DIM: usize = WAKE_N_MELS;
-pub const WAKE_THRESHOLD: f32 = 0.8;
+pub const WAKE_THRESHOLD: f32 = 0.6;
 pub const WAKE_POS_WEIGHT: f32 = 1.0;
 pub const WAKE_LR: f32 = 6e-4;
 pub const WAKE_EPOCHS: usize = 35;

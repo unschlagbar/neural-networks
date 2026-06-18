@@ -21,7 +21,6 @@ use iron_oxide::collections::Matrix;
 use rand::random_range;
 
 use crate::{
-    config::{INJECT_C, INJECT_H},
     nn::add_vec_in_place,
     nn_layer::{DynCache, NnLayer},
     optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
@@ -520,48 +519,6 @@ impl NnLayer for SLSTMLayer {
     fn accumulate_init_grad(&mut self) {
         add_vec_in_place(&mut self.grads.h_init_grad.vec(), &self.dh_bptt);
         add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
-    }
-
-    fn state_size(&self) -> usize {
-        2 * self.hidden_size
-    }
-
-    fn inject_state(&mut self, buf: &[f32], offset: usize) -> usize {
-        let h = self.hidden_size;
-        if INJECT_H {
-            self.h.copy_from_slice(&buf[offset..offset + h]);
-        } else {
-            self.h.copy_from_slice(&self.h_init);
-        }
-        if INJECT_C {
-            self.c.copy_from_slice(&buf[offset + h..offset + 2 * h]);
-        } else {
-            self.c.copy_from_slice(&self.c_init);
-        }
-        // n and m are normalizer/stabilizer; reset to zero so the injected (h, c)
-        // are internally consistent from the first step of the new segment.
-        self.n.fill(0.0);
-        self.m.fill(0.0);
-        offset + 2 * h
-    }
-
-    fn collect_bptt_grad(&mut self, buf: &mut [f32], offset: usize) -> usize {
-        let h = self.hidden_size;
-        if INJECT_H {
-            buf[offset..offset + h].copy_from_slice(&self.dh_bptt);
-        } else {
-            // h was reset from h_init — gradient belongs to h_init, not to state_head.
-            add_vec_in_place(&mut self.grads.h_init_grad.vec(), &self.dh_bptt);
-            buf[offset..offset + h].fill(0.0);
-        }
-        if INJECT_C {
-            buf[offset + h..offset + 2 * h].copy_from_slice(&self.dc_bptt);
-        } else {
-            // c was reset from c_init — gradient belongs to c_init, not to state_head.
-            add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
-            buf[offset + h..offset + 2 * h].fill(0.0);
-        }
-        offset + 2 * h
     }
 }
 

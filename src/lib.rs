@@ -1,4 +1,5 @@
 pub mod batches;
+pub mod bi_encoder;
 pub mod config;
 pub mod hierarchical;
 pub mod inspect;
@@ -17,7 +18,7 @@ pub mod wake_word;
 
 use std::{
     fs,
-    io::{BufRead, stdin},
+    io::{BufRead, Write, stdin, stdout},
     path::Path,
 };
 
@@ -31,10 +32,12 @@ pub fn run() {
     let cmd = line.trim();
 
     match cmd {
-        "" => training::train_normal(),
-        "h" => training::train_hierarchical(),
-        "s" => sampling::sample_normal(),
-        "hs" => sampling::sample_hierarchical(),
+        "" => training::train_normal(&read_model_path("models/seq")),
+        "h" => training::train_hierarchical(&read_model_path("models/fix_bi")),
+        "hp" => training::probe_hierarchical(&read_model_path("models/fix_bi")),
+        "ht" => training::trace_hierarchical(&read_model_path("models/fix_bi")),
+        "s" => sampling::sample_normal(&read_model_path("models/seq")),
+        "hs" => sampling::sample_hierarchical(&read_model_path("models/fix_bi")),
         "i" => inspect::inspect_model(),
         "wr" => wake_word::record::record_samples(),
         "wt" => wake_word::training::train_wake(),
@@ -47,5 +50,22 @@ pub fn run() {
             );
             std::process::exit(2);
         }
+    }
+}
+
+/// Prompts for a model name at runtime. Empty input keeps `default`. A bare name
+/// (no `/`) is resolved under `models/`, so typing `seq` selects `models/seq`.
+fn read_model_path(default: &str) -> String {
+    print!("Model name [{default}]: ");
+    stdout().flush().ok();
+    let mut line = String::new();
+    stdin().lock().read_line(&mut line).unwrap();
+    let name = line.trim();
+    if name.is_empty() {
+        default.to_string()
+    } else if name.contains('/') {
+        name.to_string()
+    } else {
+        format!("models/{name}")
     }
 }

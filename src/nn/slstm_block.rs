@@ -348,16 +348,6 @@ impl NnLayer for SLSTMBlock {
         self.cell.accumulate_init_grad();
     }
 
-    fn state_size(&self) -> usize { self.cell.state_size() }
-
-    fn inject_state(&mut self, buf: &[f32], offset: usize) -> usize {
-        self.cell.inject_state(buf, offset)
-    }
-
-    fn collect_bptt_grad(&mut self, buf: &mut [f32], offset: usize) -> usize {
-        self.cell.collect_bptt_grad(buf, offset)
-    }
-
     fn apply_grads(&mut self, lr: f32) {
         self.pre_norm1.apply_grads(lr);
         self.cell.apply_grads(lr);

@@ -3,6 +3,7 @@ use std::rc::Rc;
 use crate::{
     config::{CHAR_HIDDEN, OUT_HIDDEN, WORD_BLOCKS, WORD_HIDDEN},
     hierarchical::Hierarchical,
+    nn::{linear::LinearLayer, rms_norm::RMSNorm},
     nn_layer::SequentialBuilder,
     sequential::Sequential,
     tokenizer::Tokenizer,
@@ -14,33 +15,49 @@ pub fn build_normal_model(vocab: usize) -> Sequential {
     SequentialBuilder::new(vocab)
         .embedding(WORD_HIDDEN)
         .mlstm_block(NUM_HEADS, DQK)
-        .mlstm_block(NUM_HEADS, DQK)
+        .slstm_block(WORD_HIDDEN)
         .mlstm_block(NUM_HEADS, DQK)
         .rms_norm()
         .linear(vocab)
         .build()
 }
 
-// Hierarchical Autoregressive Transformer (HAT)-style three-part model.
+// Hierarchical Autoregressive Transformer (HAT)-style model (arXiv 2501.10322).
 //
-//   encoder  (char_model)  — embeds the complete characters of one word into a
-//                            single CHAR_HIDDEN vector (final hidden state).
+//   encoder  (char_fwd + char_bwd) — a bidirectional sLSTM over the characters of
+//                            one word, prefixed with the `[W]` marker. The word
+//                            embedding is read off the `[W]` position in each
+//                            direction and merged by `combine` into a CHAR_HIDDEN
+//                            vector.
 //   backbone (word_model)  — autoregressive over word embeddings; its output is
 //                            the model-space prediction for the *next* word.
 //   decoder  (char2_model) — generates the characters of a word one at a time,
 //                            conditioned (per step) on the backbone context that
-//                            was concatenated onto its input. Reset per word.
+//                            was concatenated onto its input. The decoder is fed a
+//                            leading `[W]` (BOS) and predicts the word's chars
+//                            followed by a trailing `[W]` (EOS). Reset per word.
 pub fn build_hierarchical_model(
     vocab: usize,
     boundary_token_ids: Vec<u16>,
     tokenizer: Rc<Tokenizer>,
 ) -> Hierarchical {
-    let char_model = SequentialBuilder::new(vocab)
-        .embedding(CHAR_HIDDEN)
-        .slstm_block(CHAR_HIDDEN)
-        .slstm_block(CHAR_HIDDEN)
-        .linear(CHAR_HIDDEN)
-        .build();
+    // One sLSTM encoder stack per direction (no shared weights). The word embedding
+    // is the raw sLSTM hidden state at the `[W]` position, so no per-step linear /
+    // norm head here — `combine` merges the two directions instead.
+    let encoder = || {
+        SequentialBuilder::new(vocab)
+            .embedding(CHAR_HIDDEN)
+            .slstm_block(CHAR_HIDDEN)
+            .mlstm_block(16, CHAR_HIDDEN / 16)
+            .slstm_block(CHAR_HIDDEN)
+            .build()
+    };
+    let char_fwd = encoder();
+    let char_bwd = encoder();
+
+    // Merges concat(fwd@[W], bwd@[W]) ∈ R^{2H} → the word embedding e_w ∈ R^H.
+    let combine = LinearLayer::new(2 * CHAR_HIDDEN, CHAR_HIDDEN);
+    let combine_norm = RMSNorm::new(CHAR_HIDDEN);
 
     let heads: usize = 8;
     let dqk: usize = WORD_HIDDEN / heads;
@@ -49,20 +66,23 @@ pub fn build_hierarchical_model(
     for _ in 0..WORD_BLOCKS {
         word_model = word_model.mlstm_block(heads, dqk)
     }
-    let word_model = word_model.linear(OUT_HIDDEN).build();
+    let word_model = word_model.rms_norm().linear(OUT_HIDDEN).build();
 
     let char2_builder = SequentialBuilder::new(OUT_HIDDEN + vocab);
     let char2_model = char2_builder
         .linear(OUT_HIDDEN)
         .slstm_block(OUT_HIDDEN)
+        .mlstm_block(16, CHAR_HIDDEN / 16)
         .slstm_block(OUT_HIDDEN)
-        .linear(OUT_HIDDEN)
         .rms_norm()
         .linear_no_bias(vocab)
         .build();
 
     Hierarchical::new(
-        char_model,
+        char_fwd,
+        char_bwd,
+        combine,
+        combine_norm,
         char2_model,
         word_model,
         vocab,
