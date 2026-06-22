@@ -2,11 +2,15 @@ use iron_oxide::collections::Matrix;
 
 pub mod adam;
 pub mod adamw;
+pub mod muon;
 pub mod sgd;
 pub use self::adam::Adam;
 pub use self::adamw::AdamW;
+pub use self::muon::Muon;
 pub use self::sgd::Sgd;
-pub type Optimizer = AdamW;
+// Active optimizer. Swap to `Muon` to orthogonalize the 2D hidden-weight updates
+// (embeddings + biases stay on Adam automatically); retune the lr schedule if so.
+pub type Optimizer = Muon;
 
 pub trait OptimizerGradTypes {
     type GradMatrix;

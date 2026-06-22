@@ -21,7 +21,10 @@ use iron_oxide::collections::Matrix;
 use rand::random_range;
 
 use crate::{
-    nn::add_vec_in_place,
+    nn::{
+        activations::{log_sigmoid, stable_sigmoid},
+        add_vec_in_place,
+    },
     nn_layer::{DynCache, NnLayer},
     optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
     saving,
@@ -519,28 +522,5 @@ impl NnLayer for SLSTMLayer {
     fn accumulate_init_grad(&mut self) {
         add_vec_in_place(&mut self.grads.h_init_grad.vec(), &self.dh_bptt);
         add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
-    }
-}
-
-#[inline]
-fn stable_sigmoid(x: f32) -> f32 {
-    // Avoids overflow of exp(-x) for large negative x.
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
-}
-
-#[inline]
-fn log_sigmoid(x: f32) -> f32 {
-    // log σ(x) = −softplus(−x), computed stably.
-    //   x ≥ 0 :  −ln(1 + e^{-x})
-    //   x < 0 :   x − ln(1 + e^{x})
-    if x >= 0.0 {
-        -((-x).exp() + 1.0).ln()
-    } else {
-        x - (x.exp() + 1.0).ln()
     }
 }

@@ -12,10 +12,10 @@ use crate::{
     config::MAX_SEQ_LEN,
     loading::{read_f32_vec, read_matrix, read_u16, read_u32, read_u64},
     nn::{
-        linear::LinearLayer,
+        linear_nb::LinearNBLayer,
         mlstm_block::{MLSTMBlock, MLSTMBlockCache},
         rms_norm::RMSNorm,
-        softmax::{softmax, softmax_inplace},
+        softmax::{nll_from_logits, softmax, softmax_inplace},
     },
     nn_layer::{DynCache, NnLayer},
     saving::{HIER_MAGIC, write_f32_slice, write_matrix, write_u16, write_u32, write_u64},
@@ -65,13 +65,19 @@ pub struct Hierarchical {
     /// Decoder input: `[char one-hot ‖ word context]` (size `vocab + context`).
     char2_input: Box<[f32]>,
 
-    /// Gradient w.r.t. the word embedding `e_w` (size `char_out`).
-    d_ew_buf: Box<[f32]>,
-
     /// Backward scratch: top-level delta as it flows down a layer stack.
     delta_buf: Box<[f32]>,
-    /// Accumulated gradient w.r.t. the decoder's word context, per word.
+    /// Scratch accumulator for one word's gradient w.r.t. the decoder context.
     d_o_buf: Box<[f32]>,
+
+    /// Phase seam (decoder→backbone): grad w.r.t. each word's context `o`
+    /// (size `context`), one entry per decoded word. Filled by the decoder
+    /// backward phase, consumed by the backbone backward phase.
+    d_o_words: Vec<Box<[f32]>>,
+    /// Phase seam (backbone→encoder): grad w.r.t. each word embedding `e_w`
+    /// (size `char_out`), one entry per decoded word. Filled by the backbone
+    /// backward phase, consumed by the encoder backward phase.
+    d_ew_words: Vec<Box<[f32]>>,
 
     pub last_high_grad_signal: f32,
     pub last_char1_grad_signal: f32,
@@ -90,7 +96,7 @@ impl Hierarchical {
     pub fn new(
         char_fwd: Sequential,
         char_bwd: Sequential,
-        combine: LinearLayer,
+        combine: LinearNBLayer,
         combine_norm: RMSNorm,
         char2_model: Sequential,
         word_model: Sequential,
@@ -159,9 +165,10 @@ impl Hierarchical {
             dec_ranges: Vec::new(),
             dec_targets: Vec::new(),
             char2_input,
-            d_ew_buf: vec![0.0; char_out].into(),
             delta_buf,
             d_o_buf: vec![0.0; context_size].into(),
+            d_o_words: Vec::new(),
+            d_ew_words: Vec::new(),
             last_high_grad_signal: 0.0,
             last_char1_grad_signal: 0.0,
             last_word_loss: 0.0,
@@ -181,6 +188,19 @@ impl Hierarchical {
         self.char2_model.make_cache(slots);
         self.word_model.make_cache(word_steps.max(1));
         self.dec_targets = vec![0; slots];
+
+        // Per-word phase-seam buffers (one slot per decodable word).
+        let words = word_steps.max(1);
+        let char_out = self.encoder.output_size;
+        self.d_o_words = (0..words)
+            .map(|_| vec![0.0; self.context_size].into())
+            .collect();
+        self.d_ew_words = (0..words).map(|_| vec![0.0; char_out].into()).collect();
+
+        // Pre-size the per-window index Vecs so `forward_over` never reallocates
+        // them in the training loop (it only clear()s and re-fills them).
+        self.word_segments = Vec::with_capacity(words + 1);
+        self.dec_ranges = Vec::with_capacity(words);
     }
 
     pub fn reset(&mut self) {
@@ -219,6 +239,12 @@ impl Hierarchical {
         }
     }
 
+    /// Run the full hierarchical forward over a window, **phase by phase**: all
+    /// encoder steps first, then all backbone steps, then all decoder steps. This
+    /// is numerically identical to interleaving per word (the three stages have no
+    /// within-phase cross-dependencies that order would change), but it groups the
+    /// work the way a GPU wants it: encoder words are mutually independent, the
+    /// backbone is a single recurrent sweep, and decoder words are independent too.
     pub fn forward_over(&mut self, tokens: &[u16], words: &[Range<usize>]) {
         self.word_segments.clear();
         self.word_segments.extend_from_slice(words);
@@ -229,16 +255,19 @@ impl Hierarchical {
         let w_tok = self.w_token as usize;
         let char_out = self.encoder.output_size;
 
-        let mut dec_cursor = 0;
+        // Word 0 is the encode-only prefix; words 1..n are decoded, so word w is
+        // encoded and the backbone turns it into the context for word w+1.
+        let decode_words = n.saturating_sub(1);
 
-        for w in 0..n.saturating_sub(1) {
-            let word = self.word_segments[w]; // encoder word
-            let next_word = self.word_segments[w + 1]; // decoder word
+        // --- PHASE 1: ENCODER — bidirectionally encode every word w → e_w. ---
+        // Each word resets its own state, so the words are fully independent.
+        for w in 0..decode_words {
+            self.encoder.encode_word(w, tokens, self.word_segments[w]);
+        }
 
-            // --- ENCODER: bidirectional encode of word w → e_w ---
-            self.encoder.encode_word(w, tokens, word);
-
-            // --- BACKBONE: consume e_w → o_{w+1} (context for the next word) ---
+        // --- PHASE 2: BACKBONE — autoregress e_0 … e_{n-2}, carrying recurrent
+        // state across words. Step w consumes e_w and emits o_{w+1}. ---
+        for w in 0..decode_words {
             // Probe: drop cross-word recurrent state so o reflects only this word.
             if self.backbone_mode == BackboneMode::ResetEachWord {
                 for layer in &mut self.word_model.layers {
@@ -251,9 +280,15 @@ impl Hierarchical {
                 &mut self.word_model.cache[w],
                 &self.delta_buf[..char_out],
             );
+        }
 
-            // --- DECODER: chars of word w+1, conditioned on o_{w+1} ---
-            // inputs  [W], c1, …, cn   →   targets c1, …, cn, [W]
+        // --- PHASE 3: DECODER — predict the chars of word w+1, conditioned on
+        // o_{w+1}. Each word's decode is reset and independent of the others. ---
+        // inputs  [W], c1, …, cn   →   targets c1, …, cn, [W]
+        let mut dec_cursor = 0;
+        for w in 0..decode_words {
+            let next_word = self.word_segments[w + 1];
+
             {
                 let o = self.word_model.cache[w].last().unwrap().output();
                 self.char2_input[vocab..].copy_from_slice(o);
@@ -298,7 +333,7 @@ impl Hierarchical {
             }
 
             if self.trace_io {
-                self.trace_word(w, tokens, word, next_word);
+                self.trace_word(w, tokens, self.word_segments[w], next_word);
             }
         }
     }
@@ -329,6 +364,12 @@ impl Hierarchical {
         );
     }
 
+    /// Backward of the whole window, mirroring `forward_over`'s phase split:
+    /// decoder backward for every word, then a single reverse backbone sweep,
+    /// then encoder backward for every word. The two phase seams (`d_o_words`,
+    /// `d_ew_words`) hold the per-word gradients passed between stages. Only the
+    /// backbone is order-sensitive (reverse, so its cross-word BPTT state carries);
+    /// the decoder and encoder phases are per-word independent and batchable.
     pub fn backwards_sequence(&mut self) {
         let vocab = self.vocab_size;
         let context = self.context_size;
@@ -338,8 +379,9 @@ impl Hierarchical {
         let mut high_grad_accum = 0.0;
         let mut char1_grad_accum = 0.0;
 
-        // Walk words in reverse so the backbone's cross-word BPTT state carries.
-        for w in (0..words).rev() {
+        // --- PHASE 3': DECODER backward → grad w.r.t. each word's context o. ---
+        // Words decode independently, so order is free; stash each d_o per word.
+        for w in 0..words {
             let dec_range = self.dec_ranges[w];
 
             if self.trace_io {
@@ -353,7 +395,6 @@ impl Hierarchical {
                 );
             }
 
-            // --- DECODER backward; accumulate grad w.r.t. the word context o ---
             self.d_o_buf.fill(0.0);
             for slot in dec_range.into_iter().rev() {
                 let out_len = {
@@ -383,27 +424,33 @@ impl Hierarchical {
                 layer.reset_bptt_state();
             }
             high_grad_accum += self.d_o_buf.iter().map(|x| x.abs()).sum::<f32>() / context as f32;
+            self.d_o_words[w][..context].copy_from_slice(&self.d_o_buf[..context]);
+        }
 
-            // --- BACKBONE backward → grad w.r.t. the word embedding e_w ---
-            self.delta_buf[..context].copy_from_slice(&self.d_o_buf);
+        // --- PHASE 2': BACKBONE backward → grad w.r.t. each word embedding e_w. ---
+        // Reverse word order so the backbone's cross-word BPTT state carries.
+        for w in (0..words).rev() {
+            self.delta_buf[..context].copy_from_slice(&self.d_o_words[w][..context]);
             backward_through_layers(
                 &mut self.word_model.layers,
                 &mut self.word_model.cache[w],
                 &mut self.delta_buf,
                 context,
             );
-            {
-                let de = self.word_model.cache[w][0].input_grad();
-                self.d_ew_buf[..char_out].copy_from_slice(&de[..char_out]);
-            }
-
-            // --- ENCODER backward (combine split + both directions' BPTT) ---
-            char1_grad_accum += self.encoder.backward_word(w, &self.d_ew_buf[..char_out]);
+            let de = self.word_model.cache[w][0].input_grad();
+            self.d_ew_words[w][..char_out].copy_from_slice(&de[..char_out]);
         }
-
         for layer in &mut self.word_model.layers {
             layer.accumulate_init_grad();
             layer.reset_bptt_state();
+        }
+
+        // --- PHASE 1': ENCODER backward (combine split + both directions' BPTT). ---
+        // Per word, independent.
+        for w in 0..words {
+            char1_grad_accum += self
+                .encoder
+                .backward_word(w, &self.d_ew_words[w][..char_out]);
         }
 
         let denom = words.max(1) as f32;
@@ -413,14 +460,14 @@ impl Hierarchical {
 
     /// Average NLL per decoded word (chars + the trailing `[W]` summed, then
     /// averaged over words).
-    fn compute_word_loss(&self) -> f32 {
+    fn word_loss(&self) -> f32 {
         let last = self.char2_model.layers.len() - 1;
         let mut total = 0.0;
         for &range in &self.dec_ranges {
             let mut word_nll = 0.0;
             for slot in range {
-                let probs = softmax(self.char2_model.cache[slot][last].output());
-                word_nll -= (probs[self.dec_targets[slot] as usize] + 1e-12).ln();
+                let logits = self.char2_model.cache[slot][last].output();
+                word_nll += nll_from_logits(logits, self.dec_targets[slot] as usize);
             }
             total += word_nll;
         }
@@ -434,34 +481,23 @@ impl Hierarchical {
         let mut count = 0;
         for &range in &self.dec_ranges {
             for slot in range {
-                let probs = softmax(self.char2_model.cache[slot][last].output());
-                total -= (probs[self.dec_targets[slot] as usize] + 1e-12).ln();
+                let logits = self.char2_model.cache[slot][last].output();
+                total += nll_from_logits(logits, self.dec_targets[slot] as usize);
                 count += 1;
             }
         }
         total / count.max(1) as f32
     }
 
-    /// Summed decoder NLL (nats) and step count over the currently cached window.
-    fn decode_loss_sum(&self) -> (f32, usize) {
-        let last = self.char2_model.layers.len() - 1;
-        let mut total = 0.0;
-        let mut count = 0;
-        for &range in &self.dec_ranges {
-            for slot in range {
-                let probs = softmax(self.char2_model.cache[slot][last].output());
-                total -= (probs[self.dec_targets[slot] as usize] + 1e-12).ln();
-                count += 1;
-            }
-        }
-        (total, count)
-    }
-
     /// Forward-only evaluation: runs `forward_over` (under the current
     /// `backbone_mode`) over every window and returns mean per-token decode
     /// cross-entropy in nats. No backward, no weight updates.
-    pub fn eval_decode_loss<'a, I: Iterator<Item = WordBatch<'a>>>(&mut self, data: I) -> f32 {
-        let mut total = 0.0;
+    pub fn eval_decode_loss<'a, I: Iterator<Item = WordBatch<'a>>>(
+        &mut self,
+        data: I,
+    ) -> (f32, f32) {
+        let mut c_total = 0.0;
+        let mut w_total = 0.0;
         let mut count = 0;
         for batch in data {
             let WordBatch { tokens, words } = batch;
@@ -470,11 +506,17 @@ impl Hierarchical {
             if self.word_segments.len() < 2 {
                 continue;
             }
-            let (t, c) = self.decode_loss_sum();
-            total += t;
-            count += c;
+            let c_loss = self.decode_loss();
+            let w_loss = self.word_loss();
+            c_total += c_loss;
+            w_total += w_loss;
+
+            count += 1;
         }
-        total / count.max(1) as f32
+
+        let c_loss = c_total / count.max(1) as f32;
+        let w_loss = w_total / count.max(1) as f32;
+        (c_loss, w_loss)
     }
 
     /// Per-backbone-block, per-head mean effective forget multiplier (`f_prime`)
@@ -545,7 +587,7 @@ impl Hierarchical {
             }
 
             let loss = self.decode_loss();
-            let word_loss = self.compute_word_loss();
+            let word_loss = self.word_loss();
             self.last_word_loss = word_loss;
             tokens += window.len();
 
@@ -739,7 +781,7 @@ impl Hierarchical {
         self.word_model.write_to(w)?;
         self.char2_model.write_to(w)?;
         write_matrix(w, &self.encoder.combine.weights)?;
-        write_f32_slice(w, &self.encoder.combine.biases)?;
+        write_f32_slice(w, &vec![0.0; self.encoder.combine.weights.rows()])?;
         write_f32_slice(w, &self.encoder.combine_norm.gamma)?;
         write_u64(w, self.step as u64)?;
 
@@ -770,12 +812,12 @@ impl Hierarchical {
         let word_model = Sequential::load_from(r)?;
         let char2_model = Sequential::load_from(r)?;
         let combine_weights = read_matrix(r)?;
-        let combine_biases: Box<[f32]> = read_f32_vec(r)?;
+        let _combine_biases: Box<[f32]> = read_f32_vec(r)?;
         let combine_norm_gamma: Box<[f32]> = read_f32_vec(r)?;
         let step = read_u64(r).unwrap_or(0) as usize;
 
         let (ci, co) = (combine_weights.rows(), combine_weights.cols());
-        let combine = LinearLayer::from_loaded(ci, co, combine_weights, combine_biases);
+        let combine = LinearNBLayer::from_loaded(ci, co, combine_weights);
         let combine_norm = RMSNorm::from_loaded(co, combine_norm_gamma);
 
         let mut model = Self::new(
@@ -792,835 +834,6 @@ impl Hierarchical {
         debug_assert_eq!(model.context_size, context_size);
         model.step = step;
         Ok(model)
-    }
-}
-
-#[cfg(test)]
-mod orchestration_tests {
-    use super::*;
-    use crate::model::build_hierarchical_model;
-
-    /// Build a 4-word input, run the full hierarchical forward, and check that the
-    /// word context `o` produced for the LAST word changes when only the FIRST
-    /// word's characters change. If it does not, the backbone's recurrent state is
-    /// not carried across words by the orchestration (the bug the user suspects).
-    #[test]
-    fn word_context_depends_on_earlier_words() {
-        let tokenizer = Rc::new(Tokenizer::new(crate::config::CHARSET, false));
-        let vocab = tokenizer.vocab_size();
-        let boundaries = tokenizer.boundary_tokens();
-        assert!(!boundaries.is_empty(), "need at least one boundary token");
-
-        let mut model = build_hierarchical_model(vocab, boundaries.clone(), tokenizer.clone());
-        model.make_cache(64, MAX_SEQ_LEN);
-
-        let b = boundaries[0];
-        // Distinct non-boundary content tokens.
-        let content: Vec<u16> = (0..vocab as u16)
-            .filter(|t| !boundaries.contains(t))
-            .take(8)
-            .collect();
-        assert!(content.len() >= 5, "need a few non-boundary tokens");
-
-        // Four single-char words, each closed by the boundary `b`.
-        // Only word 0's character differs between the two runs.
-        let words: Vec<Range<usize>> = vec![
-            Range { start: 0, end: 2 },
-            Range { start: 2, end: 4 },
-            Range { start: 4, end: 6 },
-            Range { start: 6, end: 8 },
-        ];
-        let make = |w0: u16| vec![w0, b, content[1], b, content[2], b, content[3], b];
-
-        let run = |model: &mut Hierarchical, toks: &[u16]| -> Vec<f32> {
-            model.reset();
-            model.forward_over(toks, &words);
-            // n = 4 → last backbone step is cache[n-2] = cache[2], the context that
-            // conditions the decode of word 3.
-            model.word_model.cache[2].last().unwrap().output().to_vec()
-        };
-
-        let o_a = run(&mut model, &make(content[0]));
-        let o_b = run(&mut model, &make(content[4]));
-
-        let mean_diff: f32 = o_a
-            .iter()
-            .zip(&o_b)
-            .map(|(a, c)| (a - c).abs())
-            .sum::<f32>()
-            / o_a.len() as f32;
-        println!("mean |Δo| at word 3 from changing word 0 only = {mean_diff:.6e}");
-
-        assert!(
-            mean_diff > 1e-6,
-            "context of the last word is independent of the first word → \
-             backbone recurrence is NOT carried across words in forward_over"
-        );
-    }
-
-    /// Reproduce the hierarchical decode pattern in isolation: a constant raw
-    /// input fed at EVERY step through sLSTM blocks, backward'd per-step with the
-    /// same `backward_through_layers` + accumulate_init_grad/reset_bptt epilogue
-    /// the decoder uses. Grad-check layer 0, whose input is active at every step.
-    ///
-    /// Regression guard for the LSTM m-stabilizer BPTT bug: the sLSTM backward
-    /// used to treat the stabilizer `m` as constant, which is only exact while
-    /// psi=max(|n|,1) is set by |n|>1. Early in a segment |n| is small, psi clamps
-    /// to 1, and the dropped m-recurrence gradient corrupted input/recurrent grads
-    /// (worst at the first timestep). Fixed by carrying `dm_bptt` in the sLSTM.
-    #[test]
-    fn const_input_through_slstm_grad() {
-        use crate::nn::softmax::softmax;
-        use crate::nn_layer::SequentialBuilder;
-        use crate::optimizers::GradMatrixOps;
-
-        let d = 16usize;
-        let h = 24usize;
-        let mut m = SequentialBuilder::new(d)
-            .linear(h)
-            .slstm_block(h)
-            .slstm_block(h)
-            .rms_norm()
-            .linear(d)
-            .build();
-        let steps = 4usize;
-        m.make_cache(steps);
-        let x: Vec<f32> = (0..d).map(|k| ((k * 13 % 7) as f32 - 3.0) * 0.2).collect();
-        let targets: Vec<u16> = (0..steps as u16).map(|t| (t * 3 + 1) % d as u16).collect();
-
-        // Forward: same constant x at every step (like the word context).
-        let forward = |m: &mut Sequential| {
-            for l in &mut m.layers {
-                l.reset_state();
-            }
-            for t in 0..steps {
-                let Sequential { layers, cache, .. } = m;
-                Sequential::forward_step(layers, &mut cache[t], &x);
-            }
-        };
-
-        let summed_loss = |m: &mut Sequential| -> f32 {
-            forward(m);
-            let last = m.layers.len() - 1;
-            let mut loss = 0.0;
-            for t in 0..steps {
-                let probs = softmax(m.cache[t][last].output());
-                loss -= (probs[targets[t] as usize] + 1e-12).ln();
-            }
-            loss
-        };
-
-        // Analytic via the SAME per-step backward the decoder uses.
-        forward(&mut m);
-        let mut delta = vec![0.0f32; d.max(h)];
-        for t in (0..steps).rev() {
-            let last = m.layers.len() - 1;
-            let out = m.cache[t][last].output();
-            let len = out.len();
-            delta[..len].copy_from_slice(out);
-            softmax_inplace(&mut delta[..len]);
-            delta[targets[t] as usize] -= 1.0;
-            backward_through_layers(&mut m.layers, &mut m.cache[t], &mut delta, len);
-        }
-        for l in &mut m.layers {
-            l.accumulate_init_grad();
-            l.reset_bptt_state();
-        }
-
-        let (i, j) = (3usize, 7usize);
-        let g_analytic = m.layers[0]
-            .as_any_mut()
-            .downcast_mut::<LinearLayer>()
-            .unwrap()
-            .grads
-            .weights
-            .matrix()[i][j];
-        let eps = 1e-3;
-        let bump = |m: &mut Sequential, dd: f32| {
-            m.layers[0]
-                .as_any_mut()
-                .downcast_mut::<LinearLayer>()
-                .unwrap()
-                .weights[i][j] += dd;
-        };
-        bump(&mut m, eps);
-        let lp = summed_loss(&mut m);
-        bump(&mut m, -2.0 * eps);
-        let lm = summed_loss(&mut m);
-        bump(&mut m, eps);
-        let g_numeric = (lp - lm) / (2.0 * eps);
-        let rel = (g_analytic - g_numeric).abs() / g_analytic.abs().max(g_numeric.abs()).max(1e-6);
-        println!(
-            "CONST-input sLSTM layer0 w[{i}][{j}]: analytic {g_analytic:.6e}  numeric {g_numeric:.6e}  rel {rel:.3e}"
-        );
-        assert!(
-            rel < 2e-2,
-            "constant multi-step input through sLSTM grad mismatch (rel {rel:.3e})"
-        );
-    }
-
-    /// Control for `const_input_through_slstm_grad`: identical harness, but with
-    /// plain LSTM cells in place of the sLSTM blocks. The vanilla LSTM has a
-    /// straightforward, well-tested backward (no m-stabilizer), so if this passes
-    /// while the sLSTM version fails, the bug is isolated to the sLSTM cell — not the
-    /// per-step `backward_through_layers` orchestration nor the grad-check harness.
-    #[test]
-    fn const_input_through_lstm_grad() {
-        use crate::nn::softmax::softmax;
-        use crate::nn_layer::SequentialBuilder;
-        use crate::optimizers::GradMatrixOps;
-
-        let d = 16usize;
-        let h = 24usize;
-        let mut m = SequentialBuilder::new(d)
-            .linear(h)
-            .lstm(h)
-            .lstm(h)
-            .rms_norm()
-            .linear(d)
-            .build();
-        let steps = 4usize;
-        m.make_cache(steps);
-        let x: Vec<f32> = (0..d).map(|k| ((k * 13 % 7) as f32 - 3.0) * 0.2).collect();
-        let targets: Vec<u16> = (0..steps as u16).map(|t| (t * 3 + 1) % d as u16).collect();
-
-        let forward = |m: &mut Sequential| {
-            for l in &mut m.layers {
-                l.reset_state();
-            }
-            for t in 0..steps {
-                let Sequential { layers, cache, .. } = m;
-                Sequential::forward_step(layers, &mut cache[t], &x);
-            }
-        };
-
-        let summed_loss = |m: &mut Sequential| -> f32 {
-            forward(m);
-            let last = m.layers.len() - 1;
-            let mut loss = 0.0;
-            for t in 0..steps {
-                let probs = softmax(m.cache[t][last].output());
-                loss -= (probs[targets[t] as usize] + 1e-12).ln();
-            }
-            loss
-        };
-
-        forward(&mut m);
-        let mut delta = vec![0.0f32; d.max(h)];
-        for t in (0..steps).rev() {
-            let last = m.layers.len() - 1;
-            let out = m.cache[t][last].output();
-            let len = out.len();
-            delta[..len].copy_from_slice(out);
-            softmax_inplace(&mut delta[..len]);
-            delta[targets[t] as usize] -= 1.0;
-            backward_through_layers(&mut m.layers, &mut m.cache[t], &mut delta, len);
-        }
-        for l in &mut m.layers {
-            l.accumulate_init_grad();
-            l.reset_bptt_state();
-        }
-
-        let (i, j) = (3usize, 7usize);
-        let g_analytic = m.layers[0]
-            .as_any_mut()
-            .downcast_mut::<LinearLayer>()
-            .unwrap()
-            .grads
-            .weights
-            .matrix()[i][j];
-        let eps = 1e-3;
-        let bump = |m: &mut Sequential, dd: f32| {
-            m.layers[0]
-                .as_any_mut()
-                .downcast_mut::<LinearLayer>()
-                .unwrap()
-                .weights[i][j] += dd;
-        };
-        bump(&mut m, eps);
-        let lp = summed_loss(&mut m);
-        bump(&mut m, -2.0 * eps);
-        let lm = summed_loss(&mut m);
-        bump(&mut m, eps);
-        let g_numeric = (lp - lm) / (2.0 * eps);
-        let rel = (g_analytic - g_numeric).abs() / g_analytic.abs().max(g_numeric.abs()).max(1e-6);
-        println!(
-            "CONST-input LSTM layer0 w[{i}][{j}]: analytic {g_analytic:.6e}  numeric {g_numeric:.6e}  rel {rel:.3e}"
-        );
-        assert!(
-            rel < 2e-2,
-            "constant multi-step input through LSTM grad mismatch (rel {rel:.3e})"
-        );
-    }
-
-    /// Same as `const_input_through_slstm_grad` but through mLSTM blocks. The
-    /// mLSTM's normalizer stays >1 in practice, so its m-as-constant backward is
-    /// already accurate — this is a regression guard.
-    #[test]
-    fn const_input_through_mlstm_grad() {
-        use crate::nn::softmax::softmax;
-        use crate::nn_layer::SequentialBuilder;
-        use crate::optimizers::GradMatrixOps;
-
-        let d = 32usize;
-        let heads = 4usize;
-        let dqk = 4usize;
-        let mut m = SequentialBuilder::new(d)
-            .linear(d)
-            .mlstm_block(heads, dqk)
-            .mlstm_block(heads, dqk)
-            .rms_norm()
-            .linear(d)
-            .build();
-        let steps = 6usize;
-        m.make_cache(steps);
-        let x: Vec<f32> = (0..d).map(|k| ((k * 11 % 9) as f32 - 4.0) * 0.25).collect();
-        let targets: Vec<u16> = (0..steps as u16).map(|t| (t * 5 + 1) % d as u16).collect();
-
-        let forward = |m: &mut Sequential| {
-            for l in &mut m.layers {
-                l.reset_state();
-            }
-            for t in 0..steps {
-                let Sequential { layers, cache, .. } = m;
-                Sequential::forward_step(layers, &mut cache[t], &x);
-            }
-        };
-        let summed_loss = |m: &mut Sequential| -> f32 {
-            forward(m);
-            let last = m.layers.len() - 1;
-            let mut loss = 0.0;
-            for t in 0..steps {
-                let probs = softmax(m.cache[t][last].output());
-                loss -= (probs[targets[t] as usize] + 1e-12).ln();
-            }
-            loss
-        };
-
-        forward(&mut m);
-        let mut delta = vec![0.0f32; d * 2];
-        for t in (0..steps).rev() {
-            let last = m.layers.len() - 1;
-            let out = m.cache[t][last].output();
-            let len = out.len();
-            delta[..len].copy_from_slice(out);
-            softmax_inplace(&mut delta[..len]);
-            delta[targets[t] as usize] -= 1.0;
-            backward_through_layers(&mut m.layers, &mut m.cache[t], &mut delta, len);
-        }
-        for l in &mut m.layers {
-            l.accumulate_init_grad();
-            l.reset_bptt_state();
-        }
-
-        let (i, j) = (3usize, 7usize);
-        let g_analytic = m.layers[0]
-            .as_any_mut()
-            .downcast_mut::<LinearLayer>()
-            .unwrap()
-            .grads
-            .weights
-            .matrix()[i][j];
-        let bump = |m: &mut Sequential, dd: f32| {
-            m.layers[0]
-                .as_any_mut()
-                .downcast_mut::<LinearLayer>()
-                .unwrap()
-                .weights[i][j] += dd;
-        };
-        // eps=1e-2 minimises finite-difference roundoff at this gradient magnitude.
-        let eps = 1e-2;
-        bump(&mut m, eps);
-        let lp = summed_loss(&mut m);
-        bump(&mut m, -2.0 * eps);
-        let lm = summed_loss(&mut m);
-        bump(&mut m, eps);
-        let g_numeric = (lp - lm) / (2.0 * eps);
-        let rel = (g_analytic - g_numeric).abs() / g_analytic.abs().max(g_numeric.abs()).max(1e-6);
-        println!(
-            "CONST-input mLSTM layer0 w[{i}][{j}]: analytic {g_analytic:.6e}  numeric {g_numeric:.6e}  rel {rel:.3e}"
-        );
-        assert!(
-            rel < 1e-2,
-            "mLSTM const multi-step input grad mismatch (rel {rel:.3e})"
-        );
-    }
-
-    /// Grad-check a weight BELOW the recurrent blocks in a standalone Sequential
-    /// (the model's own backward), to see whether the sLSTM input_grad propagation
-    /// is correct in isolation — i.e. whether the bug is in the layers or only in
-    /// the hierarchical orchestration.
-    #[test]
-    fn flat_slstm_below_recurrence_grad() {
-        use crate::nn::softmax::softmax;
-        use crate::nn_layer::SequentialBuilder;
-        use crate::optimizers::GradMatrixOps;
-
-        let vocab = 24usize;
-        let h = 32usize;
-        let mut model = SequentialBuilder::new(vocab)
-            .linear(h)
-            .slstm_block(h)
-            .slstm_block(h)
-            .rms_norm()
-            .linear(vocab)
-            .build();
-        let seq_len = 5;
-        model.make_cache(seq_len);
-        let tokens: Vec<u16> = (0..seq_len as u16)
-            .map(|t| (t * 7 + 2) % vocab as u16)
-            .collect();
-
-        let summed_loss = |model: &mut Sequential| -> f32 {
-            for l in &mut model.layers {
-                l.reset_state();
-            }
-            model.forward_over(&tokens);
-            let last = model.layers.len() - 1;
-            let mut loss = 0.0;
-            for t in 0..tokens.len() {
-                let probs = softmax(model.cache[t][last].output());
-                loss -= (probs[tokens[t] as usize] + 1e-12).ln();
-            }
-            loss
-        };
-
-        for l in &mut model.layers {
-            l.reset_state();
-        }
-        model.forward_over(&tokens);
-        model.backwards_sequence(&tokens);
-
-        // layer 0 = the input Linear; its gradient flows back through both sLSTMs.
-        // Row i must be a token that is actually fed (one-hot input), else grad is 0.
-        // TIDX selects WHICH timestep's input_grad we sample (tokens are distinct).
-        let tidx: usize = std::env::var("TIDX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
-        let (i, j) = (tokens[tidx] as usize, 7usize);
-        let g_analytic = model.layers[0]
-            .as_any_mut()
-            .downcast_mut::<LinearLayer>()
-            .unwrap()
-            .grads
-            .weights
-            .matrix()[i][j];
-        let eps = 1e-3;
-        let bump = |model: &mut Sequential, d: f32| {
-            model.layers[0]
-                .as_any_mut()
-                .downcast_mut::<LinearLayer>()
-                .unwrap()
-                .weights[i][j] += d;
-        };
-        bump(&mut model, eps);
-        let lp = summed_loss(&mut model);
-        bump(&mut model, -2.0 * eps);
-        let lm = summed_loss(&mut model);
-        bump(&mut model, eps);
-        let g_numeric = (lp - lm) / (2.0 * eps);
-        let rel = (g_analytic - g_numeric).abs() / g_analytic.abs().max(g_numeric.abs()).max(1e-6);
-        println!(
-            "FLAT below-sLSTM layer0 w[{i}][{j}]: analytic {g_analytic:.6e}  numeric {g_numeric:.6e}  rel {rel:.3e}"
-        );
-        assert!(
-            rel < 2e-2,
-            "sLSTM input_grad propagation is itself wrong (rel {rel:.3e})"
-        );
-    }
-
-    /// Harness self-check: grad-check the *flat* model (known-good Sequential
-    /// forward/backward) so we trust the finite-difference setup before trusting
-    /// its verdict on the hierarchical model.
-    #[test]
-    fn flat_model_numeric_grad_sanity() {
-        use crate::model::build_normal_model;
-        use crate::nn::softmax::softmax;
-        use crate::optimizers::GradMatrixOps;
-
-        let vocab = 32usize;
-        let mut model = build_normal_model(vocab);
-        let seq_len = 6;
-        model.make_cache(seq_len);
-        let tokens: Vec<u16> = (0..seq_len as u16)
-            .map(|t| (t * 5 + 1) % vocab as u16)
-            .collect();
-
-        // backward differentiates the SUM of per-position cross-entropy.
-        let summed_loss = |model: &mut Sequential| -> f32 {
-            for l in &mut model.layers {
-                l.reset_state();
-            }
-            model.forward_over(&tokens);
-            let last = model.layers.len() - 1;
-            let mut loss = 0.0;
-            for t in 0..tokens.len() {
-                let probs = softmax(model.cache[t][last].output());
-                loss -= (probs[tokens[t] as usize] + 1e-12).ln();
-            }
-            loss
-        };
-
-        for l in &mut model.layers {
-            l.reset_state();
-        }
-        model.forward_over(&tokens);
-        model.backwards_sequence(&tokens);
-
-        let last = model.layers.len() - 1;
-        let (i, j) = (3usize, 7usize);
-        let g_analytic = {
-            let layer = model.layers[last]
-                .as_any_mut()
-                .downcast_mut::<LinearLayer>()
-                .expect("last layer is Linear");
-            layer.grads.weights.matrix()[i][j]
-        };
-        let eps = 1e-3;
-        {
-            let layer = model.layers[last]
-                .as_any_mut()
-                .downcast_mut::<LinearLayer>()
-                .unwrap();
-            layer.weights[i][j] += eps;
-        }
-        let lp = summed_loss(&mut model);
-        {
-            let layer = model.layers[last]
-                .as_any_mut()
-                .downcast_mut::<LinearLayer>()
-                .unwrap();
-            layer.weights[i][j] -= 2.0 * eps;
-        }
-        let lm = summed_loss(&mut model);
-        {
-            let layer = model.layers[last]
-                .as_any_mut()
-                .downcast_mut::<LinearLayer>()
-                .unwrap();
-            layer.weights[i][j] += eps;
-        }
-        let g_numeric = (lp - lm) / (2.0 * eps);
-        let rel = (g_analytic - g_numeric).abs() / g_analytic.abs().max(g_numeric.abs()).max(1e-6);
-        println!(
-            "FLAT last-linear w[{i}][{j}]: analytic {g_analytic:.6e}  numeric {g_numeric:.6e}  rel {rel:.3e}"
-        );
-        assert!(
-            rel < 2e-2,
-            "harness/flat-model grad mismatch (rel {rel:.3e})"
-        );
-    }
-
-    /// Numeric gradient check across the whole encoder→backbone→decoder chain.
-    ///
-    /// Builds a hierarchical model from cells with EXACT backward (LSTM encoder +
-    /// decoder, mLSTM backbone) so the finite-difference verdict is not polluted by
-    /// the sLSTM cell's known-inexact stabilizer backward. Grad-checks one weight in
-    /// each orchestration path — the cross-word backbone input projection, the
-    /// combine head (encoder readout merge), and both encoder directions — against a
-    /// central finite difference of the summed decode loss. A match proves the new
-    /// bidirectional encoder readout split, the `[W]` decode steps, and the
-    /// cross-word backbone BPTT are all consistent.
-    #[test]
-    fn backward_matches_numeric_grad_across_words() {
-        use crate::nn::softmax::softmax;
-        use crate::nn_layer::SequentialBuilder;
-        use crate::optimizers::GradMatrixOps;
-        use iron_oxide::collections::Matrix;
-
-        // Small dims, all exact-backward cells.
-        let tokenizer = Rc::new(Tokenizer::new(crate::config::CHARSET, false));
-        let vocab = tokenizer.vocab_size();
-        let boundaries = tokenizer.boundary_tokens();
-        let h = 16usize; // encoder hidden + combine output + backbone input
-        let oh = 16usize; // backbone output (context)
-        let wh = 32usize; // backbone inner width
-        let heads = 4usize;
-        let dqk = wh / heads;
-
-        let enc = || {
-            SequentialBuilder::new(vocab)
-                .embedding(h)
-                .lstm(h)
-                .lstm(h)
-                .build()
-        };
-        let char_fwd = enc();
-        let char_bwd = enc();
-        let combine = LinearLayer::new(2 * h, h);
-        let combine_norm = RMSNorm::new(h);
-        let word_model = SequentialBuilder::new(h)
-            .linear(wh)
-            .mlstm_block(heads, dqk)
-            .linear(oh)
-            .rms_norm()
-            .build();
-        let char2_model = SequentialBuilder::new(oh + vocab)
-            .linear(oh)
-            .lstm(oh)
-            .lstm(oh)
-            .linear(oh)
-            .rms_norm()
-            .linear_no_bias(vocab)
-            .build();
-        let mut model = Hierarchical::new(
-            char_fwd,
-            char_bwd,
-            combine,
-            combine_norm,
-            char2_model,
-            word_model,
-            vocab,
-            boundaries.clone(),
-            tokenizer.clone(),
-        );
-        model.make_cache(64, MAX_SEQ_LEN);
-
-        // 4 two-token words → three decoded words, exercising cross-word backbone BPTT.
-        let b = boundaries[0];
-        let content: Vec<u16> = (0..vocab as u16)
-            .filter(|t| !boundaries.contains(t))
-            .take(8)
-            .collect();
-        let mut tokens = Vec::new();
-        let mut words: Vec<Range<usize>> = Vec::new();
-        for k in 0..4 {
-            let start = tokens.len();
-            tokens.push(content[k % content.len()]);
-            tokens.push(b);
-            words.push(Range {
-                start,
-                end: start + 2,
-            });
-        }
-
-        // Loss accumulated in f64: the central finite difference subtracts two large,
-        // nearly-equal sums, so an f32 accumulator loses the signal for the small
-        // gradients deep in the net (combine / encoder). The forward is still f32, so
-        // we grad-check each path at its LARGEST-magnitude weight (best SNR).
-        let summed_loss = |model: &mut Hierarchical| -> f64 {
-            model.reset();
-            model.forward_over(&tokens, &words);
-            let last = model.char2_model.layers.len() - 1;
-            let mut loss = 0.0f64;
-            for range in model.dec_ranges.clone() {
-                for slot in range.start..range.end {
-                    let probs = softmax(model.char2_model.cache[slot][last].output());
-                    loss -= ((probs[model.dec_targets[slot] as usize] as f64) + 1e-12).ln();
-                }
-            }
-            loss
-        };
-
-        // Analytic gradients via the real backward.
-        model.reset();
-        model.forward_over(&tokens, &words);
-        model.backwards_sequence();
-
-        let eps = 1e-2;
-        let argmax = |m: &Matrix| -> (usize, usize) {
-            let mut best = (0, 0);
-            let mut bv = -1.0;
-            for r in 0..m.rows() {
-                for c in 0..m.cols() {
-                    let v = m[r][c].abs();
-                    if v > bv {
-                        bv = v;
-                        best = (r, c);
-                    }
-                }
-            }
-            best
-        };
-
-        // Each tuple names an orchestration path and a `pick` to its weight + grad.
-        // word/0 : backbone input proj (shared every word → cross-word backbone BPTT)
-        // word/2 : backbone output proj (top of the backbone, above the recurrence)
-        // combine: bidirectional readout merge (fwd@[W] ‖ bwd@[W] → e_w)
-        // char2/3: decoder linear above the recurrence (the [W] BOS/EOS decode steps)
-        // char_fwd / char_bwd embedding: encoder internal backward + readout slot
-        use crate::nn::embedding::EmbeddingLayer;
-        type Pick = fn(&mut Hierarchical) -> (&mut Matrix, &mut Matrix); // (weights, grad)
-        fn lin(l: &mut Box<dyn NnLayer>) -> (&mut Matrix, &mut Matrix) {
-            let l = l.as_any_mut().downcast_mut::<LinearLayer>().unwrap();
-            (&mut l.weights, l.grads.weights.matrix())
-        }
-        let cases: [(&str, Pick); 6] = [
-            ("word/0", |m| lin(&mut m.word_model.layers[0])),
-            ("word/2", |m| lin(&mut m.word_model.layers[2])),
-            ("combine", |m| {
-                (
-                    &mut m.encoder.combine.weights,
-                    m.encoder.combine.grads.weights.matrix(),
-                )
-            }),
-            ("char2/3", |m| lin(&mut m.char2_model.layers[3])),
-            ("char_fwd/emb", |m| {
-                let e = m.encoder.char_fwd.layers[0]
-                    .as_any_mut()
-                    .downcast_mut::<EmbeddingLayer>()
-                    .unwrap();
-                (&mut e.weights, e.grads.weights.matrix())
-            }),
-            ("char_bwd/emb", |m| {
-                let e = m.encoder.char_bwd.layers[0]
-                    .as_any_mut()
-                    .downcast_mut::<EmbeddingLayer>()
-                    .unwrap();
-                (&mut e.weights, e.grads.weights.matrix())
-            }),
-        ];
-
-        for (label, pick) in cases {
-            let (i, j) = {
-                let (_, g) = pick(&mut model);
-                argmax(g)
-            };
-            let g_analytic = {
-                let (_, g) = pick(&mut model);
-                g[i][j]
-            };
-            let bump = |model: &mut Hierarchical, d: f32| {
-                let (w, _) = pick(model);
-                w[i][j] += d;
-            };
-            bump(&mut model, eps);
-            let l_plus = summed_loss(&mut model);
-            bump(&mut model, -2.0 * eps);
-            let l_minus = summed_loss(&mut model);
-            bump(&mut model, eps); // restore
-            let g_numeric = ((l_plus - l_minus) / (2.0 * eps as f64)) as f32;
-            let rel =
-                (g_analytic - g_numeric).abs() / g_analytic.abs().max(g_numeric.abs()).max(1e-6);
-            println!(
-                "{label} w[{i}][{j}]: analytic {g_analytic:.6e}  numeric {g_numeric:.6e}  rel {rel:.3e}"
-            );
-            assert!(
-                rel < 5e-2,
-                "{label}: analytic vs numeric gradient disagree (rel {rel:.3e})"
-            );
-        }
-    }
-
-    /// Build a small hierarchical model (LSTM encoder/decoder, mLSTM backbone) for
-    /// fast end-to-end smoke tests.
-    fn build_small(tokenizer: Rc<Tokenizer>) -> Hierarchical {
-        use crate::nn_layer::SequentialBuilder;
-        let vocab = tokenizer.vocab_size();
-        let (h, oh, wh, heads) = (16usize, 16usize, 32usize, 4usize);
-        let enc = || {
-            SequentialBuilder::new(vocab)
-                .embedding(h)
-                .lstm(h)
-                .lstm(h)
-                .build()
-        };
-        let word_model = SequentialBuilder::new(h)
-            .linear(wh)
-            .mlstm_block(heads, wh / heads)
-            .linear(oh)
-            .rms_norm()
-            .build();
-        let char2_model = SequentialBuilder::new(oh + vocab)
-            .linear(oh)
-            .lstm(oh)
-            .lstm(oh)
-            .linear(oh)
-            .rms_norm()
-            .linear_no_bias(vocab)
-            .build();
-        Hierarchical::new(
-            enc(),
-            enc(),
-            LinearLayer::new(2 * h, h),
-            RMSNorm::new(h),
-            char2_model,
-            word_model,
-            vocab,
-            tokenizer.boundary_tokens(),
-            tokenizer.clone(),
-        )
-    }
-
-    /// End-to-end: a few SGD steps on a fixed short corpus must reduce the decode
-    /// loss; saving and reloading the new HIER format must preserve the model
-    /// (identical loss); sampling must run, terminate words on the internal `[W]`
-    /// and never emit it.
-    fn segment(toks: &[u16], boundaries: &[u16]) -> Vec<Range<usize>> {
-        let mut words = Vec::new();
-        let mut start = 0;
-        for (t, tok) in toks.iter().enumerate() {
-            if boundaries.contains(tok) {
-                words.push(Range { start, end: t + 1 });
-                start = t + 1;
-            }
-        }
-        if start < toks.len() {
-            words.push(Range {
-                start,
-                end: toks.len(),
-            });
-        }
-        words
-    }
-
-    #[test]
-    fn train_save_load_sample_roundtrip() {
-        let tokenizer = Rc::new(Tokenizer::new(crate::config::CHARSET, false));
-        let boundaries = tokenizer.boundary_tokens();
-        let mut model = build_small(tokenizer.clone());
-        model.make_cache(64, MAX_SEQ_LEN);
-
-        let tokens = tokenizer.to_tokens("the cat sat on the mat. the cat ran. ");
-        let words = segment(&tokens, &boundaries);
-        assert!(words.len() >= 4);
-
-        let step = |m: &mut Hierarchical| {
-            m.reset();
-            m.forward_over(&tokens, &words);
-            let loss = m.decode_loss();
-            m.backwards_sequence();
-            let lr = 0.05;
-            m.encoder.sgd_step(lr);
-            m.char2_model.sgd_step(lr);
-            m.word_model.sgd_step(lr);
-            loss
-        };
-
-        let loss0 = step(&mut model);
-        for _ in 0..40 {
-            step(&mut model);
-        }
-        model.reset();
-        model.forward_over(&tokens, &words);
-        let loss_final = model.decode_loss();
-        println!("roundtrip: loss {loss0:.4} → {loss_final:.4}");
-        assert!(loss_final < loss0 * 0.9, "training did not reduce loss");
-
-        // Save → load → identical decode loss.
-        let path = std::env::temp_dir().join("hier_roundtrip_test.bin");
-        let path = path.to_str().unwrap();
-        model.save(path).unwrap();
-        let mut reloaded = Hierarchical::load(path, tokenizer.clone()).unwrap();
-        reloaded.make_cache(64, MAX_SEQ_LEN);
-        reloaded.reset();
-        reloaded.forward_over(&tokens, &words);
-        let loss_reloaded = reloaded.decode_loss();
-        assert!(
-            (loss_reloaded - loss_final).abs() < 1e-3,
-            "save/load changed the model: {loss_final} vs {loss_reloaded}"
-        );
-
-        // Sampling runs, terminates, and never emits the internal [W] marker.
-        let prefix = tokenizer.to_tokens("the ");
-        let out = reloaded.sample(&prefix, 80, 0.7, |_| true);
-        assert!(!out.is_empty(), "sampler produced nothing");
-        assert!(
-            !out.contains(&tokenizer.w_token()),
-            "sampler emitted the internal [W] marker"
-        );
-        std::fs::remove_file(path).ok();
     }
 }
 

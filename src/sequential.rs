@@ -111,8 +111,26 @@ impl Sequential {
         self.cache[0][out_layer].output()
     }
 
-    pub fn backwards_sequence(&mut self, targets: &[u16]) {
+    /// Layer-major BPTT driver shared by every backward variant.
+    ///
+    /// Fully unwinds one layer across all `n_steps` timesteps before descending
+    /// to the layer below, instead of hopping through all layers at each
+    /// timestep. This keeps a single layer's weights hot for the whole sequence
+    /// and is bit-identical to a time-major order, because the two gradient
+    /// channels are decoupled:
+    ///   • spatial — each layer persists dL/d(input) per timestep in its own
+    ///     cache (`input_grad()`), so the layer below reads it for every t once
+    ///     the layer above has finished.
+    ///   • temporal — each layer folds its own dh/dc BPTT channels in at the top
+    ///     of `backward` and only zeroes them at `reset_bptt_state`, so the inner
+    ///     reverse-t loop carries the recurrence correctly.
+    ///
+    /// The only thing that differs between loss heads is the gradient entering
+    /// the top layer, supplied by `top_delta(t, logits, delta_buf) -> len`: it
+    /// writes the seed delta into `delta_buf` and returns its length.
+    fn backwards_driver(&mut self, n_steps: usize, mut top_delta: impl FnMut(usize, &[f32], &mut [f32]) -> usize) {
         let n = self.layers.len();
+        let last = n - 1;
 
         // Destructure so we can mutably borrow delta_buf independently of
         // layers and cache. This is the key trick that avoids to_vec():
@@ -124,29 +142,34 @@ impl Sequential {
             ..
         } = self;
 
-        for t in (0..targets.len()).rev() {
-            let out = cache[t].last().unwrap().output();
-            let mut delta_len = out.len();
-            delta_buf[..delta_len].copy_from_slice(out);
-            softmax_inplace(&mut delta_buf[..delta_len]);
-            delta_buf[targets[t] as usize] -= 1.0;
+        for l in (0..n).rev() {
+            for t in (0..n_steps).rev() {
+                let delta_len = if l == last {
+                    // Top layer: loss-specific gradient w.r.t. the logits.
+                    top_delta(t, cache[t][last].output(), delta_buf)
+                } else {
+                    // Spatial gradient handed down from the layer above at t.
+                    let dx = cache[t][l + 1].input_grad();
+                    let len = dx.len();
+                    delta_buf[..len].copy_from_slice(dx);
+                    len
+                };
 
-            for l in (0..n).rev() {
                 // backward writes dL/d(input) into cache[t][l].input_grad().
                 layers[l].backward(&mut delta_buf[..delta_len], cache[t][l].as_mut());
-
-                if l == 0 {
-                    break;
-                }
-
-                let dx = cache[t][l].input_grad();
-                let new_len = dx.len();
-
-                delta_buf[..new_len].copy_from_slice(dx);
-
-                delta_len = new_len;
             }
         }
+    }
+
+    pub fn backwards_sequence(&mut self, targets: &[u16]) {
+        self.backwards_driver(targets.len(), |t, logits, delta_buf| {
+            // Gradient of cross-entropy under softmax: ŷ − y.
+            let len = logits.len();
+            delta_buf[..len].copy_from_slice(logits);
+            softmax_inplace(&mut delta_buf[..len]);
+            delta_buf[targets[t] as usize] -= 1.0;
+            len
+        });
     }
 
     pub fn train<'a, I: Iterator<Item = (&'a [u16], &'a [u16])>>(
@@ -319,15 +342,15 @@ impl Sequential {
                 .copied()
                 .take_while(|&i| {
                     if cum >= top_p {
-                        return false;
+                        false
+                    } else {
+                        cum += q[i];
+                        true
                     }
-                    cum += q[i];
-                    true
                 })
                 .collect();
 
-            let total: f32 = candidates.iter().map(|&i| q[i]).sum();
-            let r = random_range(0.0..total);
+            let r = random_range(0.0..cum);
             let mut cum = 0.0;
             let mut next = candidates[0] as u16;
             for &i in &candidates {
@@ -374,35 +397,13 @@ impl Sequential {
     /// Intermediate frames use label=0; only the final frame uses the sequence label.
     /// All frames contribute gradients (BPTT through the full sequence).
     pub fn backwards_wake_bce(&mut self, seq: &Sequence, weight_pos: f32, weight_neg: f32) {
-        let n_frames = seq.frames.len();
-        let n_layers = self.layers.len();
-        let last = n_layers - 1;
-
-        let Sequential {
-            layers,
-            cache,
-            delta_buf,
-            ..
-        } = self;
-        for t in (0..n_frames).rev() {
+        self.backwards_driver(seq.frames.len(), |t, logits, delta_buf| {
+            // Weighted BCE gradient on the single output logit: w·(σ(z) − y).
             let label = seq.frames[t].label;
             let weight = if label > 0.5 { weight_pos } else { weight_neg };
-
-            let logit = cache[t][last].output()[0];
-            delta_buf[0] = weight * (sigmoid(logit) - label);
-
-            let mut delta_len = 1;
-            for l in (0..n_layers).rev() {
-                layers[l].backward(&mut delta_buf[..delta_len], cache[t][l].as_mut());
-                if l == 0 {
-                    break;
-                }
-                let dx = cache[t][l].input_grad();
-                let new_len = dx.len();
-                delta_buf[..new_len].copy_from_slice(dx);
-                delta_len = new_len;
-            }
-        }
+            delta_buf[0] = weight * (sigmoid(logits[0]) - label);
+            1
+        });
     }
 
     pub fn sgd_step(&mut self, lr: f32) {

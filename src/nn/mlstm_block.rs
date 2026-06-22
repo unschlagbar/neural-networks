@@ -30,6 +30,7 @@ use std::{any::Any, io};
 
 use crate::{
     nn::{
+        activations::{silu, silu_prime},
         linear::{LinearCache, LinearLayer},
         mlstm::{MLSTMCache, MLSTMLayer},
         rms_norm::{RMSNorm, RMSNormCache},
@@ -37,27 +38,6 @@ use crate::{
     nn_layer::{DynCache, NnLayer},
     saving::{write_f32_slice, write_matrix, write_u32},
 };
-
-#[inline]
-fn stable_sigmoid(x: f32) -> f32 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
-}
-
-#[inline]
-fn silu(x: f32) -> f32 {
-    x * stable_sigmoid(x)
-}
-
-#[inline]
-fn silu_prime(pre: f32) -> f32 {
-    let s = stable_sigmoid(pre);
-    s * (1.0 + pre * (1.0 - s))
-}
 
 pub struct MLSTMBlockCache {
     pub pre_norm1: RMSNormCache,

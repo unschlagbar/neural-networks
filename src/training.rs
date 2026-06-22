@@ -241,18 +241,28 @@ pub fn probe_hierarchical(model_path: &str) {
     let mut results = Vec::new();
     for (mode, label) in modes {
         model.backbone_mode = mode;
-        let ce = model.eval_decode_loss(data.iter().take(n));
-        println!("  {label:<34} CE = {ce:.4} nats   ppl = {:.3}", ce.exp());
-        results.push((label, ce));
+        let (ce, we) = model.eval_decode_loss(data.iter().take(n));
+        println!(
+            "  {label:<34} Char loss = {ce:.4} nats   ppl = {:.3}",
+            ce.exp()
+        );
+        println!(
+            "  {label:<34} Word loss = {we:.4} nats   ppl = {:.3}",
+            we.exp()
+        );
+        results.push((label, ce, we));
     }
     model.backbone_mode = BackboneMode::Normal;
 
-    let normal = results[0].1;
-    let reset = results[1].1;
+    let c_normal = results[0].1;
+    let w_normal = results[0].2;
+    let c_reset = results[1].1;
+    let w_reset = results[1].2;
     println!("\n  ── context usage ──");
     println!(
-        "  long-range history (Reset → Normal): {:.4} nats  <- what the deep backbone actually buys",
-        reset - normal
+        "  long-range history (Reset → Normal): Char {:.4} nats, Word {:.4} <- what the deep backbone actually buys",
+        c_reset - c_normal,
+        w_reset - w_normal,
     );
 
     // ── Forget-gate / memory-horizon probe ──────────────────────────────

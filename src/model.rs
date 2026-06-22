@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::{
     config::{CHAR_HIDDEN, OUT_HIDDEN, WORD_BLOCKS, WORD_HIDDEN},
     hierarchical::Hierarchical,
-    nn::{linear::LinearLayer, rms_norm::RMSNorm},
+    nn::{linear_nb::LinearNBLayer, rms_norm::RMSNorm},
     nn_layer::SequentialBuilder,
     sequential::Sequential,
     tokenizer::Tokenizer,
@@ -48,7 +48,6 @@ pub fn build_hierarchical_model(
         SequentialBuilder::new(vocab)
             .embedding(CHAR_HIDDEN)
             .slstm_block(CHAR_HIDDEN)
-            .mlstm_block(16, CHAR_HIDDEN / 16)
             .slstm_block(CHAR_HIDDEN)
             .build()
     };
@@ -56,23 +55,26 @@ pub fn build_hierarchical_model(
     let char_bwd = encoder();
 
     // Merges concat(fwd@[W], bwd@[W]) ∈ R^{2H} → the word embedding e_w ∈ R^H.
-    let combine = LinearLayer::new(2 * CHAR_HIDDEN, CHAR_HIDDEN);
+    let combine = LinearNBLayer::new(2 * CHAR_HIDDEN, CHAR_HIDDEN);
     let combine_norm = RMSNorm::new(CHAR_HIDDEN);
 
     let heads: usize = 8;
     let dqk: usize = WORD_HIDDEN / heads;
 
-    let mut word_model = SequentialBuilder::new(CHAR_HIDDEN).linear(WORD_HIDDEN);
-    for _ in 0..WORD_BLOCKS {
-        word_model = word_model.mlstm_block(heads, dqk)
+    let mut word_model = SequentialBuilder::new(CHAR_HIDDEN).linear_no_bias(WORD_HIDDEN);
+    for i in 0..WORD_BLOCKS {
+        if i.is_multiple_of(2) {
+            word_model = word_model.slstm_block(WORD_HIDDEN)
+        } else {
+            word_model = word_model.mlstm_block(heads, dqk)
+        }
     }
-    let word_model = word_model.rms_norm().linear(OUT_HIDDEN).build();
+    let word_model = word_model.rms_norm().linear_no_bias(OUT_HIDDEN).build();
 
     let char2_builder = SequentialBuilder::new(OUT_HIDDEN + vocab);
     let char2_model = char2_builder
-        .linear(OUT_HIDDEN)
+        .linear_no_bias(OUT_HIDDEN)
         .slstm_block(OUT_HIDDEN)
-        .mlstm_block(16, CHAR_HIDDEN / 16)
         .slstm_block(OUT_HIDDEN)
         .rms_norm()
         .linear_no_bias(vocab)

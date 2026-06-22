@@ -42,6 +42,7 @@ use rand::random_range;
 
 use crate::{
     nn::{
+        activations::{log_sigmoid, stable_sigmoid},
         headwise_rms_norm::{HeadwiseRMSNorm, HeadwiseRMSNormCache},
         linear::{LinearCache, LinearLayer},
     },
@@ -50,25 +51,6 @@ use crate::{
     saving,
 };
 use std::{any::Any, io};
-
-#[inline]
-fn stable_sigmoid(x: f32) -> f32 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
-}
-
-#[inline]
-fn log_sigmoid(x: f32) -> f32 {
-    if x >= 0.0 {
-        -((-x).exp().ln_1p())
-    } else {
-        x - x.exp().ln_1p()
-    }
-}
 
 pub struct MLSTMCache {
     pub x: Box<[f32]>,

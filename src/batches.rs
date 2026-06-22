@@ -21,6 +21,9 @@ use rand::{rng, seq::SliceRandom};
 
 use crate::tokenizer::Tokenizer;
 
+const SPLIT: &str = "<|endoftext|>";
+//const SPLIT: &str = "---FILE---";
+
 #[derive(Clone, Copy, Debug)]
 struct Window {
     seq: u32,
@@ -50,7 +53,7 @@ impl PreparedDataSet {
         let mut sequences: Vec<Vec<u16>> = Vec::new();
         let mut skipped = 0;
 
-        for chunk in content.split("---FILE---") {
+        for chunk in content.split(SPLIT) {
             let chunk = chunk.trim();
             if chunk.is_empty() {
                 continue;
@@ -297,7 +300,7 @@ pub struct WordDataSet {
 }
 
 impl WordDataSet {
-    /// Load a single file (split on `---FILE---`), tokenize and word-segment each
+    /// Load a single file (split on SPLIT), tokenize and word-segment each
     /// chunk, then build contiguous windows of up to `words_per_seq` words. A
     /// window is closed early if adding the next word would push its token span
     /// past `max_tokens`. A finished window is kept only if it has at least
@@ -318,7 +321,7 @@ impl WordDataSet {
 
         let mut sequences: Vec<Vec<u16>> = Vec::new();
         let mut skipped = 0;
-        for chunk in content.split("---FILE---") {
+        for chunk in content.split(SPLIT) {
             let chunk = chunk.trim();
             if chunk.is_empty() {
                 continue;

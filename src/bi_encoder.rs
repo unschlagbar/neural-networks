@@ -21,7 +21,7 @@ use std::range::Range;
 use crate::{
     hierarchical::backward_through_layers,
     nn::{
-        linear::{LinearCache, LinearLayer},
+        linear_nb::{LinearNBCache, LinearNBLayer},
         rms_norm::{RMSNorm, RMSNormCache},
     },
     nn_layer::{DynCache, NnLayer},
@@ -34,10 +34,10 @@ pub struct BiEncoder {
     /// Backward direction stack (`cn … c1 [W]`).
     pub char_bwd: Sequential,
     /// Merges `concat(fwd, bwd) ∈ ℝ^{2H}` → word embedding `e_w ∈ ℝ^H`.
-    pub combine: LinearLayer,
+    pub combine: LinearNBLayer,
     pub combine_norm: RMSNorm,
 
-    combine_caches: Vec<LinearCache>,
+    combine_caches: Vec<LinearNBCache>,
     combine_norm_caches: Vec<RMSNormCache>,
 
     /// Reusable one-hot input buffer (size `vocab`).
@@ -64,7 +64,7 @@ impl BiEncoder {
     pub fn new(
         char_fwd: Sequential,
         char_bwd: Sequential,
-        combine: LinearLayer,
+        combine: LinearNBLayer,
         combine_norm: RMSNorm,
         vocab_size: usize,
         w_token: u16,
@@ -128,7 +128,7 @@ impl BiEncoder {
         self.char_fwd.make_cache(slots);
         self.char_bwd.make_cache(slots);
         self.combine_caches = (0..word_steps.max(1))
-            .map(|_| LinearCache::new(2 * char_out, char_out))
+            .map(|_| LinearNBCache::new(2 * char_out, char_out))
             .collect();
         self.combine_norm_caches = (0..word_steps.max(1))
             .map(|_| self.combine_norm.alloc_cache())

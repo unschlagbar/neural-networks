@@ -1,1 +1,9 @@
-
+# Compile for the host CPU so LLVM can use AVX2/FMA when auto-vectorizing the
+# hand-written matmul / outer-product loops (row_mul, add_outer, the fused
+# mLSTM backward). Without this the build targets the x86-64 baseline (SSE2),
+# leaving most of the SIMD width unused.
+#
+# Note: binaries produced this way are tuned to this machine's CPU and may not
+# run on older hardware. Fine for local training; drop this file for portable builds.
+[build]
+rustflags = ["-C", "target-cpu=native"]
