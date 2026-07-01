@@ -128,7 +128,11 @@ impl Sequential {
     /// The only thing that differs between loss heads is the gradient entering
     /// the top layer, supplied by `top_delta(t, logits, delta_buf) -> len`: it
     /// writes the seed delta into `delta_buf` and returns its length.
-    fn backwards_driver(&mut self, n_steps: usize, mut top_delta: impl FnMut(usize, &[f32], &mut [f32]) -> usize) {
+    fn backwards_driver(
+        &mut self,
+        n_steps: usize,
+        mut top_delta: impl FnMut(usize, &[f32], &mut [f32]) -> usize,
+    ) {
         let n = self.layers.len();
         let last = n - 1;
 
@@ -390,6 +394,71 @@ impl Sequential {
         let Sequential { layers, cache, .. } = self;
         for (t, frame) in features.iter().enumerate() {
             Self::forward_step(layers, &mut cache[t], frame.as_ref());
+        }
+    }
+
+    /// Backward with max-pooling loss over the positive label window.
+    ///
+    /// Positive window frames: only the frame with the highest sigmoid output receives
+    /// the positive gradient (`weight_pos * (p - 1)`).  All other frames in the window
+    /// get zero gradient from the loss (BPTT still flows through them).
+    /// Frames outside the window receive the standard negative BCE gradient.
+    ///
+    /// Pass `weight_pos = 1.0` and `weight_neg = 1.0 / n_neg_frames` at the call site.
+    pub fn backwards_wake_bce_maxpool(&mut self, seq: &Sequence, weight_pos: f32, weight_neg: f32) {
+        let n_frames = seq.frames.len();
+        let n_layers = self.layers.len();
+        let last = n_layers - 1;
+
+        // Locate the positive label window.
+        let w0 = seq
+            .frames
+            .iter()
+            .position(|f| f.label > 0.5)
+            .unwrap_or(usize::MAX);
+        let w1 = seq.frames.iter().rposition(|f| f.label > 0.5).unwrap_or(0);
+
+        // Find the frame in [w0, w1] with the highest sigmoid output.
+        let max_frame: Option<usize> = if w0 <= w1 {
+            (w0..=w1).max_by(|&a, &b| {
+                let pa = sigmoid(self.cache[a][last].output()[0]);
+                let pb = sigmoid(self.cache[b][last].output()[0]);
+                pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        } else {
+            None
+        };
+
+        let Sequential {
+            layers,
+            cache,
+            delta_buf,
+            ..
+        } = self;
+
+        for t in (0..n_frames).rev() {
+            let in_window = t >= w0 && t <= w1;
+            let logit = cache[t][last].output()[0];
+
+            delta_buf[0] = if Some(t) == max_frame {
+                weight_pos * (sigmoid(logit) - 1.0)
+            } else if in_window {
+                0.0
+            } else {
+                weight_neg * sigmoid(logit)
+            };
+
+            let mut delta_len = 1;
+            for l in (0..n_layers).rev() {
+                layers[l].backward(&mut delta_buf[..delta_len], cache[t][l].as_mut());
+                if l == 0 {
+                    break;
+                }
+                let dx = cache[t][l].input_grad();
+                let new_len = dx.len();
+                delta_buf[..new_len].copy_from_slice(dx);
+                delta_len = new_len;
+            }
         }
     }
 

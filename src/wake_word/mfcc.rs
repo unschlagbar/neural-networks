@@ -5,14 +5,64 @@ use crate::config::{WAKE_FRAME_LEN, WAKE_N_FFT, WAKE_N_MELS, WAKE_SR};
 pub struct MelExtractor {
     window: Vec<f32>,
     mel_filters: Vec<Vec<f32>>, // [N_MELS × (N_FFT/2+1)]
+
+    // Scratch buffers for `extract_frame_into` only — `extract_frame` doesn't
+    // touch these. Reused across calls so the real-time streaming path does
+    // zero heap allocation per frame.
+    scratch_re: Vec<f32>,
+    scratch_im: Vec<f32>,
+    scratch_power: Vec<f32>,
 }
 
 impl MelExtractor {
     pub fn new() -> Self {
+        let n_bins = WAKE_N_FFT / 2 + 1;
         Self {
             window: hann_window(WAKE_FRAME_LEN),
             mel_filters: build_mel_filters(WAKE_N_MELS, WAKE_SR, WAKE_N_FFT, 80.0, 8000.0),
+            scratch_re: vec![0.0; WAKE_N_FFT],
+            scratch_im: vec![0.0; WAKE_N_FFT],
+            scratch_power: vec![0.0; n_bins],
         }
+    }
+
+    /// Same as `extract_frame`, but writes into `out` (which must be exactly
+    /// `WAKE_N_MELS` long) and reuses internal scratch buffers instead of
+    /// allocating. Zero heap allocation in steady state — use this on the
+    /// real-time listen/capture hot path.
+    pub fn extract_frame_into(&mut self, samples: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(samples.len(), WAKE_FRAME_LEN);
+        debug_assert_eq!(out.len(), WAKE_N_MELS);
+        let n_bins = WAKE_N_FFT / 2 + 1;
+
+        for j in 0..WAKE_FRAME_LEN {
+            self.scratch_re[j] = samples[j] * self.window[j];
+        }
+        self.scratch_re[WAKE_FRAME_LEN..].fill(0.0);
+        self.scratch_im.fill(0.0);
+        fft_inplace(&mut self.scratch_re, &mut self.scratch_im);
+
+        for k in 0..n_bins {
+            self.scratch_power[k] =
+                self.scratch_re[k] * self.scratch_re[k] + self.scratch_im[k] * self.scratch_im[k];
+        }
+
+        let mut mean = 0.0f32;
+        for (m, filt) in self.mel_filters.iter().enumerate() {
+            let e: f32 = filt
+                .iter()
+                .zip(&self.scratch_power)
+                .map(|(w, p)| w * p)
+                .sum();
+            let v = (e + 1e-10).ln();
+            out[m] = v;
+            mean += v;
+        }
+
+        // Per-frame mean subtraction: removes overall volume offset so
+        // the model sees spectral shape rather than absolute energy level.
+        mean /= out.len() as f32;
+        out.iter_mut().for_each(|v| *v -= mean);
     }
 
     /// Extract log-mel features from a single frame of exactly `WAKE_FRAME_LEN` samples.
@@ -175,6 +225,24 @@ pub fn resample(samples: &[f32], from_sr: usize, to_sr: usize) -> Vec<f32> {
             a + frac * (b - a)
         })
         .collect()
+}
+
+/// Same as `resample`, but writes into `out` (cleared first) instead of
+/// allocating a new Vec — reuses `out`'s capacity across calls.
+pub fn resample_into(samples: &[f32], from_sr: usize, to_sr: usize, out: &mut Vec<f32>) {
+    debug_assert_ne!(from_sr, to_sr, "cannot resample to same sample rate");
+
+    let ratio = from_sr as f32 / to_sr as f32;
+    let out_len = (samples.len() as f32 / ratio) as usize;
+    out.clear();
+    out.extend((0..out_len).map(|i| {
+        let pos = i as f32 * ratio;
+        let idx = pos as usize;
+        let frac = pos - idx as f32;
+        let a = samples[idx];
+        let b = samples.get(idx + 1).copied().unwrap_or(a);
+        a + frac * (b - a)
+    }));
 }
 
 /// Trim or zero-pad to exactly `target` samples.
