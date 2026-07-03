@@ -3,7 +3,6 @@ use std::rc::Rc;
 use crate::{
     config::{CHAR_HIDDEN, OUT_HIDDEN, WORD_BLOCKS, WORD_HIDDEN},
     hierarchical::Hierarchical,
-    nn::{linear_nb::LinearNBLayer, rms_norm::RMSNorm},
     nn_layer::SequentialBuilder,
     sequential::Sequential,
     tokenizer::Tokenizer,
@@ -24,11 +23,10 @@ pub fn build_normal_model(vocab: usize) -> Sequential {
 
 // Hierarchical Autoregressive Transformer (HAT)-style model (arXiv 2501.10322).
 //
-//   encoder  (char_fwd + char_bwd) — a bidirectional sLSTM over the characters of
-//                            one word, prefixed with the `[W]` marker. The word
-//                            embedding is read off the `[W]` position in each
-//                            direction and merged by `combine` into a CHAR_HIDDEN
-//                            vector.
+//   encoder  (word_encoder) — a normal forward sLSTM stack over the characters
+//                            of one word. The word embedding e_w is the RMSNorm'd
+//                            hidden state at the LAST character, where the state
+//                            has seen the whole word. Reset per word.
 //   backbone (word_model)  — autoregressive over word embeddings; its output is
 //                            the model-space prediction for the *next* word.
 //   decoder  (char2_model) — generates the characters of a word one at a time,
@@ -41,22 +39,13 @@ pub fn build_hierarchical_model(
     boundary_token_ids: Vec<u16>,
     tokenizer: Rc<Tokenizer>,
 ) -> Hierarchical {
-    // One sLSTM encoder stack per direction (no shared weights). The word embedding
-    // is the raw sLSTM hidden state at the `[W]` position, so no per-step linear /
-    // norm head here — `combine` merges the two directions instead.
-    let encoder = || {
-        SequentialBuilder::new(vocab)
-            .embedding(CHAR_HIDDEN)
-            .slstm_block(CHAR_HIDDEN)
-            .slstm_block(CHAR_HIDDEN)
-            .build()
-    };
-    let char_fwd = encoder();
-    let char_bwd = encoder();
-
-    // Merges concat(fwd@[W], bwd@[W]) ∈ R^{2H} → the word embedding e_w ∈ R^H.
-    let combine = LinearNBLayer::new(2 * CHAR_HIDDEN, CHAR_HIDDEN);
-    let combine_norm = RMSNorm::new(CHAR_HIDDEN);
+    // The trailing RMSNorm keeps e_w at a stable scale for the backbone.
+    let encoder = SequentialBuilder::new(vocab)
+        .embedding(CHAR_HIDDEN)
+        .slstm_block(CHAR_HIDDEN)
+        .slstm_block(CHAR_HIDDEN)
+        .rms_norm()
+        .build();
 
     let heads: usize = 8;
     let dqk: usize = WORD_HIDDEN / heads;
@@ -81,10 +70,7 @@ pub fn build_hierarchical_model(
         .build();
 
     Hierarchical::new(
-        char_fwd,
-        char_bwd,
-        combine,
-        combine_norm,
+        encoder,
         char2_model,
         word_model,
         vocab,

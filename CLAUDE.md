@@ -16,6 +16,7 @@ cargo run [--release]
 
 # Bench
 cargo bench --bench lstm_training
+cargo bench --bench hierarchical_training   # set RAYON_NUM_THREADS=1 for a serial reference
 
 # Check without producing a binary
 cargo check
@@ -46,19 +47,21 @@ All comments need to be in englisch not in german
 
 `Sequential` holds `Vec<Box<dyn NnLayer>>` and a pre-allocated `cache[t][l]` matrix. The canonical model is `Embedding → mLSTMBlock → LinearNoBias → Softmax`. `make_cache(seq_len)` must be called once before training or sampling.
 
-### Hierarchical model (`src/hierarchical.rs`, `src/model.rs`)
+### Hierarchical model (`src/hierarchical.rs`, `src/word_encoder.rs`, `src/model.rs`)
 
-`HierarchicalSequential` couples three `Sequential` sub-models:
+`Hierarchical` (HAT-style, arXiv 2501.10322) couples three stages:
 
-- **char_model** — `Embedding → sLSTMBlock` — encodes the current character into a `CHAR_HIDDEN`-dim vector.
-- **word_model** — `Linear → mLSTMBlock × 4 → sLSTMBlock` — receives `char_model` output **only at boundary tokens** (spaces, punctuation), producing a `WORD_HIDDEN`-dim context vector. It is reset between boundaries.
-- **char2_model** — `Linear → sLSTMBlock × 2 → RMSNorm → Linear → Softmax` — takes `[char1_out ‖ high_ctx]` and predicts the next token every step.
+- **encoder** (`WordEncoder`) — a normal forward-only `Sequential` (`Embedding → sLSTMBlock × 2 → RMSNorm`) over the characters of one word; the word embedding `e_w` is the output at the last char. State is reset per word.
+- **word_model** (backbone) — `LinearNoBias → alternating sLSTM/mLSTM blocks × WORD_BLOCKS → RMSNorm → LinearNoBias` — autoregresses over word embeddings, carrying recurrent state across words; its output is the context for decoding the *next* word.
+- **char2_model** (decoder) — `LinearNoBias → sLSTMBlock × 2 → RMSNorm → LinearNoBias` — takes `[char one-hot ‖ word context]` per step, is fed a leading `[W]` (BOS), and predicts the word's chars plus a trailing `[W]` (EOS). Reset per word.
 
-Boundary tokens are determined by `Tokenizer::boundary_tokens()` and passed in at construction. At each boundary the char and char2 models are reset; the word_model accumulates across boundaries.
+Boundary tokens come from `Tokenizer::boundary_tokens()`; a word is the token span up to and including its boundary token. Forward/backward run phase by phase over a whole window (all encodes, then the backbone sweep, then all decodes).
+
+The encoder and decoder phases run **data-parallel over words** (rayon; see `src/parallel.rs`): each worker thread gets a full replica of the stack (`ReplicaPool`, copied weights via the NNFW round-trip, own recurrent state and grad accumulators) plus a disjoint slice of the shared forward cache, and after a parallel backward phase the replica grads are reduced into the master (`NnLayer::add_grads_from`). Replicas are rebuilt lazily after each optimizer step. Only the backbone sweep is serial (it carries cross-word state). Layers that appear in a parallel-trained stack must implement `add_grads_from`; `tests/parallel_parity.rs` checks the parallel path against single-threaded execution.
 
 ### Optimizer (`src/optimizers/mod.rs`)
 
-`pub type Optimizer = AdamW` selects the active optimizer. All layers use the type aliases `GradMatrix` / `GradVec` from this module, so swapping optimizers only requires changing that one type alias.
+`pub type Optimizer = Muon` selects the active optimizer (Muon for 2D hidden weights, aux-Adam for embeddings and 1D params). All layers use the type aliases `GradMatrix` / `GradVec` from this module, so swapping optimizers only requires changing that one type alias. `BATCH_SIZE` in `config.rs` accumulates gradients over that many windows before each optimizer step.
 
 ### Tokenizer (`src/tokenizer.rs`)
 
@@ -66,7 +69,7 @@ Character-level tokenizer built from `charset.txt`. Special tokens `<SPACE2>`, `
 
 ### Dataset (`src/batches.rs`)
 
-`PreparedDataSet` tokenizes files once at startup and pre-computes sliding windows (each window extends its right edge to the nearest boundary token). `shuffle()` reorders only the window index list — no re-tokenization. Normal training reads files from `DATA_DIR` (directory); hierarchical training reads `DATA_FILE` (single file with `---FILE---` chunk separators).
+Both training modes stream `DATA_FILE` (single file with `<|endoftext|>` document separators) through `ChunkedWordDataSet`: it reads `CHUNK_BYTES` of raw text at a time, cuts at the last complete document (the partial tail is carried into the next chunk), and tokenizes + word-windows each chunk into a `WordChunk`. Windows never cross document borders, so a streamed epoch yields exactly the windows a whole-file load would — but peak memory is bounded by `CHUNK_BYTES`, not corpus size (>1 GB corpora stream fine). Training loops call `rewind()` per epoch and grow the model cache on demand when a chunk's `max_window_tokens()` exceeds the current size; `count_windows()` does a cheap counting pass for resume arithmetic. `PreparedDataSet` (token-window loading from `DATA_DIR`) still exists but is currently unused by training.
 
 ### Persistence (`src/saving.rs`, `src/loading.rs`)
 

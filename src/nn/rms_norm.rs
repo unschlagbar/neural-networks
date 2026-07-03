@@ -26,7 +26,7 @@ use std::{any::Any, io};
 
 use crate::{
     nn_layer::{DynCache, NnLayer},
-    optimizers::{GradVec, GradVecOps},
+    optimizers::{GradVec, GradVecOps, add_grad_vec},
     saving::write_f32_slice,
 };
 
@@ -161,6 +161,11 @@ impl RMSNorm {
             cache.dx[i] = irms * (self.gamma[i] * delta[i] - cache.x_hat[i] * s_n);
         }
     }
+
+    /// Fold a replica's gamma grads into this layer (data-parallel reduction).
+    pub fn add_grads(&mut self, other: &mut Self) {
+        add_grad_vec(&mut self.grads_gamma, &mut other.grads_gamma);
+    }
 }
 
 impl NnLayer for RMSNorm {
@@ -237,5 +242,13 @@ impl NnLayer for RMSNorm {
     }
     fn clear_grads(&mut self) {
         self.grads_gamma.clear();
+    }
+
+    fn add_grads_from(&mut self, other: &mut dyn NnLayer) {
+        let o = other
+            .as_any_mut()
+            .downcast_mut::<Self>()
+            .expect("RMSNorm::add_grads_from — replica layer type mismatch");
+        self.add_grads(o);
     }
 }

@@ -12,11 +12,16 @@ codegen-units = 1
 name = "lstm_training"
 harness = false
 
+[[bench]]
+name = "hierarchical_training"
+harness = false
+
 [dev-dependencies]
 criterion = "0.8.2"
 
 [dependencies]
 iron_oxide = { path = "../iron_oxide", default-features = false }
 rand = "0.10.0"
+rayon = "1.11"
 cpal = "0.17.3"
 hound = "3"

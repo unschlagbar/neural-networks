@@ -571,6 +571,7 @@ dependencies = [
  "hound",
  "iron_oxide",
  "rand",
+ "rayon",
 ]
 
 [[package]]

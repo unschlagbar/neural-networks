@@ -1,5 +1,4 @@
 pub mod batches;
-pub mod bi_encoder;
 pub mod config;
 pub mod hierarchical;
 pub mod inspect;
@@ -8,6 +7,7 @@ pub mod model;
 pub mod nn;
 pub mod nn_layer;
 pub mod optimizers;
+pub mod parallel;
 pub mod prepare_set;
 pub mod sampling;
 pub mod saving;
@@ -15,6 +15,7 @@ pub mod sequential;
 pub mod tokenizer;
 pub mod training;
 pub mod wake_word;
+pub mod word_encoder;
 
 use std::{
     fs,

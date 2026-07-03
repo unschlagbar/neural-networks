@@ -347,4 +347,18 @@ impl NnLayer for SLSTMBlock {
         self.lin_value.clear_grads();
         self.lin_down.clear_grads();
     }
+
+    fn add_grads_from(&mut self, other: &mut dyn NnLayer) {
+        let o = other
+            .as_any_mut()
+            .downcast_mut::<Self>()
+            .expect("SLSTMBlock::add_grads_from — replica layer type mismatch");
+        self.pre_norm1.add_grads(&mut o.pre_norm1);
+        self.cell.add_grads(&mut o.cell);
+        self.post_cell_norm.add_grads(&mut o.post_cell_norm);
+        self.pre_norm2.add_grads(&mut o.pre_norm2);
+        self.lin_gate.add_grads(&mut o.lin_gate);
+        self.lin_value.add_grads(&mut o.lin_value);
+        self.lin_down.add_grads(&mut o.lin_down);
+    }
 }

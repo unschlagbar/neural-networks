@@ -83,7 +83,7 @@ pub fn sample_hierarchical(model_path: &str) {
         print!(">>> ");
         stdout().flush().unwrap();
 
-        model.sample(&prefix, MAX_LEN, TEMPERATURE, |token| {
+        model.sample(&prefix, MAX_LEN, TEMPERATURE, TOP_P, |token| {
             let s = tokenizer.get_char(token);
             if s == "<END>" {
                 false

@@ -37,3 +37,20 @@ pub trait GradVecOps {
 pub type GradMatrix = <Optimizer as OptimizerGradTypes>::GradMatrix;
 pub type GradMatrixNoDecay = <Optimizer as OptimizerGradTypes>::GradMatrixNoDecay;
 pub type GradVec = <Optimizer as OptimizerGradTypes>::GradVec;
+
+/// Add `src`'s accumulated raw gradients into `dst` element-wise. Optimizer
+/// moments are untouched — used to reduce per-thread replica gradients.
+pub fn add_grad_matrix<G: GradMatrixOps>(dst: &mut G, src: &mut G) {
+    let src = src.matrix().as_slice();
+    for (d, &s) in dst.matrix().as_slice_mut().iter_mut().zip(src) {
+        *d += s;
+    }
+}
+
+/// Vector counterpart of [`add_grad_matrix`].
+pub fn add_grad_vec<G: GradVecOps>(dst: &mut G, src: &mut G) {
+    let src = src.vec();
+    for (d, s) in dst.vec().iter_mut().zip(src) {
+        *d += *s;
+    }
+}

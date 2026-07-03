@@ -6,7 +6,7 @@ use rand::random_range;
 use crate::{
     nn::add_vec_in_place,
     nn_layer::{DynCache, NnLayer},
-    optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
+    optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps, add_grad_matrix, add_grad_vec},
 };
 
 pub struct LinearCache {
@@ -148,6 +148,12 @@ impl LinearLayer {
     pub fn output_size(&self) -> usize {
         self.weights.cols()
     }
+
+    /// Fold a replica's weight/bias grads into this layer (data-parallel reduction).
+    pub fn add_grads(&mut self, other: &mut Self) {
+        add_grad_matrix(&mut self.grads.weights, &mut other.grads.weights);
+        add_grad_vec(&mut self.grads.biases, &mut other.grads.biases);
+    }
 }
 
 impl NnLayer for LinearLayer {
@@ -199,5 +205,13 @@ impl NnLayer for LinearLayer {
     fn clear_grads(&mut self) {
         self.grads.weights.clear();
         self.grads.biases.clear();
+    }
+
+    fn add_grads_from(&mut self, other: &mut dyn NnLayer) {
+        let o = other
+            .as_any_mut()
+            .downcast_mut::<Self>()
+            .expect("LinearLayer::add_grads_from — replica layer type mismatch");
+        self.add_grads(o);
     }
 }

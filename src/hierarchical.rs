@@ -6,22 +6,23 @@ use std::{
     time::Instant,
 };
 
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+
 use crate::{
     batches::WordBatch,
-    bi_encoder::BiEncoder,
     config::MAX_SEQ_LEN,
-    loading::{read_f32_vec, read_matrix, read_u16, read_u32, read_u64},
+    loading::{read_u16, read_u32, read_u64},
     nn::{
-        linear_nb::LinearNBLayer,
         mlstm_block::{MLSTMBlock, MLSTMBlockCache},
-        rms_norm::RMSNorm,
-        softmax::{nll_from_logits, softmax, softmax_inplace},
+        softmax::{nll_from_logits, sample_top_p, softmax_inplace},
     },
     nn_layer::{DynCache, NnLayer},
-    saving::{HIER_MAGIC, write_f32_slice, write_matrix, write_u16, write_u32, write_u64},
+    parallel::{ReplicaPool, WorkerChunk, chunk_words, split_by_words},
+    saving::{HIER_MAGIC, write_u16, write_u32, write_u64},
     sequential::Sequential,
     tokenizer::Tokenizer,
     training::TrainingState,
+    word_encoder::WordEncoder,
 };
 
 /// Inference-time ablation of the cross-word context path, used by `probe`.
@@ -38,11 +39,14 @@ pub enum BackboneMode {
 }
 
 pub struct Hierarchical {
-    /// Bidirectional per-word encoder: reads each word in both directions and
-    /// merges the readouts into a word embedding `e_w`. (See `bi_encoder.rs`.)
-    pub encoder: BiEncoder,
+    /// Per-word encoder: a normal forward stack over the word's characters,
+    /// read out at the last char as the word embedding `e_w`.
+    /// (See `word_encoder.rs`.)
+    pub encoder: WordEncoder,
     pub char2_model: Sequential,
     pub word_model: Sequential,
+    /// Per-thread worker copies of `char2_model` for the parallel decode phases.
+    dec_pool: ReplicaPool,
 
     pub vocab_size: usize,
     pub context_size: usize,
@@ -67,9 +71,11 @@ pub struct Hierarchical {
 
     /// Backward scratch: top-level delta as it flows down a layer stack.
     delta_buf: Box<[f32]>,
-    /// Scratch accumulator for one word's gradient w.r.t. the decoder context.
-    d_o_buf: Box<[f32]>,
 
+    /// Phase seam (backbone→decoder): each word's context `o`, copied out of
+    /// the backbone cache so the parallel decode workers can read it without
+    /// touching the backbone. One entry per decoded word.
+    o_words: Vec<Box<[f32]>>,
     /// Phase seam (decoder→backbone): grad w.r.t. each word's context `o`
     /// (size `context`), one entry per decoded word. Filled by the decoder
     /// backward phase, consumed by the backbone backward phase.
@@ -94,10 +100,7 @@ pub struct Hierarchical {
 impl Hierarchical {
     /// `boundary_token_ids` — from `tokenizer.boundary_tokens()`.
     pub fn new(
-        char_fwd: Sequential,
-        char_bwd: Sequential,
-        combine: LinearNBLayer,
-        combine_norm: RMSNorm,
+        encoder_chars: Sequential,
         char2_model: Sequential,
         word_model: Sequential,
         vocab_size: usize,
@@ -105,16 +108,15 @@ impl Hierarchical {
         tokenizer: Rc<Tokenizer>,
     ) -> Self {
         let context_size = word_model.output_size;
-        let char_out = char_fwd.output_size;
+        let char_out = encoder_chars.output_size;
 
         assert_eq!(
             char2_model.output_size, vocab_size,
             "decoder.output_size must equal vocab_size"
         );
         assert_eq!(
-            combine.output_size(),
-            word_model.input_size,
-            "combine.output must equal backbone.input_size"
+            char_out, word_model.input_size,
+            "encoder.output must equal backbone.input_size"
         );
         assert_eq!(
             char2_model.input_size,
@@ -123,31 +125,17 @@ impl Hierarchical {
         );
 
         let w_token = tokenizer.w_token();
-        // The encoder validates its own dimension constraints (fwd/bwd in/out,
-        // combine in/out) against vocab_size and char_out.
-        let encoder = BiEncoder::new(
-            char_fwd,
-            char_bwd,
-            combine,
-            combine_norm,
-            vocab_size,
-            w_token,
-        );
+        // The encoder validates its own input size against vocab_size.
+        let encoder = WordEncoder::new(encoder_chars, vocab_size);
 
         let char2_input = vec![0.0; vocab_size + context_size].into();
 
         // delta_buf holds a layer's input_grad as the backward delta flows down a
         // stack, so it must be sized to the LARGEST layer dimension across the
         // backbone and decoder (plus char_out / context for the seam buffers).
-        let max_layer_dim = |m: &Sequential| {
-            m.layers
-                .iter()
-                .map(|l| l.output_size().max(l.input_size()))
-                .max()
-                .unwrap_or(0)
-        };
-        let buf_size = max_layer_dim(&word_model)
-            .max(max_layer_dim(&char2_model))
+        let buf_size = word_model
+            .max_layer_dim()
+            .max(char2_model.max_layer_dim())
             .max(char_out)
             .max(context_size);
         let delta_buf = vec![0.0; buf_size].into();
@@ -156,6 +144,7 @@ impl Hierarchical {
             encoder,
             char2_model,
             word_model,
+            dec_pool: ReplicaPool::new(),
             vocab_size,
             context_size,
             tokenizer,
@@ -166,7 +155,7 @@ impl Hierarchical {
             dec_targets: Vec::new(),
             char2_input,
             delta_buf,
-            d_o_buf: vec![0.0; context_size].into(),
+            o_words: Vec::new(),
             d_o_words: Vec::new(),
             d_ew_words: Vec::new(),
             last_high_grad_signal: 0.0,
@@ -180,11 +169,12 @@ impl Hierarchical {
 
     /// `word_steps` = max WORDS per window (backbone unroll length);
     /// `max_tokens` = max TOKEN span of any window. Encoder/decoder caches are
-    /// indexed by a running step cursor, so they need one slot per token plus
-    /// one extra `[W]` step per word → size by token capacity, not word count.
+    /// indexed by a running step cursor; the decoder needs one slot per token
+    /// plus one extra `[W]` EOS step per word → size by token capacity, not
+    /// word count.
     pub fn make_cache(&mut self, word_steps: usize, max_tokens: usize) {
         let slots = max_tokens + word_steps + 8;
-        self.encoder.make_cache(slots, word_steps);
+        self.encoder.make_cache(slots);
         self.char2_model.make_cache(slots);
         self.word_model.make_cache(word_steps.max(1));
         self.dec_targets = vec![0; slots];
@@ -192,6 +182,9 @@ impl Hierarchical {
         // Per-word phase-seam buffers (one slot per decodable word).
         let words = word_steps.max(1);
         let char_out = self.encoder.output_size;
+        self.o_words = (0..words)
+            .map(|_| vec![0.0; self.context_size].into())
+            .collect();
         self.d_o_words = (0..words)
             .map(|_| vec![0.0; self.context_size].into())
             .collect();
@@ -242,9 +235,10 @@ impl Hierarchical {
     /// Run the full hierarchical forward over a window, **phase by phase**: all
     /// encoder steps first, then all backbone steps, then all decoder steps. This
     /// is numerically identical to interleaving per word (the three stages have no
-    /// within-phase cross-dependencies that order would change), but it groups the
-    /// work the way a GPU wants it: encoder words are mutually independent, the
-    /// backbone is a single recurrent sweep, and decoder words are independent too.
+    /// within-phase cross-dependencies that order would change), and it groups the
+    /// work so the independent phases can run data-parallel: encoder words and
+    /// decoder words are split across the replica pools, while the backbone stays
+    /// a single serial recurrent sweep.
     pub fn forward_over(&mut self, tokens: &[u16], words: &[Range<usize>]) {
         self.word_segments.clear();
         self.word_segments.extend_from_slice(words);
@@ -252,18 +246,17 @@ impl Hierarchical {
         self.dec_ranges.clear();
         let n = self.word_segments.len();
         let vocab = self.vocab_size;
-        let w_tok = self.w_token as usize;
         let char_out = self.encoder.output_size;
 
         // Word 0 is the encode-only prefix; words 1..n are decoded, so word w is
         // encoded and the backbone turns it into the context for word w+1.
         let decode_words = n.saturating_sub(1);
 
-        // --- PHASE 1: ENCODER — bidirectionally encode every word w → e_w. ---
-        // Each word resets its own state, so the words are fully independent.
-        for w in 0..decode_words {
-            self.encoder.encode_word(w, tokens, self.word_segments[w]);
-        }
+        // --- PHASE 1: ENCODER — encode every word w → e_w. ---
+        // Each word resets its own state, so the words are fully independent —
+        // they run data-parallel across the encoder's replica pool.
+        self.encoder
+            .encode_words(tokens, &self.word_segments[..decode_words]);
 
         // --- PHASE 2: BACKBONE — autoregress e_0 … e_{n-2}, carrying recurrent
         // state across words. Step w consumes e_w and emits o_{w+1}. ---
@@ -280,29 +273,28 @@ impl Hierarchical {
                 &mut self.word_model.cache[w],
                 &self.delta_buf[..char_out],
             );
+
+            // Stash this word's context for the parallel decode phase. The
+            // ZeroContext probe (within-word floor) cuts the path right here.
+            let o = self.word_model.cache[w].last().unwrap().output();
+            if self.backbone_mode == BackboneMode::ZeroContext {
+                self.o_words[w].fill(0.0);
+            } else {
+                self.o_words[w].copy_from_slice(o);
+            }
         }
 
         // --- PHASE 3: DECODER — predict the chars of word w+1, conditioned on
         // o_{w+1}. Each word's decode is reset and independent of the others. ---
         // inputs  [W], c1, …, cn   →   targets c1, …, cn, [W]
+        //
+        // Serial pre-pass: fix every word's cache slot range and targets (cheap
+        // indexing), so the compute below can be chunked across the replica pool.
         let mut dec_cursor = 0;
         for w in 0..decode_words {
             let next_word = self.word_segments[w + 1];
-
-            {
-                let o = self.word_model.cache[w].last().unwrap().output();
-                self.char2_input[vocab..].copy_from_slice(o);
-            }
-            // Probe: cut the context path entirely (within-word floor).
-            if self.backbone_mode == BackboneMode::ZeroContext {
-                self.char2_input[vocab..].fill(0.0);
-            }
-            for layer in &mut self.char2_model.layers {
-                layer.reset_state();
-            }
-
-            let dec_start = dec_cursor;
             let dword_len = next_word.end - next_word.start;
+            let dec_start = dec_cursor;
             let dec_end = dec_start + dword_len + 1; // +1 for the [W] EOS step
             dec_cursor = dec_end;
             self.dec_ranges.push(Range {
@@ -310,45 +302,69 @@ impl Hierarchical {
                 end: dec_end,
             });
 
-            for k in 0..=dword_len {
-                let in_tok = if k == 0 {
-                    w_tok
-                } else {
-                    tokens[next_word.start + k - 1] as usize
-                };
-                let target = if k < dword_len {
-                    tokens[next_word.start + k]
-                } else {
-                    self.w_token
-                };
-                let slot = dec_start + k;
-                self.char2_input[in_tok] = 1.0;
-                Self::forward_step(
-                    &mut self.char2_model.layers,
-                    &mut self.char2_model.cache[slot],
-                    &self.char2_input,
-                );
-                self.char2_input[in_tok] = 0.0;
-                self.dec_targets[slot] = target;
+            for k in 0..dword_len {
+                self.dec_targets[dec_start + k] = tokens[next_word.start + k];
             }
+            self.dec_targets[dec_end - 1] = self.w_token;
 
             if self.trace_io {
                 self.trace_word(w, tokens, self.word_segments[w], next_word);
             }
         }
+
+        if decode_words == 0 {
+            return;
+        }
+
+        self.dec_pool.sync(&self.char2_model);
+        let context = self.context_size;
+        let w_tok = self.w_token as usize;
+        let o_words = &self.o_words;
+        let dec_ranges = &self.dec_ranges;
+        let word_segments = &self.word_segments;
+        let chunks = chunk_words(
+            &mut self.dec_pool.replicas,
+            dec_ranges,
+            decode_words,
+            &mut self.char2_model.cache,
+        );
+
+        chunks.into_par_iter().for_each(|chunk| {
+            let WorkerChunk {
+                replica,
+                words: wr,
+                cache,
+                slot_base,
+            } = chunk;
+            // Decoder input: [char one-hot ‖ word context], one buffer per worker.
+            let mut input = vec![0.0; vocab + context];
+            for w in wr.into_iter() {
+                input[vocab..].copy_from_slice(&o_words[w][..context]);
+                for layer in &mut replica.layers {
+                    layer.reset_state();
+                }
+                let next_word = word_segments[w + 1];
+                for (k, slot) in dec_ranges[w].into_iter().enumerate() {
+                    let in_tok = if k == 0 {
+                        w_tok
+                    } else {
+                        tokens[next_word.start + k - 1] as usize
+                    };
+                    input[in_tok] = 1.0;
+                    Self::forward_step(&mut replica.layers, &mut cache[slot - slot_base], &input);
+                    input[in_tok] = 0.0;
+                }
+            }
+        });
     }
 
-    /// Debug: print the encoder inputs (both directions) and the decoder
-    /// input/target strings for word `w`. Active only when `trace_io` is set.
+    /// Debug: print the encoder input and the decoder input/target strings for
+    /// word `w`. Active only when `trace_io` is set.
     fn trace_word(&self, w: usize, tokens: &[u16], word: Range<usize>, next_word: Range<usize>) {
         let wm = self.tokenizer.display(self.w_token);
-        let enc_fwd = format!(
-            "{wm}{}",
-            self.tokenizer.display_tokens(&tokens[word.start..word.end])
-        );
-        let mut rev: Vec<u16> = tokens[word.start..word.end].to_vec();
-        rev.reverse();
-        let enc_bwd = format!("{}{wm}", self.tokenizer.display_tokens(&rev));
+        let enc = self
+            .tokenizer
+            .display_tokens(&tokens[word.start..word.end]);
         let dec_in = format!(
             "{wm}{}",
             self.tokenizer
@@ -359,9 +375,7 @@ impl Hierarchical {
             self.tokenizer
                 .display_tokens(&tokens[next_word.start..next_word.end])
         );
-        println!(
-            "fwd[{w:>3}] enc.fwd {enc_fwd:?} | enc.bwd {enc_bwd:?} | dec in {dec_in:?} → tgt {dec_tgt:?}"
-        );
+        println!("fwd[{w:>3}] enc {enc:?} | dec in {dec_in:?} → tgt {dec_tgt:?}");
     }
 
     /// Backward of the whole window, mirroring `forward_over`'s phase split:
@@ -369,23 +383,17 @@ impl Hierarchical {
     /// then encoder backward for every word. The two phase seams (`d_o_words`,
     /// `d_ew_words`) hold the per-word gradients passed between stages. Only the
     /// backbone is order-sensitive (reverse, so its cross-word BPTT state carries);
-    /// the decoder and encoder phases are per-word independent and batchable.
+    /// the decoder and encoder phases are per-word independent and run
+    /// data-parallel across the replica pools.
     pub fn backwards_sequence(&mut self) {
         let vocab = self.vocab_size;
         let context = self.context_size;
         let char_out = self.encoder.output_size;
         let words = self.encoder.num_words(); // = number of decode steps (n - 1)
 
-        let mut high_grad_accum = 0.0;
-        let mut char1_grad_accum = 0.0;
-
-        // --- PHASE 3': DECODER backward → grad w.r.t. each word's context o. ---
-        // Words decode independently, so order is free; stash each d_o per word.
-        for w in 0..words {
-            let dec_range = self.dec_ranges[w];
-
-            if self.trace_io {
-                let tgt: Vec<u16> = dec_range
+        if self.trace_io {
+            for w in 0..words {
+                let tgt: Vec<u16> = self.dec_ranges[w]
                     .into_iter()
                     .map(|slot| self.dec_targets[slot])
                     .collect();
@@ -394,38 +402,75 @@ impl Hierarchical {
                     self.tokenizer.display_tokens(&tgt)
                 );
             }
-
-            self.d_o_buf.fill(0.0);
-            for slot in dec_range.into_iter().rev() {
-                let out_len = {
-                    let out = self.char2_model.cache[slot].last().unwrap().output();
-                    let len = out.len();
-                    self.delta_buf[..len].copy_from_slice(out);
-                    len
-                };
-                softmax_inplace(&mut self.delta_buf[..out_len]);
-                self.delta_buf[self.dec_targets[slot] as usize] -= 1.0;
-
-                backward_through_layers(
-                    &mut self.char2_model.layers,
-                    &mut self.char2_model.cache[slot],
-                    &mut self.delta_buf,
-                    out_len,
-                );
-
-                // Gradient w.r.t. the concatenated word context.
-                let dx = self.char2_model.cache[slot][0].input_grad();
-                for i in 0..context {
-                    self.d_o_buf[i] += dx[vocab + i];
-                }
-            }
-            for layer in &mut self.char2_model.layers {
-                layer.accumulate_init_grad();
-                layer.reset_bptt_state();
-            }
-            high_grad_accum += self.d_o_buf.iter().map(|x| x.abs()).sum::<f32>() / context as f32;
-            self.d_o_words[w][..context].copy_from_slice(&self.d_o_buf[..context]);
         }
+
+        // --- PHASE 3': DECODER backward → grad w.r.t. each word's context o. ---
+        // Words decode independently; each worker backprops its words on its own
+        // replica (own grad accumulators) and stashes d_o per word. The replica
+        // grads are then reduced into the master decoder.
+        self.dec_pool.sync(&self.char2_model);
+        let dec_max_dim = self.char2_model.max_layer_dim();
+        let dec_ranges = &self.dec_ranges;
+        let dec_targets = &self.dec_targets;
+        let chunks = chunk_words(
+            &mut self.dec_pool.replicas,
+            dec_ranges,
+            words,
+            &mut self.char2_model.cache,
+        );
+        let d_o_chunks = split_by_words(&chunks, &mut self.d_o_words[..words]);
+
+        let high_grad_accum: f32 = chunks
+            .into_par_iter()
+            .zip(d_o_chunks)
+            .map(|(chunk, d_o_chunk)| {
+                let WorkerChunk {
+                    replica,
+                    words: wr,
+                    cache,
+                    slot_base,
+                } = chunk;
+                let mut delta_buf = vec![0.0; dec_max_dim];
+                let mut d_o_buf = vec![0.0; context];
+                let mut sig = 0.0;
+                let w0 = wr.start;
+                for w in wr.into_iter() {
+                    d_o_buf.fill(0.0);
+                    for slot in dec_ranges[w].into_iter().rev() {
+                        let ci = slot - slot_base;
+                        let out_len = {
+                            let out = cache[ci].last().unwrap().output();
+                            let len = out.len();
+                            delta_buf[..len].copy_from_slice(out);
+                            len
+                        };
+                        softmax_inplace(&mut delta_buf[..out_len]);
+                        delta_buf[dec_targets[slot] as usize] -= 1.0;
+
+                        backward_through_layers(
+                            &mut replica.layers,
+                            &mut cache[ci],
+                            &mut delta_buf,
+                            out_len,
+                        );
+
+                        // Gradient w.r.t. the concatenated word context.
+                        let dx = cache[ci][0].input_grad();
+                        for i in 0..context {
+                            d_o_buf[i] += dx[vocab + i];
+                        }
+                    }
+                    for layer in &mut replica.layers {
+                        layer.accumulate_init_grad();
+                        layer.reset_bptt_state();
+                    }
+                    sig += d_o_buf.iter().map(|x| x.abs()).sum::<f32>() / context as f32;
+                    d_o_chunk[w - w0][..context].copy_from_slice(&d_o_buf);
+                }
+                sig
+            })
+            .sum();
+        self.dec_pool.reduce_into(&mut self.char2_model);
 
         // --- PHASE 2': BACKBONE backward → grad w.r.t. each word embedding e_w. ---
         // Reverse word order so the backbone's cross-word BPTT state carries.
@@ -445,13 +490,9 @@ impl Hierarchical {
             layer.reset_bptt_state();
         }
 
-        // --- PHASE 1': ENCODER backward (combine split + both directions' BPTT). ---
-        // Per word, independent.
-        for w in 0..words {
-            char1_grad_accum += self
-                .encoder
-                .backward_word(w, &self.d_ew_words[w][..char_out]);
-        }
+        // --- PHASE 1': ENCODER backward — per word, independent, data-parallel
+        // across the encoder's replica pool. ---
+        let char1_grad_accum = self.encoder.backward_words(&self.d_ew_words[..words]);
 
         let denom = words.max(1) as f32;
         self.last_high_grad_signal = high_grad_accum / denom;
@@ -598,9 +639,10 @@ impl Hierarchical {
             state.log_metric("word_loss", word_loss);
 
             if let Some(lr) = state.step(loss) {
-                self.encoder.sgd_step(lr);
+                self.encoder.sgd_step(lr); // marks its own replica pool dirty
                 self.char2_model.sgd_step(lr);
                 self.word_model.sgd_step(lr);
+                self.dec_pool.mark_dirty();
             }
             self.step = state.step;
 
@@ -655,6 +697,7 @@ impl Hierarchical {
         prefix: &[u16],
         max_len: usize,
         temperature: f32,
+        top_p: f32,
         mut callback: impl FnMut(u16) -> bool,
     ) -> Vec<u16> {
         if !self.encoder.cache_ready() {
@@ -697,6 +740,7 @@ impl Hierarchical {
         // --- Generation ------------------------------------------------------
         let mut out = Vec::with_capacity(max_len);
         let mut word_chars: Vec<u16> = Vec::new();
+        let mut empty_words = 0;
         // Each word starts with the [W] BOS input; the model emits the word's chars
         // then a [W] which marks end-of-word.
         for layer in &mut self.char2_model.layers {
@@ -718,10 +762,7 @@ impl Hierarchical {
                 Some(t) => (t, true),
                 None => {
                     let logits = self.char2_model.cache[0].last().unwrap().output();
-                    let scaled: Vec<f32> =
-                        logits.iter().map(|&v| v / temperature.max(1e-8)).collect();
-                    let probs = softmax(&scaled);
-                    (self.sample_from_probs(&probs), false)
+                    (sample_top_p(logits, temperature, top_p) as u16, false)
                 }
             };
 
@@ -731,6 +772,14 @@ impl Hierarchical {
                 if !word_chars.is_empty() {
                     self.encode_word_advance(&word_chars);
                     word_chars.clear();
+                    empty_words = 0;
+                } else {
+                    // A [W] right after a word reset emits nothing; bail out if the
+                    // model gets stuck doing that instead of spinning forever.
+                    empty_words += 1;
+                    if empty_words > 16 {
+                        break;
+                    }
                 }
                 for layer in &mut self.char2_model.layers {
                     layer.reset_state();
@@ -752,18 +801,6 @@ impl Hierarchical {
         out
     }
 
-    fn sample_from_probs(&self, probs: &[f32]) -> u16 {
-        let r = rand::random_range(0.0..1.0);
-        let mut cum = 0.0;
-        for (i, &p) in probs.iter().enumerate() {
-            cum += p;
-            if cum >= r {
-                return i as u16;
-            }
-        }
-        (probs.len() - 1) as u16
-    }
-
     pub fn save(&self, path: &str) -> io::Result<()> {
         let mut buf = Cursor::new(Vec::<u8>::new());
         let w = &mut buf as &mut dyn Write;
@@ -776,13 +813,9 @@ impl Hierarchical {
             write_u16(w, id)?;
         }
 
-        self.encoder.char_fwd.write_to(w)?;
-        self.encoder.char_bwd.write_to(w)?;
+        self.encoder.chars.write_to(w)?;
         self.word_model.write_to(w)?;
         self.char2_model.write_to(w)?;
-        write_matrix(w, &self.encoder.combine.weights)?;
-        write_f32_slice(w, &vec![0.0; self.encoder.combine.weights.rows()])?;
-        write_f32_slice(w, &self.encoder.combine_norm.gamma)?;
         write_u64(w, self.step as u64)?;
 
         File::create(path)?.write_all(&buf.into_inner())
@@ -807,24 +840,13 @@ impl Hierarchical {
             boundary_token_ids.push(read_u16(r)?);
         }
 
-        let char_fwd = Sequential::load_from(r)?;
-        let char_bwd = Sequential::load_from(r)?;
+        let encoder_chars = Sequential::load_from(r)?;
         let word_model = Sequential::load_from(r)?;
         let char2_model = Sequential::load_from(r)?;
-        let combine_weights = read_matrix(r)?;
-        let _combine_biases: Box<[f32]> = read_f32_vec(r)?;
-        let combine_norm_gamma: Box<[f32]> = read_f32_vec(r)?;
         let step = read_u64(r).unwrap_or(0) as usize;
 
-        let (ci, co) = (combine_weights.rows(), combine_weights.cols());
-        let combine = LinearNBLayer::from_loaded(ci, co, combine_weights);
-        let combine_norm = RMSNorm::from_loaded(co, combine_norm_gamma);
-
         let mut model = Self::new(
-            char_fwd,
-            char_bwd,
-            combine,
-            combine_norm,
+            encoder_chars,
             char2_model,
             word_model,
             vocab_size,

@@ -4,7 +4,7 @@ use iron_oxide::collections::Matrix;
 
 use crate::{
     nn_layer::{DynCache, NnLayer},
-    optimizers::{GradMatrixNoDecay, GradMatrixOps},
+    optimizers::{GradMatrixNoDecay, GradMatrixOps, add_grad_matrix},
 };
 
 pub struct EmbeddingCache {
@@ -145,5 +145,13 @@ impl NnLayer for EmbeddingLayer {
 
     fn clear_grads(&mut self) {
         self.grads.weights.clear();
+    }
+
+    fn add_grads_from(&mut self, other: &mut dyn NnLayer) {
+        let o = other
+            .as_any_mut()
+            .downcast_mut::<Self>()
+            .expect("EmbeddingLayer::add_grads_from — replica layer type mismatch");
+        add_grad_matrix(&mut self.grads.weights, &mut o.grads.weights);
     }
 }

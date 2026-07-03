@@ -7,10 +7,11 @@ use std::{
 };
 
 use crate::{
-    batches::WordDataSet,
+    batches::ChunkedWordDataSet,
     config::{
-        self, BATCH_SIZE, DATA_FILE, DECAY_STEPS, EPOCHS, LOG_EVERY, LR, MAX_WINDOW_TOKENS, MIN_LR,
-        MIN_WORDS_PER_SEQ, SAVE_EVERY, SEQ_LEN, WARMUP_STEPS, WORDS_PER_SEQ,
+        self, BATCH_SIZE, CHUNK_BYTES, DATA_FILE, DECAY_STEPS, EPOCHS, LOG_EVERY, LR,
+        MAX_WINDOW_TOKENS, MIN_LR, MIN_WORDS_PER_SEQ, SAVE_EVERY, SEQ_LEN, WARMUP_STEPS,
+        WORDS_PER_SEQ,
     },
     hierarchical::{BackboneMode, Hierarchical},
     model::{build_hierarchical_model, build_normal_model},
@@ -37,23 +38,16 @@ pub fn train_normal(model_path: &str) {
     };
     // Same X-word windows the hierarchical model trains on (identical params),
     // so the two systems can be compared on exactly the same samples.
-    println!("Preparing dataset from '{DATA_FILE}' ...");
-    let prep_start = Instant::now();
-    let data = WordDataSet::from_single_file(
-        &tokenizer,
+    println!("Streaming dataset from '{DATA_FILE}' in {CHUNK_BYTES}-byte chunks ...");
+    let mut data = ChunkedWordDataSet::open(
+        tokenizer.clone(),
         DATA_FILE,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
         MAX_WINDOW_TOKENS,
         &word_boundary_ids,
+        CHUNK_BYTES,
     );
-    println!(
-        "  {} windows (prep took {:.1?})",
-        data.len(),
-        prep_start.elapsed(),
-    );
-    // Size the cache to the longest window that actually occurs.
-    model.make_cache(data.max_window_tokens());
     println!(
         "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, optimizer={:?}, log every {LOG_EVERY} steps",
         Optimizer {}
@@ -62,6 +56,9 @@ pub fn train_normal(model_path: &str) {
     let mut training_state = TrainingState::new();
     training_state.init_log(model_path, &["word_loss"]);
     let mut total_time = Duration::ZERO;
+    // Cache is sized to the longest window seen so far and grown on demand —
+    // with streaming chunks the global maximum is not known up front.
+    let mut cache_tokens = 0;
 
     for epoch in 1..=EPOCHS {
         println!("── Epoch {epoch} ───────────────────────────────────────");
@@ -70,7 +67,14 @@ pub fn train_normal(model_path: &str) {
         // see the same window order — leave it unshuffled here too for parity.
 
         let start = Instant::now();
-        model.train_words(data.iter(), &mut training_state);
+        data.rewind();
+        while let Some(chunk) = data.next_chunk() {
+            if chunk.max_window_tokens() > cache_tokens {
+                cache_tokens = chunk.max_window_tokens();
+                model.make_cache(cache_tokens);
+            }
+            model.train_words(chunk.iter(), &mut training_state);
+        }
 
         let epoch_time = start.elapsed();
         total_time += epoch_time;
@@ -99,18 +103,16 @@ pub fn train_hierarchical(model_path: &str) {
             build_hierarchical_model(vocab, word_boundary_ids.clone(), tokenizer.clone())
         }
     };
-    println!("Preparing dataset from '{DATA_FILE}' ...");
-    let prep_start = Instant::now();
-    let data = WordDataSet::from_single_file(
-        &tokenizer,
+    println!("Streaming dataset from '{DATA_FILE}' in {CHUNK_BYTES}-byte chunks ...");
+    let mut data = ChunkedWordDataSet::open(
+        tokenizer.clone(),
         DATA_FILE,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
         MAX_WINDOW_TOKENS,
         &word_boundary_ids,
+        CHUNK_BYTES,
     );
-    println!("  prep took {:.1?}", prep_start.elapsed());
-    model.make_cache(WORDS_PER_SEQ, data.max_window_tokens());
     println!(
         "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, optimizer={:?}, log every {LOG_EVERY} steps",
         Optimizer {}
@@ -119,27 +121,46 @@ pub fn train_hierarchical(model_path: &str) {
     let mut training_state = TrainingState::from_step(model.step);
     training_state.init_log(model_path, &["delta_word", "delta_char1", "word_loss"]);
     let mut total_time = Duration::ZERO;
+    // Cache is sized to the longest window seen so far and grown on demand.
+    let mut cache_tokens = 0;
+
+    // Resume needs the total window count for the modulo — one cheap counting
+    // pass (tokenize only, nothing stored). Skipped for a fresh model.
+    let resume_windows = if model.step > 0 {
+        let prep_start = Instant::now();
+        let total = data.count_windows();
+        println!(
+            "  {total} windows total (counting pass took {:.1?})",
+            prep_start.elapsed()
+        );
+        model.step % total.max(1)
+    } else {
+        0
+    };
 
     for epoch in 1..=EPOCHS {
         println!("── Epoch {epoch} ───────────────────────────────────────");
 
-        //data.shuffle();
-
-        let resume_at = if epoch == 1 {
-            model.step % data.len()
-        } else {
-            0
-        };
-        if resume_at > 0 {
-            println!(
-                "  Resuming from window {resume_at} / {} (step {})",
-                data.len(),
-                model.step
-            );
+        let mut skip = if epoch == 1 { resume_windows } else { 0 };
+        if skip > 0 {
+            println!("  Resuming from window {skip} (step {})", model.step);
         }
 
         let start = Instant::now();
-        model.train(data.iter().skip(resume_at), &mut training_state);
+        data.rewind();
+        while let Some(chunk) = data.next_chunk() {
+            // Fast-forward over already-trained windows when resuming.
+            if skip >= chunk.len() {
+                skip -= chunk.len();
+                continue;
+            }
+            if chunk.max_window_tokens() > cache_tokens {
+                cache_tokens = chunk.max_window_tokens();
+                model.make_cache(WORDS_PER_SEQ, cache_tokens);
+            }
+            model.train(chunk.iter().skip(skip), &mut training_state);
+            skip = 0;
+        }
 
         let epoch_time = start.elapsed();
         total_time += epoch_time;
@@ -170,18 +191,24 @@ pub fn trace_hierarchical(model_path: &str) {
             tokenizer.clone(),
         ),
     };
-    let data = WordDataSet::from_single_file(
-        &tokenizer,
+    let mut data = ChunkedWordDataSet::open(
+        tokenizer.clone(),
         DATA_FILE,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
         MAX_WINDOW_TOKENS,
         &word_boundary_ids,
+        CHUNK_BYTES,
     );
-    model.make_cache(WORDS_PER_SEQ, data.max_window_tokens());
+    // The trace only needs the first window — one chunk is plenty.
+    let Some(chunk) = data.next_chunk() else {
+        eprintln!("no windows in dataset");
+        return;
+    };
+    model.make_cache(WORDS_PER_SEQ, chunk.max_window_tokens());
     model.trace_io = true;
 
-    let Some(batch) = data.iter().next() else {
+    let Some(batch) = chunk.iter().next() else {
         eprintln!("no windows in dataset");
         return;
     };
@@ -218,16 +245,22 @@ pub fn probe_hierarchical(model_path: &str) {
         }
     };
     println!("Preparing dataset from '{DATA_FILE}' ...");
-    let data = WordDataSet::from_single_file(
-        &tokenizer,
+    let mut data = ChunkedWordDataSet::open(
+        tokenizer.clone(),
         DATA_FILE,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
         MAX_WINDOW_TOKENS,
         &word_boundary_ids,
+        CHUNK_BYTES,
     );
-    model.make_cache(WORDS_PER_SEQ, data.max_window_tokens());
-    let n = PROBE_WINDOWS.min(data.len());
+    // The probe only evaluates a handful of windows — the first chunk suffices.
+    let Some(chunk) = data.next_chunk() else {
+        eprintln!("no windows in dataset");
+        std::process::exit(2);
+    };
+    model.make_cache(WORDS_PER_SEQ, chunk.max_window_tokens());
+    let n = PROBE_WINDOWS.min(chunk.len());
     println!("Probing on {n} windows.\n");
 
     let modes = [
@@ -241,7 +274,7 @@ pub fn probe_hierarchical(model_path: &str) {
     let mut results = Vec::new();
     for (mode, label) in modes {
         model.backbone_mode = mode;
-        let (ce, we) = model.eval_decode_loss(data.iter().take(n));
+        let (ce, we) = model.eval_decode_loss(chunk.iter().take(n));
         println!(
             "  {label:<34} Char loss = {ce:.4} nats   ppl = {:.3}",
             ce.exp()
@@ -271,7 +304,7 @@ pub fn probe_hierarchical(model_path: &str) {
     // word. survival(k) = f̄^k, so the 1/e memory horizon is -1/ln(f̄) words.
     // Low horizon → the state decays (capacity it can't use); high horizon →
     // it CAN remember and simply doesn't, i.e. nothing to fix in the cell.
-    let mut window = data.iter();
+    let mut window = chunk.iter();
     if let Some(crate::batches::WordBatch { tokens, words }) = window.next() {
         model.reset();
         model.forward_over(tokens, &words);
@@ -308,11 +341,11 @@ pub fn probe_hierarchical(model_path: &str) {
             println!(
                 "  → {}",
                 if horizon(max) < 3.0 {
-                    "state decays within ~2 words even at best — backbone CANNOT carry long-range (worth fixing)"
+                    "state decays within ~2 words even at best"
                 } else if long == 0 {
-                    "no head holds memory ≥10 words — effectively short-range despite the depth"
+                    "no head holds memory ≥10 words"
                 } else {
-                    "some heads CAN hold long memory — capability exists, it just isn't useful on this data"
+                    "some heads CAN hold long memory"
                 }
             );
         }

@@ -26,7 +26,7 @@ use crate::{
         add_vec_in_place,
     },
     nn_layer::{DynCache, NnLayer},
-    optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
+    optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps, add_grad_matrix, add_grad_vec},
     saving,
 };
 use std::{any::Any, io};
@@ -401,6 +401,22 @@ impl SLSTMLayer {
             .copy_from_slice(&cache.dconcat[self.input_size..]);
     }
 
+    /// Fold a replica's grads into this layer (data-parallel reduction).
+    pub fn add_grads(&mut self, other: &mut Self) {
+        let g = &mut self.grads;
+        let o = &mut other.grads;
+        add_grad_matrix(&mut g.wz, &mut o.wz);
+        add_grad_matrix(&mut g.wi, &mut o.wi);
+        add_grad_matrix(&mut g.wf, &mut o.wf);
+        add_grad_matrix(&mut g.wo, &mut o.wo);
+        add_grad_vec(&mut g.bz, &mut o.bz);
+        add_grad_vec(&mut g.bi, &mut o.bi);
+        add_grad_vec(&mut g.bf, &mut o.bf);
+        add_grad_vec(&mut g.bo, &mut o.bo);
+        add_grad_vec(&mut g.h_init_grad, &mut o.h_init_grad);
+        add_grad_vec(&mut g.c_init_grad, &mut o.c_init_grad);
+    }
+
     pub fn alloc_cache(&self) -> SLSTMCache {
         let h = self.hidden_size;
         let r = self.input_size + h;
@@ -522,5 +538,13 @@ impl NnLayer for SLSTMLayer {
     fn accumulate_init_grad(&mut self) {
         add_vec_in_place(&mut self.grads.h_init_grad.vec(), &self.dh_bptt);
         add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
+    }
+
+    fn add_grads_from(&mut self, other: &mut dyn NnLayer) {
+        let o = other
+            .as_any_mut()
+            .downcast_mut::<Self>()
+            .expect("SLSTMLayer::add_grads_from — replica layer type mismatch");
+        self.add_grads(o);
     }
 }

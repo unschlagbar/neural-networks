@@ -1,7 +1,9 @@
+use std::io::Cursor;
 use std::time::Instant;
 
 use iron_oxide::collections::Matrix;
 use rand::random_range;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use std::range::Range;
 
@@ -9,7 +11,7 @@ use crate::{
     batches::WordBatch,
     nn::{
         lstm::sigmoid,
-        softmax::{softmax, softmax_inplace},
+        softmax::{sample_top_p, softmax, softmax_inplace},
     },
     nn_layer::{DynCache, NnLayer},
     training::TrainingState,
@@ -35,6 +37,43 @@ impl Sequential {
         self.cache = (0..seq_len)
             .map(|_| self.layers.iter().map(|l| l.make_cache()).collect())
             .collect();
+    }
+
+    /// Largest input/output dimension across the stack — sizes the BPTT delta
+    /// scratch a backward pass needs.
+    pub fn max_layer_dim(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| l.input_size().max(l.output_size()))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Deep-copy the layer stack `n` times by round-tripping the NNFW blob:
+    /// weights are copied, grad accumulators start zeroed, no forward cache.
+    /// Used to give each worker thread its own recurrent state and gradient
+    /// accumulators during data-parallel training. Serialized once,
+    /// deserialized in parallel (this runs after every optimizer step, so its
+    /// cost is on the training hot path).
+    pub fn replicas(&self, n: usize) -> Vec<Sequential> {
+        let mut blob = Vec::new();
+        self.write_to(&mut blob)
+            .expect("in-memory model serialization cannot fail");
+        (0..n)
+            .into_par_iter()
+            .map(|_| {
+                let mut r = Cursor::new(blob.as_slice());
+                Sequential::load_from(&mut r).expect("model blob failed to round-trip")
+            })
+            .collect()
+    }
+
+    /// Fold a replica's accumulated gradients into this stack (element-wise
+    /// add of the raw grad buffers; optimizer moments stay untouched).
+    pub fn add_grads_from(&mut self, replica: &mut Sequential) {
+        for (l, r) in self.layers.iter_mut().zip(replica.layers.iter_mut()) {
+            l.add_grads_from(r.as_mut());
+        }
     }
 
     pub fn forward_over(&mut self, input: &[u16]) {
@@ -229,7 +268,7 @@ impl Sequential {
 
     /// Word-grouped training, mirroring `Hierarchical::train` for a fair
     /// head-to-head comparison: the flat model sees exactly the same X-word
-    /// windows (`WordDataSet`) the hierarchical model does, and the reported
+    /// windows (`WordChunk`) the hierarchical model does, and the reported
     /// loss is measured over the same token span.
     ///
     /// Word 0 of every window is the encode-only prefix in the hierarchical
@@ -333,37 +372,7 @@ impl Sequential {
 
         for _ in 0..max_len {
             let logits = self.forward(last_token);
-
-            let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature.max(1e-8)).collect();
-            let q = softmax(&scaled);
-
-            let mut idx: Vec<usize> = (0..q.len()).collect();
-            idx.sort_unstable_by(|&a, &b| q[b].partial_cmp(&q[a]).unwrap());
-
-            let mut cum = 0.0;
-            let candidates: Vec<usize> = idx
-                .iter()
-                .copied()
-                .take_while(|&i| {
-                    if cum >= top_p {
-                        false
-                    } else {
-                        cum += q[i];
-                        true
-                    }
-                })
-                .collect();
-
-            let r = random_range(0.0..cum);
-            let mut cum = 0.0;
-            let mut next = candidates[0] as u16;
-            for &i in &candidates {
-                cum += q[i];
-                if cum >= r {
-                    next = i as u16;
-                    break;
-                }
-            }
+            let next = sample_top_p(logits, temperature, top_p) as u16;
 
             out.push(next);
             if !callback(next) {

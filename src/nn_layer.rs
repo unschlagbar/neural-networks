@@ -48,7 +48,7 @@ impl<T: 'static> Dyn for T {
     }
 }
 
-pub trait NnLayer: Dyn {
+pub trait NnLayer: Dyn + Send {
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache);
 
     fn forward_sample(&mut self, input: &[f32], cache: &mut dyn DynCache) {
@@ -77,6 +77,15 @@ pub trait NnLayer: Dyn {
 
     fn apply_grads(&mut self, lr: f32);
     fn clear_grads(&mut self);
+
+    /// Add the gradient accumulators of `other` — a same-type replica of this
+    /// layer — into this layer's accumulators (raw grads only; optimizer
+    /// moments are untouched). Reduces per-thread gradients after a
+    /// data-parallel backward phase; layers that appear in a parallel-trained
+    /// stack must override this.
+    fn add_grads_from(&mut self, _other: &mut dyn NnLayer) {
+        unimplemented!("add_grads_from: this layer type does not support data-parallel training");
+    }
 
     /// Clear h, c
     fn reset_state(&mut self) {}

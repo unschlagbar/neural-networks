@@ -4,7 +4,7 @@ use iron_oxide::collections::Matrix;
 
 use crate::{
     nn_layer::{DynCache, NnLayer},
-    optimizers::{GradMatrixNoDecay, GradMatrixOps},
+    optimizers::{GradMatrixNoDecay, GradMatrixOps, add_grad_matrix},
 };
 
 pub struct LinearNBCache {
@@ -175,5 +175,13 @@ impl NnLayer for LinearNBLayer {
 
     fn clear_grads(&mut self) {
         self.grads.weights.clear();
+    }
+
+    fn add_grads_from(&mut self, other: &mut dyn NnLayer) {
+        let o = other
+            .as_any_mut()
+            .downcast_mut::<Self>()
+            .expect("LinearNBLayer::add_grads_from — replica layer type mismatch");
+        add_grad_matrix(&mut self.grads.weights, &mut o.grads.weights);
     }
 }

@@ -15,7 +15,14 @@
 // Rust's borrow checker forbids. Twelve bytes (3 × u32) per window is cheap —
 // even a million windows is only ~12 MB.
 
-use std::{fs, path::PathBuf, range::Range};
+use std::{
+    fs::{self, File},
+    io::{BufReader, Read, Seek, SeekFrom},
+    mem,
+    path::PathBuf,
+    range::Range,
+    rc::Rc,
+};
 
 use rand::{rng, seq::SliceRandom};
 
@@ -251,32 +258,36 @@ fn build_windows(sequences: &[Vec<u16>], seq_len: usize, boundary_ids: &[u16]) -
     }
 }
 
-// ── Word-grouped dataset (hierarchical training) ────────────────────────────
+// ── Word-grouped dataset (hierarchical + flat word training) ────────────────
 //
-// Instead of fixed-token windows, group the corpus into words once up front and
-// emit fixed-size *K-word* sequences. Every sample then unrolls the backbone for
+// Instead of fixed-token windows, group the corpus into words and emit
+// fixed-size *K-word* sequences. Every sample then unrolls the backbone for
 // the same number of word steps. Token counts still vary per window, so a window
 // is closed early if it would exceed `max_tokens` (the token-cache cap).
+//
+// The corpus is streamed in chunks (`ChunkedWordDataSet`) instead of being
+// loaded and tokenized whole: each chunk covers only complete documents (split
+// on `SPLIT`), the trailing partial document is carried into the next chunk.
+// Windows never cross document borders, so a streamed epoch yields exactly the
+// same windows a whole-file load would — but peak memory is bounded by the
+// chunk size, not the corpus size (> 1 GB corpora stream fine).
 
-/// Split `seq` into `[start, end)` word ranges. A word ends at the first boundary
-/// token (the boundary is its last element); any trailing non-boundary chars form
-/// a final word. Same rule the old `Hierarchical::segment_words` used.
-fn segment_words(seq: &[u16], boundary_ids: &[u16]) -> Vec<Range<usize>> {
-    let mut words = Vec::new();
-    let mut start = 0;
-    for (t, tok) in seq.iter().enumerate() {
-        if boundary_ids.contains(tok) {
-            words.push(Range { start, end: t + 1 });
-            start = t + 1;
+/// Word-segment `seq` into the compact ends-only representation: `ends[i]` is
+/// the exclusive end of word `i`, its start is `ends[i-1]` (0 for the first).
+/// A word ends at a boundary token (the boundary is its last element); any
+/// trailing non-boundary chars form a final word. 4 bytes per word instead of
+/// a 16-byte `Range` — words tile the sequence contiguously, starts are implied.
+fn segment_word_ends(seq: &[u16], is_boundary: &[bool]) -> Vec<u32> {
+    let mut ends = Vec::new();
+    for (t, &tok) in seq.iter().enumerate() {
+        if is_boundary[tok as usize] {
+            ends.push(t as u32 + 1);
         }
     }
-    if start < seq.len() {
-        words.push(Range {
-            start,
-            end: seq.len(),
-        });
+    if ends.last().map_or(0, |&e| e as usize) < seq.len() {
+        ends.push(seq.len() as u32);
     }
-    words
+    ends
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -286,77 +297,36 @@ struct WordWindow {
     word_count: u32,
 }
 
-pub struct WordDataSet {
-    /// One Vec<u16> per source chunk, in original order. Never moved after
+/// One streamed chunk of the corpus, fully tokenized and windowed. Everything
+/// that used to live on the whole-file `WordDataSet` lives here per chunk.
+pub struct WordChunk {
+    /// One Vec<u16> per document, in file order. Never moved after
     /// construction — windows hold stable indices into this array.
     sequences: Vec<Vec<u16>>,
-    /// Per-sequence word ranges (absolute token positions into `sequences[seq]`).
-    segments: Vec<Vec<Range<usize>>>,
-    /// Every K-word window across the corpus. `shuffle()` reorders this list.
+    /// Per-sequence word segmentation, ends-only (see `segment_word_ends`).
+    segments: Vec<Vec<u32>>,
+    /// Every K-word window in this chunk. `shuffle()` reorders this list.
     windows: Vec<WordWindow>,
     /// Token span of the longest window. Callers size their caches to exactly
     /// this — no guessing, no waste.
     max_window_tokens: usize,
 }
 
-impl WordDataSet {
-    /// Load a single file (split on SPLIT), tokenize and word-segment each
-    /// chunk, then build contiguous windows of up to `words_per_seq` words. A
-    /// window is closed early if adding the next word would push its token span
-    /// past `max_tokens`. A finished window is kept only if it has at least
-    /// `min_words` words (so the trailing remnant of a chunk is dropped when too
-    /// short, and there is always at least one decoded word).
-    pub fn from_single_file(
-        tokenizer: &Tokenizer,
-        path: &str,
+impl WordChunk {
+    fn build(
+        sequences: Vec<Vec<u16>>,
+        is_boundary: &[bool],
         words_per_seq: usize,
         min_words: usize,
         max_tokens: usize,
-        boundary_ids: &[u16],
     ) -> Self {
-        assert!(words_per_seq >= 2, "words_per_seq must be >= 2");
-
-        let content =
-            fs::read_to_string(path).unwrap_or_else(|e| panic!("konnte {path:?} nicht lesen: {e}"));
-
-        let mut sequences: Vec<Vec<u16>> = Vec::new();
-        let mut skipped = 0;
-        for chunk in content.split(SPLIT) {
-            let chunk = chunk.trim();
-            if chunk.is_empty() {
-                continue;
-            }
-            let toks = tokenizer.to_tokens(chunk);
-            if toks.len() >= 2 {
-                sequences.push(toks);
-            } else {
-                skipped += 1;
-            }
-        }
-        if skipped > 0 {
-            eprintln!("WordDataSet: {skipped} leere Chunks übersprungen");
-        }
-
-        let segments: Vec<Vec<Range<usize>>> = sequences
+        let segments: Vec<Vec<u32>> = sequences
             .iter()
-            .map(|seq| segment_words(seq, boundary_ids))
+            .map(|seq| segment_word_ends(seq, is_boundary))
             .collect();
 
         let (windows, max_window_tokens) =
             build_word_windows(&segments, words_per_seq, min_words, max_tokens);
-
-        let total_words: usize = windows.iter().map(|w| w.word_count as usize).sum();
-        let avg_words = total_words as f32 / windows.len().max(1) as f32;
-        println!(
-            "  {} Chunks, {} Tokens, {} Wörter, {} Fenster (Ziel {} Wörter, Ø {:.0} Wörter / max {} Tokens je Fenster)",
-            sequences.len(),
-            sequences.iter().map(|s| s.len()).sum::<usize>(),
-            segments.iter().map(|s| s.len()).sum::<usize>(),
-            windows.len(),
-            words_per_seq,
-            avg_words,
-            max_window_tokens,
-        );
 
         Self {
             sequences,
@@ -369,6 +339,10 @@ impl WordDataSet {
     /// Token span of the longest window — size training caches to this.
     pub fn max_window_tokens(&self) -> usize {
         self.max_window_tokens
+    }
+
+    pub fn total_tokens(&self) -> usize {
+        self.sequences.iter().map(|s| s.len()).sum()
     }
 
     /// Reorder the window list in place. Sequences themselves are untouched.
@@ -388,6 +362,232 @@ impl WordDataSet {
     }
 }
 
+/// Streaming loader: reads `chunk_bytes` of raw text at a time, cuts at the
+/// last complete document, and hands out ready-to-train `WordChunk`s.
+pub struct ChunkedWordDataSet {
+    tokenizer: Rc<Tokenizer>,
+    words_per_seq: usize,
+    min_words: usize,
+    max_tokens: usize,
+    /// Boundary lookup indexed by token id — O(1) per token instead of a
+    /// linear scan over the boundary list.
+    is_boundary: Box<[bool]>,
+    chunk_bytes: usize,
+    reader: BufReader<File>,
+    /// Bytes after the last complete document of the previous read — they
+    /// become the prefix of the next chunk.
+    carry: Vec<u8>,
+    eof: bool,
+    /// Suppress the per-chunk summary line (used by counting passes).
+    quiet: bool,
+}
+
+impl ChunkedWordDataSet {
+    pub fn open(
+        tokenizer: Rc<Tokenizer>,
+        path: &str,
+        words_per_seq: usize,
+        min_words: usize,
+        max_tokens: usize,
+        boundary_ids: &[u16],
+        chunk_bytes: usize,
+    ) -> Self {
+        assert!(words_per_seq >= 2, "words_per_seq must be >= 2");
+        assert!(chunk_bytes > SPLIT.len(), "chunk_bytes is too small");
+
+        let file = File::open(path).unwrap_or_else(|e| panic!("could not open {path:?}: {e}"));
+        let mut is_boundary = vec![false; tokenizer.vocab_size()].into_boxed_slice();
+        for &id in boundary_ids {
+            is_boundary[id as usize] = true;
+        }
+
+        Self {
+            tokenizer,
+            words_per_seq,
+            min_words,
+            max_tokens,
+            is_boundary,
+            chunk_bytes,
+            reader: BufReader::new(file),
+            carry: Vec::new(),
+            eof: false,
+            quiet: false,
+        }
+    }
+
+    /// Seek back to the start of the corpus. Call before every epoch.
+    pub fn rewind(&mut self) {
+        self.reader
+            .seek(SeekFrom::Start(0))
+            .expect("could not seek corpus file");
+        self.carry.clear();
+        self.eof = false;
+    }
+
+    /// Total window count of the whole corpus, via one streaming pass (memory
+    /// stays chunk-bounded). Rewinds before and after. Only needed for resume
+    /// arithmetic — a plain epoch never has to know the total in advance.
+    pub fn count_windows(&mut self) -> usize {
+        self.rewind();
+        self.quiet = true;
+        let mut n = 0;
+        while let Some(chunk) = self.next_chunk() {
+            n += chunk.len();
+        }
+        self.quiet = false;
+        self.rewind();
+        n
+    }
+
+    /// Load, tokenize and window the next chunk. Returns `None` once the file
+    /// is exhausted; chunks that yield no windows are skipped transparently.
+    pub fn next_chunk(&mut self) -> Option<WordChunk> {
+        loop {
+            if self.eof && self.carry.is_empty() {
+                return None;
+            }
+
+            let mut buf = mem::take(&mut self.carry);
+
+            // Fill: normally one chunk-sized read. Keep growing only when a
+            // single document is larger than the chunk (no separator yet).
+            let mut last_split = None;
+            while !self.eof {
+                let want = if buf.len() < self.chunk_bytes {
+                    self.chunk_bytes - buf.len()
+                } else {
+                    last_split = find_last(&buf, SPLIT.as_bytes());
+                    if last_split.is_some() {
+                        break;
+                    }
+                    self.chunk_bytes
+                };
+                let got = (&mut self.reader)
+                    .take(want as u64)
+                    .read_to_end(&mut buf)
+                    .unwrap_or_else(|e| panic!("could not read corpus file: {e}"));
+                if got < want {
+                    self.eof = true;
+                }
+            }
+
+            // Cut right after the last separator; the tail is carried into the
+            // next chunk. The separator is ASCII, so the cut always lands on a
+            // UTF-8 boundary. At EOF the whole rest is the final chunk.
+            let cut = if self.eof {
+                buf.len()
+            } else {
+                last_split.expect("fill loop guarantees a separator") + SPLIT.len()
+            };
+            self.carry.extend_from_slice(&buf[cut..]);
+            buf.truncate(cut);
+            let text = String::from_utf8(buf).expect("corpus is not valid UTF-8");
+
+            let mut sequences: Vec<Vec<u16>> = Vec::new();
+            for doc in text.split(SPLIT) {
+                let doc = doc.trim();
+                if doc.is_empty() {
+                    continue;
+                }
+                let toks = self.tokenizer.to_tokens(doc);
+                if toks.len() >= 2 {
+                    sequences.push(toks);
+                }
+            }
+
+            let chunk = WordChunk::build(
+                sequences,
+                &self.is_boundary,
+                self.words_per_seq,
+                self.min_words,
+                self.max_tokens,
+            );
+            if chunk.is_empty() {
+                continue;
+            }
+            if !self.quiet {
+                println!(
+                    "  chunk: {} docs, {} tokens, {} windows (max span {})",
+                    chunk.sequences.len(),
+                    chunk.total_tokens(),
+                    chunk.len(),
+                    chunk.max_window_tokens(),
+                );
+            }
+            return Some(chunk);
+        }
+    }
+}
+
+/// Byte offset of the last occurrence of `needle` in `haystack`.
+fn find_last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).rposition(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_tokenizer() -> Rc<Tokenizer> {
+        let mut vocab: Vec<char> = ('a'..='z').collect();
+        vocab.extend('0'..='9');
+        vocab.extend([
+            ' ', '.', '!', '?', ',', ';', ':', '\n', '{', '}', '(', ')', '[', ']', '<', '>', '|',
+            '"', '\'', '-',
+        ]);
+        Rc::new(Tokenizer::new_vocab(&vocab, false))
+    }
+
+    fn collect_all(loader: &mut ChunkedWordDataSet) -> Vec<(Vec<u16>, Vec<Range<usize>>)> {
+        let mut out = Vec::new();
+        while let Some(chunk) = loader.next_chunk() {
+            for b in chunk.iter() {
+                out.push((b.tokens.to_vec(), b.words.clone()));
+            }
+        }
+        out
+    }
+
+    /// Streaming in tiny chunks must yield exactly the windows a whole-file
+    /// load produces, and rewinding must reproduce them deterministically.
+    #[test]
+    fn tiny_chunks_match_whole_file() {
+        let tokenizer = test_tokenizer();
+        let boundaries = tokenizer.boundary_tokens();
+
+        // A few hundred small documents so many chunk cuts land mid-file.
+        let mut text = String::new();
+        for i in 0..300 {
+            text.push_str(&format!(
+                "story number {i} begins. someone walks, talks and stops! the end?\n"
+            ));
+            text.push_str(SPLIT);
+        }
+        let path = std::env::temp_dir().join("chunked_word_dataset_test.txt");
+        fs::write(&path, &text).unwrap();
+        let path = path.to_str().unwrap();
+
+        let open = |chunk_bytes: usize| {
+            let mut l =
+                ChunkedWordDataSet::open(tokenizer.clone(), path, 6, 2, 64, &boundaries, chunk_bytes);
+            l.quiet = true;
+            l
+        };
+
+        let whole = collect_all(&mut open(1 << 30));
+        assert!(whole.len() > 100, "test corpus yields too few windows");
+
+        let mut small_loader = open(256);
+        let small = collect_all(&mut small_loader);
+        assert_eq!(whole, small);
+
+        small_loader.rewind();
+        assert_eq!(whole, collect_all(&mut small_loader));
+
+        assert_eq!(small_loader.count_windows(), whole.len());
+    }
+}
+
 /// One training sample: the window's contiguous tokens plus its word ranges
 /// (relative to `tokens`). `words` is a fresh small Vec (K ranges) per item.
 pub struct WordBatch<'a> {
@@ -396,7 +596,7 @@ pub struct WordBatch<'a> {
 }
 
 pub struct WordIter<'a> {
-    ds: &'a WordDataSet,
+    ds: &'a WordChunk,
     idx: usize,
 }
 
@@ -406,19 +606,23 @@ impl<'a> Iterator for WordIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let w = *self.ds.windows.get(self.idx)?;
         self.idx += 1;
-        let segs = &self.ds.segments[w.seq as usize];
+        let ends = &self.ds.segments[w.seq as usize];
         let first = w.word_start as usize;
         let count = w.word_count as usize;
-        let abs_start = segs[first].start;
-        let abs_end = segs[first + count - 1].end;
+        let abs_start = if first == 0 {
+            0
+        } else {
+            ends[first - 1] as usize
+        };
+        let abs_end = ends[first + count - 1] as usize;
         let tokens = &self.ds.sequences[w.seq as usize][abs_start..abs_end];
-        let words: Vec<Range<usize>> = segs[first..first + count]
-            .iter()
-            .map(|r| Range {
-                start: r.start - abs_start,
-                end: r.end - abs_start,
-            })
-            .collect();
+        let mut words = Vec::with_capacity(count);
+        let mut start = 0;
+        for &e in &ends[first..first + count] {
+            let end = e as usize - abs_start;
+            words.push(Range { start, end });
+            start = end;
+        }
         Some(WordBatch { tokens, words })
     }
 
@@ -430,33 +634,33 @@ impl<'a> Iterator for WordIter<'a> {
 
 impl ExactSizeIterator for WordIter<'_> {}
 
-/// Walk each sequence's word ranges contiguously, packing up to `words_per_seq`
+/// Walk each sequence's words contiguously, packing up to `words_per_seq`
 /// words per window but never letting the token span exceed `max_tokens` (the
 /// first word of a window is always included even if it alone is longer). Keep a
 /// window only if it gathered at least `min_words` words.
 fn build_word_windows(
-    segments: &[Vec<Range<usize>>],
+    segments: &[Vec<u32>],
     words_per_seq: usize,
     min_words: usize,
     max_tokens: usize,
 ) -> (Vec<WordWindow>, usize) {
     let mut out = Vec::new();
     let mut max_span = 0;
-    for (s_idx, segs) in segments.iter().enumerate() {
-        let n = segs.len();
+    for (s_idx, ends) in segments.iter().enumerate() {
+        let n = ends.len();
         let mut wi = 0;
         while wi < n {
-            let start_tok = segs[wi].start;
+            let start_tok = if wi == 0 { 0 } else { ends[wi - 1] as usize };
             let mut count = 0;
             while wi + count < n && count < words_per_seq {
-                let span = segs[wi + count].end - start_tok;
+                let span = ends[wi + count] as usize - start_tok;
                 if span > max_tokens && count > 0 {
                     break;
                 }
                 count += 1;
             }
             if count >= min_words {
-                let span = segs[wi + count - 1].end - start_tok;
+                let span = ends[wi + count - 1] as usize - start_tok;
                 max_span = max_span.max(span);
                 out.push(WordWindow {
                     seq: s_idx as u32,
