@@ -23,7 +23,7 @@ pub const DECAY_STEPS: usize = 25_000;
 // Windows whose gradients are accumulated before one optimizer step. Muon
 // (matrices) is scale-invariant via the Frobenius normalization and aux-Adam
 // (vectors) via its second moment, so summed grads need no manual rescaling.
-pub const BATCH_SIZE: usize = 4;
+pub const BATCH_SIZE: usize = 8;
 pub const EPOCHS: usize = 2;
 
 pub const SAVE_EVERY: usize = 30;

@@ -22,8 +22,7 @@ pub struct Tokenizer {
     id_w: u16,
 }
 
-pub const SPECIAL_TOKENS: &[&str] =
-    &["<SPACE2>", "<SPACE4>", "<END>", "<QSTART>", "<QEND>", "<W>"];
+pub const SPECIAL_TOKENS: &[&str] = &["<SPACE2>", "<SPACE4>", "<END>", "<QSTART>", "<QEND>", "<W>"];
 
 impl Tokenizer {
     pub fn new(charset_path: &str, lowercase: bool) -> Self {
@@ -59,8 +58,8 @@ impl Tokenizer {
                 .iter()
                 .position(|&t| t == "<SPACE4>")
                 .unwrap() as u16;
-        let id_w = stoi.len() as u16
-            + SPECIAL_TOKENS.iter().position(|&t| t == "<W>").unwrap() as u16;
+        let id_w =
+            stoi.len() as u16 + SPECIAL_TOKENS.iter().position(|&t| t == "<W>").unwrap() as u16;
 
         Tokenizer {
             lowercase,
@@ -185,6 +184,7 @@ impl Tokenizer {
 
     const BOUNDARIES: &[char] = &[
         '.', '!', '?', ',', ';', ':', '\n', '{', '}', '(', ')', '[', ']', '<', '>', '|', '"', '\'',
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
     ];
 
     /// Token ids that count as word/segment boundaries for the hierarchical model.
