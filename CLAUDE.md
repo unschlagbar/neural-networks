@@ -51,9 +51,11 @@ All comments need to be in englisch not in german
 
 `Hierarchical` (HAT-style, arXiv 2501.10322) couples three stages:
 
-- **encoder** (`WordEncoder`) — a normal forward-only `Sequential` (`Embedding → sLSTMBlock × 2 → RMSNorm`) over the characters of one word; the word embedding `e_w` is the output at the last char. State is reset per word.
-- **word_model** (backbone) — `LinearNoBias → alternating sLSTM/mLSTM blocks × WORD_BLOCKS → RMSNorm → LinearNoBias` — autoregresses over word embeddings, carrying recurrent state across words; its output is the context for decoding the *next* word.
-- **char2_model** (decoder) — `LinearNoBias → sLSTMBlock × 2 → RMSNorm → LinearNoBias` — takes `[char one-hot ‖ word context]` per step, is fed a leading `[W]` (BOS), and predicts the word's chars plus a trailing `[W]` (EOS). Reset per word.
+- **encoder** (`WordEncoder`) — a normal forward-only `Sequential` (`Embedding → sLSTMBlock × 2 → RMSNorm`) over the characters of one word plus a closing `[W]` end-of-word step (fed virtually — token slices never contain it); the word embedding `e_w` is the output at the `[W]` step. State is reset per word.
+- **word_model** (backbone) — `Linear → alternating sLSTM/mLSTM blocks × WORD_BLOCKS → RMSNorm → Linear` — autoregresses over word embeddings, carrying recurrent state across words; its output is the context for decoding the *next* word.
+- **char2_model** (decoder) — `sLSTMBlock × 2 → RMSNorm → LinearNoBias → SoftCap`, input width OUT_HIDDEN — the decoder has no front layer; `Hierarchical` builds its inputs itself (paper eq. 3–4): a word's **first sequence step is the injected backbone context** (it takes the BOS slot), every later step feeds the previous char through the **encoder's char embedding** (tied table — requires CHAR_HIDDEN == OUT_HIDDEN; decoder-side embedding grads are reduced back into the encoder's table in `backwards_sequence`). Predicts the word's chars plus a trailing `[W]` (EOS). Reset per word.
+
+Optimizer assignment convention: interior projections use `linear`/`Linear` (Muon, weight-decayed); `linear_no_bias` and the embedding layers train on plain Adam without decay and are reserved for embedding-like tables and logit heads — putting hidden projections on the Adam path causes unbounded weight growth over long runs. The decoder's logit head is additionally followed by `SoftCap` (`src/nn/soft_cap.rs`, tag 17, `LOGIT_SOFTCAP = 30` like xLSTM-7B): `logits = cap·tanh(z/cap)` bounds the logits so the undecayed Adam head has no incentive to grow without limit.
 
 Boundary tokens come from `Tokenizer::boundary_tokens()`; a word is the token span up to and including its boundary token. Forward/backward run phase by phase over a whole window (all encodes, then the backbone sweep, then all decodes).
 

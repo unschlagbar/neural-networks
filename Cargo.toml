@@ -23,5 +23,5 @@ criterion = "0.8.2"
 iron_oxide = { path = "../iron_oxide", default-features = false }
 rand = "0.10.0"
 rayon = "1.11"
-cpal = "0.17.3"
+cpal = "0.18.1"
 hound = "3"

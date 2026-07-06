@@ -13,12 +13,13 @@ use crate::nn::rms_norm::RMSNorm;
 use crate::nn::silu_dense::SiluDenseLayer;
 use crate::nn::slstm::SLSTMLayer;
 use crate::nn::slstm_block::SLSTMBlock;
+use crate::nn::soft_cap::SoftCapLayer;
 use crate::sequential::Sequential;
 
 /// Type-erased per-timestep forward cache.
 /// Concrete types downcast via `as_any_mut()` inside each layer's own backward impl.
 /// Storing `Vec<Box<dyn DynCache>>` lets `Sequential` iterate without any match.
-pub trait DynCache: Send {
+pub trait DynCache: Send + Sync {
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn as_any(&self) -> &dyn Any;
     /// Post-activation output — fed as input to the next layer.
@@ -48,7 +49,7 @@ impl<T: 'static> Dyn for T {
     }
 }
 
-pub trait NnLayer: Dyn + Send {
+pub trait NnLayer: Dyn + Send + Sync {
     fn forward(&mut self, input: &[f32], cache: &mut dyn DynCache);
 
     fn forward_sample(&mut self, input: &[f32], cache: &mut dyn DynCache) {
@@ -87,6 +88,16 @@ pub trait NnLayer: Dyn + Send {
         unimplemented!("add_grads_from: this layer type does not support data-parallel training");
     }
 
+    /// Overwrite this layer's weights with those of `other` — a same-type,
+    /// same-shape layer. Refreshes an existing replica in place after an
+    /// optimizer step (plain memcpy: no serialization, no allocation); layers
+    /// that appear in a parallel-trained stack must override this.
+    fn copy_weights_from(&mut self, _other: &dyn NnLayer) {
+        unimplemented!(
+            "copy_weights_from: this layer type does not support data-parallel training"
+        );
+    }
+
     /// Clear h, c
     fn reset_state(&mut self) {}
 
@@ -99,13 +110,19 @@ pub trait NnLayer: Dyn + Send {
     fn accumulate_init_grad(&mut self) {}
 
     /// Total h+c state size (0 for stateless layers, 2*hidden for sLSTM layers).
-    fn state_size(&self) -> usize { 0 }
+    fn state_size(&self) -> usize {
+        0
+    }
 
     /// Overwrite the layer's h and c from `buf[offset..]`; returns the new offset.
-    fn inject_state(&mut self, _buf: &[f32], offset: usize) -> usize { offset }
+    fn inject_state(&mut self, _buf: &[f32], offset: usize) -> usize {
+        offset
+    }
 
     /// Copy dh_bptt then dc_bptt into `buf[offset..]`; returns the new offset.
-    fn collect_bptt_grad(&mut self, _buf: &mut [f32], offset: usize) -> usize { offset }
+    fn collect_bptt_grad(&mut self, _buf: &mut [f32], offset: usize) -> usize {
+        offset
+    }
 }
 
 pub struct SequentialBuilder {
@@ -211,6 +228,14 @@ impl SequentialBuilder {
         let channels = self.output_size;
         let layer = CausalConv1dLayer::new(channels, kernel_size);
         self.layer(Box::new(layer), channels);
+        self
+    }
+
+    /// Soft-caps the previous layer's output to (−cap, cap) via
+    /// `y = cap · tanh(x / cap)`. Meant to follow a logit head.
+    pub fn soft_cap(mut self, cap: f32) -> Self {
+        let layer = SoftCapLayer::new(self.output_size, cap);
+        self.layer(Box::new(layer), self.output_size);
         self
     }
 

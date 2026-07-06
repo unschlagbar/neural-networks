@@ -184,4 +184,12 @@ impl NnLayer for LinearNBLayer {
             .expect("LinearNBLayer::add_grads_from — replica layer type mismatch");
         add_grad_matrix(&mut self.grads.weights, &mut o.grads.weights);
     }
+
+    fn copy_weights_from(&mut self, other: &dyn NnLayer) {
+        let o = other
+            .as_any()
+            .downcast_ref::<Self>()
+            .expect("LinearNBLayer::copy_weights_from — replica layer type mismatch");
+        self.weights.copy_from(&o.weights);
+    }
 }

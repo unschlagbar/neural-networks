@@ -119,7 +119,8 @@ pub fn train_hierarchical(model_path: &str) {
     );
 
     let mut training_state = TrainingState::from_step(model.step);
-    training_state.init_log(model_path, &["delta_word", "delta_char1", "word_loss"]);
+    let extra_cols = ["delta_word", "delta_char1", "word_loss"];
+    training_state.init_log(model_path, &extra_cols);
     let mut total_time = Duration::ZERO;
     // Cache is sized to the longest window seen so far and grown on demand.
     let mut cache_tokens = 0;
@@ -304,51 +305,107 @@ pub fn probe_hierarchical(model_path: &str) {
     // word. survival(k) = f̄^k, so the 1/e memory horizon is -1/ln(f̄) words.
     // Low horizon → the state decays (capacity it can't use); high horizon →
     // it CAN remember and simply doesn't, i.e. nothing to fix in the cell.
-    let mut window = chunk.iter();
-    if let Some(crate::batches::WordBatch { tokens, words }) = window.next() {
+    //
+    // Per head we also report the resting gate σ(bf) (retention at zero input
+    // drive) and the observed min/max: a head whose swing is ~0 never
+    // modulates — its horizon is just the learned bias, not data-dependent
+    // behavior. Note bf is initialized in [3, 6] (σ ∈ [0.95, 0.998]), so
+    // every head STARTS with a ≥20-word bias-only horizon; heads below that
+    // were actively pulled down by training or by input drive.
+    let bias = model.backbone_forget_bias();
+    let mut samples: Vec<Vec<Vec<f32>>> = Vec::new();
+    for crate::batches::WordBatch { tokens, words } in chunk.iter().take(n) {
         model.reset();
         model.forward_over(tokens, &words);
-        let per_head = model.backbone_forget_per_head();
-
-        println!(
-            "\n  ── backbone forget gates (over {} words, {} blocks) ──",
-            words.len().saturating_sub(1),
-            per_head.len(),
-        );
-        let mut all: Vec<f32> = Vec::new();
-        for (b, heads) in per_head.iter().enumerate() {
-            let mean = heads.iter().sum::<f32>() / heads.len().max(1) as f32;
-            let max = heads.iter().fold(0.0_f32, |x, y| x.max(*y));
-            println!(
-                "  block {b:>2}: mean f̄ = {mean:.4} (~{:.1} words)   best head f̄ = {max:.4} (~{:.1} words)",
-                horizon(mean),
-                horizon(max),
-            );
-            all.extend_from_slice(heads);
-        }
-        all.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        if !all.is_empty() {
-            let median = all[all.len() / 2];
-            let max = *all.last().unwrap();
-            let long = all.iter().filter(|&&f| horizon(f) >= 10.0).count();
-            println!(
-                "\n  median head horizon: {:.1} words | longest head: {:.1} words | heads with ≥10-word memory: {}/{}",
-                horizon(median),
-                horizon(max),
-                long,
-                all.len(),
-            );
-            println!(
-                "  → {}",
-                if horizon(max) < 3.0 {
-                    "state decays within ~2 words even at best"
-                } else if long == 0 {
-                    "no head holds memory ≥10 words"
-                } else {
-                    "some heads CAN hold long memory"
+        let per_window = model.backbone_forget_samples();
+        if samples.is_empty() {
+            samples = per_window;
+        } else {
+            for (b, heads) in per_window.into_iter().enumerate() {
+                for (h, s) in heads.into_iter().enumerate() {
+                    samples[b][h].extend(s);
                 }
+            }
+        }
+    }
+
+    let words_probed = samples.first().and_then(|b| b.first()).map_or(0, Vec::len);
+    println!(
+        "\n  ── backbone forget gates (over {} windows, {} words, {} blocks) ──",
+        n,
+        words_probed,
+        samples.len(),
+    );
+    let mut all: Vec<f32> = Vec::new();
+    let mut static_heads = 0;
+    // A gate that never leaves this band around its resting point is static:
+    // its horizon is set by the bias alone, not by what the model reads.
+    const STATIC_SWING: f32 = 0.02;
+    for (b, heads) in samples.iter().enumerate() {
+        let means: Vec<f32> = heads
+            .iter()
+            .map(|s| (s.iter().map(|&v| v as f64).sum::<f64>() / s.len().max(1) as f64) as f32)
+            .collect();
+        let block_mean = means.iter().sum::<f32>() / means.len().max(1) as f32;
+        println!(
+            "  block {b:>2}: mean f̄ = {block_mean:.4} (~{:.1} words)",
+            horizon(block_mean),
+        );
+        println!("      head   f̄ mean    horizon      min      max   rest σ(bf)    swing");
+        for (h, s) in heads.iter().enumerate() {
+            let mean = means[h];
+            let min = s.iter().fold(1.0, |a: f32, &v| a.min(v));
+            let max = s.iter().fold(0.0, |a: f32, &v| a.max(v));
+            let rest = bias[b][h];
+            let swing = max - min;
+            if swing < STATIC_SWING {
+                static_heads += 1;
+            }
+            println!(
+                "      {h:>4}   {mean:.4}   {:>7.1} w   {min:.4}   {max:.4}       {rest:.4}   {swing:.4}{}",
+                horizon(mean),
+                if swing < STATIC_SWING { "  (static)" } else { "" },
             );
         }
+        all.extend(means);
+    }
+    all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if !all.is_empty() {
+        let median = all[all.len() / 2];
+        let max = *all.last().unwrap();
+        let long = all.iter().filter(|&&f| horizon(f) >= 10.0).count();
+        let buckets = [2.0, 10.0, 100.0];
+        let mut counts = [0usize; 4];
+        for &f in &all {
+            let h = horizon(f);
+            let idx = buckets.iter().position(|&b| h < b).unwrap_or(3);
+            counts[idx] += 1;
+        }
+        println!(
+            "\n  horizon buckets: <2 w: {} | 2–10 w: {} | 10–100 w: {} | ≥100 w: {}",
+            counts[0], counts[1], counts[2], counts[3],
+        );
+        println!(
+            "  median head horizon: {:.1} words | longest head: {:.1} words | heads with ≥10-word memory: {}/{} | static gates: {}/{}",
+            horizon(median),
+            horizon(max),
+            long,
+            all.len(),
+            static_heads,
+            all.len(),
+        );
+        println!(
+            "  → {}",
+            if horizon(max) < 3.0 {
+                "state decays within ~2 words even at best"
+            } else if long == 0 {
+                "no head holds memory ≥10 words"
+            } else if static_heads == all.len() {
+                "all gates are static — horizons are pure bias, the input projection contributes nothing"
+            } else {
+                "some heads CAN hold long memory"
+            }
+        );
     }
 }
 

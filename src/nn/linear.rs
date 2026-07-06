@@ -154,6 +154,12 @@ impl LinearLayer {
         add_grad_matrix(&mut self.grads.weights, &mut other.grads.weights);
         add_grad_vec(&mut self.grads.biases, &mut other.grads.biases);
     }
+
+    /// Overwrite weights and biases with `other`'s (in-place replica refresh).
+    pub fn copy_weights(&mut self, other: &Self) {
+        self.weights.copy_from(&other.weights);
+        self.biases.copy_from_slice(&other.biases);
+    }
 }
 
 impl NnLayer for LinearLayer {
@@ -213,5 +219,13 @@ impl NnLayer for LinearLayer {
             .downcast_mut::<Self>()
             .expect("LinearLayer::add_grads_from — replica layer type mismatch");
         self.add_grads(o);
+    }
+
+    fn copy_weights_from(&mut self, other: &dyn NnLayer) {
+        let o = other
+            .as_any()
+            .downcast_ref::<Self>()
+            .expect("LinearLayer::copy_weights_from — replica layer type mismatch");
+        self.copy_weights(o);
     }
 }

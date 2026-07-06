@@ -10,13 +10,14 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterato
 
 use crate::{
     batches::WordBatch,
-    config::MAX_SEQ_LEN,
+    config::{ENC_W_EOS, MAX_SEQ_LEN},
     loading::{read_u16, read_u32, read_u64},
     nn::{
         mlstm_block::{MLSTMBlock, MLSTMBlockCache},
         softmax::{nll_from_logits, sample_top_p, softmax_inplace},
     },
     nn_layer::{DynCache, NnLayer},
+    optimizers::GradMatrixOps,
     parallel::{ReplicaPool, WorkerChunk, chunk_words, split_by_words},
     saving::{HIER_MAGIC, write_u16, write_u32, write_u64},
     sequential::Sequential,
@@ -39,9 +40,9 @@ pub enum BackboneMode {
 }
 
 pub struct Hierarchical {
-    /// Per-word encoder: a normal forward stack over the word's characters,
-    /// read out at the last char as the word embedding `e_w`.
-    /// (See `word_encoder.rs`.)
+    /// Per-word encoder: a normal forward stack over the word's characters plus
+    /// a closing `[W]` step, read out at the `[W]` step as the word embedding
+    /// `e_w`. (See `word_encoder.rs`.)
     pub encoder: WordEncoder,
     pub char2_model: Sequential,
     pub word_model: Sequential,
@@ -52,7 +53,7 @@ pub struct Hierarchical {
     pub context_size: usize,
 
     pub tokenizer: Rc<Tokenizer>,
-    /// The `[W]` marker id (encoder prefix / decoder BOS+EOS).
+    /// The `[W]` marker id — the decoder's EOS target (and sampling stop token).
     w_token: u16,
 
     pub boundary_token_ids: Vec<u16>,
@@ -66,7 +67,8 @@ pub struct Hierarchical {
     /// Target token id for each decoder cache slot (parallel to `char2_model.cache`).
     dec_targets: Vec<u16>,
 
-    /// Decoder input: `[char one-hot ‖ word context]` (size `vocab + context`).
+    /// Decoder input buffer for the sampling path: a word's injected context
+    /// first, then the embedded previous char (size `context`).
     char2_input: Box<[f32]>,
 
     /// Backward scratch: top-level delta as it flows down a layer stack.
@@ -119,16 +121,20 @@ impl Hierarchical {
             "encoder.output must equal backbone.input_size"
         );
         assert_eq!(
-            char2_model.input_size,
-            context_size + vocab_size,
-            "decoder.input_size must equal backbone.output_size + vocab_size"
+            char2_model.input_size, context_size,
+            "decoder.input_size must equal backbone.output_size (the context is injected as the first decoder step)"
         );
 
         let w_token = tokenizer.w_token();
         // The encoder validates its own input size against vocab_size.
-        let encoder = WordEncoder::new(encoder_chars, vocab_size);
+        let encoder = WordEncoder::new(encoder_chars, vocab_size, w_token);
+        assert_eq!(
+            encoder.char_embedding().output_size(),
+            context_size,
+            "tied char embedding width must equal the decoder input width (CHAR_HIDDEN == OUT_HIDDEN)"
+        );
 
-        let char2_input = vec![0.0; vocab_size + context_size].into();
+        let char2_input = vec![0.0; context_size].into();
 
         // delta_buf holds a layer's input_grad as the backward delta flows down a
         // stack, so it must be sized to the LARGEST layer dimension across the
@@ -169,9 +175,9 @@ impl Hierarchical {
 
     /// `word_steps` = max WORDS per window (backbone unroll length);
     /// `max_tokens` = max TOKEN span of any window. Encoder/decoder caches are
-    /// indexed by a running step cursor; the decoder needs one slot per token
-    /// plus one extra `[W]` EOS step per word → size by token capacity, not
-    /// word count.
+    /// indexed by a running step cursor; both need one slot per token plus one
+    /// extra `[W]` step per word (encoder: closing input step, decoder: EOS
+    /// target step) → size by token capacity, not word count.
     pub fn make_cache(&mut self, word_steps: usize, max_tokens: usize) {
         let slots = max_tokens + word_steps + 8;
         self.encoder.make_cache(slots);
@@ -245,7 +251,6 @@ impl Hierarchical {
         self.encoder.reset();
         self.dec_ranges.clear();
         let n = self.word_segments.len();
-        let vocab = self.vocab_size;
         let char_out = self.encoder.output_size;
 
         // Word 0 is the encode-only prefix; words 1..n are decoded, so word w is
@@ -285,8 +290,10 @@ impl Hierarchical {
         }
 
         // --- PHASE 3: DECODER — predict the chars of word w+1, conditioned on
-        // o_{w+1}. Each word's decode is reset and independent of the others. ---
-        // inputs  [W], c1, …, cn   →   targets c1, …, cn, [W]
+        // o_{w+1}, injected as the word's first sequence step (paper eq. 3–4:
+        // p_i takes the BOS slot). Each word's decode is reset and independent
+        // of the others. ---
+        // inputs  o, c1, …, cn   →   targets c1, …, cn, [W]
         //
         // Serial pre-pass: fix every word's cache slot range and targets (cheap
         // indexing), so the compute below can be chunked across the replica pool.
@@ -318,10 +325,11 @@ impl Hierarchical {
 
         self.dec_pool.sync(&self.char2_model);
         let context = self.context_size;
-        let w_tok = self.w_token as usize;
         let o_words = &self.o_words;
         let dec_ranges = &self.dec_ranges;
         let word_segments = &self.word_segments;
+        // Tied char embedding: decoder char steps feed the encoder's rows.
+        let embed = &self.encoder.char_embedding().weights;
         let chunks = chunk_words(
             &mut self.dec_pool.replicas,
             dec_ranges,
@@ -336,23 +344,18 @@ impl Hierarchical {
                 cache,
                 slot_base,
             } = chunk;
-            // Decoder input: [char one-hot ‖ word context], one buffer per worker.
-            let mut input = vec![0.0; vocab + context];
             for w in wr.into_iter() {
-                input[vocab..].copy_from_slice(&o_words[w][..context]);
                 for layer in &mut replica.layers {
                     layer.reset_state();
                 }
                 let next_word = word_segments[w + 1];
                 for (k, slot) in dec_ranges[w].into_iter().enumerate() {
-                    let in_tok = if k == 0 {
-                        w_tok
+                    let input: &[f32] = if k == 0 {
+                        &o_words[w][..context]
                     } else {
-                        tokens[next_word.start + k - 1] as usize
+                        &embed[tokens[next_word.start + k - 1] as usize]
                     };
-                    input[in_tok] = 1.0;
-                    Self::forward_step(&mut replica.layers, &mut cache[slot - slot_base], &input);
-                    input[in_tok] = 0.0;
+                    Self::forward_step(&mut replica.layers, &mut cache[slot - slot_base], input);
                 }
             }
         });
@@ -362,11 +365,13 @@ impl Hierarchical {
     /// word `w`. Active only when `trace_io` is set.
     fn trace_word(&self, w: usize, tokens: &[u16], word: Range<usize>, next_word: Range<usize>) {
         let wm = self.tokenizer.display(self.w_token);
-        let enc = self
-            .tokenizer
-            .display_tokens(&tokens[word.start..word.end]);
+        let enc = format!(
+            "{}{}",
+            self.tokenizer.display_tokens(&tokens[word.start..word.end]),
+            if ENC_W_EOS { wm } else { "" }
+        );
         let dec_in = format!(
-            "{wm}{}",
+            "<ctx>{}",
             self.tokenizer
                 .display_tokens(&tokens[next_word.start..next_word.end - 1])
         );
@@ -406,8 +411,11 @@ impl Hierarchical {
 
         // --- PHASE 3': DECODER backward → grad w.r.t. each word's context o. ---
         // Words decode independently; each worker backprops its words on its own
-        // replica (own grad accumulators) and stashes d_o per word. The replica
-        // grads are then reduced into the master decoder.
+        // replica (own grad accumulators), stashes d_o per word (slot 0 — the
+        // injected context — carries the whole word-context gradient) and
+        // accumulates the char steps' input grads into a worker-local copy of
+        // the tied char-embedding gradient. Replica and embedding grads are
+        // then reduced into the masters.
         self.dec_pool.sync(&self.char2_model);
         let dec_max_dim = self.char2_model.max_layer_dim();
         let dec_ranges = &self.dec_ranges;
@@ -420,7 +428,7 @@ impl Hierarchical {
         );
         let d_o_chunks = split_by_words(&chunks, &mut self.d_o_words[..words]);
 
-        let high_grad_accum: f32 = chunks
+        let results: Vec<(f32, Vec<f32>)> = chunks
             .into_par_iter()
             .zip(d_o_chunks)
             .map(|(chunk, d_o_chunk)| {
@@ -431,12 +439,12 @@ impl Hierarchical {
                     slot_base,
                 } = chunk;
                 let mut delta_buf = vec![0.0; dec_max_dim];
-                let mut d_o_buf = vec![0.0; context];
+                let mut d_emb = vec![0.0; vocab * context];
                 let mut sig = 0.0;
                 let w0 = wr.start;
                 for w in wr.into_iter() {
-                    d_o_buf.fill(0.0);
-                    for slot in dec_ranges[w].into_iter().rev() {
+                    let range = dec_ranges[w];
+                    for slot in range.into_iter().rev() {
                         let ci = slot - slot_base;
                         let out_len = {
                             let out = cache[ci].last().unwrap().output();
@@ -454,23 +462,43 @@ impl Hierarchical {
                             out_len,
                         );
 
-                        // Gradient w.r.t. the concatenated word context.
                         let dx = cache[ci][0].input_grad();
-                        for i in 0..context {
-                            d_o_buf[i] += dx[vocab + i];
+                        if slot == range.start {
+                            // Slot 0's input was the injected context, so its
+                            // input grad is the whole word-context gradient.
+                            d_o_chunk[w - w0][..context].copy_from_slice(&dx[..context]);
+                            sig +=
+                                dx[..context].iter().map(|x| x.abs()).sum::<f32>() / context as f32;
+                        } else {
+                            // Char step: the input was a row of the tied char
+                            // embedding; the input token is the previous
+                            // slot's target.
+                            let tok = dec_targets[slot - 1] as usize;
+                            let row = &mut d_emb[tok * context..(tok + 1) * context];
+                            for (g, &d) in row.iter_mut().zip(&dx[..context]) {
+                                *g += d;
+                            }
                         }
                     }
                     for layer in &mut replica.layers {
                         layer.accumulate_init_grad();
                         layer.reset_bptt_state();
                     }
-                    sig += d_o_buf.iter().map(|x| x.abs()).sum::<f32>() / context as f32;
-                    d_o_chunk[w - w0][..context].copy_from_slice(&d_o_buf);
                 }
-                sig
+                (sig, d_emb)
             })
-            .sum();
+            .collect();
         self.dec_pool.reduce_into(&mut self.char2_model);
+
+        // Reduce the workers' tied-embedding gradients into the encoder's table.
+        let mut high_grad_accum = 0.0;
+        let emb_grads = self.encoder.char_embedding_mut().grads.weights.matrix();
+        for (sig, d_emb) in &results {
+            high_grad_accum += sig;
+            for (g, &d) in emb_grads.as_slice_mut().iter_mut().zip(d_emb.iter()) {
+                *g += d;
+            }
+        }
 
         // --- PHASE 2': BACKBONE backward → grad w.r.t. each word embedding e_w. ---
         // Reverse word order so the backbone's cross-word BPTT state carries.
@@ -560,12 +588,13 @@ impl Hierarchical {
         (c_loss, w_loss)
     }
 
-    /// Per-backbone-block, per-head mean effective forget multiplier (`f_prime`)
-    /// over the words of the currently cached window. `f_prime ∈ (0,1]` is the
-    /// fraction of the cell state carried from the previous word, so it directly
-    /// bounds how far memory can persist. Outer index = mLSTM block, inner = head.
-    /// Run `forward_over` first; reads the live forward cache.
-    pub fn backbone_forget_per_head(&self) -> Vec<Vec<f32>> {
+    /// Per-backbone-block, per-head effective forget multipliers (`f_prime`)
+    /// for every word step of the currently cached window. `f_prime ∈ (0,1]`
+    /// is the fraction of the cell state carried from the previous word, so it
+    /// directly bounds how far memory can persist. Outer index = mLSTM block,
+    /// mid = head, inner = word step. Run `forward_over` first; reads the live
+    /// forward cache.
+    pub fn backbone_forget_samples(&self) -> Vec<Vec<Vec<f32>>> {
         let steps = self.encoder.num_words(); // backbone steps = decoded words
         let block_layers: Vec<usize> = self
             .word_model
@@ -576,26 +605,45 @@ impl Hierarchical {
             .map(|(l, _)| l)
             .collect();
 
-        let mut out: Vec<Vec<f32>> = Vec::new();
+        let mut out: Vec<Vec<Vec<f32>>> = Vec::new();
         for &l in &block_layers {
-            let mut head_sums: Vec<f64> = Vec::new();
+            let mut heads: Vec<Vec<f32>> = Vec::new();
             for w in 0..steps {
                 let cache = self.word_model.cache[w][l]
                     .as_any()
                     .downcast_ref::<MLSTMBlockCache>()
                     .expect("backbone layer flagged as MLSTMBlock but cache is not");
                 let fp = &cache.cell.f_prime;
-                if head_sums.is_empty() {
-                    head_sums = vec![0.0; fp.len()];
+                if heads.is_empty() {
+                    heads = vec![Vec::with_capacity(steps); fp.len()];
                 }
                 for (h, &v) in fp.iter().enumerate() {
-                    head_sums[h] += v as f64;
+                    heads[h].push(v);
                 }
             }
-            let denom = steps.max(1) as f64;
-            out.push(head_sums.iter().map(|s| (s / denom) as f32).collect());
+            out.push(heads);
         }
         out
+    }
+
+    /// Learned forget-gate bias per backbone block/head, mapped through the
+    /// gate nonlinearity: `sigmoid(bf)` is the retention a head applies with
+    /// zero input drive — its resting point. The gap between this and the
+    /// observed f̄ is what the input projection (plus the max-stabilizer)
+    /// actually contributes on data.
+    pub fn backbone_forget_bias(&self) -> Vec<Vec<f32>> {
+        self.word_model
+            .layers
+            .iter()
+            .filter_map(|l| l.as_any().downcast_ref::<MLSTMBlock>())
+            .map(|b| {
+                b.cell
+                    .bf
+                    .iter()
+                    .map(|&x| 1.0 / (1.0 + (-x).exp()))
+                    .collect()
+            })
+            .collect()
     }
 
     pub fn train<'a, I: Iterator<Item = WordBatch<'a>>>(
@@ -673,10 +721,9 @@ impl Hierarchical {
         }
     }
 
-    /// Bidirectionally encode one completed word (`[W]` prepended) and step the
-    /// backbone, leaving the new word context in `char2_input[vocab..]`.
+    /// Encode one completed word and step the backbone, leaving the new word
+    /// context in `char2_input` — the next word's first decoder input.
     fn encode_word_advance(&mut self, word: &[u16]) {
-        let vocab = self.vocab_size;
         let char_out = self.encoder.output_size;
 
         // Encode the word → e_w, then step the backbone once on it.
@@ -689,7 +736,7 @@ impl Hierarchical {
         );
 
         let o = self.word_model.cache[0].last().unwrap().output();
-        self.char2_input[vocab..].copy_from_slice(o);
+        self.char2_input.copy_from_slice(o);
     }
 
     pub fn sample(
@@ -741,21 +788,19 @@ impl Hierarchical {
         let mut out = Vec::with_capacity(max_len);
         let mut word_chars: Vec<u16> = Vec::new();
         let mut empty_words = 0;
-        // Each word starts with the [W] BOS input; the model emits the word's chars
-        // then a [W] which marks end-of-word.
+        // Each word's first decoder input is the injected context (left in
+        // char2_input by encode_word_advance); the model emits the word's
+        // chars then a [W] which marks end-of-word.
         for layer in &mut self.char2_model.layers {
             layer.reset_state();
         }
-        let mut next_input = w_tok;
 
         loop {
-            self.char2_input[next_input] = 1.0;
             Self::forward_sample_step(
                 &mut self.char2_model.layers,
                 &mut self.char2_model.cache[0],
                 &self.char2_input,
             );
-            self.char2_input[next_input] = 0.0;
 
             // Teacher-force the known start of the word, then sample the rest.
             let (tok, forced_tok) = match forced.next() {
@@ -767,15 +812,17 @@ impl Hierarchical {
             };
 
             if tok as usize == w_tok {
-                // End of word: encode it to advance the backbone, then start the next
-                // word from the [W] BOS. (A forced prefix never contains [W].)
+                // End of word: encode it to advance the backbone, which leaves
+                // the next word's context in char2_input as its first decoder
+                // input. (A forced prefix never contains [W].)
                 if !word_chars.is_empty() {
                     self.encode_word_advance(&word_chars);
                     word_chars.clear();
                     empty_words = 0;
                 } else {
-                    // A [W] right after a word reset emits nothing; bail out if the
-                    // model gets stuck doing that instead of spinning forever.
+                    // A [W] right after a word reset emits nothing (char2_input
+                    // still holds the current context); bail out if the model
+                    // gets stuck doing that instead of spinning forever.
                     empty_words += 1;
                     if empty_words > 16 {
                         break;
@@ -784,7 +831,6 @@ impl Hierarchical {
                 for layer in &mut self.char2_model.layers {
                     layer.reset_state();
                 }
-                next_input = w_tok;
                 continue;
             }
 
@@ -795,7 +841,9 @@ impl Hierarchical {
                 }
             }
             word_chars.push(tok);
-            next_input = tok as usize;
+            // Next decoder input: the char's row of the tied embedding.
+            self.char2_input
+                .copy_from_slice(&self.encoder.char_embedding().weights[tok as usize]);
         }
 
         out
@@ -821,7 +869,10 @@ impl Hierarchical {
         File::create(path)?.write_all(&buf.into_inner())
     }
 
-    pub fn load(path: &str, tokenizer: Rc<Tokenizer>) -> io::Result<Self> {
+    /// Raw HIER parse: header plus the three layer stacks, without the
+    /// architecture validation of [`new`](Self::new) — so checkpoints of older
+    /// decoder layouts stay openable for inspection.
+    pub fn load_stacks(path: &str) -> io::Result<HierStacks> {
         let r = &mut File::open(path)? as &mut dyn Read;
 
         let magic = read_u32(r)?;
@@ -845,18 +896,42 @@ impl Hierarchical {
         let char2_model = Sequential::load_from(r)?;
         let step = read_u64(r).unwrap_or(0) as usize;
 
-        let mut model = Self::new(
-            encoder_chars,
-            char2_model,
-            word_model,
+        Ok(HierStacks {
             vocab_size,
+            context_size,
             boundary_token_ids,
+            encoder_chars,
+            word_model,
+            char2_model,
+            step,
+        })
+    }
+
+    pub fn load(path: &str, tokenizer: Rc<Tokenizer>) -> io::Result<Self> {
+        let stacks = Self::load_stacks(path)?;
+        let mut model = Self::new(
+            stacks.encoder_chars,
+            stacks.char2_model,
+            stacks.word_model,
+            stacks.vocab_size,
+            stacks.boundary_token_ids,
             tokenizer,
         );
-        debug_assert_eq!(model.context_size, context_size);
-        model.step = step;
+        debug_assert_eq!(model.context_size, stacks.context_size);
+        model.step = stacks.step;
         Ok(model)
     }
+}
+
+/// The raw contents of a HIER checkpoint (see [`Hierarchical::load_stacks`]).
+pub struct HierStacks {
+    pub vocab_size: usize,
+    pub context_size: usize,
+    pub boundary_token_ids: Vec<u16>,
+    pub encoder_chars: Sequential,
+    pub word_model: Sequential,
+    pub char2_model: Sequential,
+    pub step: usize,
 }
 
 pub(crate) fn backward_through_layers(
@@ -879,5 +954,241 @@ pub(crate) fn backward_through_layers(
         delta_buf[..new_len].copy_from_slice(dx);
 
         delta_len = new_len;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{nn::linear::LinearLayer, nn_layer::SequentialBuilder};
+    use iron_oxide::collections::Matrix;
+
+    const H: usize = 32;
+
+    /// Stateless stacks (exact backward everywhere): isolates the
+    /// `Hierarchical` gradient plumbing itself — the tied-embedding row
+    /// accumulation and the slot-0 context extraction — from any recurrent
+    /// layer's backward.
+    fn build_stateless(vocab: usize, boundaries: Vec<u16>, tok: Rc<Tokenizer>) -> Hierarchical {
+        let encoder = SequentialBuilder::new(vocab)
+            .embedding(H)
+            .rms_norm()
+            .build();
+        let word_model = SequentialBuilder::new(H).rms_norm().linear(H).build();
+        let char2_model = SequentialBuilder::new(H)
+            .linear(H)
+            .rms_norm()
+            .linear_no_bias(vocab)
+            .soft_cap(30.0)
+            .build();
+        Hierarchical::new(encoder, char2_model, word_model, vocab, boundaries, tok)
+    }
+
+    /// All-sLSTM stacks (the pre-mLSTM hierarchical layout): adds the
+    /// recurrent per-word reset and BPTT handling on top of the plumbing.
+    fn build_slstm(vocab: usize, boundaries: Vec<u16>, tok: Rc<Tokenizer>) -> Hierarchical {
+        let encoder = SequentialBuilder::new(vocab)
+            .embedding(H)
+            .slstm_block(H)
+            .build();
+        let word_model = SequentialBuilder::new(H)
+            .rms_norm()
+            .linear(H)
+            .slstm_block(H)
+            .rms_norm()
+            .linear(H)
+            .build();
+        let char2_model = SequentialBuilder::new(H)
+            .slstm_block(H)
+            .rms_norm()
+            .linear_no_bias(vocab)
+            .soft_cap(30.0)
+            .build();
+        Hierarchical::new(encoder, char2_model, word_model, vocab, boundaries, tok)
+    }
+
+    /// A small window with forward + backward already run on a fresh model.
+    struct Setup {
+        tokenizer: Rc<Tokenizer>,
+        tokens: Vec<u16>,
+        words: Vec<Range<usize>>,
+        model: Hierarchical,
+    }
+
+    fn setup(build: fn(usize, Vec<u16>, Rc<Tokenizer>) -> Hierarchical) -> Setup {
+        let tokenizer = Rc::new(Tokenizer::new("charset.txt", false));
+        let boundaries = tokenizer.boundary_tokens();
+        let mut model = build(
+            tokenizer.vocab_size(),
+            boundaries.clone(),
+            tokenizer.clone(),
+        );
+
+        let tokens = tokenizer.to_tokens("the cat sat on the mat again ");
+        let mut words: Vec<Range<usize>> = Vec::new();
+        let mut start = 0;
+        for (i, t) in tokens.iter().enumerate() {
+            if boundaries.contains(t) {
+                words.push(Range { start, end: i + 1 });
+                start = i + 1;
+            }
+        }
+        assert!(words.len() >= 4, "test text must contain several words");
+
+        model.make_cache(words.len(), tokens.len() + words.len() + 8);
+        model.reset();
+        model.forward_over(&tokens, &words);
+        model.backwards_sequence();
+
+        Setup {
+            tokenizer,
+            tokens,
+            words,
+            model,
+        }
+    }
+
+    /// Sum of the per-slot decode NLLs — exactly the loss whose gradient
+    /// `backwards_sequence` seeds (unaveraged).
+    fn total_decode_nll(m: &Hierarchical) -> f64 {
+        let last = m.char2_model.layers.len() - 1;
+        let mut total = 0.0;
+        for &range in &m.dec_ranges {
+            for slot in range {
+                let logits = m.char2_model.cache[slot][last].output();
+                total += nll_from_logits(logits, m.dec_targets[slot] as usize) as f64;
+            }
+        }
+        total
+    }
+
+    /// Save → load → forward: the reload gives fresh replica pools, so manual
+    /// weight perturbations on the master are guaranteed to reach the workers.
+    fn loss_after_reload(s: &Setup, path: &str) -> f64 {
+        s.model.save(path).unwrap();
+        let mut m = Hierarchical::load(path, s.tokenizer.clone()).unwrap();
+        m.make_cache(s.words.len(), s.tokens.len() + s.words.len() + 8);
+        m.reset();
+        m.forward_over(&s.tokens, &s.words);
+        total_decode_nll(&m)
+    }
+
+    /// Central finite difference along the normalized analytic gradient of one
+    /// weight matrix: (L(w+εu) − L(w−εu)) / 2ε with u = G/‖G‖ must equal ‖G‖.
+    /// Checking the whole tensor at once keeps the check robust against
+    /// individually tiny entries.
+    fn check_grad_direction(
+        s: &mut Setup,
+        grad: Vec<f32>,
+        name: &str,
+        tol: f64,
+        weights_of: impl Fn(&mut Hierarchical) -> &mut Matrix,
+    ) {
+        let norm = grad.iter().map(|&g| (g as f64).powi(2)).sum::<f64>().sqrt();
+        assert!(
+            norm > 1e-6,
+            "{name}: analytic gradient is ~zero, check is vacuous"
+        );
+
+        let path = std::env::temp_dir().join(format!("hier_fd_{name}.model"));
+        let path = path.to_str().unwrap();
+        // Small enough to stay in the linear regime of the softmax CE at random
+        // init (ΔL ≈ ±ε·‖G‖), large enough to dominate the f32 forward noise.
+        let eps = 2e-4;
+
+        let apply = |m: &mut Hierarchical, step: f64| {
+            let w = weights_of(m).as_slice_mut();
+            for (w, &g) in w.iter_mut().zip(&grad) {
+                *w += (step * g as f64 / norm) as f32;
+            }
+        };
+        apply(&mut s.model, eps);
+        let plus = loss_after_reload(s, path);
+        apply(&mut s.model, -2.0 * eps);
+        let minus = loss_after_reload(s, path);
+
+        let fd = (plus - minus) / (2.0 * eps);
+        assert!(
+            (fd - norm).abs() <= tol * norm + 1e-3,
+            "{name}: analytic ‖G‖ {norm} vs finite difference {fd}"
+        );
+    }
+
+    /// The tied char embedding accumulates two contributions: encoder BPTT and
+    /// the decoder char steps' input grads (the `dec_targets[slot-1]` row
+    /// indexing). A wrong row or a missed contribution breaks the match.
+    fn check_tied_embedding(
+        build: fn(usize, Vec<u16>, Rc<Tokenizer>) -> Hierarchical,
+        name: &str,
+        tol: f64,
+    ) {
+        let mut s = setup(build);
+        let grad = s
+            .model
+            .encoder
+            .char_embedding_mut()
+            .grads
+            .weights
+            .matrix()
+            .as_slice()
+            .to_vec();
+        check_grad_direction(&mut s, grad, name, tol, |m| {
+            &mut m.encoder.char_embedding_mut().weights
+        });
+    }
+
+    /// The backbone's output projection receives gradient exclusively through
+    /// the injected slot-0 context, so this validates the d_o extraction.
+    fn check_injected_context(
+        build: fn(usize, Vec<u16>, Rc<Tokenizer>) -> Hierarchical,
+        name: &str,
+        tol: f64,
+    ) {
+        let mut s = setup(build);
+        let last = s.model.word_model.layers.len() - 1;
+        let grad = s.model.word_model.layers[last]
+            .as_any_mut()
+            .downcast_mut::<LinearLayer>()
+            .expect("backbone must end in a Linear layer")
+            .grads
+            .weights
+            .matrix()
+            .as_slice()
+            .to_vec();
+        check_grad_direction(&mut s, grad, name, tol, |m| {
+            let last = m.word_model.layers.len() - 1;
+            &mut m.word_model.layers[last]
+                .as_any_mut()
+                .downcast_mut::<LinearLayer>()
+                .unwrap()
+                .weights
+        });
+    }
+
+    // Stateless stacks are exactly differentiable, so the plumbing must match
+    // FD tightly. Stacked sLSTMs are only subdifferentiable (the exp-gate
+    // stabilizer `m_t = max(…)` has branch kinks, and the backward's branch
+    // choice makes FD systematically undershoot by up to ~20% at random init,
+    // independent of ε) — the loose tolerance still catches routing bugs,
+    // which miss by far more.
+
+    #[test]
+    fn tied_embedding_grads_match_fd_stateless() {
+        check_tied_embedding(build_stateless, "emb_stateless", 0.03);
+    }
+
+    #[test]
+    fn injected_context_grads_match_fd_stateless() {
+        check_injected_context(build_stateless, "ctx_stateless", 0.03);
+    }
+
+    #[test]
+    fn tied_embedding_grads_match_fd_slstm() {
+        check_tied_embedding(build_slstm, "emb_slstm", 0.3);
+    }
+
+    #[test]
+    fn injected_context_grads_match_fd_slstm() {
+        check_injected_context(build_slstm, "ctx_slstm", 0.3);
     }
 }

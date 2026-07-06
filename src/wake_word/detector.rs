@@ -41,7 +41,7 @@ pub fn run_detector() {
             let mut acc: Vec<f32> = Vec::with_capacity(frame_shift_native * 2);
             device
                 .build_input_stream(
-                    &config.config(),
+                    config.config(),
                     move |data: &[f32], _| {
                         push_mono(&mut acc, data, channels);
                         while acc.len() >= frame_shift_native {
@@ -57,7 +57,7 @@ pub fn run_detector() {
             let mut acc: Vec<f32> = Vec::with_capacity(frame_shift_native * 2);
             device
                 .build_input_stream(
-                    &config.config(),
+                    config.config(),
                     move |data: &[i16], _| {
                         push_mono_i16(&mut acc, data, channels);
                         while acc.len() >= frame_shift_native {
@@ -132,8 +132,9 @@ fn push_mono_i16(acc: &mut Vec<f32>, data: &[i16], channels: usize) {
         acc.extend(data.iter().map(|&s| s as f32 / 32768.0));
     } else {
         let inv = 1.0 / channels as f32;
-        acc.extend(data.chunks(channels).map(|c| {
-            c.iter().map(|&s| s as f32 / 32768.0).sum::<f32>() * inv
-        }));
+        acc.extend(
+            data.chunks(channels)
+                .map(|c| c.iter().map(|&s| s as f32 / 32768.0).sum::<f32>() * inv),
+        );
     }
 }

@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use iron_oxide::collections::Matrix;
 
 use crate::optimizers::{
-    GradMatrixOps, OptimizerGradTypes,
+    GradMatrixOps, OptimizerGradTypes, WEIGHT_DECAY,
     adam::{AdamGradMatrix, AdamGradVec},
 };
 
@@ -25,9 +25,7 @@ use crate::optimizers::{
 const MOMENTUM: f32 = 0.95;
 const NESTEROV: bool = true;
 const NS_STEPS: usize = 5;
-/// Decoupled weight decay (λ), applied directly to the weights like AdamW.
-/// Muon's reference default is 0; a small value (~0.1) is common for LM pretraining.
-const WEIGHT_DECAY: f32 = 0.02;
+
 /// Per-element gradient clip, guarding against blow-ups before orthogonalization.
 const CLIP: f32 = 10.0;
 

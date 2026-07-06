@@ -361,4 +361,18 @@ impl NnLayer for SLSTMBlock {
         self.lin_value.add_grads(&mut o.lin_value);
         self.lin_down.add_grads(&mut o.lin_down);
     }
+
+    fn copy_weights_from(&mut self, other: &dyn NnLayer) {
+        let o = other
+            .as_any()
+            .downcast_ref::<Self>()
+            .expect("SLSTMBlock::copy_weights_from — replica layer type mismatch");
+        self.pre_norm1.copy_weights(&o.pre_norm1);
+        self.cell.copy_weights(&o.cell);
+        self.post_cell_norm.copy_weights(&o.post_cell_norm);
+        self.pre_norm2.copy_weights(&o.pre_norm2);
+        self.lin_gate.copy_weights(&o.lin_gate);
+        self.lin_value.copy_weights(&o.lin_value);
+        self.lin_down.copy_weights(&o.lin_down);
+    }
 }

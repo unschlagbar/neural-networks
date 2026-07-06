@@ -47,7 +47,7 @@ use crate::{
         linear::{LinearCache, LinearLayer},
     },
     nn_layer::{DynCache, NnLayer},
-    optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps},
+    optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps, add_grad_matrix, add_grad_vec},
     saving,
 };
 use std::{any::Any, io};
@@ -197,7 +197,7 @@ impl MLSTMLayer {
         let scale_v = (6.0 / (input_size as f32 + d as f32)).sqrt();
 
         let bf: Box<[f32]> = (0..heads).map(|_| random_range(3.0..6.0)).collect();
-        let bi: Box<[f32]> = vec![-10.0; heads].into();
+        let bi: Box<[f32]> = (0..heads).map(|_| random_range(-6.0..-3.0)).collect();
 
         Self {
             input_size,
@@ -319,6 +319,9 @@ impl MLSTMLayer {
         cache.x.copy_from_slice(input);
 
         // Matrix-vector multiplies for all gates.
+        // (Forking these across rayon was tried and measured SLOWER at the
+        // current dims — one matvec is only ~65K MACs, below fork/steal
+        // overhead. Revisit if hidden sizes grow well past 256.)
         self.wq.row_mul(input, &mut cache.q);
         self.wk.row_mul(input, &mut cache.k);
         self.wv.row_mul(input, &mut cache.v);
@@ -513,6 +516,8 @@ impl MLSTMLayer {
         // Fused weight-grad accumulation + dx — one pass per input row instead of 7.
         // Each weight row and its grad row are touched together while both fit in L1,
         // avoiding the double L2/L3 reload that separate add_outer + dx caused.
+        // (Chunking this pass across rayon was tried and measured slower at the
+        // current dims — per-row work is too small; keep it serial.)
         {
             let wq = self.wq.as_slice();
             let wk = self.wk.as_slice();
@@ -572,6 +577,44 @@ impl MLSTMLayer {
             std::mem::swap(&mut self.c[hd], &mut cache.c_prev[hd]);
         }
         std::mem::swap(&mut self.n, &mut cache.n_prev);
+    }
+
+    /// Fold a replica's grads into this layer (data-parallel reduction).
+    pub fn add_grads(&mut self, other: &mut Self) {
+        let g = &mut self.grads;
+        let o = &mut other.grads;
+        add_grad_matrix(&mut g.wq, &mut o.wq);
+        add_grad_matrix(&mut g.wk, &mut o.wk);
+        add_grad_matrix(&mut g.wv, &mut o.wv);
+        add_grad_matrix(&mut g.wo, &mut o.wo);
+        add_grad_matrix(&mut g.wi, &mut o.wi);
+        add_grad_matrix(&mut g.wf, &mut o.wf);
+        add_grad_vec(&mut g.bq, &mut o.bq);
+        add_grad_vec(&mut g.bk, &mut o.bk);
+        add_grad_vec(&mut g.bv, &mut o.bv);
+        add_grad_vec(&mut g.bo, &mut o.bo);
+        add_grad_vec(&mut g.bi, &mut o.bi);
+        add_grad_vec(&mut g.bf, &mut o.bf);
+        self.w_out.add_grads(&mut other.w_out);
+        self.head_norm.add_grads(&mut other.head_norm);
+    }
+
+    /// Overwrite all weights with `other`'s (in-place replica refresh).
+    pub fn copy_weights(&mut self, other: &Self) {
+        self.wq.copy_from(&other.wq);
+        self.wk.copy_from(&other.wk);
+        self.wv.copy_from(&other.wv);
+        self.wo.copy_from(&other.wo);
+        self.wi.copy_from(&other.wi);
+        self.wf.copy_from(&other.wf);
+        self.bq.copy_from_slice(&other.bq);
+        self.bk.copy_from_slice(&other.bk);
+        self.bv.copy_from_slice(&other.bv);
+        self.bo.copy_from_slice(&other.bo);
+        self.bi.copy_from_slice(&other.bi);
+        self.bf.copy_from_slice(&other.bf);
+        self.w_out.copy_weights(&other.w_out);
+        self.head_norm.copy_weights(&other.head_norm);
     }
 
     pub fn alloc_cache(&self) -> MLSTMCache {
@@ -695,6 +738,22 @@ impl NnLayer for MLSTMLayer {
         self.grads.bf.clear();
         self.w_out.clear_grads();
         self.head_norm.clear_grads();
+    }
+
+    fn add_grads_from(&mut self, other: &mut dyn NnLayer) {
+        let o = other
+            .as_any_mut()
+            .downcast_mut::<Self>()
+            .expect("MLSTMLayer::add_grads_from — replica layer type mismatch");
+        self.add_grads(o);
+    }
+
+    fn copy_weights_from(&mut self, other: &dyn NnLayer) {
+        let o = other
+            .as_any()
+            .downcast_ref::<Self>()
+            .expect("MLSTMLayer::copy_weights_from — replica layer type mismatch");
+        self.copy_weights(o);
     }
 
     fn reset_state(&mut self) {

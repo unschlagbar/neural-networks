@@ -14,6 +14,7 @@ pub mod rms_norm;
 pub mod silu_dense;
 pub mod slstm;
 pub mod slstm_block;
+pub mod soft_cap;
 pub mod softmax;
 
 pub fn add_vec_in_place(x: &mut [f32], y: &[f32]) {

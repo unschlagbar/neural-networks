@@ -331,4 +331,30 @@ impl NnLayer for MLSTMBlock {
         self.lin_value.clear_grads();
         self.lin_down.clear_grads();
     }
+
+    fn add_grads_from(&mut self, other: &mut dyn NnLayer) {
+        let o = other
+            .as_any_mut()
+            .downcast_mut::<Self>()
+            .expect("MLSTMBlock::add_grads_from — replica layer type mismatch");
+        self.pre_norm1.add_grads(&mut o.pre_norm1);
+        self.cell.add_grads(&mut o.cell);
+        self.pre_norm2.add_grads(&mut o.pre_norm2);
+        self.lin_gate.add_grads(&mut o.lin_gate);
+        self.lin_value.add_grads(&mut o.lin_value);
+        self.lin_down.add_grads(&mut o.lin_down);
+    }
+
+    fn copy_weights_from(&mut self, other: &dyn NnLayer) {
+        let o = other
+            .as_any()
+            .downcast_ref::<Self>()
+            .expect("MLSTMBlock::copy_weights_from — replica layer type mismatch");
+        self.pre_norm1.copy_weights(&o.pre_norm1);
+        self.cell.copy_weights(&o.cell);
+        self.pre_norm2.copy_weights(&o.pre_norm2);
+        self.lin_gate.copy_weights(&o.lin_gate);
+        self.lin_value.copy_weights(&o.lin_value);
+        self.lin_down.copy_weights(&o.lin_down);
+    }
 }

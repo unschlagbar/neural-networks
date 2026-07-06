@@ -2,7 +2,6 @@ use std::{
     fs::File,
     io::{BufRead, stdin},
     path::{Path, PathBuf},
-    rc::Rc,
 };
 
 use crate::{
@@ -12,12 +11,11 @@ use crate::{
         causal_conv1d::CausalConv1dLayer, dropout::DropoutLayer, embedding::EmbeddingLayer,
         linear::LinearLayer, linear_nb::LinearNBLayer, lstm::LSTMLayer, mlstm::MLSTMLayer,
         mlstm_block::MLSTMBlock, rms_norm::RMSNorm, silu_dense::SiluDenseLayer, slstm::SLSTMLayer,
-        slstm_block::SLSTMBlock,
+        slstm_block::SLSTMBlock, soft_cap::SoftCapLayer,
     },
     nn_layer::NnLayer,
     saving::{HIER_MAGIC, MAGIC},
     sequential::Sequential,
-    tokenizer::Tokenizer,
 };
 
 /// Interactive mode: reads a model name from stdin, looks it up (as given,
@@ -43,18 +41,20 @@ pub fn inspect_model() {
             print_sequential(&model);
         }
         HIER_MAGIC => {
-            let model = Hierarchical::load(&path, Rc::new(Tokenizer::default())).unwrap();
+            // Raw stacks, not `Hierarchical::load` — old decoder layouts stay
+            // inspectable even though they fail the current-architecture asserts.
+            let stacks = Hierarchical::load_stacks(&path).unwrap();
             println!("\n{path}  (HIER, hierarchical)");
             println!(
-                "vocab_size = {}, context_size = {}, boundary tokens = {:?}",
-                model.vocab_size, model.context_size, model.boundary_token_ids,
+                "vocab_size = {}, context_size = {}, boundary tokens = {:?}, step = {}",
+                stacks.vocab_size, stacks.context_size, stacks.boundary_token_ids, stacks.step,
             );
             println!("\nencoder (char model):");
-            print_sequential(&model.encoder.chars);
+            print_sequential(&stacks.encoder_chars);
             println!("\nword_model:");
-            print_sequential(&model.word_model);
+            print_sequential(&stacks.word_model);
             println!("\nchar2_model:");
-            print_sequential(&model.char2_model);
+            print_sequential(&stacks.char2_model);
         }
         other => {
             eprintln!("{path}: unknown magic 0x{other:08X} — not a NNFW or HIER model file");
@@ -121,6 +121,8 @@ fn describe(layer: &dyn NnLayer) -> (&'static str, String) {
         ("SLSTMBlock", format!("up={}", l.up_size))
     } else if any.is::<RMSNorm>() {
         ("RMSNorm", String::new())
+    } else if let Some(l) = any.downcast_ref::<SoftCapLayer>() {
+        ("SoftCap", format!("cap={}", l.cap))
     } else if let Some(l) = any.downcast_ref::<DropoutLayer>() {
         ("Dropout", format!("rate={}", l.rate))
     } else if let Some(l) = any.downcast_ref::<CausalConv1dLayer>() {

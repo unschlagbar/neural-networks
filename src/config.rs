@@ -24,7 +24,7 @@ pub const DECAY_STEPS: usize = 25_000;
 // (matrices) is scale-invariant via the Frobenius normalization and aux-Adam
 // (vectors) via its second moment, so summed grads need no manual rescaling.
 pub const BATCH_SIZE: usize = 4;
-pub const EPOCHS: usize = 10;
+pub const EPOCHS: usize = 2;
 
 pub const SAVE_EVERY: usize = 30;
 pub const LOG_EVERY: usize = 10;
@@ -32,17 +32,28 @@ pub const LOG_EVERY: usize = 10;
 // Sampling
 
 pub const MAX_LEN: usize = 2000;
-pub const TEMPERATURE: f32 = 0.2;
-pub const TOP_P: f32 = 0.8;
+pub const TEMPERATURE: f32 = 0.4;
+pub const TOP_P: f32 = 0.9;
 
 // Modell-Dimensions
 
-pub const CHAR_HIDDEN: usize = 64;
-pub const OUT_HIDDEN: usize = 128;
-pub const WORD_HIDDEN: usize = 256;
+pub const CHAR_HIDDEN: usize = 192;
+pub const OUT_HIDDEN: usize = 192;
+pub const WORD_HIDDEN: usize = 386;
+
+/// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).
+/// Bounds the logits and removes the cross-entropy incentive for unbounded
+/// head-weight growth on the no-decay Adam path.
+pub const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 4;
+pub const WORD_BLOCKS: usize = 16;
+
+/// Append a closing `[W]` end-of-word step to every encoder word and read the
+/// word embedding `e_w` out at that step (the state then knows the word is
+/// complete). Set to `false` to evaluate checkpoints trained without it
+/// (readout at the last char, the old behavior).
+pub const ENC_W_EOS: bool = true;
 
 // Dataset
 

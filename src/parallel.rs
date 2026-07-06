@@ -36,14 +36,19 @@ impl ReplicaPool {
         self.dirty = true;
     }
 
-    /// Rebuild the replicas from the master's weights if stale (or if the
-    /// active rayon pool changed size).
+    /// Bring the replicas up to date with the master's weights if stale.
+    /// Existing replicas are refreshed by an in-place weight memcpy; a full
+    /// NNFW-round-trip rebuild only happens when the pool size changes.
     pub fn sync(&mut self, master: &Sequential) {
         let workers = 4;
-        if self.dirty || self.replicas.len() != workers {
+        if self.replicas.len() != workers {
             self.replicas = master.replicas(workers);
-            self.dirty = false;
+        } else if self.dirty {
+            for replica in &mut self.replicas {
+                replica.copy_weights_from(master);
+            }
         }
+        self.dirty = false;
     }
 
     /// Fold every replica's accumulated gradients into the master and clear them.

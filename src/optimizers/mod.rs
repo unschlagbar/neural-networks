@@ -8,9 +8,11 @@ pub use self::adam::Adam;
 pub use self::adamw::AdamW;
 pub use self::muon::Muon;
 pub use self::sgd::Sgd;
+
+pub const WEIGHT_DECAY: f32 = 0.03;
 // Active optimizer. Swap to `Muon` to orthogonalize the 2D hidden-weight updates
 // (embeddings + biases stay on Adam automatically); retune the lr schedule if so.
-pub type Optimizer = Muon;
+pub type Optimizer = AdamW;
 
 pub trait OptimizerGradTypes {
     type GradMatrix;

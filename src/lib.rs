@@ -13,6 +13,7 @@ pub mod sampling;
 pub mod saving;
 pub mod sequential;
 pub mod tokenizer;
+pub mod tokenizer_utf8;
 pub mod training;
 pub mod wake_word;
 pub mod word_encoder;

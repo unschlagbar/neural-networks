@@ -107,4 +107,14 @@ impl HeadwiseRMSNorm {
     pub fn clear_grads(&mut self) {
         self.grads_gamma.clear();
     }
+
+    /// Fold a replica's gamma grads into this norm (data-parallel reduction).
+    pub fn add_grads(&mut self, other: &mut Self) {
+        crate::optimizers::add_grad_vec(&mut self.grads_gamma, &mut other.grads_gamma);
+    }
+
+    /// Overwrite gamma with `other`'s (in-place replica refresh).
+    pub fn copy_weights(&mut self, other: &Self) {
+        self.gamma.copy_from_slice(&other.gamma);
+    }
 }

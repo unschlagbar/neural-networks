@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use iron_oxide::collections::Matrix;
 use rand::random_range;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 
 use std::range::Range;
 
@@ -73,6 +73,17 @@ impl Sequential {
     pub fn add_grads_from(&mut self, replica: &mut Sequential) {
         for (l, r) in self.layers.iter_mut().zip(replica.layers.iter_mut()) {
             l.add_grads_from(r.as_mut());
+        }
+    }
+
+    /// Overwrite this stack's weights with `master`'s, layer by layer (plain
+    /// memcpy). Refreshes an existing replica after an optimizer step without
+    /// the NNFW round-trip of [`replicas`](Self::replicas): no serialization,
+    /// no allocation, grad accumulators and caches stay as they are.
+    pub fn copy_weights_from(&mut self, master: &Sequential) {
+        debug_assert_eq!(self.layers.len(), master.layers.len());
+        for (r, m) in self.layers.iter_mut().zip(master.layers.iter()) {
+            r.copy_weights_from(m.as_ref());
         }
     }
 
@@ -485,10 +496,15 @@ impl Sequential {
     }
 
     pub fn sgd_step(&mut self, lr: f32) {
-        for layer in &mut self.layers {
+        // One task per layer: each layer's update (Muon Newton-Schulz per
+        // matrix, thread-local scratch) is independent of every other
+        // layer's, so the optimizer step runs layer-parallel — it is the
+        // largest serial block of a training step. Grad clearing is folded
+        // into the same task while the buffers are still cache-hot.
+        self.layers.par_iter_mut().for_each(|layer| {
             layer.apply_grads(lr);
-        }
-        self.clear_grads();
+            layer.clear_grads();
+        });
     }
 
     pub fn clear_grads(&mut self) {

@@ -65,7 +65,7 @@ fn record_one(device: &cpal::Device, config: &cpal::SupportedStreamConfig, dir: 
     let stream: cpal::Stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device
             .build_input_stream(
-                &config.config(),
+                config.config(),
                 move |data: &[f32], _| push_mono(data, channels, &buf_cb),
                 |e| eprintln!("stream error: {e}"),
                 None,
@@ -73,7 +73,7 @@ fn record_one(device: &cpal::Device, config: &cpal::SupportedStreamConfig, dir: 
             .expect("failed to build stream"),
         cpal::SampleFormat::I16 => device
             .build_input_stream(
-                &config.config(),
+                config.config(),
                 move |data: &[i16], _| {
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
                     push_mono(&f, channels, &buf_cb2);

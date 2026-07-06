@@ -21,10 +21,7 @@ use iron_oxide::collections::Matrix;
 use rand::random_range;
 
 use crate::{
-    nn::{
-        activations::{log_sigmoid, stable_sigmoid},
-        add_vec_in_place,
-    },
+    nn::activations::{log_sigmoid, stable_sigmoid},
     nn_layer::{DynCache, NnLayer},
     optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps, add_grad_matrix, add_grad_vec},
     saving,
@@ -94,9 +91,8 @@ pub struct SLSTMLayerGrads {
     pub bi: GradVec,
     pub bf: GradVec,
     pub bo: GradVec,
-
-    pub h_init_grad: GradVec,
-    pub c_init_grad: GradVec,
+    //pub h_init_grad: GradVec,
+    //pub c_init_grad: GradVec,
 }
 
 impl SLSTMLayerGrads {
@@ -110,8 +106,8 @@ impl SLSTMLayerGrads {
             bi: GradVec::zeros(h),
             bf: GradVec::zeros(h),
             bo: GradVec::zeros(h),
-            h_init_grad: GradVec::zeros(h),
-            c_init_grad: GradVec::zeros(h),
+            // h_init_grad: GradVec::zeros(h),
+            // c_init_grad: GradVec::zeros(h),
         }
     }
 }
@@ -413,8 +409,23 @@ impl SLSTMLayer {
         add_grad_vec(&mut g.bi, &mut o.bi);
         add_grad_vec(&mut g.bf, &mut o.bf);
         add_grad_vec(&mut g.bo, &mut o.bo);
-        add_grad_vec(&mut g.h_init_grad, &mut o.h_init_grad);
-        add_grad_vec(&mut g.c_init_grad, &mut o.c_init_grad);
+        // add_grad_vec(&mut g.h_init_grad, &mut o.h_init_grad);
+        //add_grad_vec(&mut g.c_init_grad, &mut o.c_init_grad);
+    }
+
+    /// Overwrite all weights (incl. the learnable initial states) with
+    /// `other`'s (in-place replica refresh).
+    pub fn copy_weights(&mut self, other: &Self) {
+        self.wz.copy_from(&other.wz);
+        self.wi.copy_from(&other.wi);
+        self.wf.copy_from(&other.wf);
+        self.wo.copy_from(&other.wo);
+        self.bz.copy_from_slice(&other.bz);
+        self.bi.copy_from_slice(&other.bi);
+        self.bf.copy_from_slice(&other.bf);
+        self.bo.copy_from_slice(&other.bo);
+        self.h_init.copy_from_slice(&other.h_init);
+        self.c_init.copy_from_slice(&other.c_init);
     }
 
     pub fn alloc_cache(&self) -> SLSTMCache {
@@ -506,8 +517,8 @@ impl NnLayer for SLSTMLayer {
         self.grads.bf.apply_to(&mut self.bf, lr);
         self.grads.bo.apply_to(&mut self.bo, lr);
 
-        self.grads.c_init_grad.apply_to(&mut self.c_init, lr);
-        self.grads.h_init_grad.apply_to(&mut self.h_init, lr);
+        // self.grads.c_init_grad.apply_to(&mut self.c_init, lr);
+        // self.grads.h_init_grad.apply_to(&mut self.h_init, lr);
     }
 
     fn clear_grads(&mut self) {
@@ -519,13 +530,15 @@ impl NnLayer for SLSTMLayer {
         self.grads.bi.clear();
         self.grads.bf.clear();
         self.grads.bo.clear();
-        self.grads.h_init_grad.clear();
-        self.grads.c_init_grad.clear();
+        // self.grads.h_init_grad.clear();
+        //self.grads.c_init_grad.clear();
     }
 
     fn reset_state(&mut self) {
-        self.h.copy_from_slice(&self.h_init);
-        self.c.copy_from_slice(&self.c_init);
+        self.h.fill(0.0);
+        self.c.fill(0.0);
+        //self.h.copy_from_slice(&self.h_init);
+        //self.c.copy_from_slice(&self.c_init);
         self.n.fill(0.0);
         self.m.fill(0.0);
     }
@@ -536,8 +549,8 @@ impl NnLayer for SLSTMLayer {
     }
 
     fn accumulate_init_grad(&mut self) {
-        add_vec_in_place(&mut self.grads.h_init_grad.vec(), &self.dh_bptt);
-        add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
+        // add_vec_in_place(&mut self.grads.h_init_grad.vec(), &self.dh_bptt);
+        // add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
     }
 
     fn add_grads_from(&mut self, other: &mut dyn NnLayer) {
@@ -546,5 +559,13 @@ impl NnLayer for SLSTMLayer {
             .downcast_mut::<Self>()
             .expect("SLSTMLayer::add_grads_from — replica layer type mismatch");
         self.add_grads(o);
+    }
+
+    fn copy_weights_from(&mut self, other: &dyn NnLayer) {
+        let o = other
+            .as_any()
+            .downcast_ref::<Self>()
+            .expect("SLSTMLayer::copy_weights_from — replica layer type mismatch");
+        self.copy_weights(o);
     }
 }
