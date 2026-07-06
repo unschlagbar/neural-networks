@@ -39,7 +39,7 @@ pub const TOP_P: f32 = 0.9;
 
 pub const CHAR_HIDDEN: usize = 192;
 pub const OUT_HIDDEN: usize = 192;
-pub const WORD_HIDDEN: usize = 386;
+pub const WORD_HIDDEN: usize = 384;
 
 /// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).
 /// Bounds the logits and removes the cross-entropy incentive for unbounded
