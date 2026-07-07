@@ -9,8 +9,8 @@ use std::{
 use crate::{
     batches::ChunkedWordDataSet,
     config::{
-        self, BATCH_SIZE, CHUNK_BYTES, DATA_FILE, DECAY_STEPS, EPOCHS, LOG_EVERY, LR,
-        MAX_WINDOW_TOKENS, MIN_LR, MIN_WORDS_PER_SEQ, SAVE_EVERY, SEQ_LEN, WARMUP_STEPS,
+        self, BATCH_SIZE, CHUNK_BYTES, DECAY_STEPS, EPOCHS, LOG_EVERY, LR, MAX_WINDOW_TOKENS,
+        MIN_LR, MIN_WORDS_PER_SEQ, SAVE_EVERY, SEQ_LEN, TRAIN_DATA, VAL_DATA, WARMUP_STEPS,
         WORDS_PER_SEQ,
     },
     hierarchical::{BackboneMode, Hierarchical},
@@ -38,10 +38,10 @@ pub fn train_normal(model_path: &str) {
     };
     // Same X-word windows the hierarchical model trains on (identical params),
     // so the two systems can be compared on exactly the same samples.
-    println!("Streaming dataset from '{DATA_FILE}' in {CHUNK_BYTES}-byte chunks ...");
+    println!("Streaming dataset from '{TRAIN_DATA}' in {CHUNK_BYTES}-byte chunks ...");
     let mut data = ChunkedWordDataSet::open(
         tokenizer.clone(),
-        DATA_FILE,
+        TRAIN_DATA,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
         MAX_WINDOW_TOKENS,
@@ -103,10 +103,10 @@ pub fn train_hierarchical(model_path: &str) {
             build_hierarchical_model(vocab, word_boundary_ids.clone(), tokenizer.clone())
         }
     };
-    println!("Streaming dataset from '{DATA_FILE}' in {CHUNK_BYTES}-byte chunks ...");
+    println!("Streaming dataset from '{TRAIN_DATA}' in {CHUNK_BYTES}-byte chunks ...");
     let mut data = ChunkedWordDataSet::open(
         tokenizer.clone(),
-        DATA_FILE,
+        TRAIN_DATA,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
         MAX_WINDOW_TOKENS,
@@ -194,7 +194,7 @@ pub fn trace_hierarchical(model_path: &str) {
     };
     let mut data = ChunkedWordDataSet::open(
         tokenizer.clone(),
-        DATA_FILE,
+        TRAIN_DATA,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
         MAX_WINDOW_TOKENS,
@@ -245,10 +245,10 @@ pub fn probe_hierarchical(model_path: &str) {
             std::process::exit(2);
         }
     };
-    println!("Preparing dataset from '{DATA_FILE}' ...");
+    println!("Preparing dataset from '{TRAIN_DATA}' ...");
     let mut data = ChunkedWordDataSet::open(
         tokenizer.clone(),
-        DATA_FILE,
+        TRAIN_DATA,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
         MAX_WINDOW_TOKENS,
@@ -364,7 +364,11 @@ pub fn probe_hierarchical(model_path: &str) {
             println!(
                 "      {h:>4}   {mean:.4}   {:>7.1} w   {min:.4}   {max:.4}       {rest:.4}   {swing:.4}{}",
                 horizon(mean),
-                if swing < STATIC_SWING { "  (static)" } else { "" },
+                if swing < STATIC_SWING {
+                    "  (static)"
+                } else {
+                    ""
+                },
             );
         }
         all.extend(means);
@@ -407,6 +411,67 @@ pub fn probe_hierarchical(model_path: &str) {
             }
         );
     }
+}
+
+/// Forward-only validation: streams the *entire* validation set through the
+/// hierarchical model and reports mean decode char loss and word loss. No
+/// backward, no weight updates. Set via the `hv` mode.
+pub fn validate_hierarchical(model_path: &str) {
+    let tokenizer = Rc::new(Tokenizer::new(config::CHARSET, false));
+    let word_boundary_ids = tokenizer.boundary_tokens();
+
+    let mut model = match Hierarchical::load(model_path, tokenizer.clone()) {
+        Ok(m) => {
+            println!("Loaded '{model_path}' (step {}).", m.step);
+            m
+        }
+        Err(e) => {
+            eprintln!("Could not load '{model_path}': {e}");
+            std::process::exit(2);
+        }
+    };
+    println!("Streaming validation set from '{VAL_DATA}' in {CHUNK_BYTES}-byte chunks ...");
+    let mut data = ChunkedWordDataSet::open(
+        tokenizer.clone(),
+        VAL_DATA,
+        WORDS_PER_SEQ,
+        MIN_WORDS_PER_SEQ,
+        MAX_WINDOW_TOKENS,
+        &word_boundary_ids,
+        CHUNK_BYTES,
+    );
+
+    let start = Instant::now();
+    let mut cache_tokens = 0;
+    let mut c_total = 0.0;
+    let mut w_total = 0.0;
+    let mut windows = 0;
+    while let Some(chunk) = data.next_chunk() {
+        if chunk.max_window_tokens() > cache_tokens {
+            cache_tokens = chunk.max_window_tokens();
+            model.make_cache(WORDS_PER_SEQ, cache_tokens);
+        }
+        let (c, w, n) = model.eval_decode_loss_sums(chunk.iter());
+        c_total += c;
+        w_total += w;
+        windows += n;
+        println!(
+            "  {windows} windows  char {:.4}  word {:.4}  ({:.0?})",
+            c_total / windows.max(1) as f32,
+            w_total / windows.max(1) as f32,
+            start.elapsed(),
+        );
+    }
+
+    if windows == 0 {
+        eprintln!("no windows in validation set");
+        std::process::exit(2);
+    }
+    let c_loss = c_total / windows as f32;
+    let w_loss = w_total / windows as f32;
+    println!("\n── validation ({windows} windows, {:.0?}) ──", start.elapsed());
+    println!("  Char loss = {c_loss:.4} nats   ppl = {:.3}", c_loss.exp());
+    println!("  Word loss = {w_loss:.4} nats   ppl = {:.3}", w_loss.exp());
 }
 
 /// 1/e memory horizon in words for a mean per-step retention `f̄ ∈ (0,1]`.

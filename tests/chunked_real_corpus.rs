@@ -13,7 +13,7 @@ fn stream_real_corpus() {
     let start = std::time::Instant::now();
     let mut loader = ChunkedWordDataSet::open(
         tokenizer,
-        config::DATA_FILE,
+        config::TRAIN_DATA,
         config::WORDS_PER_SEQ,
         config::MIN_WORDS_PER_SEQ,
         config::MAX_WINDOW_TOKENS,

@@ -27,7 +27,7 @@ const NESTEROV: bool = true;
 const NS_STEPS: usize = 5;
 
 /// Per-element gradient clip, guarding against blow-ups before orthogonalization.
-const CLIP: f32 = 10.0;
+const CLIP: f32 = 5.0;
 
 // Newton-Schulz quintic coefficients from the reference Muon implementation
 // (Jordan 2024). The polynomial f(x) = a·x + b·x³ + c·x⁵ is tuned so that 5
@@ -174,6 +174,8 @@ impl GradMatrixOps for MuonGradMatrix {
     fn apply_to(&mut self, weights: &mut Matrix, lr: f32) {
         debug_assert_eq!(weights.rows(), self.grads.rows());
         debug_assert_eq!(weights.cols(), self.grads.cols());
+
+        self.clip();
 
         let rows = self.grads.rows();
         let cols = self.grads.cols();

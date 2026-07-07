@@ -47,8 +47,8 @@ pub fn build_hierarchical_model(
     let encoder = SequentialBuilder::new(vocab)
         .embedding(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
-        //.mlstm_block(8, CHAR_HIDDEN / 8)
-        .slstm_block(CHAR_HIDDEN)
+        //.mlstm_block(16, CHAR_HIDDEN / 16)
+        //.slstm_block(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
         .build();
 
@@ -74,9 +74,9 @@ pub fn build_hierarchical_model(
     // CHAR_HIDDEN == OUT_HIDDEN for the tie; asserted in `Hierarchical::new`.
     let char2_model = SequentialBuilder::new(OUT_HIDDEN)
         .slstm_block(OUT_HIDDEN)
-        //.mlstm_block(8, OUT_HIDDEN / 8)
+        //.mlstm_block(16, OUT_HIDDEN / 16)
         .slstm_block(OUT_HIDDEN)
-        .slstm_block(OUT_HIDDEN)
+        //.slstm_block(OUT_HIDDEN)
         .rms_norm()
         .linear_no_bias(vocab)
         .soft_cap(LOGIT_SOFTCAP)

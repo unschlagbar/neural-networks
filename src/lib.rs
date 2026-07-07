@@ -37,6 +37,7 @@ pub fn run() {
         "" => training::train_normal(&read_model_path("models/seq")),
         "h" => training::train_hierarchical(&read_model_path("models/fix_bi")),
         "hp" => training::probe_hierarchical(&read_model_path("models/fix_bi")),
+        "hv" => training::validate_hierarchical(&read_model_path("models/fix_bi")),
         "ht" => training::trace_hierarchical(&read_model_path("models/fix_bi")),
         "s" => sampling::sample_normal(&read_model_path("models/seq")),
         "hs" => sampling::sample_hierarchical(&read_model_path("models/fix_bi")),
@@ -47,6 +48,7 @@ pub fn run() {
         other => {
             eprintln!(
                 "Unknown mode {other:?}. Modes: '' train_normal | 'h' train_hierarchical | \
+                 'hv' validate_hierarchical | \
                  's' sample_normal | 'hs' sample_hierarchical | 'i' inspect model | \
                  'wr' record wake-word samples | 'wt' train wake-word | 'w' run detector",
             );

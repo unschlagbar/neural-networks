@@ -21,7 +21,10 @@ use iron_oxide::collections::Matrix;
 use rand::random_range;
 
 use crate::{
-    nn::activations::{log_sigmoid, stable_sigmoid},
+    nn::{
+        activations::{log_sigmoid, stable_sigmoid},
+        dot, matvec_acc, outer_acc_block, GRAD_BLOCK,
+    },
     nn_layer::{DynCache, NnLayer},
     optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps, add_grad_matrix, add_grad_vec},
     saving,
@@ -143,13 +146,17 @@ pub struct SLSTMLayer {
 
     pub grads: SLSTMLayerGrads,
 
-    // backward scratch (no allocation during backward)
-    pub dz: Box<[f32]>,
-    pub di_pre: Box<[f32]>,
-    pub df_pre: Box<[f32]>,
-    pub do_pre: Box<[f32]>,
-    pub dc_scratch: Box<[f32]>,
-    pub dn_scratch: Box<[f32]>,
+    // ── Deferred weight-gradient accumulation ─────────────────────────────
+    // backward() stashes (xh, per-gate deltas) per step and folds them into
+    // the grad matrices in blocks of GRAD_BLOCK, so each grad matrix is
+    // streamed once per block instead of read-modified-written every step.
+    // The delta rows double as the backward scratch for the current step.
+    pend_len: usize,
+    pend_xh: Box<[f32]>, // GRAD_BLOCK × (input+hidden)
+    pend_dz: Box<[f32]>, // GRAD_BLOCK × hidden
+    pend_di: Box<[f32]>,
+    pend_df: Box<[f32]>,
+    pend_do: Box<[f32]>,
 }
 
 impl SLSTMLayer {
@@ -185,12 +192,12 @@ impl SLSTMLayer {
             h_init,
             c_init,
             grads: SLSTMLayerGrads::zeros(rows, hidden_size),
-            dz: vec![0.0; hidden_size].into(),
-            di_pre: vec![0.0; hidden_size].into(),
-            df_pre: vec![0.0; hidden_size].into(),
-            do_pre: vec![0.0; hidden_size].into(),
-            dc_scratch: vec![0.0; hidden_size].into(),
-            dn_scratch: vec![0.0; hidden_size].into(),
+            pend_len: 0,
+            pend_xh: vec![0.0; GRAD_BLOCK * rows].into(),
+            pend_dz: vec![0.0; GRAD_BLOCK * hidden_size].into(),
+            pend_di: vec![0.0; GRAD_BLOCK * hidden_size].into(),
+            pend_df: vec![0.0; GRAD_BLOCK * hidden_size].into(),
+            pend_do: vec![0.0; GRAD_BLOCK * hidden_size].into(),
         }
     }
 
@@ -231,12 +238,12 @@ impl SLSTMLayer {
             h_init,
             c_init,
             grads: SLSTMLayerGrads::zeros(rows, hidden_size),
-            dz: vec![0.0; hidden_size].into(),
-            di_pre: vec![0.0; hidden_size].into(),
-            df_pre: vec![0.0; hidden_size].into(),
-            do_pre: vec![0.0; hidden_size].into(),
-            dc_scratch: vec![0.0; hidden_size].into(),
-            dn_scratch: vec![0.0; hidden_size].into(),
+            pend_len: 0,
+            pend_xh: vec![0.0; GRAD_BLOCK * rows].into(),
+            pend_dz: vec![0.0; GRAD_BLOCK * hidden_size].into(),
+            pend_di: vec![0.0; GRAD_BLOCK * hidden_size].into(),
+            pend_df: vec![0.0; GRAD_BLOCK * hidden_size].into(),
+            pend_do: vec![0.0; GRAD_BLOCK * hidden_size].into(),
         }
     }
 
@@ -252,45 +259,46 @@ impl SLSTMLayer {
         cache.xh[..input.len()].copy_from_slice(input);
         cache.xh[input.len()..].copy_from_slice(&self.h);
 
-        // Pre-activations (one matmul per gate)
-        self.wz.row_mul(&cache.xh, &mut cache.zt_pre);
-        self.wi.row_mul(&cache.xh, &mut cache.it_pre);
-        self.wf.row_mul(&cache.xh, &mut cache.ft_pre);
-        self.wo.row_mul(&cache.xh, &mut cache.ot_pre);
+        // Pre-activations (one matmul per gate); the bias is the accumulator init.
+        cache.zt_pre.copy_from_slice(&self.bz);
+        cache.it_pre.copy_from_slice(&self.bi);
+        cache.ft_pre.copy_from_slice(&self.bf);
+        cache.ot_pre.copy_from_slice(&self.bo);
+        matvec_acc(&self.wz, &cache.xh, &mut cache.zt_pre);
+        matvec_acc(&self.wi, &cache.xh, &mut cache.it_pre);
+        matvec_acc(&self.wf, &cache.xh, &mut cache.ft_pre);
+        matvec_acc(&self.wo, &cache.xh, &mut cache.ot_pre);
 
+        // Activations, stabilizer, gates, cell, normalizer, hidden — one pass;
+        // the transcendentals keep this loop scalar, so extra passes over the
+        // h-sized buffers would only add load/store traffic.
         for j in 0..h {
-            cache.zt_pre[j] += self.bz[j];
-            cache.it_pre[j] += self.bi[j];
-            cache.ft_pre[j] += self.bf[j];
-            cache.ot_pre[j] += self.bo[j];
-        }
+            let zt = cache.zt_pre[j].tanh();
+            let ot = stable_sigmoid(cache.ot_pre[j]);
+            let log_f = log_sigmoid(cache.ft_pre[j]);
 
-        // Activations
-        for j in 0..h {
-            cache.zt[j] = cache.zt_pre[j].tanh();
-            cache.ot[j] = stable_sigmoid(cache.ot_pre[j]);
-            cache.log_f[j] = log_sigmoid(cache.ft_pre[j]);
-        }
+            // Stabilizer  m_t = max(log f_t + m_{t-1},  ĩ_t)
+            let fm = log_f + cache.m_prev[j];
+            let m = fm.max(cache.it_pre[j]);
 
-        // Stabilizer  m_t = max(log f_t + m_{t-1},  ĩ_t)
-        for j in 0..h {
-            let a = cache.log_f[j] + cache.m_prev[j];
-            let b = cache.it_pre[j];
-            cache.m[j] = a.max(b);
-        }
+            // Stabilized exponential gates
+            let i_prime = (cache.it_pre[j] - m).exp();
+            let f_prime = (fm - m).exp();
 
-        // Stabilized exponential gates
-        for j in 0..h {
-            cache.i_prime[j] = (cache.it_pre[j] - cache.m[j]).exp();
-            cache.f_prime[j] = (cache.log_f[j] + cache.m_prev[j] - cache.m[j]).exp();
-        }
+            let c = f_prime * cache.c_prev[j] + i_prime * zt;
+            let n = f_prime * cache.n_prev[j] + i_prime;
+            let psi = n.abs().max(1.0);
 
-        // Cell, normalizer, hidden
-        for j in 0..h {
-            cache.c[j] = cache.f_prime[j] * cache.c_prev[j] + cache.i_prime[j] * cache.zt[j];
-            cache.n[j] = cache.f_prime[j] * cache.n_prev[j] + cache.i_prime[j];
-            cache.psi[j] = cache.n[j].abs().max(1.0);
-            cache.h[j] = cache.ot[j] * cache.c[j] / cache.psi[j];
+            cache.zt[j] = zt;
+            cache.ot[j] = ot;
+            cache.log_f[j] = log_f;
+            cache.m[j] = m;
+            cache.i_prime[j] = i_prime;
+            cache.f_prime[j] = f_prime;
+            cache.c[j] = c;
+            cache.n[j] = n;
+            cache.psi[j] = psi;
+            cache.h[j] = ot * c / psi;
         }
 
         // Propagate persistent state
@@ -312,93 +320,127 @@ impl SLSTMLayer {
         let h = self.hidden_size;
         let r = self.input_size + h;
 
-        for j in 0..h {
-            delta[j] += self.dh_bptt[j];
-        }
+        // This step's gate deltas are written straight into the pending block
+        // (they double as the scratch the dconcat sweep reads below).
+        let slot = self.pend_len;
+        self.pend_xh[slot * r..(slot + 1) * r].copy_from_slice(&cache.xh);
+        let dz = &mut self.pend_dz[slot * h..(slot + 1) * h];
+        let di = &mut self.pend_di[slot * h..(slot + 1) * h];
+        let df = &mut self.pend_df[slot * h..(slot + 1) * h];
+        let dob = &mut self.pend_do[slot * h..(slot + 1) * h];
 
-        // 1. Output gate
-        //   h = o · (c / ψ)   →   do/dõ = δh · c/ψ · o·(1-o)
+        // ── 1–3. Elementwise chain in one pass: output gate, δh split into
+        // δc/δn paths (+BPTT from future), gate pre-activation grads, BPTT
+        // channels for t-1. Scalar anyway (branch + transcendental), so one
+        // pass over the h-sized buffers beats three.
         for j in 0..h {
-            self.do_pre[j] =
-                delta[j] * (cache.c[j] / cache.psi[j]) * cache.ot[j] * (1.0 - cache.ot[j]);
-        }
-
-        // ── 2. Split δh into δc and δn paths, add BPTT from future ────────────
-        for j in 0..h {
+            let d = delta[j] + self.dh_bptt[j];
+            delta[j] = d;
             let psi = cache.psi[j];
-            let dc_from_h = delta[j] * cache.ot[j] / psi;
+            let ot = cache.ot[j];
+
+            //   h = o · (c / ψ)   →   do/dõ = δh · c/ψ · o·(1-o)
+            dob[j] = d * (cache.c[j] / psi) * ot * (1.0 - ot);
 
             // dψ through max(|n|, 1):  only active when |n| > 1
             let dn_from_h = if cache.n[j].abs() > 1.0 {
-                let dpsi = delta[j] * cache.ot[j] * (-cache.c[j]) / (psi * psi);
+                let dpsi = d * ot * (-cache.c[j]) / (psi * psi);
                 dpsi * cache.n[j].signum()
             } else {
                 0.0
             };
 
-            self.dc_scratch[j] = dc_from_h + self.dc_bptt[j];
-            self.dn_scratch[j] = dn_from_h + self.dn_bptt[j];
-        }
-
-        // 3. Gradients w.r.t. stabilized gates + z, and BPTT for c, n
-        //   c = f'·c_prev + i'·z
-        //   n = f'·n_prev + i'
-        for j in 0..h {
-            let dc = self.dc_scratch[j];
-            let dn = self.dn_scratch[j];
+            //   c = f'·c_prev + i'·z
+            //   n = f'·n_prev + i'
+            let dc = d * ot / psi + self.dc_bptt[j];
+            let dn = dn_from_h + self.dn_bptt[j];
 
             let df_prime = dc * cache.c_prev[j] + dn * cache.n_prev[j];
             let di_prime = dc * cache.zt[j] + dn;
             let dz_post = dc * cache.i_prime[j]; // dL/dz (post-tanh)
 
             // tanh derivative for z
-            self.dz[j] = dz_post * (1.0 - cache.zt[j] * cache.zt[j]);
+            dz[j] = dz_post * (1.0 - cache.zt[j] * cache.zt[j]);
 
             // i' = exp(ĩ − m)   →   dĩ = di' · i'     (m treated as constant — see header)
-            self.di_pre[j] = di_prime * cache.i_prime[j];
+            di[j] = di_prime * cache.i_prime[j];
 
             // f' = exp(log_f + m_prev − m)
             //   d(log_f)/df̃ = 1 − σ(f̃)
             //   → df̃ = df' · f' · (1 − σ(f̃))
             let sigm_f = stable_sigmoid(cache.ft_pre[j]);
-            self.df_pre[j] = df_prime * cache.f_prime[j] * (1.0 - sigm_f);
+            df[j] = df_prime * cache.f_prime[j] * (1.0 - sigm_f);
 
             // BPTT channels for t-1
             self.dc_bptt[j] = dc * cache.f_prime[j];
             self.dn_bptt[j] = dn * cache.f_prime[j];
         }
 
-        // 4. Weight and bias gradients
-        let g = &mut self.grads;
-        g.wz.matrix().add_outer(&cache.xh, &self.dz);
-        g.wi.matrix().add_outer(&cache.xh, &self.di_pre);
-        g.wf.matrix().add_outer(&cache.xh, &self.df_pre);
-        g.wo.matrix().add_outer(&cache.xh, &self.do_pre);
-
-        for j in 0..h {
-            g.bz.vec()[j] += self.dz[j];
-            g.bi.vec()[j] += self.di_pre[j];
-            g.bf.vec()[j] += self.df_pre[j];
-            g.bo.vec()[j] += self.do_pre[j];
+        // ── 4. Bias gradients (per step — h-sized, cheap)
+        {
+            let g = &mut self.grads;
+            for j in 0..h {
+                g.bz.vec()[j] += dz[j];
+                g.bi.vec()[j] += di[j];
+                g.bf.vec()[j] += df[j];
+                g.bo.vec()[j] += dob[j];
+            }
         }
 
-        // 5. dL/d(xh) for layers below + BPTT to h_{t-1}
-        for i in 0..r {
-            let mut s = 0.0;
-            for j in 0..h {
-                s += self.wz[i][j] * self.dz[j]
-                    + self.wi[i][j] * self.di_pre[j]
-                    + self.wf[i][j] * self.df_pre[j]
-                    + self.wo[i][j] * self.do_pre[j];
+        // ── 5. dL/d(xh): four lane-accumulated dots per weight row, one sweep
+        // over W (read-only — the weight-grad outer products are deferred to
+        // flush_grads, so gW is not read-modified-written here every step).
+        {
+            let wz = self.wz.as_slice();
+            let wi = self.wi.as_slice();
+            let wf = self.wf.as_slice();
+            let wo = self.wo.as_slice();
+            let dz = &self.pend_dz[slot * h..(slot + 1) * h];
+            let di = &self.pend_di[slot * h..(slot + 1) * h];
+            let df = &self.pend_df[slot * h..(slot + 1) * h];
+            let dob = &self.pend_do[slot * h..(slot + 1) * h];
+
+            for i in 0..r {
+                let off = i * h;
+                // Exact-length row slices — elides the bounds checks a flat
+                // `[off + j]` index would keep.
+                cache.dconcat[i] = dot(&wz[off..off + h], dz)
+                    + dot(&wi[off..off + h], di)
+                    + dot(&wf[off..off + h], df)
+                    + dot(&wo[off..off + h], dob);
             }
-            cache.dconcat[i] = s;
         }
         self.dh_bptt
             .copy_from_slice(&cache.dconcat[self.input_size..]);
+
+        self.pend_len += 1;
+        if self.pend_len == GRAD_BLOCK {
+            self.flush_grads();
+        }
+    }
+
+    /// Fold the pending (xh, gate-delta) outer products into the weight-grad
+    /// matrices. No-op when nothing is pending.
+    fn flush_grads(&mut self) {
+        let n = self.pend_len;
+        if n == 0 {
+            return;
+        }
+        self.pend_len = 0;
+        let h = self.hidden_size;
+        let r = self.input_size + h;
+        let xh = &self.pend_xh;
+        let g = &mut self.grads;
+        outer_acc_block(g.wz.matrix().as_slice_mut(), xh, &self.pend_dz, n, r, h);
+        outer_acc_block(g.wi.matrix().as_slice_mut(), xh, &self.pend_di, n, r, h);
+        outer_acc_block(g.wf.matrix().as_slice_mut(), xh, &self.pend_df, n, r, h);
+        outer_acc_block(g.wo.matrix().as_slice_mut(), xh, &self.pend_do, n, r, h);
     }
 
     /// Fold a replica's grads into this layer (data-parallel reduction).
     pub fn add_grads(&mut self, other: &mut Self) {
+        self.flush_grads();
+        other.flush_grads();
         let g = &mut self.grads;
         let o = &mut other.grads;
         add_grad_matrix(&mut g.wz, &mut o.wz);
@@ -505,6 +547,7 @@ impl NnLayer for SLSTMLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
+        self.flush_grads();
         self.grads.wi.clip();
         self.grads.wo.clip();
 
@@ -522,6 +565,8 @@ impl NnLayer for SLSTMLayer {
     }
 
     fn clear_grads(&mut self) {
+        // Pending outer products belong to the grads being discarded.
+        self.pend_len = 0;
         self.grads.wz.clear();
         self.grads.wi.clear();
         self.grads.wf.clear();
@@ -543,12 +588,16 @@ impl NnLayer for SLSTMLayer {
         self.m.fill(0.0);
     }
     fn reset_bptt_state(&mut self) {
+        // Window seam — fold any partial pending block into the grad matrices.
+        self.flush_grads();
         self.dh_bptt.fill(0.0);
         self.dc_bptt.fill(0.0);
         self.dn_bptt.fill(0.0);
     }
 
     fn accumulate_init_grad(&mut self) {
+        // Window seam — fold any partial pending block into the grad matrices.
+        self.flush_grads();
         // add_vec_in_place(&mut self.grads.h_init_grad.vec(), &self.dh_bptt);
         // add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
     }

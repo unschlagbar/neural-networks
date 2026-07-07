@@ -1,0 +1,14 @@
+  Normal (full history)              Char loss = 0.4113 nats   ppl = 1.509
+  Normal (full history)              Word loss = 2.1541 nats   ppl = 8.620
+  ResetEachWord (prev word only)     Char loss = 1.1711 nats   ppl = 3.226
+  ResetEachWord (prev word only)     Word loss = 6.0976 nats   ppl = 444.778
+
+  No RMS
+  lr = 3e-4
+  batch = 4
+  step = 135960
+
+Once upon a time there was a pumpkin. 
+>>>  It was very big and shiny. It was a very special pumpkin. It was so big that it could be a lot of monsters. The pumpkin was very special and had a lot of fun.
+One day, a little girl named Lily went to the park. She saw the pumpkin and said, "Hello, pumpkin! Can I play with you?" The pumpkin said, "Yes, you can play with me!" Lily was very happy and she started to play with the pumpkin. They had lots of fun and laughed a lot.
+Lily and the pumpkin became best friends. They played together every day.

@@ -5,7 +5,7 @@ use crate::optimizers::{
     adam::{AdamGradMatrix, AdamGradVec},
 };
 
-const CLIP: f32 = 10.0;
+const CLIP: f32 = 5.0;
 const BETA1: f32 = 0.9;
 const BETA2: f32 = 0.95;
 const EPS: f32 = 1e-8;
@@ -43,6 +43,8 @@ impl GradMatrixOps for AdamWGradMatrix {
         debug_assert_eq!(self.m.cols(), self.grads.cols());
         debug_assert_eq!(self.v.rows(), self.grads.rows());
         debug_assert_eq!(self.v.cols(), self.grads.cols());
+
+        self.clip();
 
         let t = self.step as f32;
         let beta1_t = 1.0 - BETA1.powf(t);

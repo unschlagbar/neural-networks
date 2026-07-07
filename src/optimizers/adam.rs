@@ -2,7 +2,7 @@ use iron_oxide::collections::Matrix;
 
 use crate::optimizers::{GradMatrixOps, GradVecOps, OptimizerGradTypes};
 
-const CLIP: f32 = 150.0;
+const CLIP: f32 = 5.0;
 const BETA1: f32 = 0.9;
 const BETA2: f32 = 0.95;
 const EPS: f32 = 1e-8;
@@ -43,6 +43,8 @@ impl GradMatrixOps for AdamGradMatrix {
         debug_assert_eq!(self.m.cols(), self.grads.cols());
         debug_assert_eq!(self.v.rows(), self.grads.rows());
         debug_assert_eq!(self.v.cols(), self.grads.cols());
+
+        self.clip();
 
         let t = self.step as f32;
         let beta1_t = 1.0 - BETA1.powf(t);
@@ -89,6 +91,8 @@ impl GradVecOps for AdamGradVec {
         debug_assert_eq!(weights.len(), self.grads.len());
         debug_assert_eq!(self.m.len(), self.grads.len());
         debug_assert_eq!(self.v.len(), self.grads.len());
+
+        self.clip();
 
         let t = self.step as f32;
         let beta1_t = 1.0 - BETA1.powf(t);

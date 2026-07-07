@@ -565,6 +565,18 @@ impl Hierarchical {
         &mut self,
         data: I,
     ) -> (f32, f32) {
+        let (c_total, w_total, count) = self.eval_decode_loss_sums(data);
+        let c_loss = c_total / count.max(1) as f32;
+        let w_loss = w_total / count.max(1) as f32;
+        (c_loss, w_loss)
+    }
+
+    /// Like `eval_decode_loss`, but returns the raw per-window loss sums plus
+    /// the window count so callers can aggregate across multiple chunks.
+    pub fn eval_decode_loss_sums<'a, I: Iterator<Item = WordBatch<'a>>>(
+        &mut self,
+        data: I,
+    ) -> (f32, f32, usize) {
         let mut c_total = 0.0;
         let mut w_total = 0.0;
         let mut count = 0;
@@ -575,17 +587,11 @@ impl Hierarchical {
             if self.word_segments.len() < 2 {
                 continue;
             }
-            let c_loss = self.decode_loss();
-            let w_loss = self.word_loss();
-            c_total += c_loss;
-            w_total += w_loss;
-
+            c_total += self.decode_loss();
+            w_total += self.word_loss();
             count += 1;
         }
-
-        let c_loss = c_total / count.max(1) as f32;
-        let w_loss = w_total / count.max(1) as f32;
-        (c_loss, w_loss)
+        (c_total, w_total, count)
     }
 
     /// Per-backbone-block, per-head effective forget multipliers (`f_prime`)

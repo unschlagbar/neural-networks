@@ -3,6 +3,7 @@ use std::any::Any;
 use iron_oxide::collections::Matrix;
 
 use crate::{
+    nn::{GRAD_BLOCK, dot, matvec_into, outer_acc_block},
     nn_layer::{DynCache, NnLayer},
     optimizers::{GradMatrixNoDecay, GradMatrixOps, add_grad_matrix},
 };
@@ -57,52 +58,46 @@ pub struct LinearNBLayer {
     pub weights: Matrix,
     /// Gradient accumulators — cleared per batch, applied in `sgd_step`.
     pub grads: LinearNBGrads,
+
+    // Deferred weight-gradient accumulation (see slstm.rs): backward stashes
+    // (input, delta) per step; blocks are folded into `grads.weights` every
+    // GRAD_BLOCK steps and before any read of the grads.
+    pend_len: usize,
+    pend_x: Box<[f32]>, // GRAD_BLOCK × input
+    pend_d: Box<[f32]>, // GRAD_BLOCK × output
 }
 
 impl LinearNBLayer {
     pub fn new(input_size: usize, hidden_size: usize) -> Self {
         let scale = (6.0 / (input_size as f32 + hidden_size as f32)).sqrt();
-        let weights = Matrix::random(input_size, hidden_size, scale);
-
-        Self {
-            weights,
-            grads: LinearNBGrads::zeros(input_size, hidden_size),
-        }
+        Self::from_parts(Matrix::random(input_size, hidden_size, scale))
     }
 
     pub fn zeroed(input_size: usize, hidden_size: usize) -> Self {
-        let weights = Matrix::zeros(input_size, hidden_size);
-        Self {
-            weights,
-            grads: LinearNBGrads::zeros(input_size, hidden_size),
-        }
+        Self::from_parts(Matrix::zeros(input_size, hidden_size))
     }
 
     pub fn from_loaded(input_size: usize, output_size: usize, weights: Matrix) -> Self {
         debug_assert_eq!(weights.rows(), input_size);
         debug_assert_eq!(weights.cols(), output_size);
+        Self::from_parts(weights)
+    }
 
+    fn from_parts(weights: Matrix) -> Self {
+        let (input_size, output_size) = (weights.rows(), weights.cols());
         Self {
             weights,
             grads: LinearNBGrads::zeros(input_size, output_size),
+            pend_len: 0,
+            pend_x: vec![0.0; GRAD_BLOCK * input_size].into(),
+            pend_d: vec![0.0; GRAD_BLOCK * output_size].into(),
         }
     }
 
-    /// matmul + bias into a pre-allocated output buffer.
-    #[inline]
-    fn matmul(&self, input: &[f32], out: &mut [f32]) {
-        out.fill(0.0);
-        for (i, &x) in input.iter().enumerate() {
-            for (j, &w) in self.weights[i].iter().enumerate() {
-                out[j] += x * w;
-            }
-        }
-    }
-
-    /// Standard forward: z = Wx+b → activation(z).
+    /// Standard forward: z = Wx → activation(z).
     pub fn forward(&self, input: &[f32], cache: &mut LinearNBCache) {
         cache.input.copy_from_slice(input);
-        self.matmul(input, &mut cache.output);
+        matvec_into(&self.weights, input, &mut cache.output);
     }
 
     /// Backward.
@@ -113,14 +108,37 @@ impl LinearNBLayer {
     ///
     /// `cache.dx` ← dL/d(input) = Wᵀ · delta.
     pub fn backward(&mut self, delta: &mut [f32], cache: &mut LinearNBCache) {
-        self.grads.weights.matrix().add_outer(&cache.input, delta);
+        // Defer the weight-grad outer product: stash (input, delta) and fold
+        // blocks in flush_grads, so gW is streamed once per block instead of
+        // read-modified-written every step.
+        let (r, c) = (self.weights.rows(), self.weights.cols());
+        let slot = self.pend_len;
+        self.pend_x[slot * r..(slot + 1) * r].copy_from_slice(&cache.input);
+        self.pend_d[slot * c..(slot + 1) * c].copy_from_slice(delta);
+        self.pend_len += 1;
 
-        cache.dx.fill(0.0);
+        // Lane-accumulated dot per weight row — a serial `*dx +=` chain
+        // would keep this loop scalar (f32 adds don't reassociate).
         for (i, dx) in cache.dx.iter_mut().enumerate() {
-            for (&dy, &w) in delta.iter().zip(&self.weights[i]) {
-                *dx += dy * w;
-            }
+            *dx = dot(delta, &self.weights[i]);
         }
+
+        if self.pend_len == GRAD_BLOCK {
+            self.flush_grads();
+        }
+    }
+
+    /// Fold the pending (input, delta) outer products into the weight grads.
+    /// No-op when nothing is pending.
+    pub fn flush_grads(&mut self) {
+        let n = self.pend_len;
+        if n == 0 {
+            return;
+        }
+        self.pend_len = 0;
+        let (r, c) = (self.weights.rows(), self.weights.cols());
+        let gw = self.grads.weights.matrix().as_slice_mut();
+        outer_acc_block(gw, &self.pend_x, &self.pend_d, n, r, c);
     }
 
     pub fn input_size(&self) -> usize {
@@ -169,11 +187,25 @@ impl NnLayer for LinearNBLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
+        self.flush_grads();
         self.grads.weights.clip();
         self.grads.weights.apply_to(&mut self.weights, lr);
     }
 
+    // Window seams — fold any partial pending block so callers (drivers,
+    // tests, diagnostics) that read `grads` after a backward window see the
+    // materialized values.
+    fn accumulate_init_grad(&mut self) {
+        self.flush_grads();
+    }
+
+    fn reset_bptt_state(&mut self) {
+        self.flush_grads();
+    }
+
     fn clear_grads(&mut self) {
+        // Pending outer products belong to the grads being discarded.
+        self.pend_len = 0;
         self.grads.weights.clear();
     }
 
@@ -182,6 +214,8 @@ impl NnLayer for LinearNBLayer {
             .as_any_mut()
             .downcast_mut::<Self>()
             .expect("LinearNBLayer::add_grads_from — replica layer type mismatch");
+        self.flush_grads();
+        o.flush_grads();
         add_grad_matrix(&mut self.grads.weights, &mut o.grads.weights);
     }
 

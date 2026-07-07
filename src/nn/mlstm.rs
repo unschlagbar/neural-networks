@@ -43,6 +43,7 @@ use rand::random_range;
 use crate::{
     nn::{
         activations::{log_sigmoid, stable_sigmoid},
+        GRAD_BLOCK, dot, matvec_acc, matvec_into, outer_acc_block,
         headwise_rms_norm::{HeadwiseRMSNorm, HeadwiseRMSNormCache},
         linear::{LinearCache, LinearLayer},
     },
@@ -176,6 +177,20 @@ pub struct MLSTMLayer {
     pub di_pre: Box<[f32]>,    // H
     pub df_pre: Box<[f32]>,    // H
     pub d_h_tilde: Box<[f32]>, // d
+    pub dc_tmp: Box<[f32]>,    // dqk — pre-scale dC row scratch in backward
+
+    // Deferred weight-gradient accumulation (see slstm.rs): backward stashes
+    // (x, per-projection deltas) per step; blocks are folded into the grad
+    // matrices every GRAD_BLOCK steps and before any read of the grads.
+    // w_out defers on its own (LinearLayer).
+    pend_len: usize,
+    pend_x: Box<[f32]>,  // GRAD_BLOCK × input
+    pend_dq: Box<[f32]>, // GRAD_BLOCK × H·dqk
+    pend_dk: Box<[f32]>, // GRAD_BLOCK × H·dqk
+    pend_dv: Box<[f32]>, // GRAD_BLOCK × d
+    pend_do: Box<[f32]>, // GRAD_BLOCK × d
+    pend_di: Box<[f32]>, // GRAD_BLOCK × H
+    pend_df: Box<[f32]>, // GRAD_BLOCK × H
 }
 
 impl MLSTMLayer {
@@ -244,6 +259,15 @@ impl MLSTMLayer {
             di_pre: vec![0.0; heads].into(),
             df_pre: vec![0.0; heads].into(),
             d_h_tilde: vec![0.0; d].into(),
+            dc_tmp: vec![0.0; dqk].into(),
+            pend_len: 0,
+            pend_x: vec![0.0; GRAD_BLOCK * input_size].into(),
+            pend_dq: vec![0.0; GRAD_BLOCK * d_qk].into(),
+            pend_dk: vec![0.0; GRAD_BLOCK * d_qk].into(),
+            pend_dv: vec![0.0; GRAD_BLOCK * d].into(),
+            pend_do: vec![0.0; GRAD_BLOCK * d].into(),
+            pend_di: vec![0.0; GRAD_BLOCK * heads].into(),
+            pend_df: vec![0.0; GRAD_BLOCK * heads].into(),
         }
     }
 
@@ -306,6 +330,15 @@ impl MLSTMLayer {
             di_pre: vec![0.0; h].into(),
             df_pre: vec![0.0; h].into(),
             d_h_tilde: vec![0.0; d].into(),
+            dc_tmp: vec![0.0; dqk].into(),
+            pend_len: 0,
+            pend_x: vec![0.0; GRAD_BLOCK * input_size].into(),
+            pend_dq: vec![0.0; GRAD_BLOCK * d_qk].into(),
+            pend_dk: vec![0.0; GRAD_BLOCK * d_qk].into(),
+            pend_dv: vec![0.0; GRAD_BLOCK * d].into(),
+            pend_do: vec![0.0; GRAD_BLOCK * d].into(),
+            pend_di: vec![0.0; GRAD_BLOCK * h].into(),
+            pend_df: vec![0.0; GRAD_BLOCK * h].into(),
         }
     }
 
@@ -322,21 +355,25 @@ impl MLSTMLayer {
         // (Forking these across rayon was tried and measured SLOWER at the
         // current dims — one matvec is only ~65K MACs, below fork/steal
         // overhead. Revisit if hidden sizes grow well past 256.)
-        self.wq.row_mul(input, &mut cache.q);
-        self.wk.row_mul(input, &mut cache.k);
-        self.wv.row_mul(input, &mut cache.v);
-        self.wo.row_mul(input, &mut cache.o);
-        self.wi.row_mul(input, &mut cache.i_pre);
-        self.wf.row_mul(input, &mut cache.f_pre);
+        matvec_into(&self.wq, input, &mut cache.q);
+        matvec_into(&self.wk, input, &mut cache.k);
+        matvec_into(&self.wv, input, &mut cache.v);
+        matvec_into(&self.wo, input, &mut cache.o);
+        matvec_into(&self.wi, input, &mut cache.i_pre);
+        matvec_into(&self.wf, input, &mut cache.f_pre);
 
         // Bias + scaling — contiguous flat passes, SIMD-friendly.
-        for j in 0..h * dqk {
-            cache.q[j] += self.bq[j];
-            cache.k[j] = (cache.k[j] + self.bk[j]) * self.inv_sqrt_dqk;
+        for (q, &b) in cache.q.iter_mut().zip(&self.bq) {
+            *q += b;
         }
-        for i in 0..d {
-            cache.v[i] += self.bv[i];
-            cache.o[i] = stable_sigmoid(cache.o[i] + self.bo[i]);
+        for (k, &b) in cache.k.iter_mut().zip(&self.bk) {
+            *k = (*k + b) * self.inv_sqrt_dqk;
+        }
+        for (v, &b) in cache.v.iter_mut().zip(&self.bv) {
+            *v += b;
+        }
+        for (o, &b) in cache.o.iter_mut().zip(&self.bo) {
+            *o = stable_sigmoid(*o + b);
         }
         for hd in 0..h {
             cache.i_pre[hd] += self.bi[hd];
@@ -351,6 +388,12 @@ impl MLSTMLayer {
             let qk_off = hd * dqk;
             let v_off = hd * dhv;
 
+            // Exact-length head slices — indexing below stays in [0, dqk) / [0, dhv),
+            // so the inner loops carry no bounds checks and vectorize.
+            let q_h = &cache.q[qk_off..qk_off + dqk];
+            let k_h = &cache.k[qk_off..qk_off + dqk];
+            let v_h = &cache.v[v_off..v_off + dhv];
+
             // Stabilizer.
             let m_prev_h = self.m[hd];
             cache.log_f[hd] = log_sigmoid(cache.f_pre[hd]);
@@ -363,13 +406,14 @@ impl MLSTMLayer {
 
             // Fused n update + nq. Reads n_{t-1} from cache.n_prev (after the swap above),
             // writes n_t into self.n — one pass, no extra n copy.
-            let mut nq = 0.0;
+            let n_prev_h = &cache.n_prev[hd][..dqk];
+            let n_h = &mut self.n[hd][..dqk];
             for j in 0..dqk {
-                let n_prev_j = cache.n_prev[hd][j];
-                let n_j = f_prime * n_prev_j + i_prime * cache.k[qk_off + j];
-                self.n[hd][j] = n_j;
-                nq += n_j * cache.q[qk_off + j];
+                n_h[j] = f_prime.mul_add(n_prev_h[j], i_prime * k_h[j]);
             }
+            // Reduction split out of the update loop: `dot` reassociates into
+            // SIMD lanes, a fused serial `nq +=` would keep the loop scalar.
+            let nq = dot(n_h, q_h);
             cache.nq[hd] = nq;
             let psi = nq.abs().max(1.0);
             cache.psi[hd] = psi;
@@ -378,15 +422,17 @@ impl MLSTMLayer {
             // O(1) swap — cache.c_prev[hd] becomes C_{t-1}, self.c[hd] becomes the write
             // buffer. Mirrors the swap at the end of backward; no per-element copy.
             std::mem::swap(&mut self.c[hd], &mut cache.c_prev[hd]);
+            let c_prev_mat = &cache.c_prev[hd];
+            let c_mat = &mut self.c[hd];
             for i in 0..dhv {
-                let v_i = cache.v[v_off + i];
-                let iprime_vi = i_prime * v_i;
-                let mut s = 0.0;
+                let iprime_vi = i_prime * v_h[i];
+                let c_prev_row = &c_prev_mat[i][..dqk];
+                let c_row = &mut c_mat[i][..dqk];
                 for j in 0..dqk {
-                    let c_ij = f_prime * cache.c_prev[hd][i][j] + iprime_vi * cache.k[qk_off + j];
-                    self.c[hd][i][j] = c_ij;
-                    s += c_ij * cache.q[qk_off + j];
+                    c_row[j] = f_prime.mul_add(c_prev_row[j], iprime_vi * k_h[j]);
                 }
+                // C·q reduction via lane-accumulated dot (row is L1-hot).
+                let s = dot(c_row, q_h);
                 cache.cq[v_off + i] = s;
                 cache.h_tilde[v_off + i] = s * inv_psi;
             }
@@ -401,11 +447,7 @@ impl MLSTMLayer {
             cache.w_out.input[i] = cache.o[i] * cache.head_norm.output[i];
         }
         cache.w_out.output.copy_from_slice(&self.w_out.biases);
-        for (i, &xi) in cache.w_out.input.iter().enumerate() {
-            for (j, &w) in self.w_out.weights[i].iter().enumerate() {
-                cache.w_out.output[j] += xi * w;
-            }
-        }
+        matvec_acc(&self.w_out.weights, &cache.w_out.input, &mut cache.w_out.output);
     }
 
     // Incoming `delta` = dL/d(cell-output), size d.
@@ -434,12 +476,22 @@ impl MLSTMLayer {
             let qk_off = hd * dqk;
             let v_off = hd * dhv;
 
+            // Exact-length head slices — the inner loops below index only within
+            // [0, dqk) / [0, dhv), so bounds checks vanish and the loops vectorize.
+            let q_h = &cache.q[qk_off..qk_off + dqk];
+            let k_h = &cache.k[qk_off..qk_off + dqk];
+            let v_h = &cache.v[v_off..v_off + dhv];
+            let dht_h = &self.d_h_tilde[v_off..v_off + dhv];
+            let cq_h = &cache.cq[v_off..v_off + dhv];
+            let dq_h = &mut self.dq[qk_off..qk_off + dqk];
+            let dk_h = &mut self.dk_pre[qk_off..qk_off + dqk];
+            let dn_h = &mut self.dn_bptt[hd][..dqk];
+            let n_h = &self.n[hd][..dqk];
+            let n_prev_h = &cache.n_prev[hd][..dqk];
+
             let inv_psi = 1.0 / cache.psi[hd];
             let psi_sq = inv_psi * inv_psi;
-            let mut dpsi = 0.0;
-            for i in 0..dhv {
-                dpsi += self.d_h_tilde[v_off + i] * (-cache.cq[v_off + i] * psi_sq);
-            }
+            let dpsi = -psi_sq * dot(dht_h, cq_h);
             let dnq_h = if cache.nq[hd].abs() > 1.0 {
                 cache.nq[hd].signum() * dpsi
             } else {
@@ -453,24 +505,35 @@ impl MLSTMLayer {
 
             // Init dq, zero dk_pre, fold dnq into dn_bptt — single j pass.
             for j in 0..dqk {
-                self.dq[qk_off + j] = dnq_h * self.n[hd][j];
-                self.dk_pre[qk_off + j] = 0.0;
-                self.dn_bptt[hd][j] += dnq_h * cache.q[qk_off + j];
+                dq_h[j] = dnq_h * n_h[j];
+                dk_h[j] = 0.0;
+                dn_h[j] += dnq_h * q_h[j];
             }
 
-            // Fused (i,j): update dc_bptt → dc_total, dq from C, df/dv/dk — one pass over dc_bptt.
+            // Per row of dc_bptt: build the total dC in `tmp` (elementwise,
+            // vectorizes), take the two reductions via lane dots on the L1-hot
+            // row, then do the elementwise updates. A single fused loop was
+            // measured slower — its serial `row_df`/`row_dv` accumulators keep
+            // the whole j-loop scalar.
+            let dc_mat = &mut self.dc_bptt[hd];
+            let c_mat = &self.c[hd];
+            let c_prev_mat = &cache.c_prev[hd];
+            let tmp = &mut self.dc_tmp[..dqk];
             for i in 0..dhv {
-                let dh_over_psi = self.d_h_tilde[v_off + i] * inv_psi;
-                let v_i = cache.v[v_off + i];
-                let mut row_dv = 0.0;
-                let mut row_df = 0.0;
+                let dh_over_psi = dht_h[i] * inv_psi;
+                let v_i = v_h[i];
+                let dc_row = &mut dc_mat[i][..dqk];
+                let c_row = &c_mat[i][..dqk];
+                let c_prev_row = &c_prev_mat[i][..dqk];
                 for j in 0..dqk {
-                    let dc = self.dc_bptt[hd][i][j] + dh_over_psi * cache.q[qk_off + j];
-                    self.dc_bptt[hd][i][j] = dc * f_prime; // scale for BPTT in-place
-                    self.dq[qk_off + j] += dh_over_psi * self.c[hd][i][j];
-                    row_df += dc * cache.c_prev[hd][i][j];
-                    row_dv += dc * cache.k[qk_off + j];
-                    self.dk_pre[qk_off + j] += dc * v_i;
+                    tmp[j] = dh_over_psi.mul_add(q_h[j], dc_row[j]);
+                }
+                let row_df = dot(tmp, c_prev_row);
+                let row_dv = dot(tmp, k_h);
+                for j in 0..dqk {
+                    dc_row[j] = tmp[j] * f_prime; // scale for BPTT in-place
+                    dq_h[j] = dh_over_psi.mul_add(c_row[j], dq_h[j]);
+                    dk_h[j] = tmp[j].mul_add(v_i, dk_h[j]);
                 }
                 df_prime += row_df;
                 di_prime += v_i * row_dv; // saves dhv·dqk multiplications vs inner accumulation
@@ -478,12 +541,11 @@ impl MLSTMLayer {
             }
 
             // dn contribution to df/di/dk, finalize dk_pre with i', scale dn_bptt.
+            df_prime += dot(dn_h, n_prev_h);
+            di_prime += dot(dn_h, k_h);
             for j in 0..dqk {
-                let dn = self.dn_bptt[hd][j];
-                df_prime += dn * cache.n_prev[hd][j];
-                di_prime += dn * cache.k[qk_off + j];
-                self.dk_pre[qk_off + j] = i_prime * (self.dk_pre[qk_off + j] + dn);
-                self.dn_bptt[hd][j] = dn * f_prime;
+                dk_h[j] = i_prime * (dk_h[j] + dn_h[j]);
+                dn_h[j] *= f_prime;
             }
 
             self.di_pre[hd] = di_prime * i_prime;
@@ -513,11 +575,11 @@ impl MLSTMLayer {
             }
         }
 
-        // Fused weight-grad accumulation + dx — one pass per input row instead of 7.
-        // Each weight row and its grad row are touched together while both fit in L1,
-        // avoiding the double L2/L3 reload that separate add_outer + dx caused.
-        // (Chunking this pass across rayon was tried and measured slower at the
-        // current dims — per-row work is too small; keep it serial.)
+        // dx — six lane-accumulated dots per input row, one read-only sweep
+        // over the weights. The weight-grad outer products are deferred: this
+        // step's (x, deltas) are stashed below and folded into the grad
+        // matrices in flush_grads, so gW is streamed once per GRAD_BLOCK steps
+        // instead of read-modified-written every step.
         {
             let wq = self.wq.as_slice();
             let wk = self.wk.as_slice();
@@ -525,51 +587,41 @@ impl MLSTMLayer {
             let wo = self.wo.as_slice();
             let wi = self.wi.as_slice();
             let wf = self.wf.as_slice();
-            // Different fields from wq..wf → Rust field borrow-splitting allows simultaneous borrows.
-            let gwq = self.grads.wq.matrix().as_slice_mut();
-            let gwk = self.grads.wk.matrix().as_slice_mut();
-            let gwv = self.grads.wv.matrix().as_slice_mut();
-            let gwo = self.grads.wo.matrix().as_slice_mut();
-            let gwi = self.grads.wi.matrix().as_slice_mut();
-            let gwf = self.grads.wf.matrix().as_slice_mut();
-            let dq = &*self.dq;
-            let dk = &*self.dk_pre;
-            let dv = &*self.dv;
-            let doo = &*self.do_pre;
-            let di = &*self.di_pre;
-            let df = &*self.df_pre;
+            let dq = &self.dq[..d_qk];
+            let dk = &self.dk_pre[..d_qk];
+            let dv = &self.dv[..d];
+            let doo = &self.do_pre[..d];
+            let di = &self.di_pre[..h];
+            let df = &self.df_pre[..h];
             let x = &*cache.x;
             let dx = &mut *cache.dx;
 
-            for idx in 0..self.input_size {
-                let xi = x[idx];
-                let mut s = 0.0;
+            for idx in 0..x.len() {
                 let qk_off = idx * d_qk;
                 let d_off = idx * d;
                 let h_off = idx * h;
-                for j in 0..d_qk {
-                    let dq_j = dq[j];
-                    let dk_j = dk[j];
-                    gwq[qk_off + j] += xi * dq_j;
-                    gwk[qk_off + j] += xi * dk_j;
-                    s += wq[qk_off + j] * dq_j + wk[qk_off + j] * dk_j;
-                }
-                for j in 0..d {
-                    let dv_j = dv[j];
-                    let do_j = doo[j];
-                    gwv[d_off + j] += xi * dv_j;
-                    gwo[d_off + j] += xi * do_j;
-                    s += wv[d_off + j] * dv_j + wo[d_off + j] * do_j;
-                }
-                for hd2 in 0..h {
-                    let di_h = di[hd2];
-                    let df_h = df[hd2];
-                    gwi[h_off + hd2] += xi * di_h;
-                    gwf[h_off + hd2] += xi * df_h;
-                    s += wi[h_off + hd2] * di_h + wf[h_off + hd2] * df_h;
-                }
-                dx[idx] = s;
+                // Exact-length row slices — elides the bounds checks that a
+                // flat `[off + j]` index would keep.
+                dx[idx] = dot(&wq[qk_off..qk_off + d_qk], dq)
+                    + dot(&wk[qk_off..qk_off + d_qk], dk)
+                    + dot(&wv[d_off..d_off + d], dv)
+                    + dot(&wo[d_off..d_off + d], doo)
+                    + dot(&wi[h_off..h_off + h], di)
+                    + dot(&wf[h_off..h_off + h], df);
             }
+
+            let slot = self.pend_len;
+            self.pend_x[slot * x.len()..(slot + 1) * x.len()].copy_from_slice(x);
+            self.pend_dq[slot * d_qk..(slot + 1) * d_qk].copy_from_slice(dq);
+            self.pend_dk[slot * d_qk..(slot + 1) * d_qk].copy_from_slice(dk);
+            self.pend_dv[slot * d..(slot + 1) * d].copy_from_slice(dv);
+            self.pend_do[slot * d..(slot + 1) * d].copy_from_slice(doo);
+            self.pend_di[slot * h..(slot + 1) * h].copy_from_slice(di);
+            self.pend_df[slot * h..(slot + 1) * h].copy_from_slice(df);
+        }
+        self.pend_len += 1;
+        if self.pend_len == GRAD_BLOCK {
+            self.flush_grads();
         }
 
         // Roll self.c/n backward via O(1) pointer swap — self.c becomes C_{t-1} for next step.
@@ -579,8 +631,32 @@ impl MLSTMLayer {
         std::mem::swap(&mut self.n, &mut cache.n_prev);
     }
 
+    /// Fold the pending (x, delta) outer products into the weight grads.
+    /// No-op when nothing is pending. w_out flushes itself (LinearLayer).
+    fn flush_grads(&mut self) {
+        let n = self.pend_len;
+        if n == 0 {
+            return;
+        }
+        self.pend_len = 0;
+        let r = self.input_size;
+        let d = self.hidden_size;
+        let h = self.num_heads;
+        let d_qk = h * self.dqk;
+        let x = &self.pend_x;
+        let g = &mut self.grads;
+        outer_acc_block(g.wq.matrix().as_slice_mut(), x, &self.pend_dq, n, r, d_qk);
+        outer_acc_block(g.wk.matrix().as_slice_mut(), x, &self.pend_dk, n, r, d_qk);
+        outer_acc_block(g.wv.matrix().as_slice_mut(), x, &self.pend_dv, n, r, d);
+        outer_acc_block(g.wo.matrix().as_slice_mut(), x, &self.pend_do, n, r, d);
+        outer_acc_block(g.wi.matrix().as_slice_mut(), x, &self.pend_di, n, r, h);
+        outer_acc_block(g.wf.matrix().as_slice_mut(), x, &self.pend_df, n, r, h);
+    }
+
     /// Fold a replica's grads into this layer (data-parallel reduction).
     pub fn add_grads(&mut self, other: &mut Self) {
+        self.flush_grads();
+        other.flush_grads();
         let g = &mut self.grads;
         let o = &mut other.grads;
         add_grad_matrix(&mut g.wq, &mut o.wq);
@@ -699,6 +775,7 @@ impl NnLayer for MLSTMLayer {
     }
 
     fn apply_grads(&mut self, lr: f32) {
+        self.flush_grads();
         self.grads.wo.clip();
         self.grads.wi.clip();
 
@@ -724,6 +801,8 @@ impl NnLayer for MLSTMLayer {
     }
 
     fn clear_grads(&mut self) {
+        // Pending outer products belong to the grads being discarded.
+        self.pend_len = 0;
         self.grads.wq.clear();
         self.grads.wk.clear();
         self.grads.wv.clear();
@@ -765,10 +844,19 @@ impl NnLayer for MLSTMLayer {
     }
 
     fn reset_bptt_state(&mut self) {
+        // Window seam — fold any partial pending block into the grad matrices.
+        self.flush_grads();
+        self.w_out.flush_grads();
         for mat in self.dc_bptt.iter_mut() {
             mat.clear();
         }
         self.dn_bptt.clear();
+    }
+
+    fn accumulate_init_grad(&mut self) {
+        // Window seam — fold any partial pending block into the grad matrices.
+        self.flush_grads();
+        self.w_out.flush_grads();
     }
 
     fn state_size(&self) -> usize {

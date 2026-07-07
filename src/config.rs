@@ -16,10 +16,10 @@ pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 6;
 
 // Training-Schedule
 
-pub const LR: f32 = 5e-4;
-pub const MIN_LR: f32 = 5e-4;
-pub const WARMUP_STEPS: usize = 100;
-pub const DECAY_STEPS: usize = 25_000;
+pub const LR: f32 = 3e-4;
+pub const MIN_LR: f32 = 3e-5;
+pub const WARMUP_STEPS: usize = 150;
+pub const DECAY_STEPS: usize = 150_000;
 // Windows whose gradients are accumulated before one optimizer step. Muon
 // (matrices) is scale-invariant via the Frobenius normalization and aux-Adam
 // (vectors) via its second moment, so summed grads need no manual rescaling.
@@ -37,8 +37,8 @@ pub const TOP_P: f32 = 0.9;
 
 // Modell-Dimensions
 
-pub const CHAR_HIDDEN: usize = 192;
-pub const OUT_HIDDEN: usize = 192;
+pub const CHAR_HIDDEN: usize = 128;
+pub const OUT_HIDDEN: usize = 128;
 pub const WORD_HIDDEN: usize = 384;
 
 /// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).
@@ -47,7 +47,7 @@ pub const WORD_HIDDEN: usize = 384;
 pub const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 16;
+pub const WORD_BLOCKS: usize = 6;
 
 /// Append a closing `[W]` end-of-word step to every encoder word and read the
 /// word embedding `e_w` out at that step (the state then knows the word is
@@ -62,8 +62,8 @@ pub const ENC_W_EOS: bool = true;
 /// dataset memory scales with this constant — not with the corpus size.
 pub const CHUNK_BYTES: usize = 32 * 1024 * 1024;
 
-pub const DATA_DIR: &str = "data/rust-lib/";
-pub const DATA_FILE: &str = "../../training_data/TinyStoriesV2-GPT4-train.txt";
+pub const TRAIN_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-train.txt";
+pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 pub const CHARSET: &str = "charset.txt";
 
 // Wake Word
