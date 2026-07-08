@@ -37,8 +37,8 @@ pub const TOP_P: f32 = 0.9;
 
 // Modell-Dimensions
 
-pub const CHAR_HIDDEN: usize = 128;
-pub const OUT_HIDDEN: usize = 128;
+pub const CHAR_HIDDEN: usize = 192;
+pub const OUT_HIDDEN: usize = 192;
 pub const WORD_HIDDEN: usize = 384;
 
 /// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).
@@ -70,7 +70,7 @@ pub const CHARSET: &str = "charset.txt";
 
 pub const WAKE_HIDDEN: usize = 128;
 pub const WAKE_SR: usize = 16_000;
-pub const WAKE_FRAME_LEN: usize = 400;
+pub const WAKE_FRAME_LEN: usize = 320;
 pub const WAKE_FRAME_SHIFT: usize = 320;
 pub const WAKE_N_FFT: usize = 512;
 pub const WAKE_N_MELS: usize = 80;
@@ -79,6 +79,6 @@ pub const WAKE_THRESHOLD: f32 = 0.6;
 pub const WAKE_POS_WEIGHT: f32 = 1.0;
 pub const WAKE_LR: f32 = 1e-3;
 pub const WAKE_EPOCHS: usize = 35;
-pub const WAKE_MODEL_LOC: &str = "models/wake_word2";
+pub const WAKE_MODEL_LOC: &str = "models/wake_word3";
 pub const WAKE_DATA_POS: &str = "data/wake_word/positive";
 pub const WAKE_DATA_NEG: &str = "data/wake_word/negative";
