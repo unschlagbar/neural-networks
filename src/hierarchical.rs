@@ -10,7 +10,9 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterato
 
 use crate::{
     batches::WordBatch,
-    config::{ENC_W_EOS, MAX_SEQ_LEN},
+    config::{
+        BACKBONE_WEIGHT_DECAY, DECODER_WEIGHT_DECAY, ENC_W_EOS, ENCODER_WEIGHT_DECAY, MAX_SEQ_LEN,
+    },
     loading::{read_u16, read_u32, read_u64},
     nn::{
         mlstm_block::{MLSTMBlock, MLSTMBlockCache},
@@ -693,9 +695,11 @@ impl Hierarchical {
             state.log_metric("word_loss", word_loss);
 
             if let Some(lr) = state.step(loss) {
-                self.encoder.sgd_step(lr); // marks its own replica pool dirty
-                self.char2_model.sgd_step(lr);
-                self.word_model.sgd_step(lr);
+                // Character stacks train as Adam (no decay); the backbone stays
+                // AdamW (decoupled decay on its interior projections).
+                self.encoder.sgd_step(lr, ENCODER_WEIGHT_DECAY); // marks its own replica pool dirty
+                self.char2_model.sgd_step(lr, DECODER_WEIGHT_DECAY);
+                self.word_model.sgd_step(lr, BACKBONE_WEIGHT_DECAY);
                 self.dec_pool.mark_dirty();
             }
             self.step = state.step;

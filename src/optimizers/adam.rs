@@ -35,7 +35,7 @@ impl GradMatrixOps for AdamGradMatrix {
         }
     }
 
-    fn apply_to(&mut self, weights: &mut Matrix, lr: f32) {
+    fn apply_to(&mut self, weights: &mut Matrix, lr: f32, weight_decay: f32) {
         self.step += 1;
         debug_assert_eq!(weights.rows(), self.grads.rows());
         debug_assert_eq!(weights.cols(), self.grads.cols());
@@ -50,6 +50,11 @@ impl GradMatrixOps for AdamGradMatrix {
         let beta1_t = 1.0 - BETA1.powf(t);
         let beta2_t = 1.0 - BETA2.powf(t);
 
+        // Decoupled weight decay (AdamW): applied directly to the weights, not
+        // through the gradient. `weight_decay == 0.0` recovers plain Adam, so a
+        // stack can be Adam or AdamW purely by what it passes here.
+        let decay = 1.0 - lr * weight_decay;
+
         for ((w, g), (m_val, v_val)) in weights
             .iter_mut()
             .zip(self.grads.as_slice())
@@ -59,7 +64,7 @@ impl GradMatrixOps for AdamGradMatrix {
             *v_val = BETA2 * *v_val + (1.0 - BETA2) * g * g;
             let m_hat = *m_val / beta1_t;
             let v_hat = *v_val / beta2_t;
-            *w -= lr * m_hat / (v_hat.sqrt() + EPS);
+            *w = *w * decay - lr * m_hat / (v_hat.sqrt() + EPS);
         }
     }
 

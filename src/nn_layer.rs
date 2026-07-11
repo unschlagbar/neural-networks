@@ -76,7 +76,13 @@ pub trait NnLayer: Dyn + Send + Sync {
     fn input_size(&self) -> usize;
     fn output_size(&self) -> usize;
 
-    fn apply_grads(&mut self, lr: f32);
+    /// Apply accumulated gradients. `weight_decay` is the per-step decoupled
+    /// decay coefficient (λ) applied to this layer's *decay-eligible* weight
+    /// matrices (interior projections); embedding tables, no-bias logit heads,
+    /// biases and norm scales are never decayed regardless of λ. Pass `0.0` for
+    /// plain Adam, a positive λ for AdamW. Callers set λ per stack, so the
+    /// hierarchical encoder/decoder and backbone can be decayed independently.
+    fn apply_grads(&mut self, lr: f32, weight_decay: f32);
     fn clear_grads(&mut self);
 
     /// Add the gradient accumulators of `other` — a same-type replica of this

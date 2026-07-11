@@ -319,7 +319,7 @@ impl NnLayer for LSTMLayer {
         self.hidden_size
     }
 
-    fn apply_grads(&mut self, lr: f32) {
+    fn apply_grads(&mut self, lr: f32, weight_decay: f32) {
         self.grads.wf.clip();
         self.grads.wi.clip();
         self.grads.wc.clip();
@@ -327,11 +327,12 @@ impl NnLayer for LSTMLayer {
         self.grads.b.clip();
         self.grads.h_init_grad.clip();
         self.grads.c_init_grad.clip();
-        self.grads.wf.apply_to(&mut self.wf, lr);
-        self.grads.wi.apply_to(&mut self.wi, lr);
-        self.grads.wc.apply_to(&mut self.wc, lr);
-        self.grads.wo.apply_to(&mut self.wo, lr);
-        self.grads.b.apply_to(&mut self.b, lr);
+        self.grads.wf.apply_to(&mut self.wf, lr, weight_decay);
+        self.grads.wi.apply_to(&mut self.wi, lr, weight_decay);
+        self.grads.wc.apply_to(&mut self.wc, lr, weight_decay);
+        self.grads.wo.apply_to(&mut self.wo, lr, weight_decay);
+        // `b` is a bias (stored as a matrix): never decayed.
+        self.grads.b.apply_to(&mut self.b, lr, 0.0);
         self.grads.h_init_grad.apply_to(&mut self.h_init, lr);
         self.grads.c_init_grad.apply_to(&mut self.c_init, lr);
     }

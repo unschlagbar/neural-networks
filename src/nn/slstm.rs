@@ -546,15 +546,15 @@ impl NnLayer for SLSTMLayer {
         self.hidden_size
     }
 
-    fn apply_grads(&mut self, lr: f32) {
+    fn apply_grads(&mut self, lr: f32, weight_decay: f32) {
         self.flush_grads();
         self.grads.wi.clip();
         self.grads.wo.clip();
 
-        self.grads.wz.apply_to(&mut self.wz, lr);
-        self.grads.wi.apply_to(&mut self.wi, lr);
-        self.grads.wf.apply_to(&mut self.wf, lr);
-        self.grads.wo.apply_to(&mut self.wo, lr);
+        self.grads.wz.apply_to(&mut self.wz, lr, weight_decay);
+        self.grads.wi.apply_to(&mut self.wi, lr, weight_decay);
+        self.grads.wf.apply_to(&mut self.wf, lr, weight_decay);
+        self.grads.wo.apply_to(&mut self.wo, lr, weight_decay);
         self.grads.bz.apply_to(&mut self.bz, lr);
         self.grads.bi.apply_to(&mut self.bi, lr);
         self.grads.bf.apply_to(&mut self.bf, lr);

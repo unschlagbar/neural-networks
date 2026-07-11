@@ -1,7 +1,7 @@
 use iron_oxide::collections::Matrix;
 
 use crate::optimizers::{
-    GradMatrixOps, OptimizerGradTypes, WEIGHT_DECAY,
+    GradMatrixOps, OptimizerGradTypes,
     adam::{AdamGradMatrix, AdamGradVec},
 };
 
@@ -35,7 +35,7 @@ impl GradMatrixOps for AdamWGradMatrix {
         }
     }
 
-    fn apply_to(&mut self, weights: &mut Matrix, lr: f32) {
+    fn apply_to(&mut self, weights: &mut Matrix, lr: f32, weight_decay: f32) {
         self.step += 1;
         debug_assert_eq!(weights.rows(), self.grads.rows());
         debug_assert_eq!(weights.cols(), self.grads.cols());
@@ -59,7 +59,7 @@ impl GradMatrixOps for AdamWGradMatrix {
         //   w ← w · (1 - lr·λ) − lr · m̂ / (√v̂ + ε)
         //
         // Referenz: Loshchilov & Hutter, "Decoupled Weight Decay Regularization" (2019)
-        let decay = 1.0 - lr * WEIGHT_DECAY;
+        let decay = 1.0 - lr * weight_decay;
 
         for ((w, g), (m_val, v_val)) in weights
             .iter_mut()

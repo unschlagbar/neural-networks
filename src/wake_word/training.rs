@@ -135,7 +135,7 @@ pub fn train_wake() {
                 layer.reset_state();
             }
 
-            model.sgd_step(lr);
+            model.sgd_step(lr, crate::config::FLAT_WEIGHT_DECAY);
         }
 
         println!(

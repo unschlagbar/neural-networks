@@ -139,8 +139,9 @@ impl NnLayer for EmbeddingLayer {
         self.weights.cols()
     }
 
-    fn apply_grads(&mut self, lr: f32) {
-        self.grads.weights.apply_to(&mut self.weights, lr);
+    fn apply_grads(&mut self, lr: f32, _weight_decay: f32) {
+        // Embedding table: never weight-decayed (pass 0.0).
+        self.grads.weights.apply_to(&mut self.weights, lr, 0.0);
     }
 
     fn clear_grads(&mut self) {

@@ -250,7 +250,7 @@ impl Sequential {
             state.log_tokens(inputs.len());
 
             if let Some(lr) = state.step(loss) {
-                self.sgd_step(lr);
+                self.sgd_step(lr, crate::config::FLAT_WEIGHT_DECAY);
             }
 
             if state.save() {
@@ -331,7 +331,7 @@ impl Sequential {
             state.log_metric("word_loss", word_loss);
 
             if let Some(lr) = state.step(loss) {
-                self.sgd_step(lr);
+                self.sgd_step(lr, crate::config::FLAT_WEIGHT_DECAY);
             }
 
             if state.save() {
@@ -495,14 +495,18 @@ impl Sequential {
         });
     }
 
-    pub fn sgd_step(&mut self, lr: f32) {
+    /// Optimizer step for every layer. `weight_decay` is the per-step decoupled
+    /// decay (λ) forwarded to each layer — `0.0` for Adam, positive for AdamW.
+    /// The hierarchical trainer calls this per stack with a different λ so the
+    /// encoder/decoder and backbone can be decayed independently.
+    pub fn sgd_step(&mut self, lr: f32, weight_decay: f32) {
         // One task per layer: each layer's update (Muon Newton-Schulz per
         // matrix, thread-local scratch) is independent of every other
         // layer's, so the optimizer step runs layer-parallel — it is the
         // largest serial block of a training step. Grad clearing is folded
         // into the same task while the buffers are still cache-hot.
         self.layers.par_iter_mut().for_each(|layer| {
-            layer.apply_grads(lr);
+            layer.apply_grads(lr, weight_decay);
             layer.clear_grads();
         });
     }

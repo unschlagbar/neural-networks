@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use iron_oxide::collections::Matrix;
 
 use crate::optimizers::{
-    GradMatrixOps, OptimizerGradTypes, WEIGHT_DECAY,
+    GradMatrixOps, OptimizerGradTypes,
     adam::{AdamGradMatrix, AdamGradVec},
 };
 
@@ -171,7 +171,7 @@ impl GradMatrixOps for MuonGradMatrix {
         }
     }
 
-    fn apply_to(&mut self, weights: &mut Matrix, lr: f32) {
+    fn apply_to(&mut self, weights: &mut Matrix, lr: f32, weight_decay: f32) {
         debug_assert_eq!(weights.rows(), self.grads.rows());
         debug_assert_eq!(weights.cols(), self.grads.cols());
 
@@ -227,7 +227,7 @@ impl GradMatrixOps for MuonGradMatrix {
             // values ≈ 1 regardless of shape), applied together with decoupled
             // weight decay in one pass:  w ← w·(1 - lr·λ) − lr·scale·ortho.
             let scale = (rows as f32 / cols as f32).max(1.0).sqrt();
-            let decay = 1.0 - lr * WEIGHT_DECAY;
+            let decay = 1.0 - lr * weight_decay;
             let step = -lr * scale;
             let w = weights.as_slice_mut();
             if transposed {
@@ -357,6 +357,7 @@ mod tests {
     fn apply_to_matches_reference() {
         for &(rows, cols) in &[(6, 10), (10, 6), (8, 8)] {
             let lr = 0.01;
+            let weight_decay = 0.03;
             let g = filled(rows, cols, 3);
 
             let mut gm = MuonGradMatrix::zeros(rows, cols);
@@ -364,7 +365,7 @@ mod tests {
             let mut w = filled(rows, cols, 11);
             let mut w_ref = w.clone();
 
-            gm.apply_to(&mut w, lr);
+            gm.apply_to(&mut w, lr, weight_decay);
 
             // Reference: first step ⇒ momentum = (1-β)·g, Nesterov update
             // u = (1-β)·g + β·momentum = (1-β)(1+β)·g.
@@ -372,7 +373,7 @@ mod tests {
             u.scale((1.0 - MOMENTUM) * (1.0 + MOMENTUM));
             let ortho = newton_schulz5(&u);
             let scale = (rows as f32 / cols as f32).max(1.0).sqrt();
-            w_ref.scale(1.0 - lr * WEIGHT_DECAY);
+            w_ref.scale(1.0 - lr * weight_decay);
             w_ref.add_inplace_scaled(&ortho, -lr * scale);
 
             for (a, b) in w.as_slice().iter().zip(w_ref.as_slice()) {

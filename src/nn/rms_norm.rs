@@ -242,7 +242,8 @@ impl NnLayer for RMSNorm {
         self.norm_size
     }
 
-    fn apply_grads(&mut self, lr: f32) {
+    fn apply_grads(&mut self, lr: f32, _weight_decay: f32) {
+        // Norm scale (gamma): never weight-decayed.
         self.grads_gamma.apply_to(&mut self.gamma, lr);
     }
     fn clear_grads(&mut self) {

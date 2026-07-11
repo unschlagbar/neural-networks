@@ -324,13 +324,13 @@ impl NnLayer for MLSTMBlock {
         offset
     }
 
-    fn apply_grads(&mut self, lr: f32) {
-        self.pre_norm1.apply_grads(lr);
-        self.cell.apply_grads(lr);
-        self.pre_norm2.apply_grads(lr);
-        self.lin_gate.apply_grads(lr);
-        self.lin_value.apply_grads(lr);
-        self.lin_down.apply_grads(lr);
+    fn apply_grads(&mut self, lr: f32, weight_decay: f32) {
+        self.pre_norm1.apply_grads(lr, weight_decay);
+        self.cell.apply_grads(lr, weight_decay);
+        self.pre_norm2.apply_grads(lr, weight_decay);
+        self.lin_gate.apply_grads(lr, weight_decay);
+        self.lin_value.apply_grads(lr, weight_decay);
+        self.lin_down.apply_grads(lr, weight_decay);
     }
 
     fn clear_grads(&mut self) {

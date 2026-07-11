@@ -774,7 +774,7 @@ impl NnLayer for MLSTMLayer {
         self.hidden_size
     }
 
-    fn apply_grads(&mut self, lr: f32) {
+    fn apply_grads(&mut self, lr: f32, weight_decay: f32) {
         self.flush_grads();
         self.grads.wo.clip();
         self.grads.wi.clip();
@@ -782,12 +782,12 @@ impl NnLayer for MLSTMLayer {
         self.grads.bo.clip();
         self.grads.bi.clip();
 
-        self.grads.wq.apply_to(&mut self.wq, lr);
-        self.grads.wk.apply_to(&mut self.wk, lr);
-        self.grads.wv.apply_to(&mut self.wv, lr);
-        self.grads.wo.apply_to(&mut self.wo, lr);
-        self.grads.wi.apply_to(&mut self.wi, lr);
-        self.grads.wf.apply_to(&mut self.wf, lr);
+        self.grads.wq.apply_to(&mut self.wq, lr, weight_decay);
+        self.grads.wk.apply_to(&mut self.wk, lr, weight_decay);
+        self.grads.wv.apply_to(&mut self.wv, lr, weight_decay);
+        self.grads.wo.apply_to(&mut self.wo, lr, weight_decay);
+        self.grads.wi.apply_to(&mut self.wi, lr, weight_decay);
+        self.grads.wf.apply_to(&mut self.wf, lr, weight_decay);
 
         self.grads.bq.apply_to(&mut self.bq, lr);
         self.grads.bk.apply_to(&mut self.bk, lr);
@@ -796,7 +796,7 @@ impl NnLayer for MLSTMLayer {
         self.grads.bi.apply_to(&mut self.bi, lr);
         self.grads.bf.apply_to(&mut self.bf, lr);
 
-        self.w_out.apply_grads(lr);
+        self.w_out.apply_grads(lr, weight_decay);
         self.head_norm.apply_grads(lr);
     }
 

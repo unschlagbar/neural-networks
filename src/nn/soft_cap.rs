@@ -102,7 +102,7 @@ impl NnLayer for SoftCapLayer {
     }
 
     // No learnable parameters — all gradient ops are no-ops.
-    fn apply_grads(&mut self, _lr: f32) {}
+    fn apply_grads(&mut self, _lr: f32, _weight_decay: f32) {}
     fn clear_grads(&mut self) {}
     fn add_grads_from(&mut self, _other: &mut dyn NnLayer) {}
     fn copy_weights_from(&mut self, _other: &dyn NnLayer) {}

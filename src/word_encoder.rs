@@ -241,8 +241,8 @@ impl WordEncoder {
         signal
     }
 
-    pub fn sgd_step(&mut self, lr: f32) {
-        self.chars.sgd_step(lr);
+    pub fn sgd_step(&mut self, lr: f32, weight_decay: f32) {
+        self.chars.sgd_step(lr, weight_decay);
         self.pool.mark_dirty();
     }
 

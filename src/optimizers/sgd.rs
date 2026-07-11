@@ -26,7 +26,10 @@ impl GradMatrixOps for SgdGradMatrix {
         }
     }
 
-    fn apply_to(&mut self, weights: &mut Matrix, lr: f32) {
+    fn apply_to(&mut self, weights: &mut Matrix, lr: f32, weight_decay: f32) {
+        if weight_decay != 0.0 {
+            weights.scale(1.0 - lr * weight_decay);
+        }
         sub_in_place(weights, &self.grads, lr);
     }
 

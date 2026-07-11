@@ -29,6 +29,20 @@ pub const EPOCHS: usize = 2;
 pub const SAVE_EVERY: usize = 30;
 pub const LOG_EVERY: usize = 10;
 
+// Per-stack decoupled weight decay (λ), passed at optimizer-step time. `0.0`
+// makes a stack plain Adam; a positive λ makes it AdamW (decoupled decay on the
+// interior projection matrices only — embeddings, logit heads, biases and norm
+// scales are never decayed). This lets the hierarchical character stacks
+// (encoder/decoder) train as Adam while the backbone stays AdamW.
+pub const ENCODER_WEIGHT_DECAY: f32 = 0.0;
+pub const BACKBONE_WEIGHT_DECAY: f32 = crate::optimizers::WEIGHT_DECAY;
+pub const DECODER_WEIGHT_DECAY: f32 = 0.0;
+
+/// Weight decay for the flat (non-hierarchical) model's optimizer step. Kept at
+/// `0.0` to preserve the current plain-Adam behavior; raise it to run the flat
+/// model as AdamW.
+pub const FLAT_WEIGHT_DECAY: f32 = 0.0;
+
 // Sampling
 
 pub const MAX_LEN: usize = 2000;
@@ -37,8 +51,8 @@ pub const TOP_P: f32 = 0.9;
 
 // Modell-Dimensions
 
-pub const CHAR_HIDDEN: usize = 192;
-pub const OUT_HIDDEN: usize = 192;
+pub const CHAR_HIDDEN: usize = 128;
+pub const OUT_HIDDEN: usize = 128;
 pub const WORD_HIDDEN: usize = 384;
 
 /// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).

@@ -186,10 +186,11 @@ impl NnLayer for LinearNBLayer {
         self.weights.cols()
     }
 
-    fn apply_grads(&mut self, lr: f32) {
+    fn apply_grads(&mut self, lr: f32, _weight_decay: f32) {
         self.flush_grads();
         self.grads.weights.clip();
-        self.grads.weights.apply_to(&mut self.weights, lr);
+        // No-bias logit / embedding-like head: never weight-decayed (pass 0.0).
+        self.grads.weights.apply_to(&mut self.weights, lr, 0.0);
     }
 
     // Window seams — fold any partial pending block so callers (drivers,

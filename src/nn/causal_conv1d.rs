@@ -243,10 +243,10 @@ impl NnLayer for CausalConv1dLayer {
         self.channels
     }
 
-    fn apply_grads(&mut self, lr: f32) {
+    fn apply_grads(&mut self, lr: f32, weight_decay: f32) {
         self.dw.clip();
         self.db.clip();
-        self.dw.apply_to(&mut self.weights, lr);
+        self.dw.apply_to(&mut self.weights, lr, weight_decay);
         self.db.apply_to(&mut self.bias, lr);
     }
 

@@ -12,7 +12,7 @@ pub use self::sgd::Sgd;
 pub const WEIGHT_DECAY: f32 = 0.03;
 // Active optimizer. Swap to `Muon` to orthogonalize the 2D hidden-weight updates
 // (embeddings + biases stay on Adam automatically); retune the lr schedule if so.
-pub type Optimizer = Muon;
+pub type Optimizer = Adam;
 
 pub trait OptimizerGradTypes {
     type GradMatrix;
@@ -22,7 +22,13 @@ pub trait OptimizerGradTypes {
 
 pub trait GradMatrixOps {
     fn zeros(rows: usize, cols: usize) -> Self;
-    fn apply_to(&mut self, weights: &mut Matrix, lr: f32);
+    /// Apply the accumulated gradient to `weights`. `weight_decay` is the
+    /// per-step decoupled decay coefficient (λ) for THIS matrix: pass `0.0` to
+    /// get plain Adam (no decay), or a positive λ for AdamW-style decay. This is
+    /// a runtime argument (not the compile-time `WEIGHT_DECAY` constant) so that
+    /// different stacks — e.g. the hierarchical encoder/decoder vs. the backbone
+    /// — can be decayed independently while sharing one optimizer type.
+    fn apply_to(&mut self, weights: &mut Matrix, lr: f32, weight_decay: f32);
     fn clear(&mut self);
     fn clip(&mut self);
     fn matrix(&mut self) -> &mut Matrix;
