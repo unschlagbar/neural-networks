@@ -68,15 +68,30 @@ pub const LOGIT_SOFTCAP: f32 = 30.0;
 /// Number of mLSTM backbone blocks in the hierarchical word model.
 pub const WORD_BLOCKS: usize = 12;
 
-/// GPU mLSTM: recompute the two `[heads, T, T]` decay matrices (D̄, DS) in
-/// backward instead of caching them from forward.
+/// GPU mLSTM: chunk length for the chunkwise formulation, or `0` for the
+/// single-chunk (whole-sequence) form.
 ///
-/// They are the largest tensors in the model — at WORDS_PER_SEQ = 2048 they are
-/// 134 MB *each, per backbone mLSTM block* — and they are a pure function of
-/// `Q·Kᵀ` and a few `[heads, T]` vectors, so backward can rebuild them for one
-/// extra GEMM per block. `true` trades that GEMM for ~1.6 GB at 2048 words;
-/// `false` is the fastest path when the window already fits in VRAM.
-pub const MLSTM_RECOMPUTE: bool = true;
+/// The single-chunk parallel form materializes `[heads, T, T]` matrices, so it is
+/// O(T²) in both time and memory — fine for the encoder/decoder (T = word length,
+/// ≤ MAX_WORD_BYTES) but quadratic exactly where the backbone lives (T = the
+/// window's word count). Chunking splits the sequence into `T/L` chunks of length
+/// `L`, carrying the recurrent state `(C, n, m)` across them: the attention core
+/// is then `[heads, L, L]` per chunk, i.e. O(T·L) — linear in T.
+///
+/// The math is an exact refactoring, not an approximation: the chunk-local
+/// stabilizer `max(max_{j in chunk} logD_tj, fc_t + m_prev)` telescopes to the
+/// single-chunk global row-max, so both paths agree to floating-point tolerance
+/// (`mlstm_chunking_matches_single_chunk` pins this). A cell whose T is already
+/// ≤ L takes the single-chunk path unchanged.
+///
+/// Override at runtime with `MLSTM_CHUNK=<L>` (0 = single-chunk) for A/B runs.
+///
+/// 256 measured fastest on the RTX 4050 at the backbone shape (B=1, d=512, 16
+/// heads): at T=2048 it is 18.9 ms/iter against 63.5 for single-chunk, and the
+/// scaling is linear (T=1024 → 9.3 ms) instead of quadratic. Below ~64 the chunk
+/// loop becomes launch-bound; above ~512 the [L, L] matrices start to dominate
+/// again. `cargo run --release --features cuda --example mlstm_chunk_bench`.
+pub const MLSTM_CHUNK: usize = 256;
 
 /// Append a closing `[W]` end-of-word step to every encoder word and read the
 /// word embedding `e_w` out at that step (the state then knows the word is

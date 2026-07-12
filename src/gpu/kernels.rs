@@ -585,6 +585,118 @@ extern "C" __global__ void mul(float* out, const float* a, const float* b, int n
     if (i < n) out[i] = a[i] * b[i];
 }
 
+// --- mLSTM chunking (inter-chunk state carry; see gpu/mlstm.rs) ------------
+// A chunk is a contiguous T-range [c0, c0+L) of a [BH, T, W] head-major tensor.
+// Within a group g the range is contiguous (g*T*W + c0*W, length L*W), so both
+// directions are plain index math.
+
+// Extract a chunk: out[BH,L,W] = x[BH, c0..c0+L, W].
+extern "C" __global__ void slice_t(const float* x, float* out, int T, int L, int c0,
+                                   int W, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int w = idx % W;
+    int t = (idx / W) % L;
+    int g = idx / (W * L);
+    out[idx] = x[((long)g * T + c0 + t) * W + w];
+}
+
+// Write a chunk back: dst[BH, c0..c0+L, W] = src[BH,L,W]. Chunks partition T, so
+// every destination element is written exactly once — a plain store, not an add.
+extern "C" __global__ void unslice_t(float* dst, const float* src, int T, int L, int c0,
+                                     int W, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int w = idx % W;
+    int t = (idx / W) % L;
+    int g = idx / (W * L);
+    dst[((long)g * T + c0 + t) * W + w] = src[idx];
+}
+
+// The two inter-chunk decay weights, both [BH, L] (fc is the chunk-LOCAL cumsum):
+//   b_t = exp(fc_t + m_prev − m_t)               — scales the carried state into row t
+//   a_j = exp(fc_last − fc_j + ig_j − m_last)    — scales row j into the outgoing state
+// a_j is the last row of D̄ and b_last is the state-decay scalar g, so the
+// end-of-chunk update needs no further exponentials. One thread per (g,t).
+extern "C" __global__ void mlstm_chunk_ab(const float* fc, const float* ig, const float* m,
+                                          const float* m_prev, float* b, float* a,
+                                          int L, int BHL) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= BHL) return;
+    int t = idx % L, g = idx / L;
+    int last = g * L + L - 1;
+    b[idx] = expf(fc[idx] + m_prev[g] - m[idx]);
+    a[idx] = expf(fc[last] - fc[idx] + ig[idx] - m[last]);
+}
+
+// out[i] = s[i/W] · x[i] — scale each row of a [·, W] tensor by a per-row scalar.
+extern "C" __global__ void mul_rows(float* out, const float* x, const float* s,
+                                    int W, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) out[i] = s[i / W] * x[i];
+}
+
+// out[i] += s[i/W] · x[i]. Used both for row scaling (W = dhv) and for the
+// per-head state decay dst += g[head]·src (W = the head's element count).
+extern "C" __global__ void mul_rows_add(float* out, const float* x, const float* s,
+                                        int W, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) out[i] += s[i / W] * x[i];
+}
+
+// ψ = max(|qn|, 1), recomputed once the inter-chunk term has been added into qn
+// (the single-chunk path gets ψ straight out of `mlstm_ds`).
+extern "C" __global__ void psi_from_qn(const float* qn, float* psi, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) psi[i] = fmaxf(fabsf(qn[i]), 1.0f);
+}
+
+// out[r] += Σ_w x[r,W+w]·y[r,W+w] — row-wise dot of two [R, W] tensors.
+extern "C" __global__ void row_dot_add(float* out, const float* x, const float* y,
+                                       int W, int R) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= R) return;
+    long base = (long)r * W;
+    float acc = 0.0f;
+    for (int w = 0; w < W; ++w) acc += x[base + w] * y[base + w];
+    out[r] += acc;
+}
+
+// out[g] += Σ_e x[g,e]·y[g,e] — the per-head reduction behind dg (E = dhv·dqk for
+// the C state, dqk for n).
+extern "C" __global__ void group_dot_add(float* out, const float* x, const float* y,
+                                         int E, int G) {
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= G) return;
+    long base = (long)g * E;
+    float acc = 0.0f;
+    for (int e = 0; e < E; ++e) acc += x[base + e] * y[base + e];
+    out[g] += acc;
+}
+
+// Backward of `mlstm_chunk_ab`, ACCUMULATING into the dfc/dig that `mlstm_dfc_dig`
+// already wrote from the intra-chunk D̄ (m held const, as everywhere):
+//   b_t = exp(fc_t + m_prev − m_t)            → dfc_t += db_t·b_t
+//   a_j = exp(fc_last − fc_j + ig_j − m_last) → Pa_j = da_j·a_j;
+//                                               dig_j += Pa_j; dfc_j −= Pa_j;
+//                                               dfc_last += Σ_j Pa_j
+// The Σ_j term lands on the last row, so the thread that owns it also runs the
+// (serial, L-long) reduction — no cross-thread race on dfc[last].
+extern "C" __global__ void mlstm_chunk_ab_bwd(const float* db, const float* da,
+                                              const float* b, const float* a,
+                                              float* dfc, float* dig, int L, int BHL) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= BHL) return;
+    int t = idx % L, g = idx / L;
+    float pa = da[idx] * a[idx];
+    float acc = db[idx] * b[idx] - pa;
+    dig[idx] += pa;
+    if (t == L - 1) {
+        for (int j = 0; j < L; ++j) acc += da[g * L + j] * a[g * L + j];
+    }
+    dfc[idx] += acc;
+}
+
 // --- hierarchical model ----------------------------------------------------
 // Copy rows of `src` into arbitrary rows of `dst`: dst[row_ids[i], :] = src[i, :].
 // The inverse (gathering those rows back out) is just `embedding_gather` with the
@@ -762,6 +874,15 @@ const NAMES: &[&str] = &[
     "mlstm_ds",
     "div_rows",
     "mul",
+    "slice_t",
+    "unslice_t",
+    "mlstm_chunk_ab",
+    "mul_rows",
+    "mul_rows_add",
+    "psi_from_qn",
+    "row_dot_add",
+    "group_dot_add",
+    "mlstm_chunk_ab_bwd",
     "ogate_bwd",
     "div_rows_bwd",
     "mlstm_ds_bwd",

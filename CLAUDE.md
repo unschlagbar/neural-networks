@@ -82,12 +82,20 @@ A device-resident port of the `nn2` stack (see `PLAN-gpu.md`): `DTensor` (reside
 device buffer), cuBLAS GEMM + ~21 NVRTC kernels, and layers `Linear`, `RmsNorm`,
 `SLstm`, `MLstm`, `Block<Cell>`, `Lm`, `Hierarchical`. Every layer is parity-tested
 against its `nn2` twin (`cargo test --features cuda gpu::`). The mLSTM uses the
-**parallel/attention** formulation, not the scalar recurrence — O(T²) in sequence
-length but ~128x faster than the CPU cell. `gpu::Hierarchical` checkpoints to the
-`GHIR` format (config header + every param in `params_mut` order); weights only,
-so a resumed run restarts the Adam moments.
+**chunkwise parallel/attention** formulation, not the scalar recurrence (~128x
+faster than the CPU cell): the sequence is cut into chunks of `config::MLSTM_CHUNK`
+(256), each an attention-style `[heads, L, L]` block, with the stabilized recurrent
+state `(C, n, m)` carried across boundaries — O(T·L), linear in T, where the
+single-chunk form was O(T²). It is an exact refactoring, not an approximation (the
+chunk-local row-max telescopes to the global one), so both paths agree to fp
+tolerance; `MLSTM_CHUNK=0` restores the single-chunk path for A/B benchmarking and
+`mlstm_chunking_matches_single_chunk` pins the two together. A sequence shorter
+than one chunk (the encoder/decoder, where T is a word length) takes the
+single-chunk path unchanged. `gpu::Hierarchical` checkpoints to the `GHIR` format
+(config header + every param in `params_mut` order); weights only, so a resumed run
+restarts the Adam moments.
 
-**VRAM.** Two things dominate a window and both have a knob:
+**VRAM.** Word batching is what dominates a window, and it has a knob:
 - *Word batching.* The encoder/decoder run words as `[words, tmax]` rectangles and
   `tmax` is the longest word in the group, so a single 16-byte word would pad every
   2-byte word (~4.5x waste on Rust source). `group_by_len` splits a window's words
@@ -98,9 +106,15 @@ so a resumed run restarts the Adam moments.
   checkpointing), so only one group is ever resident. `gpu::hierarchical`'s
   `grouping_matches_single_rectangle` pins this to be numerically identical to the
   unsplit path, and `GPU_NO_GROUP=1` restores that path for A/B benchmarking.
-- *Backbone decay matrices.* `config::MLSTM_RECOMPUTE` (default on) drops the two
-  `[heads, T, T]` matrices (134 MB **each, per mLSTM block** at 2048 words) and
-  rebuilds them in backward from one GEMM. Off = faster when it already fits.
+The backbone's decay matrices used to be the other one — `[heads, T, T]`, 134 MB
+each per mLSTM block at 2048 words — and were recomputed in backward behind an
+`MLSTM_RECOMPUTE` flag to claw that back. Chunking shrank them to `[heads, L, L]`
+per chunk (~64 MB across the whole backbone), so the flag was **removed**: forward
+just keeps them and backward skips the rebuild GEMM.
+
+`cargo run --release --features cuda --example mlstm_chunk_bench` sweeps the cell in
+T and reports ms/iter + VRAM (honors `MLSTM_CHUNK`); it is how the 256 default was
+picked.
 
 `GPU_PROF=1` prints per-phase timings; `GPU_MEM=1` adds device memory in use after
 each phase. `cargo run --release --features cuda --example gpu_fit -- <corpus> [words]`

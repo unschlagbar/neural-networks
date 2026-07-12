@@ -207,11 +207,10 @@ fresh outputs per call.
 functionally complete: `gpu::Lm` is a real, fully device-resident language model
 with a recurrent core (sLSTM + mLSTM blocks), trainable end to end.
 
-**Next (laptop): `cargo test --features cuda gpu:: -- --nocapture`** — verifies the
-mLSTM cell, both block flavours and the whole LM against their CPU twins. Then:
-benchmark a real training step (`cargo run --release --features cuda --example
-gpu_bench`), and the one remaining optimization, **Phase C step 4: chunking (O(T))**
-— a scaling win, not a correctness gap.
+**Phase C is complete as of 2026-07-12** — including step 4 (chunking, O(T)), done
+and verified on hardware. `cargo test --features cuda gpu::` (24 tests) verifies the
+mLSTM cell (single-chunk AND chunked), both block flavours and the whole LM against
+their CPU twins.
 
 ### Orientation (what already exists to build on)
 
@@ -341,12 +340,40 @@ end-of-chunk update `C_L = exp(fc_L+m_prev-m_L)·C_prev + (Vscaled)ᵀ·K` with
    CPU backward is itself FD-verified so GPU-vs-CPU is the tighter check.
    `impl Cell for gpu::MLstm` added. mLSTM row added to `gpu_bench.rs` (scalar CPU
    vs parallel GPU, ms/iter). **← laptop: run `cargo test --features cuda gpu::mlstm`.**
-4. **Chunking** (L < T, inter-chunk state carry) for O(T) + long sequences; the
-   serial loop is over `T/L` chunks only. Re-check parity. **← the remaining step.**
-   Needs: carry `C[BH,dhv,dqk]`, `n[BH,dqk]`, `m[BH]` across chunks; the inter
-   terms `exp(fc_t+m_prev−m_t)·(C_prev·q_t)` / `(q_t·n_prev)` added into num/qn;
-   end-of-chunk `C_L,n_L` update via a `matmul_batched_tn` of `D̄`-scaled V/K; and
-   the matching backward through the carried state (BPTT over chunks).
+4. ~~**Chunking** (L < T, inter-chunk state carry) for O(T) + long sequences~~
+   **DONE (2026-07-12, laptop, on hardware).** `config::MLSTM_CHUNK` (default 256,
+   `MLSTM_CHUNK=<L>` env override, 0 = single-chunk) + 10 kernels (`slice_t`,
+   `unslice_t`, `mlstm_chunk_ab`, `mul_rows`, `mul_rows_add`, `psi_from_qn`,
+   `row_dot_add`, `group_dot_add`, `mlstm_chunk_ab_bwd`). Forward carries
+   `C[BH,dhv,dqk]`, `n[BH,1,dqk]`, `m[BH]`; backward sweeps chunks in reverse
+   carrying `dC`/`dn` (BPTT over chunks, parallel form within each).
+
+   Two things fell out of the derivation and made it much easier than feared:
+   - **`fc` must be the chunk-LOCAL cumsum.** Then the existing `mlstm_rowmax_m`'s
+     `fc_t + m_prev` branch (written for exactly this and previously fed a zero
+     `m_prev`) makes the chunk-local row-max telescope to the *global* one — so
+     chunking is an exact refactoring, not an approximation, and chunked vs
+     single-chunk agree to fp tolerance in forward AND backward.
+   - **`a_j` is just the last row of D̄, and `g` is `b_last`** — the end-of-chunk
+     state update needs no new exponentials.
+
+   Parity: `mlstm_chunking_matches_single_chunk` (L ∈ {1,3,8,16,32} incl. a short
+   final chunk, vs the single-chunk path, 2e-6 on the weight update) and
+   `mlstm_chunked_matches_cpu` (multi-chunk vs the CPU scalar recurrence).
+
+   **Measured (RTX 4050, B=1 d=512 16 heads, fwd+bwd ms/iter):**
+
+   | T | single-chunk | L=256 | |
+   |---|---|---|---|
+   | 512 | 5.08 | 4.69 | |
+   | 1024 | 17.32 | 9.31 | |
+   | 2048 | 63.53 | **18.90** | **3.4x**, and linear in T (was quadratic) |
+
+   End-to-end (`gpu_fit`, worst window of political_speeches.xml, 1236 words) the
+   step is only ~4% faster — the mLSTM blocks are ~20 ms of a ~550 ms window, which
+   the sLSTM backbone blocks and the encoder/decoder phases dominate. The real
+   end-to-end win is **VRAM: peak 3132 → 2332 MB (−26%)**, which is headroom for a
+   longer `WORDS_PER_SEQ` (the whole point of O(T)).
 5. ~~`gpu::Block<MLstm>` vs `nn2::MLstmBlock`~~ **DONE (blind).** Parity test
    `mlstm_block_matches_cpu`. Added `BlockLike` (type-erased `Block`, so a model can
    hold a heterogeneous `Vec<Box<dyn BlockLike>>`) and `from_cpu` uploaders:
@@ -354,10 +381,9 @@ end-of-chunk update `C_L = exp(fc_L+m_prev-m_L)·C_prev + (Vscaled)ᵀ·K` with
    `Block::<MLstm>::from_cpu` (useful beyond tests — loading a trained CPU model
    onto the GPU).
 
-**Milestone C reached (blind):** `gpu::MLstm` single-chunk parity vs `nn2::MLstm`
-**and** `gpu::Block<MLstm>` vs `nn2::MLstmBlock`. Only remaining Phase-C item is
-**step 4, chunking (O(T))** — a scaling optimization, *not* a correctness
-prerequisite: the single-chunk cell is already a complete, trainable mLSTM.
+**Milestone C COMPLETE (2026-07-12, on hardware):** `gpu::MLstm` parity vs
+`nn2::MLstm` in both the single-chunk and the chunked form, `gpu::Block<MLstm>` vs
+`nn2::MLstmBlock`, and step 4 (chunking → O(T)) landed and benchmarked.
 
 ### Phase D — assemble the real GPU LM + retire the flat toy
 

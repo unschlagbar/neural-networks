@@ -810,6 +810,135 @@ pub fn mlstm_ds(gpu: &Gpu, s: &DTensor, fc: &DTensor, ig: &DTensor, m: &DTensor)
     (dbar, ds, qn, psi)
 }
 
+// ---------------------------------------------------------------------------
+// mLSTM chunking (inter-chunk state carry; see gpu/mlstm.rs).
+// ---------------------------------------------------------------------------
+
+/// Extract the T-range `[c0, c0+len)` of a head-major `[BH, T, W]` tensor.
+pub fn slice_t(gpu: &Gpu, x: &DTensor, c0: usize, len: usize) -> DTensor {
+    let (bh, t, w) = (x.shape[0], x.shape[1], x.shape[2]);
+    assert!(c0 + len <= t, "slice_t: chunk [{c0}, {}) out of range T={t}", c0 + len);
+    let mut out = DTensor::uninit(gpu, &[bh, len, w]);
+    let total = bh * len * w;
+    let (ti, li, c0i, wi, total_i) = (t as i32, len as i32, c0 as i32, w as i32, total as i32);
+    let f = gpu.kernels.get("slice_t");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&x.buf).arg(&mut out.buf).arg(&ti).arg(&li).arg(&c0i).arg(&wi).arg(&total_i);
+    unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("slice_t");
+    out
+}
+
+/// Write `src` `[BH, len, W]` back into the T-range `[c0, c0+len)` of `dst`
+/// `[BH, T, W]`. Chunks partition T, so this is a store, not an accumulate.
+pub fn unslice_t(gpu: &Gpu, dst: &mut DTensor, src: &DTensor, c0: usize) {
+    let (bh, t, w) = (dst.shape[0], dst.shape[1], dst.shape[2]);
+    let len = src.shape[1];
+    assert!(c0 + len <= t, "unslice_t: chunk [{c0}, {}) out of range T={t}", c0 + len);
+    let total = bh * len * w;
+    let (ti, li, c0i, wi, total_i) = (t as i32, len as i32, c0 as i32, w as i32, total as i32);
+    let f = gpu.kernels.get("unslice_t");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut dst.buf).arg(&src.buf).arg(&ti).arg(&li).arg(&c0i).arg(&wi).arg(&total_i);
+    unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("unslice_t");
+}
+
+/// The chunk's two inter-chunk decay weight vectors, both `[BH, L]`:
+/// `b_t = exp(fc_t + m_prev − m_t)` (carried state → row t) and
+/// `a_j = exp(fc_last − fc_j + ig_j − m_last)` (row j → outgoing state).
+pub fn mlstm_chunk_ab(gpu: &Gpu, fc: &DTensor, ig: &DTensor, m: &DTensor, m_prev: &DTensor)
+    -> (DTensor, DTensor) {
+    let (bh, l) = (fc.rows(), fc.cols());
+    let mut b = DTensor::uninit(gpu, &[bh, l]);
+    let mut a = DTensor::uninit(gpu, &[bh, l]);
+    let (li, bhl) = (l as i32, (bh * l) as i32);
+    let f = gpu.kernels.get("mlstm_chunk_ab");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&fc.buf).arg(&ig.buf).arg(&m.buf).arg(&m_prev.buf)
+        .arg(&mut b.buf).arg(&mut a.buf).arg(&li).arg(&bhl);
+    unsafe { lb.launch(LaunchConfig::for_num_elems((bh * l) as u32)) }.expect("mlstm_chunk_ab");
+    (b, a)
+}
+
+/// `out = s ⊙ x` broadcast over the trailing width `w`: `out[i] = s[i/w]·x[i]`.
+pub fn mul_rows(gpu: &Gpu, x: &DTensor, s: &DTensor, w: usize) -> DTensor {
+    let total = x.len();
+    assert_eq!(total, s.len() * w, "mul_rows: {total} != {} · {w}", s.len());
+    let mut out = DTensor::uninit(gpu, x.dims());
+    let (wi, total_i) = (w as i32, total as i32);
+    let f = gpu.kernels.get("mul_rows");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut out.buf).arg(&x.buf).arg(&s.buf).arg(&wi).arg(&total_i);
+    unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("mul_rows");
+    out
+}
+
+/// `out += s ⊙ x` broadcast over the trailing width `w`. Doubles as the per-head
+/// state decay (`C += g[head]·C_prev`, with `w` = the head's element count).
+pub fn mul_rows_add(gpu: &Gpu, out: &mut DTensor, x: &DTensor, s: &DTensor, w: usize) {
+    let total = x.len();
+    assert_eq!(total, out.len(), "mul_rows_add: out/x length mismatch");
+    assert_eq!(total, s.len() * w, "mul_rows_add: {total} != {} · {w}", s.len());
+    let (wi, total_i) = (w as i32, total as i32);
+    let f = gpu.kernels.get("mul_rows_add");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut out.buf).arg(&x.buf).arg(&s.buf).arg(&wi).arg(&total_i);
+    unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("mul_rows_add");
+}
+
+/// `ψ = max(|qn|, 1)` — needed once the inter-chunk term has been folded into `qn`.
+pub fn psi_from_qn(gpu: &Gpu, qn: &DTensor) -> DTensor {
+    let n = qn.len();
+    let n_i = n as i32;
+    let mut psi = DTensor::uninit(gpu, qn.dims());
+    let f = gpu.kernels.get("psi_from_qn");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&qn.buf).arg(&mut psi.buf).arg(&n_i);
+    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("psi_from_qn");
+    psi
+}
+
+/// `out[r] += Σ_w x[r,w]·y[r,w]` for `[R, W]` operands (`out` is `[R]`).
+pub fn row_dot_add(gpu: &Gpu, out: &mut DTensor, x: &DTensor, y: &DTensor, w: usize) {
+    let r = out.len();
+    assert_eq!(x.len(), r * w, "row_dot_add: x length mismatch");
+    assert_eq!(y.len(), r * w, "row_dot_add: y length mismatch");
+    let (wi, ri) = (w as i32, r as i32);
+    let f = gpu.kernels.get("row_dot_add");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut out.buf).arg(&x.buf).arg(&y.buf).arg(&wi).arg(&ri);
+    unsafe { lb.launch(LaunchConfig::for_num_elems(r as u32)) }.expect("row_dot_add");
+}
+
+/// `out[g] += Σ_e x[g,e]·y[g,e]` for `[G, E]` operands (`out` is `[G]`) — the
+/// per-head reduction behind `dg`.
+pub fn group_dot_add(gpu: &Gpu, out: &mut DTensor, x: &DTensor, y: &DTensor) {
+    let g = out.len();
+    let e = x.len() / g;
+    assert_eq!(x.len(), y.len(), "group_dot_add: x/y length mismatch");
+    assert_eq!(x.len(), g * e, "group_dot_add: not divisible by group count");
+    let (ei, gi) = (e as i32, g as i32);
+    let f = gpu.kernels.get("group_dot_add");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut out.buf).arg(&x.buf).arg(&y.buf).arg(&ei).arg(&gi);
+    unsafe { lb.launch(LaunchConfig::for_num_elems(g as u32)) }.expect("group_dot_add");
+}
+
+/// Backward of [`mlstm_chunk_ab`], accumulating into the `dfc`/`dig` that
+/// [`mlstm_dfc_dig`] already wrote from the intra-chunk D̄.
+pub fn mlstm_chunk_ab_bwd(
+    gpu: &Gpu, db: &DTensor, da: &DTensor, b: &DTensor, a: &DTensor,
+    dfc: &mut DTensor, dig: &mut DTensor,
+) {
+    let (bh, l) = (b.rows(), b.cols());
+    let (li, bhl) = (l as i32, (bh * l) as i32);
+    let f = gpu.kernels.get("mlstm_chunk_ab_bwd");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&db.buf).arg(&da.buf).arg(&b.buf).arg(&a.buf)
+        .arg(&mut dfc.buf).arg(&mut dig.buf).arg(&li).arg(&bhl);
+    unsafe { lb.launch(LaunchConfig::for_num_elems((bh * l) as u32)) }
+        .expect("mlstm_chunk_ab_bwd");
+}
+
 /// Copy rows of `src` into arbitrary rows of `dst`: `dst[row_ids[i]] = src[i]`.
 /// The inverse (pulling those rows back out) is [`embedding_gather`] with the same
 /// row ids, treating the matrix as the "table".
