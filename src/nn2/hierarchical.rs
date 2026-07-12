@@ -6,14 +6,18 @@
 //! while the backbone is a single sequence over the words carrying recurrent
 //! state across them.
 //!
-//!   1. encoder   — per word, `Embedding → sLSTM block×N → RMSNorm`, read out
-//!                  `e_w` at the closing `[W]` step.
-//!   2. backbone  — `Linear → (sLSTM/mLSTM block)×N → RMSNorm → Linear`,
-//!                  autoregress over `e_w`; output `o_w` = context for word w+1.
+//!   1. encoder   — per word, `Embedding → sLSTM block×N`, read out `e_w` at the
+//!                  closing `[W]` step.
+//!   2. backbone  — `Linear → (sLSTM/mLSTM block)×N → Linear`, autoregress over
+//!                  `e_w`; output `o_w` = context for word w+1.
 //!   3. decoder   — per word, first step is the injected backbone context `o`
 //!                  (BOS slot), later steps feed the previous char via the
 //!                  **tied** encoder char table; `sLSTM block×N → RMSNorm →
 //!                  Linear head → SoftCap`, predicting the word's chars + `[W]`.
+//!
+//! Norm placement matches `model.rs::build_hierarchical_model`: the decoder's
+//! pre-head RMSNorm is the **only** stage-level norm (the blocks keep their own
+//! internal pre/post norms). Encoder and backbone have none.
 //!
 //! Words are end-padded to the batch's max length; the recurrence is causal and
 //! readout/loss are masked, so padding never corrupts a valid position.
@@ -58,10 +62,9 @@ pub struct Hierarchical {
     pub char_embed: Embedding, // [vocab, HC], tied between encoder and decoder
     pub encoder: WordEncoder,
 
-    pub bb_front: Linear,        // HC → WH
+    pub bb_front: Linear,         // HC → WH
     pub bb_blocks: Vec<AnyBlock>, // WH
-    pub bb_norm: RmsNorm,        // WH
-    pub bb_back: Linear,         // WH → HC (context)
+    pub bb_back: Linear,          // WH → HC (context)
 
     pub dec_blocks: Vec<SLstmBlock>, // HC
     pub dec_norm: RmsNorm,           // HC
@@ -108,7 +111,6 @@ impl Hierarchical {
             encoder: WordEncoder::new(c.hc, c.up, c.enc_blocks),
             bb_front: Linear::new(c.hc, c.wh),
             bb_blocks,
-            bb_norm: RmsNorm::new(c.wh),
             bb_back: Linear::new(c.wh, c.hc),
             dec_blocks: (0..c.dec_blocks).map(|_| SLstmBlock::new_slstm(c.hc, c.up)).collect(),
             dec_norm: RmsNorm::new(c.hc),
@@ -161,8 +163,7 @@ impl Hierarchical {
         for blk in &mut self.bb_blocks {
             h = blk.forward(&h);
         }
-        let hn = self.bb_norm.forward(&h.reshape(&[dw, wh]));
-        let o = self.bb_back.forward(&hn); // [dw, HC]  o[w] decodes word w+1
+        let o = self.bb_back.forward(&h.reshape(&[dw, wh])); // [dw, HC]  o[w] decodes word w+1
 
         // ---- PHASE 3: DECODER ----------------------------------------------
         // Word w's decode target is word w+1. Slot 0 = o[w]; slot k = embed(prev char).
@@ -236,8 +237,7 @@ impl Hierarchical {
 
         // Backbone backward.
         let d_hn = self.bb_back.backward(&d_o);
-        let d_h2 = self.bb_norm.backward(&d_hn);
-        let mut d_h = d_h2.reshape(&[1, dw, wh]);
+        let mut d_h = d_hn.reshape(&[1, dw, wh]);
         for blk in self.bb_blocks.iter_mut().rev() {
             d_h = blk.backward(&d_h);
         }
@@ -257,7 +257,6 @@ impl Hierarchical {
         for blk in &mut self.bb_blocks {
             blk.step(cfg);
         }
-        self.bb_norm.step(cfg);
         self.bb_back.step(cfg);
         for blk in &mut self.dec_blocks {
             blk.step(cfg);

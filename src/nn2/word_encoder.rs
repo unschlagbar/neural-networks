@@ -5,20 +5,23 @@
 //! here they are simply the leading batch dimension). Each word is a padded
 //! char-plus-`[W]` sequence `[W_count, T, Hc]` that has already been embedded by
 //! the caller (the char table is tied with the decoder and owned by
-//! `Hierarchical`). The stack is `sLSTM block × N → RMSNorm`; `e_w` for word `w`
-//! is read out at that word's closing `[W]` step (`readout[w]`), so the state
-//! has seen the whole word and knows it is complete.
+//! `Hierarchical`). The stack is `sLSTM block × N`; `e_w` for word `w` is read out
+//! at that word's closing `[W]` step (`readout[w]`), so the state has seen the
+//! whole word and knows it is complete.
+//!
+//! No trailing norm: the real model (`model.rs::build_hierarchical_model`) ends
+//! the encoder at the last `slstm_block`. The only RMSNorm in the whole
+//! hierarchical stack is the decoder's, right before the logit head.
 //!
 //! Words encode independently — the recurrent cells reset state per sequence
 //! (i.e. per word) at the start of each block forward.
 
+use crate::nn2::SLstmBlock;
 use crate::nn2::optim::AdamCfg;
-use crate::nn2::{RmsNorm, SLstmBlock};
 use crate::tensor::Tensor;
 
 pub struct WordEncoder {
     pub blocks: Vec<SLstmBlock>,
-    pub norm: RmsNorm,
     hc: usize,
     // Saved for backward.
     dims: (usize, usize), // (W_count, T)
@@ -29,7 +32,6 @@ impl WordEncoder {
     pub fn new(hc: usize, up: usize, n_blocks: usize) -> Self {
         Self {
             blocks: (0..n_blocks).map(|_| SLstmBlock::new_slstm(hc, up)).collect(),
-            norm: RmsNorm::new(hc),
             hc,
             dims: (0, 0),
             readout: Vec::new(),
@@ -51,13 +53,12 @@ impl WordEncoder {
         for blk in &mut self.blocks {
             h = blk.forward(&h);
         }
-        let hn = self.norm.forward(&h.reshape(&[w * t, hc])); // [W*T, Hc]
 
         // Gather e_w at each word's [W] step.
         let mut e_w = Tensor::zeros(&[w, hc]);
         for wi in 0..w {
             let src = (wi * t + readout[wi]) * hc;
-            e_w.data[wi * hc..(wi + 1) * hc].copy_from_slice(&hn.data[src..src + hc]);
+            e_w.data[wi * hc..(wi + 1) * hc].copy_from_slice(&h.data[src..src + hc]);
         }
         e_w
     }
@@ -70,14 +71,12 @@ impl WordEncoder {
         assert_eq!(d_e_w.rows(), w, "WordEncoder::backward — word count mismatch");
 
         // Scatter d_e_w back to the [W]-step rows; all other rows have zero grad.
-        let mut d_hn = Tensor::zeros(&[w * t, hc]);
+        let mut d_h = Tensor::zeros(&[w, t, hc]);
         for wi in 0..w {
             let dst = (wi * t + self.readout[wi]) * hc;
-            d_hn.data[dst..dst + hc].copy_from_slice(&d_e_w.data[wi * hc..(wi + 1) * hc]);
+            d_h.data[dst..dst + hc].copy_from_slice(&d_e_w.data[wi * hc..(wi + 1) * hc]);
         }
 
-        let d_h_flat = self.norm.backward(&d_hn); // [W*T, Hc]
-        let mut d_h = d_h_flat.reshape(&[w, t, hc]);
         for blk in self.blocks.iter_mut().rev() {
             d_h = blk.backward(&d_h);
         }
@@ -88,14 +87,12 @@ impl WordEncoder {
         for blk in &mut self.blocks {
             blk.zero_grad();
         }
-        self.norm.zero_grad();
     }
 
     pub fn step(&mut self, cfg: &AdamCfg) {
         for blk in &mut self.blocks {
             blk.step(cfg);
         }
-        self.norm.step(cfg);
     }
 }
 

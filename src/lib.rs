@@ -4,6 +4,8 @@ pub mod hierarchical;
 pub mod inspect;
 pub mod loading;
 pub mod model;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod nn;
 pub mod nn2;
 pub mod nn_layer;
@@ -38,6 +40,8 @@ pub fn run() {
     match cmd {
         "" => training::train_normal(&read_model_path("models/seq")),
         "h" => training::train_hierarchical(&read_model_path("models/fix_bi")),
+        #[cfg(feature = "cuda")]
+        "hg" => gpu::train::train_hierarchical_gpu(&read_model_path("models/hier_gpu")),
         "hp" => training::probe_hierarchical(&read_model_path("models/fix_bi")),
         "hv" => training::validate_hierarchical(&read_model_path("models/fix_bi")),
         "ht" => training::trace_hierarchical(&read_model_path("models/fix_bi")),
@@ -51,6 +55,7 @@ pub fn run() {
             eprintln!(
                 "Unknown mode {other:?}. Modes: '' train_normal | 'h' train_hierarchical | \
                  'hv' validate_hierarchical | \
+                 'hg' train_hierarchical on GPU | \
                  's' sample_normal | 'hs' sample_hierarchical | 'i' inspect model | \
                  'wr' record wake-word samples | 'wt' train wake-word | 'w' run detector",
             );

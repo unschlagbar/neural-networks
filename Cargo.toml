@@ -19,9 +19,29 @@ harness = false
 [dev-dependencies]
 criterion = "0.8.2"
 
+[features]
+# Optional CUDA backend. Off by default so the CPU build (the always-available
+# reference / FD-test oracle) keeps building on machines without a toolkit.
+# Enable with `cargo build --features cuda` on the box that has the RTX GPU.
+cuda = ["dep:cudarc"]
+default = ["cuda"]
+
 [dependencies]
 iron_oxide = { path = "../iron_oxide", default-features = false }
 rand = "0.10.0"
 rayon = "1.11"
 cpal = "0.18.1"
 hound = "3"
+# NVRTC (runtime kernel compilation) + driver API + cuBLAS. `dynamic-loading`
+# dlopen's the libs at runtime so the build doesn't hard-link a fixed CUDA
+# version; the toolkit version is detected from the installed toolchain.
+# Pin cuda-13000 bindings: cudarc 0.17.8's auto-detect doesn't recognise the
+# installed 13.3 toolkit, but the 13.0 API surface is what we use and, with
+# `dynamic-loading`, the real 13.3 .so's are dlopen'd at runtime regardless.
+cudarc = { version = "0.17", default-features = false, features = [
+    "cuda-13000",
+    "driver",
+    "nvrtc",
+    "cublas",
+    "dynamic-loading",
+], optional = true }

@@ -43,7 +43,8 @@ pub fn build_hierarchical_model(
     boundary_token_ids: Vec<u16>,
     tokenizer: Rc<Tokenizer>,
 ) -> Hierarchical {
-    // The trailing RMSNorm keeps e_w at a stable scale for the backbone.
+    // No trailing norm: the decoder's pre-head RMSNorm is the only stage-level
+    // norm in the whole hierarchical stack (the blocks keep their internal ones).
     let encoder = SequentialBuilder::new(vocab)
         .embedding(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)

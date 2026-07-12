@@ -27,7 +27,8 @@ The binary reads one line from stdin to select its mode:
 | Input | Action |
 |-------|--------|
 | *(empty)* | `train_normal` — trains the flat mLSTM model |
-| `h` | `train_hierarchical` — trains the three-part hierarchical model |
+| `h` | `train_hierarchical` — trains the three-part hierarchical model (CPU) |
+| `hg` | `train_hierarchical_gpu` — same model, trained on the GPU (needs `--features cuda`); checkpoints to `models/hier_gpu` as a `GHIR` blob |
 | `s` | `sample_normal` — interactive sampling from the flat model |
 | `hs` | `sample_hierarchical` — interactive sampling from the hierarchical model |
 | `i` | `inspect_model` — prompts for a model name, looks it up in `models/` and prints all layers with their settings |
@@ -51,8 +52,8 @@ All comments need to be in englisch not in german
 
 `Hierarchical` (HAT-style, arXiv 2501.10322) couples three stages:
 
-- **encoder** (`WordEncoder`) — a normal forward-only `Sequential` (`Embedding → sLSTMBlock × 2 → RMSNorm`) over the characters of one word plus a closing `[W]` end-of-word step (fed virtually — token slices never contain it); the word embedding `e_w` is the output at the `[W]` step. State is reset per word.
-- **word_model** (backbone) — `Linear → alternating sLSTM/mLSTM blocks × WORD_BLOCKS → RMSNorm → Linear` — autoregresses over word embeddings, carrying recurrent state across words; its output is the context for decoding the *next* word.
+- **encoder** (`WordEncoder`) — a normal forward-only `Sequential` (`Embedding → sLSTMBlock × 2`) over the characters of one word plus a closing `[W]` end-of-word step (fed virtually — token slices never contain it); the word embedding `e_w` is the output at the `[W]` step. State is reset per word.
+- **word_model** (backbone) — `Linear → alternating sLSTM/mLSTM blocks × WORD_BLOCKS → Linear` — autoregresses over word embeddings, carrying recurrent state across words; its output is the context for decoding the *next* word.
 - **char2_model** (decoder) — `sLSTMBlock × 2 → RMSNorm → LinearNoBias → SoftCap`, input width OUT_HIDDEN — the decoder has no front layer; `Hierarchical` builds its inputs itself (paper eq. 3–4): a word's **first sequence step is the injected backbone context** (it takes the BOS slot), every later step feeds the previous char through the **encoder's char embedding** (tied table — requires CHAR_HIDDEN == OUT_HIDDEN; decoder-side embedding grads are reduced back into the encoder's table in `backwards_sequence`). Predicts the word's chars plus a trailing `[W]` (EOS). Reset per word.
 
 Optimizer assignment convention: interior projections use `linear`/`Linear` (Muon, weight-decayed); `linear_no_bias` and the embedding layers train on plain Adam without decay and are reserved for embedding-like tables and logit heads — putting hidden projections on the Adam path causes unbounded weight growth over long runs. The decoder's logit head is additionally followed by `SoftCap` (`src/nn/soft_cap.rs`, tag 17, `LOGIT_SOFTCAP = 30` like xLSTM-7B): `logits = cap·tanh(z/cap)` bounds the logits so the undecayed Adam head has no incentive to grow without limit.
@@ -72,6 +73,17 @@ Character-level tokenizer built from `charset.txt`. Special tokens `<SPACE2>`, `
 ### Dataset (`src/batches.rs`)
 
 Both training modes stream `DATA_FILE` (single file with `<|endoftext|>` document separators) through `ChunkedWordDataSet`: it reads `CHUNK_BYTES` of raw text at a time, cuts at the last complete document (the partial tail is carried into the next chunk), and tokenizes + word-windows each chunk into a `WordChunk`. Windows never cross document borders, so a streamed epoch yields exactly the windows a whole-file load would — but peak memory is bounded by `CHUNK_BYTES`, not corpus size (>1 GB corpora stream fine). Training loops call `rewind()` per epoch and grow the model cache on demand when a chunk's `max_window_tokens()` exceeds the current size; `count_windows()` does a cheap counting pass for resume arithmetic. `PreparedDataSet` (token-window loading from `DATA_DIR`) still exists but is currently unused by training.
+
+### GPU backend (`src/gpu/`, feature `cuda`, default-off)
+
+A device-resident port of the `nn2` stack (see `PLAN-gpu.md`): `DTensor` (resident
+device buffer), cuBLAS GEMM + ~21 NVRTC kernels, and layers `Linear`, `RmsNorm`,
+`SLstm`, `MLstm`, `Block<Cell>`, `Lm`, `Hierarchical`. Every layer is parity-tested
+against its `nn2` twin (`cargo test --features cuda gpu::`). The mLSTM uses the
+**parallel/attention** formulation, not the scalar recurrence — O(T²) in sequence
+length but ~128x faster than the CPU cell. `gpu::Hierarchical` checkpoints to the
+`GHIR` format (config header + every param in `params_mut` order); weights only,
+so a resumed run restarts the Adam moments.
 
 ### Persistence (`src/saving.rs`, `src/loading.rs`)
 
