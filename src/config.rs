@@ -11,13 +11,6 @@ pub const MIN_WORDS_PER_SEQ: usize = 8; // keep a trailing window only if >= thi
 /// Cap on the bytes of a single word (see `crate::segment`). Words longer than
 /// this — a giant identifier, a base64 blob, a huge indent block — are chopped
 /// into pieces, which bounds the decoder's per-word unroll.
-///
-/// This is the main VRAM knob on the GPU path: the GPU encoder/decoder run all
-/// words of a window as one padded `[words, tmax]` rectangle, where `tmax` is
-/// the LONGEST word in the window + 1 — so a single 32-byte word pads all 2048
-/// words to 32 steps even though the median word is 2 bytes. On Rust source
-/// only ~0.3% of words are longer than 16 bytes, so 16 halves the rectangle at
-/// almost no cost (32 OOMs a 6 GB card at WORDS_PER_SEQ = 2048; 16 peaks ~2.9 GB).
 pub const MAX_WORD_BYTES: usize = 16;
 
 /// Safety cap on tokens per word-window. Deliberately generous: WORDS_PER_SEQ
