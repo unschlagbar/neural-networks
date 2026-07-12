@@ -26,7 +26,7 @@ pub const DECAY_STEPS: usize = 150_000;
 pub const BATCH_SIZE: usize = 8;
 pub const EPOCHS: usize = 2;
 
-pub const SAVE_EVERY: usize = 30;
+pub const SAVE_EVERY: usize = 100;
 pub const LOG_EVERY: usize = 10;
 
 // Per-stack decoupled weight decay (λ), passed at optimizer-step time. `0.0`
@@ -76,7 +76,7 @@ pub const ENC_W_EOS: bool = true;
 /// dataset memory scales with this constant — not with the corpus size.
 pub const CHUNK_BYTES: usize = 32 * 1024 * 1024;
 
-pub const TRAIN_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-train.txt";
+pub const TRAIN_DATA: &str = "C:/Users/GBT B450M-S2H/Downloads/TinyStoriesV2-GPT4-train.txt";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 pub const CHARSET: &str = "charset.txt";
 

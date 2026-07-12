@@ -31,6 +31,23 @@ pub struct Sequential {
 }
 
 impl Sequential {
+    /// Assemble a stack from already-built layers (input/output/scratch derived
+    /// from them, no forward cache). Mirrors what `load_from` produces, so the
+    /// result serializes identically via `write_to`.
+    pub fn from_layers(layers: Vec<Box<dyn NnLayer>>) -> Self {
+        let input_size = layers.first().map(|l| l.input_size()).unwrap_or(0);
+        let output_size = layers.last().map(|l| l.output_size()).unwrap_or(0);
+        let max_size = layers.iter().map(|l| l.output_size()).max().unwrap_or(0);
+        Sequential {
+            input_size,
+            output_size,
+            layers,
+            cache: Vec::new(),
+            delta_buf: vec![0.0; max_size].into(),
+            input_buf: vec![0.0; input_size].into(),
+        }
+    }
+
     /// Pre-allocate caches for a fixed sequence length.
     /// Call once before the training loop (or when seq length changes).
     pub fn make_cache(&mut self, seq_len: usize) {

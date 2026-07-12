@@ -5,9 +5,9 @@
 //! intervals), same gradient accumulation over `BATCH_SIZE` windows — but the
 //! whole model lives on the GPU (`gpu::Hierarchical`).
 //!
-//! Checkpoints are `GHIR` blobs (see `gpu::hierarchical`), written to
+//! Checkpoints use the CPU `HIER` format (see `gpu::hierarchical`), written to
 //! `<model_path>` every `SAVE_EVERY` steps and reloaded on startup, so a run can
-//! be stopped and resumed.
+//! be stopped and resumed — and the same file opens in `hp` / `hs`.
 
 use std::rc::Rc;
 use std::time::Instant;
@@ -56,7 +56,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
     let word_boundary_ids = tokenizer.boundary_tokens();
     let cfg = cfg_from_config(vocab, w_token);
 
-    let mut model = match Hierarchical::load(&gpu, model_path) {
+    let mut model = match Hierarchical::load(&gpu, model_path, w_token) {
         Ok(m) => {
             println!(
                 "Loaded GPU hierarchical model from '{model_path}' (step {}).",
@@ -94,6 +94,9 @@ pub fn train_hierarchical_gpu(model_path: &str) {
 
     let mut state = TrainingState::from_step(model.step_count);
     state.init_log(model_path, &[]);
+    // Buffer CSV rows and only flush them when the model is saved (every
+    // SAVE_EVERY steps), so the on-disk log never gets ahead of the checkpoint.
+    state.set_defer_log_flush(true);
 
     let mut opt = AdamCfg::new(LR, crate::optimizers::WEIGHT_DECAY);
 
@@ -161,8 +164,13 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                     time = Instant::now();
                 }
                 if state.save() {
-                    match model.save(&gpu, state.save_path()) {
-                        Ok(()) => println!("saved -> {}", state.save_path()),
+                    match model.save(&gpu, state.save_path(), &word_boundary_ids) {
+                        Ok(()) => {
+                            // Flush the log only now, so it never reflects a step
+                            // past the checkpoint just written.
+                            state.flush_log();
+                            println!("saved -> {}", state.save_path());
+                        }
                         Err(e) => eprintln!("save failed: {e}"),
                     }
                 }
@@ -172,8 +180,11 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         println!("Epoch {epoch} took {:.1?}", epoch_start.elapsed());
     }
 
-    match model.save(&gpu, state.save_path()) {
-        Ok(()) => println!("final save -> {}", state.save_path()),
+    match model.save(&gpu, state.save_path(), &word_boundary_ids) {
+        Ok(()) => {
+            state.flush_log();
+            println!("final save -> {}", state.save_path());
+        }
         Err(e) => eprintln!("final save failed: {e}"),
     }
 }

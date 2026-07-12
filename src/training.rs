@@ -499,6 +499,10 @@ pub struct TrainingState {
     /// Where the model is saved during training. Set by `init_log`.
     save_path: String,
     log_writer: Option<BufWriter<File>>,
+    /// When true, `get_loss` writes CSV rows but does not flush them; the caller
+    /// flushes explicitly via `flush_log` (aligned with model saves) so the log on
+    /// disk never gets ahead of the last saved checkpoint.
+    defer_log_flush: bool,
     last_log: Instant,
     steps_since_log: usize,
     tokens_since_log: usize,
@@ -525,6 +529,7 @@ impl TrainingState {
             save_interval: SAVE_EVERY,
             save_path: String::new(),
             log_writer: None,
+            defer_log_flush: false,
             last_log: Instant::now(),
             steps_since_log: 0,
             tokens_since_log: 0,
@@ -636,7 +641,9 @@ impl TrainingState {
                 ms_per_step,
                 s_per_norm,
             );
-            let _ = writer.flush();
+            if !self.defer_log_flush {
+                let _ = writer.flush();
+            }
             for v in &mut self.extra_vals {
                 *v = (0.0, 0);
             }
@@ -649,5 +656,18 @@ impl TrainingState {
 
     pub fn save(&self) -> bool {
         self.step.is_multiple_of(self.save_interval)
+    }
+
+    /// Defer CSV flushing to explicit `flush_log` calls (see the field docs).
+    pub fn set_defer_log_flush(&mut self, defer: bool) {
+        self.defer_log_flush = defer;
+    }
+
+    /// Flush any buffered CSV rows to disk. Call right after a successful model
+    /// save so the log never reflects a state newer than the checkpoint.
+    pub fn flush_log(&mut self) {
+        if let Some(writer) = &mut self.log_writer {
+            let _ = writer.flush();
+        }
     }
 }

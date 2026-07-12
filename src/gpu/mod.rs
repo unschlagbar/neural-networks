@@ -33,6 +33,32 @@ pub mod train;
 pub use dtensor::DTensor;
 use kernels::Kernels;
 
+use iron_oxide::collections::Matrix;
+
+/// Download a 2-D device tensor into an `iron_oxide` `Matrix` (row-major), used
+/// when exporting device weights into the CPU `nn` layer format for `HIER`.
+pub(crate) fn dt_matrix(gpu: &Gpu, t: &DTensor) -> Matrix {
+    let h = t.to_host(gpu);
+    let (rows, cols) = (h.dims()[0], h.dims()[1]);
+    Matrix::from_vec(h.data, rows, cols)
+}
+
+/// Download a 1-D device tensor into a boxed slice.
+pub(crate) fn dt_vec(gpu: &Gpu, t: &DTensor) -> Box<[f32]> {
+    t.to_host(gpu).data.into_boxed_slice()
+}
+
+/// Host `Matrix` → `Tensor` (2-D, row-major), for uploading `nn` weights back to
+/// the device when importing a `HIER` checkpoint.
+pub(crate) fn tensor_from_matrix(m: &Matrix) -> crate::tensor::Tensor {
+    crate::tensor::Tensor::new(&[m.rows(), m.cols()], m.as_slice().to_vec())
+}
+
+/// Host slice → 1-D `Tensor`.
+pub(crate) fn tensor_from_slice(s: &[f32]) -> crate::tensor::Tensor {
+    crate::tensor::Tensor::new(&[s.len()], s.to_vec())
+}
+
 /// A live CUDA device: the context, its default stream, a cuBLAS handle, and the
 /// NVRTC-compiled kernel set. Cheap to clone (every field is an `Arc`). Created
 /// once via [`Gpu::new`].

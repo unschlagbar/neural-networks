@@ -19,19 +19,20 @@
 //! bookkeeping (which row is a `[W]` step, which slot is a char) is computed on
 //! the host and uploaded as id lists; only tensor *data* stays on the device.
 //!
-//! Checkpoints: `save`/`load` write a `GHIR` blob — the config header followed by
-//! every parameter in `params_mut` order.
+//! Checkpoints: `save`/`load` use the CPU `HIER` format (three `NNFW`
+//! `Sequential` blobs plus vocab/boundary metadata), the exact layout
+//! `model::build_hierarchical_model` produces — so a GPU-trained model opens
+//! directly in the CPU sampler/probe (`hs` / `hp`). Weights only; the AdamW
+//! moments are not persisted, so a resumed run restarts them.
 
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, Write};
 
 use super::block::{Block, BlockLike};
 use super::{DTensor, Gpu, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm};
 use crate::nn2::optim::AdamCfg;
+use crate::sequential::Sequential;
 use crate::tensor::Tensor;
-
-const MAGIC: u32 = 0x4748_4952; // "GHIR"
-const VERSION: u32 = 1;
 
 /// Config for the hierarchical stack (mirrors `nn2::HierCfg`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -135,26 +136,6 @@ impl Hierarchical {
             dec_head: Linear::new_rand(gpu, cfg.hc, cfg.vocab),
             step_count: 0,
         }
-    }
-
-    /// Every learnable tensor, in a fixed order. Save and load both walk this, so
-    /// the order defines the checkpoint layout.
-    fn params_mut(&mut self) -> Vec<&mut DTensor> {
-        let mut v: Vec<&mut DTensor> = vec![&mut self.table];
-        for b in self.encoder.blocks.iter_mut() {
-            v.extend(b.params_mut());
-        }
-        v.extend(self.bb_front.params_mut());
-        for b in self.bb_blocks.iter_mut() {
-            v.extend(b.params_mut());
-        }
-        v.extend(self.bb_back.params_mut());
-        for b in self.dec_blocks.iter_mut() {
-            v.extend(b.params_mut());
-        }
-        v.extend(self.dec_norm.params_mut());
-        v.extend(self.dec_head.params_mut());
-        v
     }
 
     /// Forward + backward over one window; accumulates all grads and returns the
@@ -329,123 +310,218 @@ impl Hierarchical {
             b.step(gpu, cfg);
         }
         self.dec_norm.step(gpu, cfg);
-        self.dec_head.step_wd(gpu, cfg, false); // logit head: no weight decay
+        // Logit head: no weight decay and no bias (bias stays at its zero init) so
+        // it matches `nn::linear_no_bias` and exports faithfully to the HIER head.
+        self.dec_head.step_w_only(gpu, cfg, false);
         self.step_count += 1;
     }
 
     // --- checkpointing ------------------------------------------------------
 
-    /// Write a `GHIR` checkpoint: config header, step count, then every parameter
-    /// in `params_mut` order. Weights only (Adam moments are not persisted, so a
-    /// resumed run restarts the moment estimates — same as the CPU system).
-    pub fn save(&mut self, gpu: &Gpu, path: &str) -> io::Result<()> {
+    /// Export the three stages into CPU `nn` `Sequential`s laid out exactly like
+    /// `model::build_hierarchical_model`, so the result serializes to the same
+    /// `HIER` blob a CPU-trained model would (readable by `hp` / `hs`).
+    fn to_sequentials(&mut self, gpu: &Gpu) -> (Sequential, Sequential, Sequential) {
+        use super::{dt_matrix, dt_vec};
+        use crate::nn::{
+            embedding::EmbeddingLayer, linear::LinearLayer, linear_nb::LinearNBLayer,
+            rms_norm::RMSNorm, soft_cap::SoftCapLayer,
+        };
+        use crate::nn_layer::NnLayer;
+        let (vocab, hc, wh) = (self.cfg.vocab, self.cfg.hc, self.cfg.wh);
+
+        // Encoder: Embedding(tied table) → sLSTM block × enc_blocks.
+        let mut enc: Vec<Box<dyn NnLayer>> = Vec::new();
+        enc.push(Box::new(EmbeddingLayer::from_loaded(vocab, hc, dt_matrix(gpu, &self.table))));
+        for b in self.encoder.blocks.iter_mut() {
+            enc.push(b.to_nn_layer(gpu));
+        }
+
+        // Backbone: Linear(HC→WH) → blocks → Linear(WH→HC).
+        let mut wm: Vec<Box<dyn NnLayer>> = Vec::new();
+        wm.push(Box::new(LinearLayer::from_loaded(
+            hc, wh, dt_matrix(gpu, &self.bb_front.w), dt_vec(gpu, &self.bb_front.b),
+        )));
+        for b in self.bb_blocks.iter_mut() {
+            wm.push(b.to_nn_layer(gpu));
+        }
+        wm.push(Box::new(LinearLayer::from_loaded(
+            wh, hc, dt_matrix(gpu, &self.bb_back.w), dt_vec(gpu, &self.bb_back.b),
+        )));
+
+        // Decoder: sLSTM blocks → RMSNorm → LinearNoBias(head) → SoftCap.
+        let mut dec: Vec<Box<dyn NnLayer>> = Vec::new();
+        for b in self.dec_blocks.iter_mut() {
+            dec.push(b.to_nn_layer(gpu));
+        }
+        dec.push(Box::new(RMSNorm::from_loaded(hc, dt_vec(gpu, &self.dec_norm.gamma))));
+        dec.push(Box::new(LinearNBLayer::from_loaded(hc, vocab, dt_matrix(gpu, &self.dec_head.w))));
+        dec.push(Box::new(SoftCapLayer::new(vocab, self.cfg.cap)));
+
+        (
+            Sequential::from_layers(enc),
+            Sequential::from_layers(wm),
+            Sequential::from_layers(dec),
+        )
+    }
+
+    /// Write a `HIER` checkpoint — the same format the CPU hierarchical model
+    /// uses, so `hp` / `hs` can open a GPU-trained model directly. Weights only
+    /// (Adam moments are not persisted, so a resumed run restarts them).
+    pub fn save(&mut self, gpu: &Gpu, path: &str, boundary_token_ids: &[u16]) -> io::Result<()> {
+        use crate::saving::{HIER_MAGIC, write_u16, write_u32, write_u64};
         if let Some(dir) = std::path::Path::new(path).parent() {
             fs::create_dir_all(dir)?;
         }
-        let tmp = format!("{path}.tmp");
-        {
-            let mut w = BufWriter::new(File::create(&tmp)?);
-            w.write_all(&MAGIC.to_le_bytes())?;
-            w.write_all(&VERSION.to_le_bytes())?;
-            let c = self.cfg;
-            for v in [
-                c.vocab, c.hc, c.wh, c.enc_blocks, c.bb_blocks, c.dec_blocks, c.heads,
-                c.dqk, c.w_token,
-            ] {
-                w.write_all(&(v as u32).to_le_bytes())?;
-            }
-            w.write_all(&c.cap.to_le_bytes())?;
-            w.write_all(&(self.step_count as u64).to_le_bytes())?;
 
-            let params = self.params_mut();
-            w.write_all(&(params.len() as u32).to_le_bytes())?;
-            for p in params {
-                let host = p.to_host(gpu);
-                w.write_all(&(host.rank as u32).to_le_bytes())?;
-                for d in host.dims() {
-                    w.write_all(&(*d as u32).to_le_bytes())?;
-                }
-                for v in &host.data {
-                    w.write_all(&v.to_le_bytes())?;
-                }
-            }
-            w.flush()?;
+        let (encoder, word_model, char2_model) = self.to_sequentials(gpu);
+
+        // context_size == the backbone's output width == HC (the decoder's input),
+        // exactly what `Hierarchical::new` recomputes and debug-asserts on load.
+        let context_size = word_model.output_size;
+
+        let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+        let w = &mut buf as &mut dyn Write;
+        write_u32(w, HIER_MAGIC)?;
+        write_u32(w, self.cfg.vocab as u32)?;
+        write_u32(w, context_size as u32)?;
+        write_u32(w, boundary_token_ids.len() as u32)?;
+        for &id in boundary_token_ids {
+            write_u16(w, id)?;
         }
-        // Rename only after a complete write, so a crash can't leave a torn file.
+        encoder.write_to(w)?;
+        word_model.write_to(w)?;
+        char2_model.write_to(w)?;
+        write_u64(w, self.step_count as u64)?;
+
+        // Atomic: write to a temp file, then rename over the target.
+        let tmp = format!("{path}.tmp");
+        File::create(&tmp)?.write_all(&buf.into_inner())?;
         fs::rename(&tmp, path)
     }
 
-    /// Load a `GHIR` checkpoint, rebuilding the model from its stored config.
-    pub fn load(gpu: &Gpu, path: &str) -> io::Result<Self> {
-        let mut r = BufReader::new(File::open(path)?);
-        let mut u32b = [0u8; 4];
-        let mut rd_u32 = |r: &mut BufReader<File>| -> io::Result<u32> {
-            r.read_exact(&mut u32b)?;
-            Ok(u32::from_le_bytes(u32b))
+    /// Load a `HIER` checkpoint (written by this model or a CPU run), rebuilding
+    /// the device model. `w_token` is supplied by the caller (from the tokenizer)
+    /// because the HIER format does not store it.
+    pub fn load(gpu: &Gpu, path: &str, w_token: usize) -> io::Result<Self> {
+        use super::{tensor_from_matrix, tensor_from_slice};
+        use crate::nn::{
+            embedding::EmbeddingLayer, linear::LinearLayer, linear_nb::LinearNBLayer,
+            mlstm_block::MLSTMBlock, rms_norm::RMSNorm, slstm_block::SLSTMBlock,
+            soft_cap::SoftCapLayer,
         };
-        if rd_u32(&mut r)? != MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a GHIR checkpoint"));
-        }
-        let ver = rd_u32(&mut r)?;
-        if ver != VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("GHIR version {ver} != {VERSION}"),
-            ));
-        }
-        let mut f = [0usize; 9];
-        for slot in f.iter_mut() {
-            *slot = rd_u32(&mut r)? as usize;
-        }
-        let cap = f32::from_le_bytes({
-            let mut b = [0u8; 4];
-            r.read_exact(&mut b)?;
-            b
-        });
-        let step_count = {
-            let mut b = [0u8; 8];
-            r.read_exact(&mut b)?;
-            u64::from_le_bytes(b) as usize
+
+        let stacks = crate::hierarchical::Hierarchical::load_stacks(path)?;
+
+        let err = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+        let to_block = |gpu: &Gpu, l: &Box<dyn crate::nn_layer::NnLayer>| -> io::Result<Box<dyn BlockLike>> {
+            if let Some(s) = l.as_any().downcast_ref::<SLSTMBlock>() {
+                Ok(Box::new(Block::<SLstm>::from_nn_block(gpu, s)))
+            } else if let Some(m) = l.as_any().downcast_ref::<MLSTMBlock>() {
+                Ok(Box::new(Block::<MLstm>::from_nn_block(gpu, m)))
+            } else {
+                Err(err("expected an sLSTM/mLSTM block in the checkpoint".into()))
+            }
         };
+
+        // --- Encoder: Embedding + sLSTM blocks -----------------------------
+        let enc = &stacks.encoder_chars.layers;
+        let emb = enc[0]
+            .as_any()
+            .downcast_ref::<EmbeddingLayer>()
+            .ok_or_else(|| err("encoder must start with an Embedding".into()))?;
+        let vocab = emb.input_size();
+        let hc = emb.output_size();
+        let table = DTensor::from_host(gpu, &tensor_from_matrix(&emb.weights));
+        let enc_blocks: Vec<Box<dyn BlockLike>> =
+            enc[1..].iter().map(|l| to_block(gpu, l)).collect::<io::Result<_>>()?;
+
+        // --- Backbone: Linear + blocks + Linear ----------------------------
+        let wm = &stacks.word_model.layers;
+        let front = wm[0]
+            .as_any()
+            .downcast_ref::<LinearLayer>()
+            .ok_or_else(|| err("backbone must start with a Linear".into()))?;
+        let wh = front.output_size();
+        let bb_front = linear_layer_to_gpu(gpu, front);
+        let back = wm[wm.len() - 1]
+            .as_any()
+            .downcast_ref::<LinearLayer>()
+            .ok_or_else(|| err("backbone must end with a Linear".into()))?;
+        let bb_back = linear_layer_to_gpu(gpu, back);
+        let bb_blocks: Vec<Box<dyn BlockLike>> = wm[1..wm.len() - 1]
+            .iter()
+            .map(|l| to_block(gpu, l))
+            .collect::<io::Result<_>>()?;
+
+        // heads/dqk read off the first mLSTM block (all mLSTM blocks share them).
+        let (heads, dqk) = wm[1..wm.len() - 1]
+            .iter()
+            .find_map(|l| l.as_any().downcast_ref::<MLSTMBlock>())
+            .map(|m| (m.cell.num_heads, m.cell.dqk))
+            .unwrap_or((8, wh / 8));
+
+        // --- Decoder: sLSTM blocks + RMSNorm + LinearNoBias + SoftCap ------
+        let dl = &stacks.char2_model.layers;
+        let norm_idx = dl
+            .iter()
+            .position(|l| l.as_any().downcast_ref::<RMSNorm>().is_some())
+            .ok_or_else(|| err("decoder is missing its RMSNorm".into()))?;
+        let dec_blocks: Vec<Box<dyn BlockLike>> =
+            dl[..norm_idx].iter().map(|l| to_block(gpu, l)).collect::<io::Result<_>>()?;
+        let rms = dl[norm_idx].as_any().downcast_ref::<RMSNorm>().unwrap();
+        let dec_norm = super::rms_norm::RmsNorm::from_parts(gpu, &tensor_from_slice(&rms.gamma));
+        let head = dl
+            .iter()
+            .find_map(|l| l.as_any().downcast_ref::<LinearNBLayer>())
+            .ok_or_else(|| err("decoder is missing its LinearNoBias head".into()))?;
+        let dec_head = super::linear::Linear::from_parts(
+            gpu,
+            &tensor_from_matrix(&head.weights),
+            &crate::tensor::Tensor::zeros(&[vocab]),
+        );
+        let cap = dl
+            .iter()
+            .find_map(|l| l.as_any().downcast_ref::<SoftCapLayer>())
+            .map(|s| s.cap)
+            .unwrap_or(crate::config::LOGIT_SOFTCAP);
+
         let cfg = HierCfg {
-            vocab: f[0], hc: f[1], wh: f[2], enc_blocks: f[3], bb_blocks: f[4],
-            dec_blocks: f[5], heads: f[6], dqk: f[7], w_token: f[8], cap,
+            vocab,
+            hc,
+            wh,
+            enc_blocks: enc_blocks.len(),
+            bb_blocks: bb_blocks.len(),
+            dec_blocks: dec_blocks.len(),
+            heads,
+            dqk,
+            w_token,
+            cap,
         };
 
+        // Build a fresh model (for the zeroed grads/moments), then swap in the
+        // loaded weight-bearing parts.
         let mut model = Hierarchical::new(gpu, &cfg);
-        model.step_count = step_count;
-
-        let count = rd_u32(&mut r)? as usize;
-        let mut params = model.params_mut();
-        if count != params.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("checkpoint has {count} params, model expects {}", params.len()),
-            ));
-        }
-        for p in params.iter_mut() {
-            let rank = rd_u32(&mut r)? as usize;
-            let mut dims = Vec::with_capacity(rank);
-            for _ in 0..rank {
-                dims.push(rd_u32(&mut r)? as usize);
-            }
-            if dims != p.dims() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("param shape {dims:?} != model {:?}", p.dims()),
-                ));
-            }
-            let n: usize = dims.iter().product();
-            let mut data = vec![0f32; n];
-            let mut buf = [0u8; 4];
-            for v in data.iter_mut() {
-                r.read_exact(&mut buf)?;
-                *v = f32::from_le_bytes(buf);
-            }
-            **p = DTensor::from_host(gpu, &Tensor::new(&dims, data));
-        }
+        model.step_count = stacks.step;
+        model.table = table;
+        model.encoder.blocks = enc_blocks;
+        model.bb_front = bb_front;
+        model.bb_blocks = bb_blocks;
+        model.bb_back = bb_back;
+        model.dec_blocks = dec_blocks;
+        model.dec_norm = dec_norm;
+        model.dec_head = dec_head;
         Ok(model)
     }
+}
+
+/// Upload an `nn::LinearLayer` (weights + bias) to a device `Linear`.
+fn linear_layer_to_gpu(gpu: &Gpu, l: &crate::nn::linear::LinearLayer) -> super::linear::Linear {
+    super::linear::Linear::from_parts(
+        gpu,
+        &super::tensor_from_matrix(&l.weights),
+        &super::tensor_from_slice(&l.biases),
+    )
 }
 
 #[cfg(test)]
@@ -481,10 +557,11 @@ mod tests {
         assert!(last < first * 0.4, "decode loss did not fall: {first} -> {last}");
 
         // Checkpoint round-trip: reloading must reproduce the exact same loss.
-        let path = std::env::temp_dir().join("gpu_hier_test.ghir");
+        // Saves in the CPU HIER format; `w_token` is supplied on load.
+        let path = std::env::temp_dir().join("gpu_hier_test.hier");
         let path = path.to_str().unwrap();
-        model.save(&gpu, path).expect("save");
-        let mut back = Hierarchical::load(&gpu, path).expect("load");
+        model.save(&gpu, path, &[cfg.w_token as u16]).expect("save");
+        let mut back = Hierarchical::load(&gpu, path, cfg.w_token).expect("load");
         assert_eq!(back.cfg, cfg, "config did not survive the round-trip");
         assert_eq!(back.step_count, model.step_count, "step count lost");
         let reloaded = back.forward_backward(&gpu, &tokens, &words);

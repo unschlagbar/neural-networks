@@ -23,6 +23,11 @@ pub trait Cell {
     fn backward(&mut self, dy: &Tensor) -> Tensor;
     fn zero_grad(&mut self);
     fn step(&mut self, cfg: &AdamCfg);
+    /// Whether the block wraps this cell with a `post_cell_norm` before the
+    /// residual. sLSTM does (like `nn::slstm_block`); mLSTM does not — its own
+    /// head-wise norm already normalizes the cell output, so a second norm here
+    /// is redundant and absent from `nn::mlstm_block`.
+    fn wants_post_cell_norm(&self) -> bool;
 }
 
 impl Cell for SLstm {
@@ -30,6 +35,7 @@ impl Cell for SLstm {
     fn backward(&mut self, dy: &Tensor) -> Tensor { SLstm::backward(self, dy) }
     fn zero_grad(&mut self) { SLstm::zero_grad(self) }
     fn step(&mut self, cfg: &AdamCfg) { SLstm::step(self, cfg) }
+    fn wants_post_cell_norm(&self) -> bool { true }
 }
 
 impl Cell for MLstm {
@@ -37,6 +43,7 @@ impl Cell for MLstm {
     fn backward(&mut self, dy: &Tensor) -> Tensor { MLstm::backward(self, dy) }
     fn zero_grad(&mut self) { MLstm::zero_grad(self) }
     fn step(&mut self, cfg: &AdamCfg) { MLstm::step(self, cfg) }
+    fn wants_post_cell_norm(&self) -> bool { false }
 }
 
 #[inline]
@@ -53,7 +60,8 @@ pub struct Block<C: Cell> {
     pub up: usize,
     pub pre_norm1: RmsNorm,
     pub cell: C,
-    pub post_cell_norm: RmsNorm,
+    /// Present only when `cell.wants_post_cell_norm()` (sLSTM); `None` for mLSTM.
+    pub post_cell_norm: Option<RmsNorm>,
     pub pre_norm2: RmsNorm,
     pub lin_gate: Linear,
     pub lin_value: Linear,
@@ -68,12 +76,13 @@ pub struct Block<C: Cell> {
 
 impl<C: Cell> Block<C> {
     pub fn from_cell(hidden: usize, up: usize, cell: C) -> Self {
+        let post_cell_norm = cell.wants_post_cell_norm().then(|| RmsNorm::new(hidden));
         Self {
             hidden,
             up,
             pre_norm1: RmsNorm::new(hidden),
             cell,
-            post_cell_norm: RmsNorm::new(hidden),
+            post_cell_norm,
             pre_norm2: RmsNorm::new(hidden),
             lin_gate: Linear::new(hidden, up),
             lin_value: Linear::new(hidden, up),
@@ -95,10 +104,15 @@ impl<C: Cell> Block<C> {
 
         let x_flat = x.reshape(&[n, h]);
 
-        // Residual 1: z = x + post_cell_norm(cell(pre_norm1(x))).
+        // Residual 1: z = x + post_cell_norm(cell(pre_norm1(x))).  The post-cell
+        // norm is skipped for cells that don't want it (mLSTM).
         let xn1 = self.pre_norm1.forward(&x_flat);
         let cell_out = self.cell.forward(&xn1.reshape(&[b, t, h]));
-        let cn = self.post_cell_norm.forward(&cell_out.reshape(&[n, h]));
+        let cell_flat = cell_out.reshape(&[n, h]);
+        let cn = match &mut self.post_cell_norm {
+            Some(norm) => norm.forward(&cell_flat),
+            None => cell_flat,
+        };
         let mut z = Tensor::zeros(&[n, h]);
         for i in 0..n * h {
             z.data[i] = x_flat.data[i] + cn.data[i];
@@ -157,7 +171,10 @@ impl<C: Cell> Block<C> {
         }
 
         // Residual 1: z = x + cn.
-        let d_cell_out = self.post_cell_norm.backward(&d_z);
+        let d_cell_out = match &mut self.post_cell_norm {
+            Some(norm) => norm.backward(&d_z),
+            None => d_z.clone(),
+        };
         let d_cell_in = self.cell.backward(&d_cell_out.reshape(&[b, t, h]));
         let d_xn1 = self.pre_norm1.backward(&d_cell_in.reshape(&[n, h]));
         // x feeds pre_norm1 (cell path) and the z = x + cn residual.
@@ -171,7 +188,9 @@ impl<C: Cell> Block<C> {
     pub fn zero_grad(&mut self) {
         self.pre_norm1.zero_grad();
         self.cell.zero_grad();
-        self.post_cell_norm.zero_grad();
+        if let Some(norm) = &mut self.post_cell_norm {
+            norm.zero_grad();
+        }
         self.pre_norm2.zero_grad();
         self.lin_gate.zero_grad();
         self.lin_value.zero_grad();
@@ -182,7 +201,9 @@ impl<C: Cell> Block<C> {
     pub fn step(&mut self, cfg: &AdamCfg) {
         self.pre_norm1.step(cfg);
         self.cell.step(cfg);
-        self.post_cell_norm.step(cfg);
+        if let Some(norm) = &mut self.post_cell_norm {
+            norm.step(cfg);
+        }
         self.pre_norm2.step(cfg);
         self.lin_gate.step(cfg);
         self.lin_value.step(cfg);

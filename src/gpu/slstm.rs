@@ -171,6 +171,40 @@ impl SLstm {
         self.hidden
     }
 
+    /// Export this cell into the CPU `nn::SLSTMLayer` format (weights only; the
+    /// `h_init`/`c_init` the CPU format carries are always zero here). Used to
+    /// write a `HIER` checkpoint from a GPU model.
+    pub fn to_nn_cell(&self, gpu: &Gpu) -> crate::nn::slstm::SLSTMLayer {
+        use super::{dt_matrix, dt_vec};
+        let h = self.hidden;
+        crate::nn::slstm::SLSTMLayer::from_loaded(
+            self.input,
+            h,
+            dt_matrix(gpu, &self.w[0]),
+            dt_matrix(gpu, &self.w[1]),
+            dt_matrix(gpu, &self.w[2]),
+            dt_matrix(gpu, &self.w[3]),
+            dt_vec(gpu, &self.bias[0]),
+            dt_vec(gpu, &self.bias[1]),
+            dt_vec(gpu, &self.bias[2]),
+            dt_vec(gpu, &self.bias[3]),
+            vec![0.0; h].into(),
+            vec![0.0; h].into(),
+        )
+    }
+
+    /// Rebuild a GPU cell from a CPU `nn::SLSTMLayer` (inverse of `to_nn_cell`).
+    pub fn from_nn_cell(gpu: &Gpu, c: &crate::nn::slstm::SLSTMLayer) -> Self {
+        use super::{tensor_from_matrix as m, tensor_from_slice as v};
+        Self::from_parts(
+            gpu,
+            c.input_size,
+            c.hidden_size,
+            &m(&c.wz), &m(&c.wi), &m(&c.wf), &m(&c.wo),
+            &v(&c.bz), &v(&c.bi), &v(&c.bf), &v(&c.bo),
+        )
+    }
+
     /// Forward over a whole `[B, T, in]` sequence → `[B, T, H]`. State resets to
     /// zero at t=0 and stays device-resident across the T-loop.
     pub fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {

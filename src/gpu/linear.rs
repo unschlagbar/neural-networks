@@ -119,6 +119,14 @@ impl Linear {
         ops::adamw(gpu, &mut self.b, &self.db, &mut self.mb, &mut self.vb, cfg, false);
         self.zero_grad(gpu);
     }
+
+    /// AdamW step on `w` only, leaving `b` untouched; clears both grads. Used for
+    /// a bias-free head: `b` stays at its (zero) init so the layer is equivalent
+    /// to `nn::LinearNBLayer` and exports to the no-bias `HIER` head faithfully.
+    pub fn step_w_only(&mut self, gpu: &Gpu, cfg: &AdamCfg, decay_w: bool) {
+        ops::adamw(gpu, &mut self.w, &self.dw, &mut self.mw, &mut self.vw, cfg, decay_w);
+        self.zero_grad(gpu);
+    }
 }
 
 #[cfg(test)]

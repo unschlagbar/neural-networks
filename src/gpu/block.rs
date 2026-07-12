@@ -23,6 +23,24 @@ pub trait Cell {
     fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg);
     /// Learnable tensors in a fixed order (checkpoint save/load).
     fn params_mut(&mut self) -> Vec<&mut DTensor>;
+    /// Whether the surrounding block applies a `post_cell_norm` before the
+    /// residual. sLSTM does; mLSTM doesn't (see `nn2::block::Cell`).
+    fn wants_post_cell_norm(&self) -> bool;
+    /// Build the matching CPU `nn` block (`SLSTMBlock` / `MLSTMBlock`) from this
+    /// cell plus the already-exported surrounding norms and projections.
+    #[allow(clippy::too_many_arguments)]
+    fn to_nn_block(
+        &self,
+        gpu: &Gpu,
+        hidden: usize,
+        up: usize,
+        pre_norm1: crate::nn::rms_norm::RMSNorm,
+        post_cell_norm: Option<crate::nn::rms_norm::RMSNorm>,
+        pre_norm2: crate::nn::rms_norm::RMSNorm,
+        lin_gate: crate::nn::linear::LinearLayer,
+        lin_value: crate::nn::linear::LinearLayer,
+        lin_down: crate::nn::linear::LinearLayer,
+    ) -> Box<dyn crate::nn_layer::NnLayer>;
 }
 
 impl Cell for SLstm {
@@ -31,6 +49,32 @@ impl Cell for SLstm {
     fn zero_grad(&mut self, gpu: &Gpu) { SLstm::zero_grad(self, gpu) }
     fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) { SLstm::step(self, gpu, cfg) }
     fn params_mut(&mut self) -> Vec<&mut DTensor> { SLstm::params_mut(self) }
+    fn wants_post_cell_norm(&self) -> bool { true }
+    fn to_nn_block(
+        &self,
+        gpu: &Gpu,
+        hidden: usize,
+        up: usize,
+        pre_norm1: crate::nn::rms_norm::RMSNorm,
+        post_cell_norm: Option<crate::nn::rms_norm::RMSNorm>,
+        pre_norm2: crate::nn::rms_norm::RMSNorm,
+        lin_gate: crate::nn::linear::LinearLayer,
+        lin_value: crate::nn::linear::LinearLayer,
+        lin_down: crate::nn::linear::LinearLayer,
+    ) -> Box<dyn crate::nn_layer::NnLayer> {
+        let post = post_cell_norm.expect("sLSTM block requires a post_cell_norm");
+        Box::new(crate::nn::slstm_block::SLSTMBlock::from_loaded(
+            hidden,
+            up,
+            pre_norm1,
+            post,
+            pre_norm2,
+            self.to_nn_cell(gpu),
+            lin_gate,
+            lin_value,
+            lin_down,
+        ))
+    }
 }
 
 /// Type-erased `Block`, so a model can hold a heterogeneous stack (alternating
@@ -43,6 +87,9 @@ pub trait BlockLike {
     fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg);
     /// Learnable tensors in a fixed order (checkpoint save/load).
     fn params_mut(&mut self) -> Vec<&mut DTensor>;
+    /// Export the block into the matching CPU `nn` block (`SLSTMBlock` /
+    /// `MLSTMBlock`) for a `HIER` checkpoint.
+    fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn crate::nn_layer::NnLayer>;
 }
 
 impl<C: Cell> BlockLike for Block<C> {
@@ -51,6 +98,9 @@ impl<C: Cell> BlockLike for Block<C> {
     fn zero_grad(&mut self, gpu: &Gpu) { Block::zero_grad(self, gpu) }
     fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) { Block::step(self, gpu, cfg) }
     fn params_mut(&mut self) -> Vec<&mut DTensor> { Block::params_mut(self) }
+    fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn crate::nn_layer::NnLayer> {
+        Block::to_nn_layer(self, gpu)
+    }
 }
 
 pub struct Block<C: Cell> {
@@ -58,7 +108,8 @@ pub struct Block<C: Cell> {
     pub up: usize,
     pub pre_norm1: RmsNorm,
     pub cell: C,
-    pub post_cell_norm: RmsNorm,
+    /// Present only when `cell.wants_post_cell_norm()` (sLSTM); `None` for mLSTM.
+    pub post_cell_norm: Option<RmsNorm>,
     pub pre_norm2: RmsNorm,
     pub lin_gate: Linear,
     pub lin_value: Linear,
@@ -75,12 +126,13 @@ impl<C: Cell> Block<C> {
     /// Assemble a block around a cell, with fresh norms (γ=1) and Xavier `Linear`
     /// weights. `hidden` is the model width, `up` the SwiGLU inner width.
     pub fn from_cell(gpu: &Gpu, hidden: usize, up: usize, cell: C) -> Self {
+        let post_cell_norm = cell.wants_post_cell_norm().then(|| RmsNorm::new(gpu, hidden));
         Self {
             hidden,
             up,
             pre_norm1: RmsNorm::new(gpu, hidden),
             cell,
-            post_cell_norm: RmsNorm::new(gpu, hidden),
+            post_cell_norm,
             pre_norm2: RmsNorm::new(gpu, hidden),
             lin_gate: Linear::from_parts(gpu, &crate::tensor::Tensor::xavier(hidden, up), &crate::tensor::Tensor::zeros(&[up])),
             lin_value: Linear::from_parts(gpu, &crate::tensor::Tensor::xavier(hidden, up), &crate::tensor::Tensor::zeros(&[up])),
@@ -104,7 +156,10 @@ impl<C: Cell> Block<C> {
             up: cpu.up,
             pre_norm1: RmsNorm::from_parts(gpu, &cpu.pre_norm1.gamma),
             cell,
-            post_cell_norm: RmsNorm::from_parts(gpu, &cpu.post_cell_norm.gamma),
+            post_cell_norm: cpu
+                .post_cell_norm
+                .as_ref()
+                .map(|n| RmsNorm::from_parts(gpu, &n.gamma)),
             pre_norm2: RmsNorm::from_parts(gpu, &cpu.pre_norm2.gamma),
             lin_gate: Linear::from_parts(gpu, &cpu.lin_gate.w, &cpu.lin_gate.b),
             lin_value: Linear::from_parts(gpu, &cpu.lin_value.w, &cpu.lin_value.b),
@@ -128,10 +183,15 @@ impl<C: Cell> Block<C> {
         // residual (read twice), and the caller's `x` is only borrowed.
         let x_flat = x.dup(gpu).reshaped(&[n, h]);
 
-        // Residual 1: z = x + post_cell_norm(cell(pre_norm1(x))).
+        // Residual 1: z = x + post_cell_norm(cell(pre_norm1(x))). The post-cell
+        // norm is skipped for cells that don't want it (mLSTM).
         let xn1 = self.pre_norm1.forward(gpu, &x_flat);
         let cell_out = self.cell.forward(gpu, &xn1.reshaped(&[b, t, h]));
-        let cn = self.post_cell_norm.forward(gpu, &cell_out.reshaped(&[n, h]));
+        let cell_flat = cell_out.reshaped(&[n, h]);
+        let cn = match &mut self.post_cell_norm {
+            Some(norm) => norm.forward(gpu, &cell_flat),
+            None => cell_flat,
+        };
         let z = ops::add(gpu, &x_flat, &cn);
 
         // Residual 2: y = z + SwiGLU(pre_norm2(z)).
@@ -174,7 +234,10 @@ impl<C: Cell> Block<C> {
         let d_z = ops::add(gpu, &d_z_mlp, &dy_flat);
 
         // Residual 1.
-        let d_cell_out = self.post_cell_norm.backward(gpu, &d_z);
+        let d_cell_out = match &mut self.post_cell_norm {
+            Some(norm) => norm.backward(gpu, &d_z),
+            None => d_z.dup(gpu),
+        };
         let d_cell_in = self.cell.backward(gpu, &d_cell_out.reshaped(&[b, t, h]));
         let d_xn1 = self.pre_norm1.backward(gpu, &d_cell_in.reshaped(&[n, h]));
         // x feeds pre_norm1 (cell path) and the z = x + cn residual.
@@ -187,7 +250,9 @@ impl<C: Cell> Block<C> {
         let mut v = Vec::new();
         v.extend(self.pre_norm1.params_mut());
         v.extend(self.cell.params_mut());
-        v.extend(self.post_cell_norm.params_mut());
+        if let Some(norm) = &mut self.post_cell_norm {
+            v.extend(norm.params_mut());
+        }
         v.extend(self.pre_norm2.params_mut());
         v.extend(self.lin_gate.params_mut());
         v.extend(self.lin_value.params_mut());
@@ -195,10 +260,31 @@ impl<C: Cell> Block<C> {
         v
     }
 
+    /// Export the block into the matching CPU `nn` block for a `HIER` checkpoint.
+    /// Downloads every surrounding norm/projection, then lets the cell assemble
+    /// the concrete `SLSTMBlock` / `MLSTMBlock`.
+    pub fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn crate::nn_layer::NnLayer> {
+        use super::{dt_matrix, dt_vec};
+        use crate::nn::{linear::LinearLayer, rms_norm::RMSNorm};
+        let (h, u) = (self.hidden, self.up);
+        let pre1 = RMSNorm::from_loaded(h, dt_vec(gpu, &self.pre_norm1.gamma));
+        let pre2 = RMSNorm::from_loaded(h, dt_vec(gpu, &self.pre_norm2.gamma));
+        let post = self
+            .post_cell_norm
+            .as_ref()
+            .map(|nm| RMSNorm::from_loaded(h, dt_vec(gpu, &nm.gamma)));
+        let gate = LinearLayer::from_loaded(h, u, dt_matrix(gpu, &self.lin_gate.w), dt_vec(gpu, &self.lin_gate.b));
+        let value = LinearLayer::from_loaded(h, u, dt_matrix(gpu, &self.lin_value.w), dt_vec(gpu, &self.lin_value.b));
+        let down = LinearLayer::from_loaded(u, h, dt_matrix(gpu, &self.lin_down.w), dt_vec(gpu, &self.lin_down.b));
+        self.cell.to_nn_block(gpu, h, u, pre1, post, pre2, gate, value, down)
+    }
+
     pub fn zero_grad(&mut self, gpu: &Gpu) {
         self.pre_norm1.zero_grad(gpu);
         self.cell.zero_grad(gpu);
-        self.post_cell_norm.zero_grad(gpu);
+        if let Some(norm) = &mut self.post_cell_norm {
+            norm.zero_grad(gpu);
+        }
         self.pre_norm2.zero_grad(gpu);
         self.lin_gate.zero_grad(gpu);
         self.lin_value.zero_grad(gpu);
@@ -209,7 +295,9 @@ impl<C: Cell> Block<C> {
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
         self.pre_norm1.step(gpu, cfg);
         self.cell.step(gpu, cfg);
-        self.post_cell_norm.step(gpu, cfg);
+        if let Some(norm) = &mut self.post_cell_norm {
+            norm.step(gpu, cfg);
+        }
         self.pre_norm2.step(gpu, cfg);
         self.lin_gate.step(gpu, cfg);
         self.lin_value.step(gpu, cfg);
@@ -217,10 +305,36 @@ impl<C: Cell> Block<C> {
     }
 }
 
+/// Upload an `nn::LinearLayer` to the device.
+fn lin_from_nn(gpu: &Gpu, l: &crate::nn::linear::LinearLayer) -> Linear {
+    use super::{tensor_from_matrix as m, tensor_from_slice as v};
+    Linear::from_parts(gpu, &m(&l.weights), &v(&l.biases))
+}
+
 impl Block<SLstm> {
     /// Upload a whole CPU sLSTM block (norms, SwiGLU projections and the cell).
     pub fn from_cpu(gpu: &Gpu, cpu: &crate::nn2::SLstmBlock) -> Self {
         Self::from_cpu_parts(gpu, cpu, SLstm::from_cpu(gpu, &cpu.cell))
+    }
+
+    /// Import an `nn::SLSTMBlock` (from a `HIER` checkpoint) onto the device.
+    pub fn from_nn_block(gpu: &Gpu, cpu: &crate::nn::slstm_block::SLSTMBlock) -> Self {
+        use super::tensor_from_slice as v;
+        Self {
+            hidden: cpu.hidden_size,
+            up: cpu.up_size,
+            pre_norm1: RmsNorm::from_parts(gpu, &v(&cpu.pre_norm1.gamma)),
+            cell: SLstm::from_nn_cell(gpu, &cpu.cell),
+            post_cell_norm: Some(RmsNorm::from_parts(gpu, &v(&cpu.post_cell_norm.gamma))),
+            pre_norm2: RmsNorm::from_parts(gpu, &v(&cpu.pre_norm2.gamma)),
+            lin_gate: lin_from_nn(gpu, &cpu.lin_gate),
+            lin_value: lin_from_nn(gpu, &cpu.lin_value),
+            lin_down: lin_from_nn(gpu, &cpu.lin_down),
+            gate_pre: None,
+            gate_act: None,
+            value: None,
+            seq: (0, 0),
+        }
     }
 }
 
@@ -228,6 +342,26 @@ impl Block<MLstm> {
     /// Upload a whole CPU mLSTM block (norms, SwiGLU projections and the cell).
     pub fn from_cpu(gpu: &Gpu, cpu: &crate::nn2::MLstmBlock) -> Self {
         Self::from_cpu_parts(gpu, cpu, MLstm::from_cpu(gpu, &cpu.cell))
+    }
+
+    /// Import an `nn::MLSTMBlock` (from a `HIER` checkpoint) onto the device.
+    pub fn from_nn_block(gpu: &Gpu, cpu: &crate::nn::mlstm_block::MLSTMBlock) -> Self {
+        use super::tensor_from_slice as v;
+        Self {
+            hidden: cpu.hidden_size,
+            up: cpu.up_size,
+            pre_norm1: RmsNorm::from_parts(gpu, &v(&cpu.pre_norm1.gamma)),
+            cell: MLstm::from_nn_cell(gpu, &cpu.cell),
+            post_cell_norm: None,
+            pre_norm2: RmsNorm::from_parts(gpu, &v(&cpu.pre_norm2.gamma)),
+            lin_gate: lin_from_nn(gpu, &cpu.lin_gate),
+            lin_value: lin_from_nn(gpu, &cpu.lin_value),
+            lin_down: lin_from_nn(gpu, &cpu.lin_down),
+            gate_pre: None,
+            gate_act: None,
+            value: None,
+            seq: (0, 0),
+        }
     }
 }
 

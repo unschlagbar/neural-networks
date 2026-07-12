@@ -98,6 +98,55 @@ impl MLstm {
         Self::from_cpu(gpu, &crate::nn2::MLstm::new(input_size, d, heads, dqk))
     }
 
+    /// Export this cell into the CPU `nn::MLSTMLayer` format. Used to write a
+    /// `HIER` checkpoint from a GPU model.
+    pub fn to_nn_cell(&self, gpu: &Gpu) -> crate::nn::mlstm::MLSTMLayer {
+        use super::{dt_matrix, dt_vec};
+        let w_out = crate::nn::linear::LinearLayer::from_loaded(
+            self.d,
+            self.d,
+            dt_matrix(gpu, &self.lin_out.w),
+            dt_vec(gpu, &self.lin_out.b),
+        );
+        crate::nn::mlstm::MLSTMLayer::from_loaded(
+            self.input_size,
+            self.d,
+            self.heads,
+            self.dqk,
+            dt_matrix(gpu, &self.lin_q.w),
+            dt_matrix(gpu, &self.lin_k.w),
+            dt_matrix(gpu, &self.lin_v.w),
+            dt_matrix(gpu, &self.lin_o.w),
+            dt_matrix(gpu, &self.lin_i.w),
+            dt_matrix(gpu, &self.lin_f.w),
+            dt_vec(gpu, &self.lin_q.b),
+            dt_vec(gpu, &self.lin_k.b),
+            dt_vec(gpu, &self.lin_v.b),
+            dt_vec(gpu, &self.lin_o.b),
+            dt_vec(gpu, &self.lin_i.b),
+            dt_vec(gpu, &self.lin_f.b),
+            w_out,
+            dt_vec(gpu, &self.headnorm.gamma),
+        )
+    }
+
+    /// Rebuild a GPU cell from a CPU `nn::MLSTMLayer` (inverse of `to_nn_cell`).
+    pub fn from_nn_cell(gpu: &Gpu, c: &crate::nn::mlstm::MLSTMLayer) -> Self {
+        use super::{tensor_from_matrix as m, tensor_from_slice as v};
+        Self::from_parts(
+            gpu,
+            c.input_size,
+            c.hidden_size,
+            c.num_heads,
+            c.dqk,
+            &m(&c.wq), &m(&c.wk), &m(&c.wv), &m(&c.wo), &m(&c.wi), &m(&c.wf),
+            &v(&c.bq), &v(&c.bk), &v(&c.bv), &v(&c.bo), &v(&c.bi), &v(&c.bf),
+            &m(&c.w_out.weights),
+            &v(&c.w_out.biases),
+            &v(&c.head_norm.gamma),
+        )
+    }
+
     /// Upload a CPU cell (weights are copied; grads/moments start at zero).
     pub fn from_cpu(gpu: &Gpu, c: &crate::nn2::MLstm) -> Self {
         Self::from_parts(
@@ -248,6 +297,31 @@ impl Cell for MLstm {
     fn zero_grad(&mut self, gpu: &Gpu) { MLstm::zero_grad(self, gpu) }
     fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) { MLstm::step(self, gpu, cfg) }
     fn params_mut(&mut self) -> Vec<&mut DTensor> { MLstm::params_mut(self) }
+    fn wants_post_cell_norm(&self) -> bool { false }
+    fn to_nn_block(
+        &self,
+        gpu: &Gpu,
+        hidden: usize,
+        up: usize,
+        pre_norm1: crate::nn::rms_norm::RMSNorm,
+        _post_cell_norm: Option<crate::nn::rms_norm::RMSNorm>,
+        pre_norm2: crate::nn::rms_norm::RMSNorm,
+        lin_gate: crate::nn::linear::LinearLayer,
+        lin_value: crate::nn::linear::LinearLayer,
+        lin_down: crate::nn::linear::LinearLayer,
+    ) -> Box<dyn crate::nn_layer::NnLayer> {
+        // mLSTM blocks have no post-cell norm (the cell's head norm normalizes).
+        Box::new(crate::nn::mlstm_block::MLSTMBlock::from_loaded(
+            hidden,
+            up,
+            pre_norm1,
+            pre_norm2,
+            self.to_nn_cell(gpu),
+            lin_gate,
+            lin_value,
+            lin_down,
+        ))
+    }
 }
 
 #[cfg(test)]
