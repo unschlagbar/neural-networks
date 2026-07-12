@@ -2,7 +2,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::{rc::Rc, time::Duration};
 
 use neural_networks::{
-    batches::ChunkedWordDataSet, model::build_hierarchical_model, tokenizer::Tokenizer,
+    batches::ChunkedWordDataSet, model::build_hierarchical_model, tokenizer_utf8::Utf8Tokenizer,
     training::TrainingState,
 };
 
@@ -19,9 +19,8 @@ fn benchmark_hierarchical(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_nanos(1));
 
-    let tokenizer = Rc::new(Tokenizer::new("charset.txt", false));
+    let tokenizer = Rc::new(Utf8Tokenizer::new());
     let vocab = tokenizer.vocab_size();
-    let boundaries = tokenizer.boundary_tokens();
 
     let mut loader = ChunkedWordDataSet::open(
         tokenizer.clone(),
@@ -29,7 +28,6 @@ fn benchmark_hierarchical(c: &mut Criterion) {
         WORDS_PER_SEQ,
         MIN_WORDS,
         MAX_TOKENS,
-        &boundaries,
         64 * 1024 * 1024, // alice.txt fits in one chunk
     );
     let data = loader
@@ -40,7 +38,7 @@ fn benchmark_hierarchical(c: &mut Criterion) {
         "alice.txt yields too few windows for the bench"
     );
 
-    let mut model = build_hierarchical_model(vocab, boundaries.clone(), tokenizer.clone());
+    let mut model = build_hierarchical_model(vocab, tokenizer.clone());
     model.make_cache(WORDS_PER_SEQ, data.max_window_tokens());
 
     let mut state = TrainingState::new();

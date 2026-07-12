@@ -5,7 +5,7 @@ use crate::{
     hierarchical::Hierarchical,
     nn_layer::SequentialBuilder,
     sequential::Sequential,
-    tokenizer::Tokenizer,
+    tokenizer_utf8::Utf8Tokenizer,
 };
 
 pub fn build_normal_model(vocab: usize) -> Sequential {
@@ -38,11 +38,7 @@ pub fn build_normal_model(vocab: usize) -> Sequential {
 //                            table, held by `Hierarchical`). Predicts the
 //                            word's chars followed by a trailing `[W]` (EOS).
 //                            Reset per word.
-pub fn build_hierarchical_model(
-    vocab: usize,
-    boundary_token_ids: Vec<u16>,
-    tokenizer: Rc<Tokenizer>,
-) -> Hierarchical {
+pub fn build_hierarchical_model(vocab: usize, tokenizer: Rc<Utf8Tokenizer>) -> Hierarchical {
     // No trailing norm: the decoder's pre-head RMSNorm is the only stage-level
     // norm in the whole hierarchical stack (the blocks keep their internal ones).
     let encoder = SequentialBuilder::new(vocab)
@@ -83,12 +79,5 @@ pub fn build_hierarchical_model(
         .soft_cap(LOGIT_SOFTCAP)
         .build();
 
-    Hierarchical::new(
-        encoder,
-        char2_model,
-        word_model,
-        vocab,
-        boundary_token_ids,
-        tokenizer,
-    )
+    Hierarchical::new(encoder, char2_model, word_model, vocab, tokenizer)
 }

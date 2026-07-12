@@ -1,19 +1,25 @@
-// Byte-level tokenizer: every token is one raw UTF-8 byte, vocab is exactly 256.
+// Byte-level tokenizer: token ids 0..256 are raw UTF-8 bytes, ids 256.. are
+// special tokens. Vocab is exactly 256 + SPECIAL_TOKENS.len().
 //
-// No charset file, no HashMap, no special tokens appended on top — encoding is
-// `str::as_bytes` and decoding is `String::from_utf8_lossy`. Any text in any
-// language round-trips losslessly.
-//
-// The hierarchical model still needs a word-boundary marker `[W]`. Bytes
-// 0xC0, 0xC1 and 0xF5..=0xFF can never occur in valid UTF-8, so 0xFF is used
-// as `[W]`. It is model-internal (fed virtually, never present in token
-// slices), so decoding never sees it either.
+// No charset file and no HashMap — encoding is `str::as_bytes` and decoding is
+// `String::from_utf8_lossy`, so text in any language round-trips losslessly.
+// Special tokens live *above* the byte range instead of stealing byte values,
+// so no valid input can ever collide with them.
 
-#[derive(Clone, Default)]
+/// Special tokens, in id order. Their ids are `256 + index`.
+pub const SPECIAL_TOKENS: &[&str] = &["<W>", "<END>"];
+
+/// Number of byte tokens — ids `0..256` are exactly the UTF-8 byte values.
+pub const BYTE_TOKENS: usize = 256;
+
+/// `[W]` word-boundary marker (HAT): appended as the encoder's end-of-word step
+/// and as the decoder's end-of-word target. Model-internal — never in the data.
+pub const W_TOKEN: u16 = BYTE_TOKENS as u16;
+/// End-of-text marker. Not emitted by `to_tokens`; used by samplers as a stop.
+pub const END_TOKEN: u16 = BYTE_TOKENS as u16 + 1;
+
+#[derive(Clone, Copy, Default)]
 pub struct Utf8Tokenizer;
-
-/// `[W]` word-boundary marker (HAT): 0xFF never occurs in valid UTF-8.
-pub const W_TOKEN: u16 = 0xFF;
 
 impl Utf8Tokenizer {
     pub fn new() -> Self {
@@ -25,69 +31,85 @@ impl Utf8Tokenizer {
         text.bytes().map(u16::from).collect()
     }
 
-    /// Decode a token sequence back into text. Invalid UTF-8 sequences
-    /// (e.g. a multi-byte character cut off mid-window) decode to U+FFFD.
+    /// Decode a token sequence back into text. Special tokens are skipped;
+    /// invalid UTF-8 (a multi-byte char cut off at a window edge) becomes U+FFFD.
     pub fn to_text(&self, tokens: &[u16]) -> String {
-        let bytes: Vec<u8> = tokens.iter().map(|&t| t as u8).collect();
+        let bytes: Vec<u8> = tokens
+            .iter()
+            .filter(|&&t| (t as usize) < BYTE_TOKENS)
+            .map(|&t| t as u8)
+            .collect();
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// Display string for a token id: printable ASCII as-is, everything else
-    /// as an escape like `\xC3` (a lone byte of a multi-byte char is not
-    /// valid text on its own).
+    /// Display string for a single token id: printable ASCII as itself, special
+    /// tokens by name, every other byte as an escape (a lone byte of a
+    /// multi-byte char is not valid text on its own).
     pub fn display(&self, token: u16) -> String {
-        assert!(token < 256, "Token {} not in vocabulary", token);
-        if token == W_TOKEN {
-            return "<W>".to_string();
+        let id = token as usize;
+        if let Some(name) = SPECIAL_TOKENS.get(id.wrapping_sub(BYTE_TOKENS)) {
+            return (*name).to_string();
         }
+        assert!(id < BYTE_TOKENS, "Token {token} not in vocabulary");
         match token as u8 {
-            b' '..=b'~' => (token as u8 as char).to_string(),
             b'\n' => "\\n".to_string(),
             b'\t' => "\\t".to_string(),
-            b => format!("\\x{:02X}", b),
+            b @ b' '..=b'~' => (b as char).to_string(),
+            b => format!("\\x{b:02X}"),
         }
     }
 
-    /// Human-readable rendering of a token sequence: decodes valid UTF-8
-    /// runs and escapes stray bytes.
+    /// Human-readable rendering of a token sequence: decodes the byte tokens as
+    /// UTF-8 and spells out any special token inline.
     pub fn display_tokens(&self, tokens: &[u16]) -> String {
-        self.to_text(tokens)
+        let mut out = String::new();
+        let mut run: Vec<u16> = Vec::new();
+        for &t in tokens {
+            if (t as usize) < BYTE_TOKENS {
+                run.push(t);
+            } else {
+                out.push_str(&self.to_text(&run));
+                run.clear();
+                out.push_str(&self.display(t));
+            }
+        }
+        out.push_str(&self.to_text(&run));
+        out
     }
 
     /// Token id of a single-byte (ASCII) character.
     pub fn get_token(&self, c: char) -> u16 {
-        let mapped = if c == '—' { '-' } else { c };
         assert!(
-            mapped.is_ascii(),
-            "Char {:?} is multi-byte; use to_tokens for non-ASCII",
-            c
+            c.is_ascii(),
+            "Char {c:?} is multi-byte; use to_tokens for non-ASCII"
         );
-        mapped as u16
+        c as u16
     }
 
-    /// Always 256 — one token per byte value.
+    /// 256 byte tokens plus the specials.
     pub const fn vocab_size(&self) -> usize {
-        256
+        BYTE_TOKENS + SPECIAL_TOKENS.len()
     }
 
-    /// The `[W]` word-boundary marker id (HAT encoder prefix / decoder EOS target).
+    /// The `[W]` end-of-word marker id (encoder EOS step / decoder EOS target).
     pub const fn w_token(&self) -> u16 {
         W_TOKEN
     }
 
-    const BOUNDARIES: &[u8] = &[
-        b' ', b'.', b'!', b'?', b',', b';', b':', b'\n', b'{', b'}', b'(', b')', b'[', b']', b'<',
-        b'>', b'|', b'"', b'\'',
-    ];
-
-    /// Token ids that count as word/segment boundaries for the hierarchical model.
-    pub fn boundary_tokens(&self) -> Vec<u16> {
-        Self::BOUNDARIES.iter().map(|&b| u16::from(b)).collect()
+    /// The `<END>` end-of-text marker id.
+    pub const fn end_token(&self) -> u16 {
+        END_TOKEN
     }
 
-    /// Token ids that count as sentence boundaries.
-    pub fn sentence_tokens(&self) -> Vec<u16> {
-        vec![b'.' as u16, b'!' as u16, b'?' as u16, b';' as u16]
+    /// Bytes a fixed-size token window may be cut at (used by the flat model's
+    /// window builder — the hierarchical word split lives in `crate::segment`).
+    pub fn boundary_tokens(&self) -> Vec<u16> {
+        [
+            b' ', b'.', b'!', b'?', b',', b';', b':', b'\n', b'{', b'}', b'(', b')',
+        ]
+        .iter()
+        .map(|&b| u16::from(b))
+        .collect()
     }
 
     /// Round-trip a string through encode → decode and check it matches.
@@ -100,8 +122,9 @@ impl Utf8Tokenizer {
     pub fn debug_summary(&self, sample: &str) {
         println!("=== Utf8Tokenizer ===");
         println!("  vocab_size : {}", self.vocab_size());
+        println!("  specials   : {SPECIAL_TOKENS:?} (ids {BYTE_TOKENS}..)");
         let tokens = self.to_tokens(sample);
-        println!("  encode({:?}) → {:?}", sample, tokens);
+        println!("  encode({sample:?}) → {tokens:?}");
         println!("  decode     → {:?}", self.to_text(&tokens));
     }
 }
@@ -113,17 +136,19 @@ mod tests {
     #[test]
     fn roundtrip_ascii_and_multibyte() {
         let tok = Utf8Tokenizer::new();
-        assert!(tok.roundtrip_check("Hello, world!\n"));
+        assert!(tok.roundtrip_check("fn main() { println!(\"hi\"); }\n"));
         assert!(tok.roundtrip_check("Größe — äöü ß 日本語 🦀"));
     }
 
     #[test]
-    fn vocab_is_256_and_w_token_is_reserved() {
+    fn specials_sit_above_the_byte_range() {
         let tok = Utf8Tokenizer::new();
-        assert_eq!(tok.vocab_size(), 256);
-        assert_eq!(tok.w_token(), 0xFF);
-        // 0xFF never appears when encoding valid UTF-8.
-        assert!(!tok.to_tokens("Größe 🦀 日本語").contains(&0xFF));
+        assert_eq!(tok.vocab_size(), 256 + SPECIAL_TOKENS.len());
+        assert_eq!(tok.w_token(), 256);
+        assert_eq!(tok.end_token(), 257);
+        // No encoded text can collide with a special token.
+        assert!(tok.to_tokens("Größe 🦀 日本語").iter().all(|&t| t < 256));
+        assert_eq!(tok.display(W_TOKEN), "<W>");
     }
 
     #[test]

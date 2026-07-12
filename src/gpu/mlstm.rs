@@ -25,23 +25,34 @@
 
 use super::block::Cell;
 use super::{DTensor, Gpu, linear::Linear, ops, rms_norm::RmsNorm};
+use crate::config::MLSTM_RECOMPUTE;
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
 
 /// Forward intermediates retained for the backward pass.
+///
+/// The two [BH, T, T] decay matrices (D̄ and DS) are the largest tensors here: at
+/// T = 2048 words they are 134 MB each, per block. Under `MLSTM_RECOMPUTE` they
+/// are NOT kept — both are a pure function of `s = Q·Kᵀ` and the [BH, T] vectors
+/// below, so backward rebuilds them (one GEMM + one elementwise kernel) and frees
+/// them again immediately. With the flag off they are cached as before, which is
+/// faster but costs 268 MB per block. See `config::MLSTM_RECOMPUTE`.
 struct Saved {
     b: usize,
     t: usize,
-    qh: DTensor,   // [BH, T, dqk]
-    kh: DTensor,   // [BH, T, dqk]  (already ×1/√dqk)
-    vh: DTensor,   // [BH, T, dhv]
-    fgh: DTensor,  // [BH, T]  forget-gate logit (head-major)
-    dbar: DTensor, // [BH, T, T]
-    ds: DTensor,   // [BH, T, T]
-    num: DTensor,  // [BH, T, dhv]
-    qn: DTensor,   // [BH, T]
-    psi: DTensor,  // [BH, T]
-    o: DTensor,    // [N, d]  (post-sigmoid)
+    qh: DTensor,  // [BH, T, dqk]
+    kh: DTensor,  // [BH, T, dqk]  (already ×1/√dqk)
+    vh: DTensor,  // [BH, T, dhv]
+    fgh: DTensor, // [BH, T]  forget-gate logit (head-major)
+    igh: DTensor, // [BH, T]  input-gate logit (head-major)  — for the D̄/DS rebuild
+    fc: DTensor,  // [BH, T]  cumsum of logσ(f)             — for the D̄/DS rebuild
+    m: DTensor,   // [BH, T]  running row-max stabilizer    — for the D̄/DS rebuild
+    /// D̄ and DS, cached only when `MLSTM_RECOMPUTE` is off (else rebuilt).
+    decay: Option<(DTensor, DTensor)>, // ([BH, T, T], [BH, T, T])
+    num: DTensor, // [BH, T, dhv]
+    qn: DTensor,  // [BH, T]
+    psi: DTensor, // [BH, T]
+    o: DTensor,   // [N, d]  (post-sigmoid)
     yhat: DTensor, // [N, d]
 }
 
@@ -185,11 +196,17 @@ impl MLstm {
 
         // Decay/stabilizer machinery.
         let fc = ops::cumsum_logsig(gpu, &fgh); // [BH, T]
-        let s = ops::matmul_batched_nt(gpu, &qh, &kh); // S = Q·Kᵀ  [BH, T, T]
         let m_prev = DTensor::zeros(gpu, &[b * h]); // single chunk: m_0 = 0
         let m = ops::mlstm_rowmax_m(gpu, &fc, &igh, &m_prev);
-        let (dbar, ds, qn, psi) = ops::mlstm_ds(gpu, &s, &fc, &igh, &m);
-        let num = ops::matmul_batched_nn(gpu, &ds, &vh); // (D̄⊙S)·V  [BH, T, dhv]
+        // S, D̄ and DS are the three [BH, T, T] tensors. S never outlives this
+        // scope; D̄/DS only do when recompute is off. See `Saved`.
+        let (num, qn, psi, decay) = {
+            let s = ops::matmul_batched_nt(gpu, &qh, &kh); // S = Q·Kᵀ  [BH, T, T]
+            let (dbar, ds, qn, psi) = ops::mlstm_ds(gpu, &s, &fc, &igh, &m);
+            let num = ops::matmul_batched_nn(gpu, &ds, &vh); // (D̄⊙S)·V  [BH, T, dhv]
+            let decay = (!MLSTM_RECOMPUTE).then_some((dbar, ds));
+            (num, qn, psi, decay)
+        };
         let ytil = ops::div_rows(gpu, &num, &psi, dhv); // ỹ  [BH, T, dhv]
 
         // Back to position-major, head-norm, o-gate, output projection.
@@ -199,7 +216,7 @@ impl MLstm {
         let out = self.lin_out.forward(gpu, &hconcat); // [N, d]
 
         // `o`/`yhat` are unused after `mul`, so move (not dup) them into the cache.
-        self.saved = Some(Saved { b, t, qh, kh, vh, fgh, dbar, ds, num, qn, psi, o, yhat });
+        self.saved = Some(Saved { b, t, qh, kh, vh, fgh, igh, fc, m, decay, num, qn, psi, o, yhat });
         out.reshaped(&[b, t, d])
     }
 
@@ -228,16 +245,32 @@ impl MLstm {
         // ỹ = num/ψ  → d_num, d_qn.
         let (d_num, d_qn) = ops::div_rows_bwd(gpu, &d_ytil, &sv.num, &sv.psi, &sv.qn, dhv);
 
-        // num = DS·V:  dV = DSᵀ·d_num ;  dDS(num path) = d_num·Vᵀ.
-        let dvh = ops::matmul_batched_tn(gpu, &sv.ds, &d_num); // [BH, T, dhv]
-        let dds_num = ops::matmul_batched_nt(gpu, &d_num, &sv.vh); // [BH, T, T]
+        // D̄/DS: cached by forward, or rebuilt here from (qh, kh, fc, igh, m) when
+        // `MLSTM_RECOMPUTE` is on. Either way they are dropped at the end of this
+        // scope — everything derived from them below is at most [BH, T, dqk].
+        let (dvh, d_s, p) = {
+            let (dbar, ds) = match &sv.decay {
+                Some((dbar, ds)) => (dbar.dup(gpu), ds.dup(gpu)),
+                None => {
+                    let s = ops::matmul_batched_nt(gpu, &sv.qh, &sv.kh); // S = Q·Kᵀ
+                    let (dbar, ds, _qn, _psi) = ops::mlstm_ds(gpu, &s, &sv.fc, &sv.igh, &sv.m);
+                    (dbar, ds)
+                }
+            };
 
-        // DS = D̄⊙S + qn-sum:  dS and P (= dD̄⊙D̄, feeds fc/ig grads).
-        let (d_s, p) = ops::mlstm_ds_bwd(gpu, &dds_num, &d_qn, &sv.dbar, &sv.ds);
+            // num = DS·V:  dV = DSᵀ·d_num ;  dDS(num path) = d_num·Vᵀ.
+            let dvh = ops::matmul_batched_tn(gpu, &ds, &d_num); // [BH, T, dhv]
+            let dds_num = ops::matmul_batched_nt(gpu, &d_num, &sv.vh); // [BH, T, T]
+
+            // DS = D̄⊙S + qn-sum:  dS and P (= dD̄⊙D̄, feeds fc/ig grads).
+            let (d_s, p) = ops::mlstm_ds_bwd(gpu, &dds_num, &d_qn, &dbar, &ds);
+            (dvh, d_s, p)
+        };
 
         // S = Q·Kᵀ:  dQ = dS·K ;  dK = dSᵀ·Q.
         let dqh = ops::matmul_batched_nn(gpu, &d_s, &sv.kh); // [BH, T, dqk]
         let dkh = ops::matmul_batched_tn(gpu, &d_s, &sv.qh); // [BH, T, dqk]
+        drop(d_s);
 
         // Decay grads: P → (dfc, dig); dfc → d(f-logit) via reverse-cumsum·logσ'.
         let (dfc, dig) = ops::mlstm_dfc_dig(gpu, &p);

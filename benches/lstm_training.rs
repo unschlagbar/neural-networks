@@ -4,7 +4,7 @@ use neural_networks::training::TrainingState;
 use std::{rc::Rc, time::Duration};
 
 use neural_networks::nn_layer::SequentialBuilder;
-use neural_networks::{self, tokenizer::Tokenizer};
+use neural_networks::{self, tokenizer_utf8::Utf8Tokenizer};
 
 const HIDDEN_SIZE: usize = 128;
 const SEQ_LEN: usize = 25;
@@ -20,7 +20,7 @@ pub const VOCAB: &[char] = &[
     '~', '"', '\'', '`', '\\', '_', '$', '“', '„', '🦀', '·', '\n',
 ];
 
-pub fn train(tokenizer: Rc<Tokenizer>, data: &PreparedDataSet) {
+pub fn train(tokenizer: Rc<Utf8Tokenizer>, data: &PreparedDataSet) {
     let vocab = tokenizer.vocab_size();
 
     let mut model = SequentialBuilder::new(vocab)
@@ -47,7 +47,7 @@ fn benchmark_lstm_behavior(c: &mut Criterion) {
     group.sample_size(20);
     group.measurement_time(Duration::from_nanos(1));
 
-    let tokenizer = Rc::new(Tokenizer::new_vocab(VOCAB, false));
+    let tokenizer = Rc::new(Utf8Tokenizer::new());
     let boundaries = tokenizer.boundary_tokens();
     let data =
         PreparedDataSet::from_dir(&tokenizer, "data/political_speeches/", SEQ_LEN, &boundaries);

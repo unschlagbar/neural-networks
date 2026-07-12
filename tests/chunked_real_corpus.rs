@@ -3,13 +3,12 @@
 // `cargo test --release --test chunked_real_corpus -- --ignored --nocapture`.
 use std::rc::Rc;
 
-use neural_networks::{batches::ChunkedWordDataSet, config, tokenizer::Tokenizer};
+use neural_networks::{batches::ChunkedWordDataSet, config, tokenizer_utf8::Utf8Tokenizer};
 
 #[test]
 #[ignore]
 fn stream_real_corpus() {
-    let tokenizer = Rc::new(Tokenizer::new("charset.txt", false));
-    let boundaries = tokenizer.boundary_tokens();
+    let tokenizer = Rc::new(Utf8Tokenizer::new());
     let start = std::time::Instant::now();
     let mut loader = ChunkedWordDataSet::open(
         tokenizer,
@@ -17,7 +16,6 @@ fn stream_real_corpus() {
         config::WORDS_PER_SEQ,
         config::MIN_WORDS_PER_SEQ,
         config::MAX_WINDOW_TOKENS,
-        &boundaries,
         4 * 1024 * 1024,
     );
     let (mut chunks, mut windows, mut tokens, mut max_span) = (0, 0, 0usize, 0);

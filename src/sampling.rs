@@ -4,14 +4,47 @@ use std::{
 };
 
 use crate::{
-    config::{CHARSET, MAX_LEN, MAX_SEQ_LEN, TEMPERATURE, TOP_P},
+    config::{MAX_LEN, MAX_SEQ_LEN, TEMPERATURE, TOP_P},
     hierarchical::Hierarchical,
     sequential::Sequential,
-    tokenizer::Tokenizer,
+    tokenizer_utf8::{BYTE_TOKENS, Utf8Tokenizer},
 };
 
+/// Streams sampled byte tokens to stdout. A UTF-8 character spans several byte
+/// tokens, so bytes are held back until they form a complete character.
+#[derive(Default)]
+struct Utf8Printer {
+    pending: Vec<u8>,
+}
+
+impl Utf8Printer {
+    /// Print `token` once its character is complete. Returns false on `<END>`.
+    fn print(&mut self, token: u16, tokenizer: &Utf8Tokenizer) -> bool {
+        if token == tokenizer.end_token() {
+            return false;
+        }
+        if (token as usize) >= BYTE_TOKENS {
+            return true; // model-internal marker — never displayed
+        }
+
+        self.pending.push(token as u8);
+        match std::str::from_utf8(&self.pending) {
+            Ok(s) => {
+                print!("{s}");
+                stdout().flush().unwrap();
+                self.pending.clear();
+            }
+            // Incomplete character: keep collecting. Anything else is a byte the
+            // model made up that can never complete — drop it.
+            Err(e) if e.error_len().is_none() => {}
+            Err(_) => self.pending.clear(),
+        }
+        true
+    }
+}
+
 pub fn sample_normal(model_path: &str) {
-    let tokenizer = Tokenizer::new(CHARSET, false);
+    let tokenizer = Utf8Tokenizer::new();
 
     let mut model = match Sequential::load(model_path) {
         Ok(m) => {
@@ -44,15 +77,9 @@ pub fn sample_normal(model_path: &str) {
         print!(">>> ");
         stdout().flush().unwrap();
 
+        let mut printer = Utf8Printer::default();
         model.sample(&prefix, MAX_LEN, TEMPERATURE, TOP_P, |token| {
-            let s = tokenizer.get_char(token);
-            if s == "<END>" {
-                false
-            } else {
-                print!("{s}");
-                stdout().flush().unwrap();
-                true
-            }
+            printer.print(token, &tokenizer)
         });
 
         println!();
@@ -60,9 +87,9 @@ pub fn sample_normal(model_path: &str) {
 }
 
 pub fn sample_hierarchical(model_path: &str) {
-    let tokenizer = Tokenizer::new(CHARSET, false);
+    let tokenizer = Utf8Tokenizer::new();
 
-    let mut model = Hierarchical::load(model_path, Rc::new(tokenizer.clone())).unwrap();
+    let mut model = Hierarchical::load(model_path, Rc::new(tokenizer)).unwrap();
 
     model.make_cache(1, MAX_SEQ_LEN);
 
@@ -83,15 +110,9 @@ pub fn sample_hierarchical(model_path: &str) {
         print!(">>> ");
         stdout().flush().unwrap();
 
+        let mut printer = Utf8Printer::default();
         model.sample(&prefix, MAX_LEN, TEMPERATURE, TOP_P, |token| {
-            let s = tokenizer.get_char(token);
-            if s == "<END>" {
-                false
-            } else {
-                print!("{s}");
-                stdout().flush().unwrap();
-                true
-            }
+            printer.print(token, &tokenizer)
         });
 
         println!();

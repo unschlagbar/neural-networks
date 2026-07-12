@@ -14,13 +14,13 @@ use std::time::Instant;
 
 use crate::batches::ChunkedWordDataSet;
 use crate::config::{
-    self, BATCH_SIZE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, LOG_EVERY, LOGIT_SOFTCAP, LR,
+    BATCH_SIZE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, LOG_EVERY, LOGIT_SOFTCAP, LR,
     MIN_WORDS_PER_SEQ, MAX_WINDOW_TOKENS, TRAIN_DATA, WORD_BLOCKS, WORD_HIDDEN, WORDS_PER_SEQ,
 };
 use crate::gpu::Gpu;
 use crate::gpu::hierarchical::{HierCfg, Hierarchical};
 use crate::nn2::optim::AdamCfg;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer_utf8::Utf8Tokenizer;
 use crate::training::TrainingState;
 
 /// Architecture, taken from `config.rs` so the GPU model matches the CPU one.
@@ -50,10 +50,9 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         }
     };
 
-    let tokenizer = Rc::new(Tokenizer::new(config::CHARSET, false));
+    let tokenizer = Rc::new(Utf8Tokenizer::new());
     let vocab = tokenizer.vocab_size();
     let w_token = tokenizer.w_token() as usize;
-    let word_boundary_ids = tokenizer.boundary_tokens();
     let cfg = cfg_from_config(vocab, w_token);
 
     let mut model = match Hierarchical::load(&gpu, model_path, w_token) {
@@ -84,7 +83,6 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
         MAX_WINDOW_TOKENS,
-        &word_boundary_ids,
         CHUNK_BYTES,
     );
     println!(
@@ -164,7 +162,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                     time = Instant::now();
                 }
                 if state.save() {
-                    match model.save(&gpu, state.save_path(), &word_boundary_ids) {
+                    match model.save(&gpu, state.save_path(), &[]) {
                         Ok(()) => {
                             // Flush the log only now, so it never reflects a step
                             // past the checkpoint just written.
@@ -180,7 +178,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         println!("Epoch {epoch} took {:.1?}", epoch_start.elapsed());
     }
 
-    match model.save(&gpu, state.save_path(), &word_boundary_ids) {
+    match model.save(&gpu, state.save_path(), &[]) {
         Ok(()) => {
             state.flush_log();
             println!("final save -> {}", state.save_path());

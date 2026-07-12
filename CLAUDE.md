@@ -58,7 +58,7 @@ All comments need to be in englisch not in german
 
 Optimizer assignment convention: interior projections use `linear`/`Linear` (Muon, weight-decayed); `linear_no_bias` and the embedding layers train on plain Adam without decay and are reserved for embedding-like tables and logit heads — putting hidden projections on the Adam path causes unbounded weight growth over long runs. The decoder's logit head is additionally followed by `SoftCap` (`src/nn/soft_cap.rs`, tag 17, `LOGIT_SOFTCAP = 30` like xLSTM-7B): `logits = cap·tanh(z/cap)` bounds the logits so the undecayed Adam head has no incentive to grow without limit.
 
-Boundary tokens come from `Tokenizer::boundary_tokens()`; a word is the token span up to and including its boundary token. Forward/backward run phase by phase over a whole window (all encodes, then the backbone sweep, then all decodes).
+Words come from `src/segment.rs` (see Tokenizer below), not from a boundary-token set. Forward/backward run phase by phase over a whole window (all encodes, then the backbone sweep, then all decodes).
 
 The encoder and decoder phases run **data-parallel over words** (rayon; see `src/parallel.rs`): each worker thread gets a full replica of the stack (`ReplicaPool`, copied weights via the NNFW round-trip, own recurrent state and grad accumulators) plus a disjoint slice of the shared forward cache, and after a parallel backward phase the replica grads are reduced into the master (`NnLayer::add_grads_from`). Replicas are rebuilt lazily after each optimizer step. Only the backbone sweep is serial (it carries cross-word state). Layers that appear in a parallel-trained stack must implement `add_grads_from`; `tests/parallel_parity.rs` checks the parallel path against single-threaded execution.
 
@@ -66,9 +66,11 @@ The encoder and decoder phases run **data-parallel over words** (rayon; see `src
 
 `pub type Optimizer = Muon` selects the active optimizer (Muon for 2D hidden weights, aux-Adam for embeddings and 1D params). All layers use the type aliases `GradMatrix` / `GradVec` from this module, so swapping optimizers only requires changing that one type alias. `BATCH_SIZE` in `config.rs` accumulates gradients over that many windows before each optimizer step.
 
-### Tokenizer (`src/tokenizer.rs`)
+### Tokenizer (`src/tokenizer_utf8.rs`) and word segmentation (`src/segment.rs`)
 
-Character-level tokenizer built from `charset.txt`. Special tokens `<SPACE2>`, `<SPACE4>`, `<END>`, `<QSTART>`, `<QEND>` extend the base vocab. `vocab_size()` includes these specials.
+`Utf8Tokenizer` is byte-level: ids `0..256` are raw UTF-8 bytes, ids `256..` are the specials in `SPECIAL_TOKENS` (`<W>` = end-of-word marker, `<END>`), so `vocab_size() == 256 + SPECIAL_TOKENS.len()` (258). Any UTF-8 text round-trips losslessly and no input byte can collide with a special. There is no charset file. Sampling decodes with `Utf8Printer` (`src/sampling.rs`), which holds bytes back until they form a whole character.
+
+`segment::word_ends` decides what a "word" is — the unit the backbone autoregresses over — with a lexer-shaped split tuned for Rust: a whitespace run is one unit and attaches as a *suffix* to the word before it (`"use "`, `";\n    "`), so a word carries the separator that closes it and the decoder emits that separator right before `[W]`; identifiers/keywords and numbers stay whole (`foo`, `1_000u32`), multi-byte operators are one word (`::`, `->`, `..=`, `//`), lifetimes (`'a`) differ from char literals (`'a'`), and non-ASCII bytes group into their character. Words tile the sequence contiguously and are capped at `MAX_WORD_BYTES` (config), which bounds the decoder unroll. Roughly 3–4 bytes per word on Rust source. `cargo run --example seg_demo -- src/foo.rs` prints the split for a file.
 
 ### Dataset (`src/batches.rs`)
 
@@ -85,11 +87,30 @@ length but ~128x faster than the CPU cell. `gpu::Hierarchical` checkpoints to th
 `GHIR` format (config header + every param in `params_mut` order); weights only,
 so a resumed run restarts the Adam moments.
 
+**VRAM.** Two things dominate a window and both have a knob:
+- *Word batching.* The encoder/decoder run words as `[words, tmax]` rectangles and
+  `tmax` is the longest word in the group, so a single 16-byte word would pad every
+  2-byte word (~4.5x waste on Rust source). `group_by_len` splits a window's words
+  into power-of-two length groups, each its own dense rectangle — the mLSTM's
+  per-word `[T, T]` attention still needs a rectangle, which is why groups exist
+  rather than a fully packed row layout. The decoder runs forward+backward per
+  group; the encoder re-forwards each group in its backward phase (activation
+  checkpointing), so only one group is ever resident. `gpu::hierarchical`'s
+  `grouping_matches_single_rectangle` pins this to be numerically identical to the
+  unsplit path, and `GPU_NO_GROUP=1` restores that path for A/B benchmarking.
+- *Backbone decay matrices.* `config::MLSTM_RECOMPUTE` (default on) drops the two
+  `[heads, T, T]` matrices (134 MB **each, per mLSTM block** at 2048 words) and
+  rebuilds them in backward from one GEMM. Off = faster when it already fits.
+
+`GPU_PROF=1` prints per-phase timings; `GPU_MEM=1` adds device memory in use after
+each phase. `cargo run --release --features cuda --example gpu_fit -- <corpus> [words]`
+runs a corpus's worst-shaped window and reports peak VRAM and s/window.
+
 ### Persistence (`src/saving.rs`, `src/loading.rs`)
 
 Two binary formats:
 - `NNFW` (magic `0x4E4E_4657`) — `Sequential` flat format: architecture header then weights, all little-endian.
-- `HIER` (magic `0x4849_4552`) — wraps three `NNFW` blobs with vocab/boundary metadata.
+- `HIER` (magic `0x4849_4552`) — wraps three `NNFW` blobs with vocab metadata. The header still carries the old boundary-token list, now always written empty (words come from `src/segment.rs`), so older checkpoints stay parseable by `load_stacks`.
 
 Models are saved to `models/` (created automatically). Paths and all hyperparameters (LR, dims, sequence length, save/print intervals) live in `src/config.rs`.
 

@@ -9,9 +9,9 @@ use std::path::Path;
 use std::rc::Rc;
 
 use neural_networks::{
-    config::{CHARSET, MAX_SEQ_LEN},
+    config::MAX_SEQ_LEN,
     hierarchical::Hierarchical,
-    tokenizer::Tokenizer,
+    tokenizer_utf8::Utf8Tokenizer,
 };
 
 // `pu-` cluster first, then unrelated controls.
@@ -47,7 +47,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    let tokenizer = Rc::new(Tokenizer::new(CHARSET, false));
+    let tokenizer = Rc::new(Utf8Tokenizer::new());
 
     for name in &args {
         let path = resolve(name);

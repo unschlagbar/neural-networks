@@ -26,7 +26,7 @@ use std::{
 
 use rand::{rng, seq::SliceRandom};
 
-use crate::tokenizer::Tokenizer;
+use crate::{segment, tokenizer_utf8::Utf8Tokenizer};
 
 const SPLIT: &str = "<|endoftext|>";
 //const SPLIT: &str = "---FILE---";
@@ -49,7 +49,7 @@ pub struct PreparedDataSet {
 
 impl PreparedDataSet {
     pub fn from_single_file(
-        tokenizer: &Tokenizer,
+        tokenizer: &Utf8Tokenizer,
         path: &str,
         seq_len: usize,
         boundary_ids: &[u16],
@@ -90,7 +90,7 @@ impl PreparedDataSet {
     /// pre-compute all windows. Files that fail to read or are too short are
     /// skipped with a warning.
     pub fn from_dir(
-        tokenizer: &Tokenizer,
+        tokenizer: &Utf8Tokenizer,
         dir: &str,
         seq_len: usize,
         boundary_ids: &[u16],
@@ -106,7 +106,7 @@ impl PreparedDataSet {
     /// Build a `PreparedDataSet` from an explicit file list. Use this when you
     /// want recursive collection (gather paths yourself, then pass them in).
     pub fn from_paths(
-        tokenizer: &Tokenizer,
+        tokenizer: &Utf8Tokenizer,
         paths: &[PathBuf],
         seq_len: usize,
         boundary_ids: &[u16],
@@ -272,24 +272,6 @@ fn build_windows(sequences: &[Vec<u16>], seq_len: usize, boundary_ids: &[u16]) -
 // same windows a whole-file load would — but peak memory is bounded by the
 // chunk size, not the corpus size (> 1 GB corpora stream fine).
 
-/// Word-segment `seq` into the compact ends-only representation: `ends[i]` is
-/// the exclusive end of word `i`, its start is `ends[i-1]` (0 for the first).
-/// A word ends at a boundary token (the boundary is its last element); any
-/// trailing non-boundary chars form a final word. 4 bytes per word instead of
-/// a 16-byte `Range` — words tile the sequence contiguously, starts are implied.
-fn segment_word_ends(seq: &[u16], is_boundary: &[bool]) -> Vec<u32> {
-    let mut ends = Vec::new();
-    for (t, &tok) in seq.iter().enumerate() {
-        if is_boundary[tok as usize] {
-            ends.push(t as u32 + 1);
-        }
-    }
-    if ends.last().map_or(0, |&e| e as usize) < seq.len() {
-        ends.push(seq.len() as u32);
-    }
-    ends
-}
-
 #[derive(Clone, Copy, Debug)]
 struct WordWindow {
     seq: u32,
@@ -315,14 +297,13 @@ pub struct WordChunk {
 impl WordChunk {
     fn build(
         sequences: Vec<Vec<u16>>,
-        is_boundary: &[bool],
         words_per_seq: usize,
         min_words: usize,
         max_tokens: usize,
     ) -> Self {
         let segments: Vec<Vec<u32>> = sequences
             .iter()
-            .map(|seq| segment_word_ends(seq, is_boundary))
+            .map(|seq| segment::word_ends(seq))
             .collect();
 
         let (windows, max_window_tokens) =
@@ -365,13 +346,10 @@ impl WordChunk {
 /// Streaming loader: reads `chunk_bytes` of raw text at a time, cuts at the
 /// last complete document, and hands out ready-to-train `WordChunk`s.
 pub struct ChunkedWordDataSet {
-    tokenizer: Rc<Tokenizer>,
+    tokenizer: Rc<Utf8Tokenizer>,
     words_per_seq: usize,
     min_words: usize,
     max_tokens: usize,
-    /// Boundary lookup indexed by token id — O(1) per token instead of a
-    /// linear scan over the boundary list.
-    is_boundary: Box<[bool]>,
     chunk_bytes: usize,
     reader: BufReader<File>,
     /// Bytes after the last complete document of the previous read — they
@@ -384,29 +362,23 @@ pub struct ChunkedWordDataSet {
 
 impl ChunkedWordDataSet {
     pub fn open(
-        tokenizer: Rc<Tokenizer>,
+        tokenizer: Rc<Utf8Tokenizer>,
         path: &str,
         words_per_seq: usize,
         min_words: usize,
         max_tokens: usize,
-        boundary_ids: &[u16],
         chunk_bytes: usize,
     ) -> Self {
         assert!(words_per_seq >= 2, "words_per_seq must be >= 2");
         assert!(chunk_bytes > SPLIT.len(), "chunk_bytes is too small");
 
         let file = File::open(path).unwrap_or_else(|e| panic!("could not open {path:?}: {e}"));
-        let mut is_boundary = vec![false; tokenizer.vocab_size()].into_boxed_slice();
-        for &id in boundary_ids {
-            is_boundary[id as usize] = true;
-        }
 
         Self {
             tokenizer,
             words_per_seq,
             min_words,
             max_tokens,
-            is_boundary,
             chunk_bytes,
             reader: BufReader::new(file),
             carry: Vec::new(),
@@ -497,7 +469,6 @@ impl ChunkedWordDataSet {
 
             let chunk = WordChunk::build(
                 sequences,
-                &self.is_boundary,
                 self.words_per_seq,
                 self.min_words,
                 self.max_tokens,
@@ -528,16 +499,6 @@ fn find_last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
-    fn test_tokenizer() -> Rc<Tokenizer> {
-        let mut vocab: Vec<char> = ('a'..='z').collect();
-        vocab.extend('0'..='9');
-        vocab.extend([
-            ' ', '.', '!', '?', ',', ';', ':', '\n', '{', '}', '(', ')', '[', ']', '<', '>', '|',
-            '"', '\'', '-',
-        ]);
-        Rc::new(Tokenizer::new_vocab(&vocab, false))
-    }
-
     fn collect_all(loader: &mut ChunkedWordDataSet) -> Vec<(Vec<u16>, Vec<Range<usize>>)> {
         let mut out = Vec::new();
         while let Some(chunk) = loader.next_chunk() {
@@ -552,8 +513,7 @@ mod tests {
     /// load produces, and rewinding must reproduce them deterministically.
     #[test]
     fn tiny_chunks_match_whole_file() {
-        let tokenizer = test_tokenizer();
-        let boundaries = tokenizer.boundary_tokens();
+        let tokenizer = Rc::new(Utf8Tokenizer::new());
 
         // A few hundred small documents so many chunk cuts land mid-file.
         let mut text = String::new();
@@ -568,8 +528,7 @@ mod tests {
         let path = path.to_str().unwrap();
 
         let open = |chunk_bytes: usize| {
-            let mut l =
-                ChunkedWordDataSet::open(tokenizer.clone(), path, 6, 2, 64, &boundaries, chunk_bytes);
+            let mut l = ChunkedWordDataSet::open(tokenizer.clone(), path, 6, 2, 64, chunk_bytes);
             l.quiet = true;
             l
         };

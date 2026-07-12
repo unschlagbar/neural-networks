@@ -831,11 +831,20 @@ pub fn scatter_rows(gpu: &Gpu, dst: &mut DTensor, src: &DTensor, row_ids: &[usiz
 pub fn masked_softmax_cross_entropy(
     gpu: &Gpu, logits: &DTensor, targets: &[usize], mask: &[bool],
 ) -> (f32, DTensor) {
+    let num_valid = mask.iter().filter(|&&m| m).count().max(1) as f32;
+    masked_softmax_cross_entropy_scaled(gpu, logits, targets, mask, 1.0 / num_valid)
+}
+
+/// Masked CE with an explicit `1/N` normalizer. When one window is split into
+/// several rectangles (the length-grouped word batches), every group must be
+/// scaled by the window's TOTAL valid-row count — not its own — so the summed
+/// losses and gradients equal the single-rectangle result.
+pub fn masked_softmax_cross_entropy_scaled(
+    gpu: &Gpu, logits: &DTensor, targets: &[usize], mask: &[bool], inv: f32,
+) -> (f32, DTensor) {
     let (r, c) = (logits.rows(), logits.cols());
     assert_eq!(targets.len(), r, "masked CE — targets len != rows");
     assert_eq!(mask.len(), r, "masked CE — mask len != rows");
-    let num_valid = mask.iter().filter(|&&m| m).count().max(1) as f32;
-    let inv = 1.0 / num_valid;
     let dtargets = upload_ids(gpu, targets);
     let mask_u: Vec<usize> = mask.iter().map(|&m| m as usize).collect();
     let dmask = upload_ids(gpu, &mask_u);

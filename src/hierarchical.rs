@@ -21,9 +21,10 @@ use crate::{
     nn_layer::{DynCache, NnLayer},
     optimizers::GradMatrixOps,
     parallel::{ReplicaPool, WorkerChunk, chunk_words, split_by_words},
-    saving::{HIER_MAGIC, write_u16, write_u32, write_u64},
+    saving::{HIER_MAGIC, write_u32, write_u64},
+    segment,
     sequential::Sequential,
-    tokenizer::Tokenizer,
+    tokenizer_utf8::{BYTE_TOKENS, Utf8Tokenizer},
     training::TrainingState,
     word_encoder::WordEncoder,
 };
@@ -54,11 +55,10 @@ pub struct Hierarchical {
     pub vocab_size: usize,
     pub context_size: usize,
 
-    pub tokenizer: Rc<Tokenizer>,
+    pub tokenizer: Rc<Utf8Tokenizer>,
     /// The `[W]` marker id — the decoder's EOS target (and sampling stop token).
     w_token: u16,
 
-    pub boundary_token_ids: Vec<u16>,
     /// `[start, end)` (half-open) token ranges over the window, one per word.
     /// Filled by `forward_over`, reused by `backwards_sequence`.
     word_segments: Vec<Range<usize>>,
@@ -102,14 +102,14 @@ pub struct Hierarchical {
 }
 
 impl Hierarchical {
-    /// `boundary_token_ids` — from `tokenizer.boundary_tokens()`.
+    /// Words are segmented by `crate::segment` — the model itself only needs the
+    /// `[W]` marker, which it takes from the tokenizer.
     pub fn new(
         encoder_chars: Sequential,
         char2_model: Sequential,
         word_model: Sequential,
         vocab_size: usize,
-        boundary_token_ids: Vec<u16>,
-        tokenizer: Rc<Tokenizer>,
+        tokenizer: Rc<Utf8Tokenizer>,
     ) -> Self {
         let context_size = word_model.output_size;
         let char_out = encoder_chars.output_size;
@@ -157,7 +157,6 @@ impl Hierarchical {
             context_size,
             tokenizer,
             w_token,
-            boundary_token_ids,
             word_segments: Vec::new(),
             dec_ranges: Vec::new(),
             dec_targets: Vec::new(),
@@ -370,7 +369,7 @@ impl Hierarchical {
         let enc = format!(
             "{}{}",
             self.tokenizer.display_tokens(&tokens[word.start..word.end]),
-            if ENC_W_EOS { wm } else { "" }
+            if ENC_W_EOS { wm.as_str() } else { "" }
         );
         let dec_in = format!(
             "<ctx>{}",
@@ -762,37 +761,31 @@ impl Hierarchical {
         }
 
         self.reset();
-        let vocab = self.vocab_size;
         let w_tok = self.w_token as usize;
 
         // --- Bootstrap the backbone from the prefix --------------------------
-        // Encode each COMPLETE word of the prefix (boundary-terminated) to advance
-        // the backbone, exactly like the encode words in training. The decoder only
-        // ever decodes the word currently being generated.
-        let mut enc_buf: Vec<u16> = Vec::new();
-        let mut context_ready = false;
-        for &tok in prefix {
-            enc_buf.push(tok);
-            if self.boundary_token_ids.contains(&tok) {
-                self.encode_word_advance(&enc_buf);
-                enc_buf.clear();
-                context_ready = true;
+        // Segment the prefix and encode every complete word to advance the
+        // backbone, exactly like the encode words in training. The prefix's
+        // trailing word may be cut off mid-token (`fn ma`), so it is not encoded
+        // — it becomes the teacher-forced start of the word we generate next.
+        let (complete, tail) = segment::split_prefix(prefix);
+        let mut tail = tail.to_vec();
+
+        if complete.is_empty() {
+            // Nothing complete to encode → seed the backbone with the tail (or a
+            // random byte when the prefix is empty), so a word context exists.
+            if tail.is_empty() {
+                tail.push(rand::random_range(0..BYTE_TOKENS) as u16);
+            }
+            let seed = std::mem::take(&mut tail);
+            self.encode_word_advance(&seed);
+        } else {
+            for word in complete {
+                self.encode_word_advance(word);
             }
         }
 
-        // No complete word in the prefix → treat the whole prefix (or a random seed
-        // when empty) as the first encode word, so a word context exists.
-        if !context_ready {
-            if enc_buf.is_empty() {
-                enc_buf.push(rand::random_range(0..vocab) as u16);
-            }
-            self.encode_word_advance(&enc_buf);
-            enc_buf.clear();
-        }
-
-        // Whatever trailed the last boundary is the teacher-forced start of the
-        // word we are about to generate (empty unless the prefix ended mid-word).
-        let mut forced = enc_buf.into_iter();
+        let mut forced = tail.into_iter();
 
         // --- Generation ------------------------------------------------------
         let mut out = Vec::with_capacity(max_len);
@@ -866,10 +859,9 @@ impl Hierarchical {
         write_u32(w, HIER_MAGIC)?;
         write_u32(w, self.vocab_size as u32)?;
         write_u32(w, self.context_size as u32)?;
-        write_u32(w, self.boundary_token_ids.len() as u32)?;
-        for &id in &self.boundary_token_ids {
-            write_u16(w, id)?;
-        }
+        // Boundary-id list: empty since words are segmented by `crate::segment`.
+        // The field stays in the header so older checkpoints still parse.
+        write_u32(w, 0)?;
 
         self.encoder.chars.write_to(w)?;
         self.word_model.write_to(w)?;
@@ -917,14 +909,13 @@ impl Hierarchical {
         })
     }
 
-    pub fn load(path: &str, tokenizer: Rc<Tokenizer>) -> io::Result<Self> {
+    pub fn load(path: &str, tokenizer: Rc<Utf8Tokenizer>) -> io::Result<Self> {
         let stacks = Self::load_stacks(path)?;
         let mut model = Self::new(
             stacks.encoder_chars,
             stacks.char2_model,
             stacks.word_model,
             stacks.vocab_size,
-            stacks.boundary_token_ids,
             tokenizer,
         );
         debug_assert_eq!(model.context_size, stacks.context_size);
@@ -979,7 +970,7 @@ mod tests {
     /// `Hierarchical` gradient plumbing itself — the tied-embedding row
     /// accumulation and the slot-0 context extraction — from any recurrent
     /// layer's backward.
-    fn build_stateless(vocab: usize, boundaries: Vec<u16>, tok: Rc<Tokenizer>) -> Hierarchical {
+    fn build_stateless(vocab: usize, tok: Rc<Utf8Tokenizer>) -> Hierarchical {
         let encoder = SequentialBuilder::new(vocab)
             .embedding(H)
             .rms_norm()
@@ -991,12 +982,12 @@ mod tests {
             .linear_no_bias(vocab)
             .soft_cap(30.0)
             .build();
-        Hierarchical::new(encoder, char2_model, word_model, vocab, boundaries, tok)
+        Hierarchical::new(encoder, char2_model, word_model, vocab, tok)
     }
 
     /// All-sLSTM stacks (the pre-mLSTM hierarchical layout): adds the
     /// recurrent per-word reset and BPTT handling on top of the plumbing.
-    fn build_slstm(vocab: usize, boundaries: Vec<u16>, tok: Rc<Tokenizer>) -> Hierarchical {
+    fn build_slstm(vocab: usize, tok: Rc<Utf8Tokenizer>) -> Hierarchical {
         let encoder = SequentialBuilder::new(vocab)
             .embedding(H)
             .slstm_block(H)
@@ -1014,34 +1005,30 @@ mod tests {
             .linear_no_bias(vocab)
             .soft_cap(30.0)
             .build();
-        Hierarchical::new(encoder, char2_model, word_model, vocab, boundaries, tok)
+        Hierarchical::new(encoder, char2_model, word_model, vocab, tok)
     }
 
     /// A small window with forward + backward already run on a fresh model.
     struct Setup {
-        tokenizer: Rc<Tokenizer>,
+        tokenizer: Rc<Utf8Tokenizer>,
         tokens: Vec<u16>,
         words: Vec<Range<usize>>,
         model: Hierarchical,
     }
 
-    fn setup(build: fn(usize, Vec<u16>, Rc<Tokenizer>) -> Hierarchical) -> Setup {
-        let tokenizer = Rc::new(Tokenizer::new("charset.txt", false));
-        let boundaries = tokenizer.boundary_tokens();
-        let mut model = build(
-            tokenizer.vocab_size(),
-            boundaries.clone(),
-            tokenizer.clone(),
-        );
+    fn setup(build: fn(usize, Rc<Utf8Tokenizer>) -> Hierarchical) -> Setup {
+        let tokenizer = Rc::new(Utf8Tokenizer::new());
+        let mut model = build(tokenizer.vocab_size(), tokenizer.clone());
 
-        let tokens = tokenizer.to_tokens("the cat sat on the mat again ");
+        let tokens = tokenizer.to_tokens("let cat = sat(on, the).mat();");
         let mut words: Vec<Range<usize>> = Vec::new();
         let mut start = 0;
-        for (i, t) in tokens.iter().enumerate() {
-            if boundaries.contains(t) {
-                words.push(Range { start, end: i + 1 });
-                start = i + 1;
-            }
+        for e in segment::word_ends(&tokens) {
+            words.push(Range {
+                start,
+                end: e as usize,
+            });
+            start = e as usize;
         }
         assert!(words.len() >= 4, "test text must contain several words");
 
@@ -1128,7 +1115,7 @@ mod tests {
     /// the decoder char steps' input grads (the `dec_targets[slot-1]` row
     /// indexing). A wrong row or a missed contribution breaks the match.
     fn check_tied_embedding(
-        build: fn(usize, Vec<u16>, Rc<Tokenizer>) -> Hierarchical,
+        build: fn(usize, Rc<Utf8Tokenizer>) -> Hierarchical,
         name: &str,
         tol: f64,
     ) {
@@ -1150,7 +1137,7 @@ mod tests {
     /// The backbone's output projection receives gradient exclusively through
     /// the injected slot-0 context, so this validates the d_o extraction.
     fn check_injected_context(
-        build: fn(usize, Vec<u16>, Rc<Tokenizer>) -> Hierarchical,
+        build: fn(usize, Rc<Utf8Tokenizer>) -> Hierarchical,
         name: &str,
         tol: f64,
     ) {
