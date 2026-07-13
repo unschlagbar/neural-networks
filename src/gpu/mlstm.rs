@@ -113,6 +113,35 @@ struct Saved {
     yhat: DTensor, // [N, d]
 }
 
+/// Forward intermediates of the **fused** path. Far smaller than `Saved`: the
+/// per-chunk `[BH, L, L]` decay matrices do not exist — backward rebuilds them in
+/// shared memory (see `ops::MlstmFused`).
+struct SavedFused {
+    b: usize,
+    t: usize,
+    qh: DTensor,
+    kh: DTensor,
+    vh: DTensor,
+    igh: DTensor,
+    fgh: DTensor,
+    fused: ops::MlstmFused,
+    o: DTensor,
+    yhat: DTensor,
+}
+
+/// Which forward ran, and hence which backward must.
+enum Cache {
+    Fused(SavedFused),
+    Legacy(Saved),
+}
+
+/// `MLSTM_LEGACY=1` forces the op-at-a-time chunk loop — the A/B baseline for
+/// `mlstm_fused_bench`, and the escape hatch if a fused kernel ever misbehaves.
+fn legacy_forced() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("MLSTM_LEGACY").is_ok())
+}
+
 pub struct MLstm {
     pub input_size: usize,
     pub d: usize,
@@ -134,7 +163,7 @@ pub struct MLstm {
     lin_out: Linear,
     headnorm: RmsNorm, // head-wise (group == dhv)
 
-    saved: Option<Saved>,
+    saved: Option<Cache>,
 }
 
 impl MLstm {
@@ -234,6 +263,24 @@ impl MLstm {
         self.chunk = chunk;
     }
 
+    /// The chunk length the **fused** kernels would run this sequence at, or `None`
+    /// if it must take the op-at-a-time path.
+    ///
+    /// `chunk == 0` means "one chunk over the whole sequence", which the fused
+    /// kernels cannot do beyond `FUSED_MAX_L` (the decay matrix would not fit in
+    /// shared memory) — and it is only ever set to A/B the O(T²) single-chunk form,
+    /// so it keeps the old path rather than being silently reblocked. A configured
+    /// chunk longer than `FUSED_MAX_L` *is* silently clamped: chunk length is a
+    /// blocking choice with no effect on the result, which
+    /// `mlstm_chunking_matches_single_chunk` pins.
+    fn fused_chunk(&self, t: usize) -> Option<usize> {
+        if legacy_forced() || self.chunk == 0 {
+            return None;
+        }
+        let l = self.chunk.min(ops::FUSED_MAX_L).min(t).max(1);
+        ops::mlstm_fused_supported(l, self.dqk, self.dhv).then_some(l)
+    }
+
     /// Chunk boundaries for a sequence of length `t`: `[(c0, len), …]`. A `t` that
     /// already fits in one chunk yields a single full-length chunk, i.e. exactly
     /// the pre-chunking path.
@@ -275,6 +322,21 @@ impl MLstm {
         let vh = ops::head_gather(gpu, &v, b, h, t, dhv); // [BH, T, dhv]
         let igh = ops::head_gather(gpu, &ig, b, h, t, 1).reshaped(&[bh, t]); // [BH, T]
         let fgh = ops::head_gather(gpu, &fg, b, h, t, 1).reshaped(&[bh, t]);
+
+        // The fused kernels do the whole chunkwise core — states and all chunks — in
+        // three launches. Everything before and after (projections, head norm, the
+        // o-gate, the output projection) is shared with the path below.
+        if let Some(l) = self.fused_chunk(t) {
+            let fused = ops::mlstm_fused_fw(gpu, &qh, &kh, &vh, &igh, &fgh, l);
+            let h_tilde = ops::head_scatter(gpu, &fused.ytil, b, h, t, dhv); // [N, d]
+            let yhat = self.headnorm.forward(gpu, &h_tilde);
+            let hconcat = ops::mul(gpu, &o, &yhat);
+            let out = self.lin_out.forward(gpu, &hconcat);
+            self.saved = Some(Cache::Fused(SavedFused {
+                b, t, qh, kh, vh, igh, fgh, fused, o, yhat,
+            }));
+            return out.reshaped(&[b, t, d]);
+        }
 
         // Recurrent state carried across chunks (stabilized, as on the CPU).
         let mut c_state = DTensor::zeros(gpu, &[bh, dhv, dqk]);
@@ -362,7 +424,7 @@ impl MLstm {
         let out = self.lin_out.forward(gpu, &hconcat); // [N, d]
 
         // `o`/`yhat` are unused after `mul`, so move (not dup) them into the cache.
-        self.saved = Some(Saved { b, t, qh, kh, vh, fgh, chunks, o, yhat });
+        self.saved = Some(Cache::Legacy(Saved { b, t, qh, kh, vh, fgh, chunks, o, yhat }));
         out.reshaped(&[b, t, d])
     }
 
@@ -372,12 +434,50 @@ impl MLstm {
     /// chunk hands to its successor) backwards the way forward carried `C`/`n`
     /// forwards — BPTT over chunks, with the parallel form inside each.
     pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+        // `take`, not `as_ref`: the cache holds a window's activations, and dropping
+        // them at the end of this call (rather than when the next forward overwrites
+        // the field) keeps them from staying resident across the optimizer step.
+        match self.saved.take().expect("MLstm::backward before forward") {
+            Cache::Fused(sv) => self.backward_fused(gpu, dy, sv),
+            Cache::Legacy(sv) => self.backward_legacy(gpu, dy, sv),
+        }
+    }
+
+    /// Backward of the fused path: two kernels for the whole chunkwise core, with
+    /// the same projection/head-norm/o-gate shell as the op-at-a-time path.
+    fn backward_fused(&mut self, gpu: &Gpu, dy: &DTensor, sv: SavedFused) -> DTensor {
         let (d, h, dqk, dhv, inp) = (self.d, self.heads, self.dqk, self.dhv, self.input_size);
-        // `take`, not `as_ref`: the cache holds the per-chunk decay matrices, the
-        // largest tensors in the model. Dropping them at the end of this call
-        // (rather than when the next forward overwrites the field) keeps a window's
-        // activations from staying resident across the optimizer step.
-        let sv = self.saved.take().expect("MLstm::backward before forward");
+        let (b, t) = (sv.b, sv.t);
+        let (n, bh) = (b * t, b * h);
+
+        let dy_flat = dy.dup(gpu).reshaped(&[n, d]);
+        let d_hconcat = self.lin_out.backward(gpu, &dy_flat);
+        let (do_pre, d_yhat) = ops::ogate_bwd(gpu, &d_hconcat, &sv.o, &sv.yhat);
+        let d_h_tilde = self.headnorm.backward(gpu, &d_yhat);
+        let d_ytil = ops::head_gather(gpu, &d_h_tilde, b, h, t, dhv); // [BH, T, dhv]
+
+        let (dqh, dkh, dvh, digh, dfgh) = ops::mlstm_fused_bw(
+            gpu, &sv.fused, &sv.qh, &sv.kh, &sv.vh, &sv.igh, &sv.fgh, &d_ytil,
+        );
+
+        let dq = ops::head_scatter(gpu, &dqh, b, h, t, dqk); // [N, dqk·H]
+        let mut dk = ops::head_scatter(gpu, &dkh, b, h, t, dqk);
+        ops::scale_(gpu, &mut dk, self.inv_sqrt_dqk); // k = (·)·1/√dqk
+        let dv = ops::head_scatter(gpu, &dvh, b, h, t, dhv);
+        let d_ig = ops::head_scatter(gpu, &digh.reshaped(&[bh, t, 1]), b, h, t, 1);
+        let d_fg = ops::head_scatter(gpu, &dfgh.reshaped(&[bh, t, 1]), b, h, t, 1);
+
+        let mut dxf = self.lin_q.backward(gpu, &dq);
+        dxf = ops::add(gpu, &dxf, &self.lin_k.backward(gpu, &dk));
+        dxf = ops::add(gpu, &dxf, &self.lin_v.backward(gpu, &dv));
+        dxf = ops::add(gpu, &dxf, &self.lin_o.backward(gpu, &do_pre));
+        dxf = ops::add(gpu, &dxf, &self.lin_i.backward(gpu, &d_ig));
+        dxf = ops::add(gpu, &dxf, &self.lin_f.backward(gpu, &d_fg));
+        dxf.reshaped(&[b, t, inp])
+    }
+
+    fn backward_legacy(&mut self, gpu: &Gpu, dy: &DTensor, sv: Saved) -> DTensor {
+        let (d, h, dqk, dhv, inp) = (self.d, self.heads, self.dqk, self.dhv, self.input_size);
         let sv = &sv;
         let (b, t) = (sv.b, sv.t);
         let (n, bh) = (b * t, b * h);
@@ -716,6 +816,50 @@ mod tests {
             assert_close(&wf, &wf0, 2e-6, &format!("wf (chunk {l})"));
             assert_close(&wo, &wo0, 2e-6, &format!("w_out (chunk {l})"));
         }
+    }
+
+    /// The fused kernels vs the op-at-a-time path at the **backbone's real shape**.
+    ///
+    /// The other tests run at toy dims (dqk = dhv = 4, T = 20), where a fused block
+    /// uses a few hundred bytes of shared memory and most of its 256 threads idle.
+    /// This one runs dqk = dhv = 64 over a T that spans many chunks and ends on a
+    /// SHORT one (T = 200 = 6·32 + 8), which is what actually exercises the shared-
+    /// memory staging, the block-wide max/sum reductions, and the `len` masking on
+    /// the ragged final chunk. A bug in any of those is invisible at the toy dims.
+    #[test]
+    fn mlstm_fused_matches_legacy() {
+        let Some(gpu) = super::super::test_gpu() else { return };
+        let (b, t, inp, d, heads, dqk) = (2, 200, 64, 512, 8, 64); // dhv = 64
+        assert!(t % super::ops::FUSED_MAX_L != 0, "the last chunk must be short");
+
+        let mut proto = CpuMLstm::new(inp, d, heads, dqk);
+        proto.wi = Tensor::random(&[inp, heads], 0.3);
+        proto.wf = Tensor::random(&[inp, heads], 0.3);
+
+        let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, inp], 0.5));
+        let g = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
+
+        // `chunk` here selects the path, not just the blocking: 0 is the only value
+        // the fused kernels decline, so it is the reference. See `fused_chunk`.
+        let run = |chunk: usize| {
+            let mut dev = MLstm::from_cpu(&gpu, &proto);
+            dev.set_chunk(chunk);
+            let y = dev.forward(&gpu, &x).to_host(&gpu).data;
+            let dx = dev.backward(&gpu, &g).to_host(&gpu).data;
+            let mut cfg = AdamCfg::new(1e-3, 0.01);
+            cfg.t = 1;
+            dev.step(&gpu, &cfg);
+            let wf = dev.lin_f.w.to_host(&gpu).data; // rides the decay path
+            let wout = dev.lin_out.w.to_host(&gpu).data; // rides the value path
+            (y, dx, wf, wout)
+        };
+
+        let (y0, dx0, wf0, wo0) = run(0); // op-at-a-time, single chunk
+        let (y1, dx1, wf1, wo1) = run(32); // fused
+        assert_close(&y1, &y0, 2e-3, "y");
+        assert_close(&dx1, &dx0, 2e-3, "dx");
+        assert_close(&wf1, &wf0, 2e-5, "wf");
+        assert_close(&wo1, &wo0, 2e-5, "w_out");
     }
 
     /// The chunked path vs the CPU scalar recurrence — the same check as

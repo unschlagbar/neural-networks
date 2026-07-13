@@ -95,6 +95,54 @@ single-chunk path unchanged. `gpu::Hierarchical` checkpoints to the `GHIR` forma
 (config header + every param in `params_mut` order); weights only, so a resumed run
 restarts the Adam moments.
 
+#### Fused mLSTM kernels (TFLA)
+
+The chunkwise math above runs as **five fused kernels** (after
+[nx-ai/mlstm_kernels](https://github.com/NX-AI/mlstm_kernels)): three launches for a
+whole forward, two for a backward. It replaces an op-at-a-time chunk loop that
+issued ~25 launches *per chunk* — ~600 for one fwd+bwd at the backbone's shape,
+which was ~1 ms of arithmetic stretched over 14 ms of driver latency. That is why a
+5070 and a 4050m used to score the same: neither was computing, both were waiting on
+launches.
+
+The decomposition splits the one sequential axis (the chunk state `C, n, m`, which is
+small) from the FLOPs (every chunk's intra-chunk attention, which is independent):
+
+| kernel | grid | does |
+|---|---|---|
+| `mlstm_fw_gates` | one thread per (bh, chunk) | `fc`, the chunk-local cumulative log-forget |
+| `mlstm_fw_C` | (dhv tiles, BH) | all chunk states, looping chunks **inside** the kernel |
+| `mlstm_fw_parallel` | (chunks, BH) | every chunk independently: intra attention + state read-out |
+| `mlstm_bw_dC` | (dhv tiles, BH) | the state gradients, chunks in reverse, inside the kernel |
+| `mlstm_bw_parallel` | (chunks, BH) | dQ/dK/dV and the gate grads, every chunk independently |
+
+The `[L, L]` decay matrix never reaches HBM — it lives in shared memory for the life
+of a block, and backward *recomputes* it from `(Q, K, fc, ig, m)` rather than reading
+back what forward saved. Three things dominated the kernels' own speed, in order:
+**bank conflicts** (every 2D shared array is stored with its row stride padded by one
+float, or a warp walking rows at fixed column hits one bank 32 ways — worth ~2x);
+**tiling the two recurrent kernels over `dhv`** (their grid is otherwise BH alone, 8
+blocks on a 48-SM card — worth ~1.6x); and **parallelizing the `da`/`db` reductions**
+in backward over the full `len·dhv` grid instead of `len` threads.
+
+`cargo run --release --features cuda --example gpu_occupancy` asks the **driver** what
+these kernels cost — registers/thread, shared memory, register spills, blocks resident
+per SM, and `waves` (grid ÷ machine capacity). Run it after touching a kernel. What it
+currently says: no spills anywhere; shared memory (not registers) is what caps the two
+parallel kernels, which is why they launch 512 threads and the recurrent ones 256
+(`FUSED_THREADS_PAR` / `_REC`); and `fw_C`/`bw_dC` sit at `waves` ≈ 0.15, i.e. their
+grid is too small to fill the GPU at B=1 — the standing argument for batching the
+backbone over windows.
+
+`FUSED_MAX_L` (32, in `gpu/ops.rs`) caps the chunk length the kernels accept — it is
+what bounds their shared memory. A configured `MLSTM_CHUNK` above it is silently
+clamped, which is free: chunk length is a blocking choice with no effect on the
+result. `MLSTM_CHUNK=0` (single chunk) and `MLSTM_LEGACY=1` both fall back to the
+op-at-a-time path, which is retained as the A/B baseline and as the oracle for
+`mlstm_fused_matches_legacy` — the test that runs both at the real backbone shape
+(dqk=dhv=64, T ending on a short chunk) and requires identical forward, `dx` and
+weight updates.
+
 **VRAM.** Word batching is what dominates a window, and it has a knob:
 - *Word batching.* The encoder/decoder run words as `[words, tmax]` rectangles and
   `tmax` is the longest word in the group, so a single 16-byte word would pad every
@@ -114,7 +162,9 @@ just keeps them and backward skips the rebuild GEMM.
 
 `cargo run --release --features cuda --example mlstm_chunk_bench` sweeps the cell in
 T and reports ms/iter + VRAM (honors `MLSTM_CHUNK`); it is how the 256 default was
-picked.
+picked. `cargo run --release --features cuda --example mlstm_stage_prof` breaks one
+cell down into cuBLAS throughput / projections / fused core / shell, which is how the
+fused kernels were tuned — run it with `MLSTM_LEGACY=1` for the before picture.
 
 `GPU_PROF=1` prints per-phase timings; `GPU_MEM=1` adds device memory in use after
 each phase. `cargo run --release --features cuda --example gpu_fit -- <corpus> [words]`

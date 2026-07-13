@@ -73,9 +73,29 @@ pub struct Gpu {
 impl Gpu {
     /// Initialise CUDA device 0. Returns an error string (rather than panicking)
     /// so callers can fall back to the CPU path when no GPU is present.
+    ///
+    /// The work goes on an explicitly created stream, not `default_stream()`:
+    /// cudarc's default stream is the *legacy* NULL stream, and CUDA refuses to
+    /// capture that one (`cuStreamBeginCapture` errors on it). The sLSTM's
+    /// per-timestep loop is captured as a graph (see `gpu::slstm`), so the whole
+    /// backend has to live on a capturable stream. Everything is submitted to this
+    /// one stream in issue order, so ordering semantics are unchanged.
     pub fn new() -> Result<Self, String> {
         let context = CudaContext::new(0).map_err(|e| format!("CUDA init failed: {e:?}"))?;
-        let stream = context.default_stream();
+        // Leaving the default stream also puts cudarc into "multi stream mode", where
+        // every `CudaSlice` records a CUDA event on each use so that buffers shared
+        // across streams stay ordered. We submit everything to the one stream below,
+        // in issue order, so that bookkeeping buys nothing and costs host time on the
+        // per-launch path we are here to shorten. It is also a capture hazard: a
+        // captured launch may not wait on an event recorded outside the capture.
+        //
+        // SAFETY: the contract is "the caller manages stream synchronization". There
+        // is a single stream, so program order *is* the synchronization. Must happen
+        // before any allocation — the flag only affects slices created after it.
+        unsafe { context.disable_event_tracking() };
+        let stream = context
+            .new_stream()
+            .map_err(|e| format!("stream creation failed: {e:?}"))?;
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS init failed: {e:?}"))?;
         let kernels = Kernels::load(&context)?;
         Ok(Self { context, stream, blas: Arc::new(blas), kernels: Arc::new(kernels) })
@@ -83,11 +103,39 @@ impl Gpu {
 }
 
 #[cfg(test)]
+/// A `Gpu` plus the lock that serializes GPU tests; derefs to `Gpu`, so call sites
+/// use it exactly like one. See [`test_gpu`] for why the lock exists.
+pub struct TestGpu {
+    gpu: Gpu,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestGpu {
+    type Target = Gpu;
+    fn deref(&self) -> &Gpu {
+        &self.gpu
+    }
+}
+
+#[cfg(test)]
 /// Shared test helper: a `Gpu` if the machine has one, else `None` (so GPU tests
 /// self-skip on the dev box with no Nvidia card).
-fn test_gpu() -> Option<Gpu> {
+///
+/// Holds a process-wide lock for the caller's lifetime, so **only one GPU test runs
+/// at a time**. `cargo test` runs tests on parallel threads, and CUDA stream capture
+/// (`gpu::slstm`) does not tolerate other threads allocating on the same context
+/// while a capture is open — it intermittently produced a corrupt graph and a
+/// `CUBLAS_STATUS_EXECUTION_FAILED` in whichever test got unlucky. Serializing here
+/// keeps `cargo test --features cuda` honest without a `--test-threads=1` incantation
+/// that a future runner would forget.
+fn test_gpu() -> Option<TestGpu> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A panicking test poisons the lock; the guarded data is `()`, so there is no
+    // broken invariant to protect and the next test may proceed.
+    let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     match Gpu::new() {
-        Ok(g) => Some(g),
+        Ok(gpu) => Some(TestGpu { gpu, _lock: lock }),
         Err(e) => {
             eprintln!("skipping GPU test: {e}");
             None

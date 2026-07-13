@@ -28,8 +28,8 @@ pub const DECAY_STEPS: usize = 150_000;
 // Windows whose gradients are accumulated before one optimizer step. Muon
 // (matrices) is scale-invariant via the Frobenius normalization and aux-Adam
 // (vectors) via its second moment, so summed grads need no manual rescaling.
-pub const BATCH_SIZE: usize = 2;
-pub const EPOCHS: usize = 2;
+pub const BATCH_SIZE: usize = 1;
+pub const EPOCHS: usize = 1;
 
 pub const SAVE_EVERY: usize = 100;
 pub const LOG_EVERY: usize = 10;
@@ -56,8 +56,8 @@ pub const TOP_P: f32 = 0.9;
 
 // Modell-Dimensions
 
-pub const CHAR_HIDDEN: usize = 128;
-pub const OUT_HIDDEN: usize = 128;
+pub const CHAR_HIDDEN: usize = 192;
+pub const OUT_HIDDEN: usize = 192;
 pub const WORD_HIDDEN: usize = 512;
 
 /// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).
@@ -66,7 +66,7 @@ pub const WORD_HIDDEN: usize = 512;
 pub const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 12;
+pub const WORD_BLOCKS: usize = 8;
 
 /// GPU mLSTM: chunk length for the chunkwise formulation, or `0` for the
 /// single-chunk (whole-sequence) form.
@@ -106,7 +106,7 @@ pub const ENC_W_EOS: bool = true;
 /// dataset memory scales with this constant — not with the corpus size.
 pub const CHUNK_BYTES: usize = 32 * 1024 * 1024;
 
-pub const TRAIN_DATA: &str = "../../training_data/train.txt";
+pub const TRAIN_DATA: &str = "../train.txt";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
 // Wake Word
