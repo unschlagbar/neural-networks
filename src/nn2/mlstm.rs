@@ -9,7 +9,7 @@
 //!   o = σ(Xt·Wo+bo), ĩ = Xt·Wi+bi, f̃ = Xt·Wf+bf
 //!   per head:  m = max(logσ(f̃)+m_prev, ĩ),  i'=exp(ĩ-m),  f'=exp(logσ(f̃)+m_prev-m)
 //!              C = f'·C_prev + i'·(v⊗k),  n = f'·n_prev + i'·k
-//!              ψ = max(|nᵀq|, 1),  ỹ = C·q / ψ,  ŷ = headnorm(ỹ),  y = o⊙ŷ
+//!              ψ = max(|nᵀq|, exp(-m)),  ỹ = C·q / ψ,  ŷ = headnorm(ỹ),  y = o⊙ŷ
 //!   h = y·W_out + b_out
 //!
 //! The projections and output projection are batched GEMMs; the per-head
@@ -75,6 +75,10 @@ fn project(b: usize, inp: usize, out_w: usize, xt: &[f32], w: &[f32], bias: &[f3
 struct Step {
     xt: Tensor, q: Tensor, k: Tensor, v: Tensor, o: Tensor,
     log_f: Tensor, i_prime: Tensor, f_prime: Tensor, nq: Tensor, psi: Tensor,
+    /// The lower clamp of ψ, `exp(−m)`. Saved rather than re-derived because
+    /// backward needs to know which of the two arguments the `max` picked, and `m`
+    /// itself is a running value that the next timestep overwrites.
+    psi_floor: Tensor,
     cq: Tensor, c: Tensor, c_prev: Tensor, n: Tensor, n_prev: Tensor,
     yhat: Tensor, x_hat: Tensor, inv_rms: Tensor, hconcat: Tensor,
 }
@@ -84,7 +88,7 @@ impl Step {
         let z = || Tensor::zeros(&[0, 0]);
         Self {
             xt: z(), q: z(), k: z(), v: z(), o: z(), log_f: z(), i_prime: z(),
-            f_prime: z(), nq: z(), psi: z(), cq: z(), c: z(), c_prev: z(),
+            f_prime: z(), nq: z(), psi: z(), psi_floor: z(), cq: z(), c: z(), c_prev: z(),
             n: z(), n_prev: z(), yhat: z(), x_hat: z(), inv_rms: z(), hconcat: z(),
         }
     }
@@ -102,6 +106,7 @@ impl Step {
         self.f_prime.fit(&[b, h]);
         self.nq.fit(&[b, h]);
         self.psi.fit(&[b, h]);
+        self.psi_floor.fit(&[b, h]);
         self.cq.fit(&[b, d]);
         self.c.fit(&[b, cdim]);
         self.c_prev.fit(&[b, cdim]);
@@ -277,7 +282,20 @@ impl MLstm {
                     }
                     let nqv = dot(&n_state.data[n_off..n_off + dqk], q_h);
                     st.nq.data[bh] = nqv;
-                    let p = nqv.abs().max(1.0);
+                    // ψ = max(|nᵀq|, exp(−m)) — NOT max(|nᵀq|, 1).
+                    //
+                    // xLSTM normalizes by max(|n_trueᵀq|, 1). `n` here is the
+                    // STABILIZED normalizer, n = n_true·exp(−m), and C likewise, so
+                    //   C_true·q / max(|n_trueᵀq|, 1)
+                    //     = (C·q)·exp(m) / max(|nᵀq|·exp(m), 1)
+                    //     = (C·q)        / max(|nᵀq|, exp(−m))
+                    // and the exp(m) cancels. Clamping at 1 instead would leave the
+                    // floor at exp(m) in unstabilized terms, i.e. it would let the
+                    // stabilizer — which is supposed to be a pure numerical
+                    // reparametrization — change what the cell computes.
+                    let floor = (-mh).exp();
+                    let p = nqv.abs().max(floor);
+                    st.psi_floor.data[bh] = floor;
                     st.psi.data[bh] = p;
                     let inv_psi = 1.0 / p;
 
@@ -434,7 +452,13 @@ impl MLstm {
 
                     let inv_psi = 1.0 / st.psi.data[bh];
                     let dpsi = -(inv_psi * inv_psi) * dot(dht_h, cq_h);
-                    let dnq = if st.nq.data[bh].abs() > 1.0 { st.nq.data[bh].signum() * dpsi } else { 0.0 };
+                    // Grad flows through nᵀq only where it, not the floor, won the max.
+                    // (m is held constant in backward, so the floor branch has no grad.)
+                    let dnq = if st.nq.data[bh].abs() > st.psi_floor.data[bh] {
+                        st.nq.data[bh].signum() * dpsi
+                    } else {
+                        0.0
+                    };
 
                     let ip = st.i_prime.data[bh];
                     let fp = st.f_prime.data[bh];

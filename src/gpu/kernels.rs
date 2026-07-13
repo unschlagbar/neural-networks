@@ -207,7 +207,7 @@ extern "C" __global__ void slstm_cell_step(
         const float* zt_pre, const float* it_pre, const float* ft_pre, const float* ot_pre,
         float* c_state, float* n_state, float* m_state, float* h_state,
         float* c_prev, float* n_prev, float* zt, float* ot,
-        float* i_prime, float* f_prime, float* c_out, float* n_out, float* psi,
+        float* i_prime, float* f_prime, float* c_out, float* n_out,
         float* out, int t, int T, int H, int BH) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= BH) return;
@@ -216,20 +216,26 @@ extern "C" __global__ void slstm_cell_step(
     float log_f = log_sigmoid(ft_pre[k]);
     float fm = log_f + m_state[k];
     float it = it_pre[k];
-    float m = fmaxf(fm, it);
+    float np = n_state[k];
+    // First step of a sequence (n == 0): take m = ĩ, so i' is exactly 1 and n
+    // starts at 1. Otherwise max(logσ(f̃)+m_prev, ĩ) could make i' underflow to 0
+    // and leave h = c/n as 0/0. This is the reference's `if all(n == 0)` guard, and
+    // the state resets per word here, so it is hit constantly.
+    float m = (np == 0.0f) ? it : fmaxf(fm, it);
     float ip = expf(it - m);
     float fp = expf(fm - m);
     float cp = c_state[k];
-    float np = n_state[k];
     float c = fp * cp + ip * z;
     float n = fp * np + ip;
-    float p = fmaxf(fabsf(n), 1.0f);
     c_prev[k] = cp;
     n_prev[k] = np;
     zt[k] = z; ot[k] = o; i_prime[k] = ip; f_prime[k] = fp;
-    c_out[k] = c; n_out[k] = n; psi[k] = p;
+    c_out[k] = c; n_out[k] = n;
     c_state[k] = c; n_state[k] = n; m_state[k] = m;
-    float hh = o * c / p;
+    // h = o·c/n, NOT o·c/max(|n|,1). c and n both carry exp(−m), so it cancels in
+    // the ratio — the sLSTM normalizer is stabilizer-invariant by construction, and
+    // clamping the STABILIZED n at 1 would let m leak into the model's output.
+    float hh = o * c / n;
     h_state[k] = hh;
     int b = k / H, j = k % H;
     out[(b * T + t) * H + j] = hh;
@@ -241,7 +247,7 @@ extern "C" __global__ void slstm_cell_step(
 // step). dh_bptt (incoming) is read here; it is rewritten by split_dxh afterward.
 extern "C" __global__ void slstm_cell_step_bwd(
         const float* dy, int t, int T, const float* dh_bptt,
-        const float* psi, const float* ot, const float* c, const float* n,
+        const float* ot, const float* c, const float* n,
         const float* c_prev, const float* n_prev, const float* zt,
         const float* i_prime, const float* f_prime, const float* ft_pre,
         float* dc_bptt, float* dn_bptt,
@@ -250,18 +256,13 @@ extern "C" __global__ void slstm_cell_step_bwd(
     if (k >= BH) return;
     int b = k / H, j = k % H;
     float d = dy[(b * T + t) * H + j] + dh_bptt[k];
-    float ps = psi[k];
     float o = ot[k];
     float cc = c[k];
     float nn = n[k];
-    dob[k] = d * (cc / ps) * o * (1.0f - o);
-    float dn_from_h = 0.0f;
-    if (fabsf(nn) > 1.0f) {
-        float dpsi = d * o * (-cc) / (ps * ps);
-        dn_from_h = dpsi * (nn > 0.0f ? 1.0f : -1.0f);
-    }
-    float dc = d * o / ps + dc_bptt[k];
-    float dn = dn_from_h + dn_bptt[k];
+    // h = o·c/n — no clamp, so dn has no branch: ∂h/∂n = −o·c/n².
+    dob[k] = d * (cc / nn) * o * (1.0f - o);
+    float dc = d * o / nn + dc_bptt[k];
+    float dn = d * o * (-cc) / (nn * nn) + dn_bptt[k];
     float fp = f_prime[k];
     float df_prime = dc * c_prev[k] + dn * n_prev[k];
     float ztk = zt[k];
@@ -365,7 +366,7 @@ extern "C" __global__ void slstm_step_fused(
         float* g, const float* gh, const float* bcat, float* h_prev,
         float* c_state, float* n_state, float* m_state, float* h_state,
         float* c_prev, float* n_prev, float* zt, float* ot,
-        float* i_prime, float* f_prime, float* c_out, float* n_out, float* psi,
+        float* i_prime, float* f_prime, float* c_out, float* n_out,
         float* out, int t, int T, int H, int BH) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= BH) return;
@@ -386,22 +387,24 @@ extern "C" __global__ void slstm_step_fused(
     float o = stable_sigmoid(o_pre);
     float log_f = log_sigmoid(f_pre);
     float fm = log_f + m_state[k];
-    float m = fmaxf(fm, i_pre);
+    float np = n_state[k];
+    // See `slstm_cell_step`: n == 0 is the first step of a sequence, where m must be
+    // ĩ so that i' is exactly 1 and h = c/n cannot become 0/0.
+    float m = (np == 0.0f) ? i_pre : fmaxf(fm, i_pre);
     float ip = expf(i_pre - m);
     float fp = expf(fm - m);
     float cp = c_state[k];
-    float np = n_state[k];
     float c = fp * cp + ip * z;
     float n = fp * np + ip;
-    float p = fmaxf(fabsf(n), 1.0f);
 
     c_prev[s] = cp;
     n_prev[s] = np;
     zt[s] = z; ot[s] = o; i_prime[s] = ip; f_prime[s] = fp;
-    c_out[s] = c; n_out[s] = n; psi[s] = p;
+    c_out[s] = c; n_out[s] = n;
     c_state[k] = c; n_state[k] = n; m_state[k] = m;
 
-    float hh = o * c / p;
+    // h = o·c/n — the exp(−m) in c and n cancels. See `slstm_cell_step`.
+    float hh = o * c / n;
     h_state[k] = hh;
     out[s] = hh;
 }
@@ -416,7 +419,7 @@ extern "C" __global__ void slstm_step_fused(
 // defer, and going through the scratch keeps that a dense GEMM at any batch size.
 extern "C" __global__ void slstm_step_fused_bwd(
         const float* dy, float* g, float* dgh, const float* dh_bptt,
-        const float* psi, const float* ot, const float* c, const float* n,
+        const float* ot, const float* c, const float* n,
         const float* c_prev, const float* n_prev, const float* zt,
         const float* i_prime, const float* f_prime,
         float* dc_bptt, float* dn_bptt, int t, int T, int H, int BH) {
@@ -429,18 +432,13 @@ extern "C" __global__ void slstm_step_fused_bwd(
 
     float ft_pre = g[go + 2 * H];
     float d = dy[s] + dh_bptt[k];
-    float ps = psi[s];
     float o = ot[s];
     float cc = c[s];
     float nn = n[s];
-    float dob = d * (cc / ps) * o * (1.0f - o);
-    float dn_from_h = 0.0f;
-    if (fabsf(nn) > 1.0f) {
-        float dpsi = d * o * (-cc) / (ps * ps);
-        dn_from_h = dpsi * (nn > 0.0f ? 1.0f : -1.0f);
-    }
-    float dc = d * o / ps + dc_bptt[k];
-    float dn = dn_from_h + dn_bptt[k];
+    // h = o·c/n — no clamp, so dn has no branch: ∂h/∂n = −o·c/n².
+    float dob = d * (cc / nn) * o * (1.0f - o);
+    float dc = d * o / nn + dc_bptt[k];
+    float dn = d * o * (-cc) / (nn * nn) + dn_bptt[k];
     float fp = f_prime[s];
     float df_prime = dc * c_prev[s] + dn * n_prev[s];
     float ztk = zt[s];
@@ -568,7 +566,9 @@ extern "C" __global__ void mlstm_ds(const float* S, const float* fc, const float
         }
     }
     qn[idx] = acc;
-    psi[idx] = fmaxf(fabsf(acc), 1.0f);
+    // ψ = max(|qn|, exp(−m)): qn is the STABILIZED normalizer, so xLSTM's
+    // max(|n_trueᵀq|, 1) becomes this once exp(m) cancels. See `nn2::mlstm`.
+    psi[idx] = fmaxf(fabsf(acc), expf(-mt));
 }
 
 // Row-normalize num by ψ: ytil[g,t,i] = num[g,t,i] / psi[g,t]. num:[BH,T,dhv].
@@ -646,9 +646,9 @@ extern "C" __global__ void mul_rows_add(float* out, const float* x, const float*
 
 // ψ = max(|qn|, 1), recomputed once the inter-chunk term has been added into qn
 // (the single-chunk path gets ψ straight out of `mlstm_ds`).
-extern "C" __global__ void psi_from_qn(const float* qn, float* psi, int n) {
+extern "C" __global__ void psi_from_qn(const float* qn, const float* m, float* psi, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) psi[i] = fmaxf(fabsf(qn[i]), 1.0f);
+    if (i < n) psi[i] = fmaxf(fabsf(qn[i]), expf(-m[i]));
 }
 
 // out[r] += Σ_w x[r,W+w]·y[r,W+w] — row-wise dot of two [R, W] tensors.
@@ -753,7 +753,8 @@ extern "C" __global__ void ogate_bwd(const float* d_hconcat, const float* o, con
 // Backward of ytil = num/ψ (with ψ = max(|qn|,1)). One thread per row (g,t):
 //   d_num = d_ytil/ψ ;  dψ = −(Σ_i d_ytil·num)/ψ² ;  d_qn = (|qn|>1? sign(qn):0)·dψ.
 extern "C" __global__ void div_rows_bwd(const float* d_ytil, const float* num, const float* psi,
-                                        const float* qn, float* d_num, float* d_qn,
+                                        const float* qn, const float* m,
+                                        float* d_num, float* d_qn,
                                         int dhv, int BHT) {
     int gt = blockIdx.x * blockDim.x + threadIdx.x;
     if (gt >= BHT) return;
@@ -767,7 +768,8 @@ extern "C" __global__ void div_rows_bwd(const float* d_ytil, const float* num, c
     }
     float dpsi = -red * inv * inv;
     float q = qn[gt];
-    d_qn[gt] = (fabsf(q) > 1.0f) ? ((q > 0.0f ? 1.0f : -1.0f) * dpsi) : 0.0f;
+    // Grad flows through qn only where it, not the exp(−m) floor, won the max.
+    d_qn[gt] = (fabsf(q) > expf(-m[gt])) ? ((q > 0.0f ? 1.0f : -1.0f) * dpsi) : 0.0f;
 }
 
 // Backward of DS = D̄⊙S plus the qn row-sum. Given dDS_num (= d_num·Vᵀ, the num
@@ -1109,7 +1111,8 @@ extern "C" __global__ void mlstm_fw_parallel(
         long gt = (long)bh * T + c0 + t;
         qnv[gt] = acc;
         msv[gt] = sM[t];
-        psiv[gt] = fmaxf(fabsf(acc), 1.0f);
+        // ψ = max(|qn|, exp(−m)) — qn is the stabilized normalizer. See `nn2::mlstm`.
+        psiv[gt] = fmaxf(fabsf(acc), expf(-sM[t]));
     }
     __syncthreads();
 
@@ -1120,7 +1123,8 @@ extern "C" __global__ void mlstm_fw_parallel(
         float inter = 0.0f;
         for (int q = 0; q < dqk; ++q) inter += sQ[t * LQ + q] * sC[v * LQ + q];
         acc += sB[t] * inter;
-        ytil[((long)bh * T + c0 + t) * dhv + v] = acc / fmaxf(fabsf(sQn[t]), 1.0f);
+        ytil[((long)bh * T + c0 + t) * dhv + v] =
+            acc / fmaxf(fabsf(sQn[t]), expf(-sM[t]));
     }
 }
 
@@ -1196,7 +1200,10 @@ extern "C" __global__ void mlstm_bw_dC(
                 sDN[t * LV + v] = dytil[gt * dhv + v0 + v] * inv;
             float dpsi = -red * inv;
             float qn = qnv[gt];
-            sDQn[t] = (fabsf(qn) > 1.0f) ? ((qn > 0.0f ? 1.0f : -1.0f) * dpsi) : 0.0f;
+            // Grad flows through qn only where it, not the exp(−m) floor, won the max.
+            sDQn[t] = (fabsf(qn) > expf(-msv[gt]))
+                          ? ((qn > 0.0f ? 1.0f : -1.0f) * dpsi)
+                          : 0.0f;
             sB[t] = expf(fcb[((long)bh * NC + k) * L + t] + m_prev - msv[gt]);
         }
         __syncthreads();
@@ -1327,7 +1334,8 @@ extern "C" __global__ void mlstm_bw_parallel(
         }
         float dpsi = -red * inv;
         float qn = sQn[t];
-        sDQn[t] = (fabsf(qn) > 1.0f) ? ((qn > 0.0f ? 1.0f : -1.0f) * dpsi) : 0.0f;
+        // Grad flows through qn only where it, not the exp(−m) floor, won the max.
+        sDQn[t] = (fabsf(qn) > expf(-sM[t])) ? ((qn > 0.0f ? 1.0f : -1.0f) * dpsi) : 0.0f;
     }
     __syncthreads();
 

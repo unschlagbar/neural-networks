@@ -131,7 +131,7 @@ fn main() {
         let h4 = 4 * h;
         let slab = || DTensor::zeros(&gpu, &[b, t, h]);
         let mut slabs = SlstmSlabs { c_prev: slab(), n_prev: slab(), zt: slab(), ot: slab(),
-            i_prime: slab(), f_prime: slab(), c: slab(), n: slab(), psi: slab(), h_prev: slab() };
+            i_prime: slab(), f_prime: slab(), c: slab(), n: slab(), h_prev: slab() };
         let mut g = DTensor::zeros(&gpu, &[b, t, h4]);
         let mut gh = DTensor::zeros(&gpu, &[b, h4]);
         let bcat = DTensor::zeros(&gpu, &[h4]);

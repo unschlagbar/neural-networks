@@ -21,14 +21,14 @@ pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 6;
 
 // Training-Schedule
 
-pub const LR: f32 = 1e-4;
-pub const MIN_LR: f32 = 1e-5;
+pub const LR: f32 = 2e-4;
+pub const MIN_LR: f32 = 2e-5;
 pub const WARMUP_STEPS: usize = 500;
 pub const DECAY_STEPS: usize = 150_000;
 // Windows whose gradients are accumulated before one optimizer step. Muon
 // (matrices) is scale-invariant via the Frobenius normalization and aux-Adam
 // (vectors) via its second moment, so summed grads need no manual rescaling.
-pub const BATCH_SIZE: usize = 1;
+pub const BATCH_SIZE: usize = 8;
 pub const EPOCHS: usize = 1;
 
 pub const SAVE_EVERY: usize = 100;
@@ -106,7 +106,7 @@ pub const ENC_W_EOS: bool = true;
 /// dataset memory scales with this constant — not with the corpus size.
 pub const CHUNK_BYTES: usize = 32 * 1024 * 1024;
 
-pub const TRAIN_DATA: &str = "../train.txt";
+pub const TRAIN_DATA: &str = "../TinyStoriesV2-GPT4-train";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
 // Wake Word

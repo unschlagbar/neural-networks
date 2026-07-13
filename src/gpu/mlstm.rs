@@ -11,7 +11,7 @@
 //! ```text
 //!   S = Q·Kᵀ ;  m_t = max(max_{j≤t} logD_{tj}, fc_t)
 //!   D̄_{tj} = exp(logD_{tj} − m_t)  (j≤t else 0)
-//!   ỹ_t = ((D̄⊙S)·V)_t / ψ_t ,  ψ_t = max(|Σ_j (D̄⊙S)_{tj}|, 1)
+//!   ỹ_t = ((D̄⊙S)·V)_t / ψ_t ,  ψ_t = max(|Σ_j (D̄⊙S)_{tj}|, exp(−m_t))
 //! ```
 //! then head-norm(ỹ) → ŷ, `y = o⊙ŷ`, `h = y·W_out + b_out`. Backward
 //! differentiates this graph with `m` held constant (the reference stabilizer
@@ -74,6 +74,9 @@ struct Chunk {
     avec: DTensor, // [BH, L]  a_j: row j → outgoing state
     qn: DTensor,   // [BH, L]  (intra + inter)
     psi: DTensor,  // [BH, L]
+    /// Per-row stabilizer. Backward needs it because ψ = max(|qn|, exp(−m)), so the
+    /// branch "did qn win the max?" is against exp(−m), not against 1.
+    m: DTensor,    // [BH, L]
     num: DTensor,  // [BH, L, dhv]  (intra + inter)
     dbar: DTensor, // [BH, L, L]  D̄
     ds: DTensor,   // [BH, L, L]  D̄⊙S
@@ -382,7 +385,7 @@ impl MLstm {
                 let inter_qn = ops::matmul_batched_nt(gpu, &qc, &n_state); // [BH, L, 1]
                 ops::mul_rows_add(gpu, &mut num, &inter_num, &bvec, dhv);
                 ops::mul_rows_add(gpu, &mut qn, &inter_qn, &bvec, 1);
-                let psi = ops::psi_from_qn(gpu, &qn); // ψ follows the COMBINED qn
+                let psi = ops::psi_from_qn(gpu, &qn, &m); // ψ follows the COMBINED qn
                 let inter = Inter {
                     c_prev: c_state.dup(gpu),
                     n_prev: n_state.dup(gpu),
@@ -414,7 +417,7 @@ impl MLstm {
                     .reshaped(&[bh]);
             }
 
-            chunks.push(Chunk { c0, len, bvec, avec, qn, psi, num, dbar, ds, inter });
+            chunks.push(Chunk { c0, len, bvec, avec, qn, psi, m, num, dbar, ds, inter });
         }
 
         // Back to position-major, head-norm, o-gate, output projection.
@@ -516,7 +519,7 @@ impl MLstm {
             let d_ytil_c = ops::slice_t(gpu, &d_ytil, c0, len); // [BH, L, dhv]
 
             // ỹ = num/ψ  → d_num, d_qn  (num/ψ/qn all include the inter term).
-            let (d_num, d_qn) = ops::div_rows_bwd(gpu, &d_ytil_c, &ch.num, &ch.psi, &ch.qn, dhv);
+            let (d_num, d_qn) = ops::div_rows_bwd(gpu, &d_ytil_c, &ch.num, &ch.psi, &ch.qn, &ch.m, dhv);
 
             // The [BH, L, L] tensors, from forward's cache. Everything derived from
             // them below is at most [BH, L, dqk].

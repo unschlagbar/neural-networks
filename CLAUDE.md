@@ -62,6 +62,28 @@ Words come from `src/segment.rs` (see Tokenizer below), not from a boundary-toke
 
 The encoder and decoder phases run **data-parallel over words** (rayon; see `src/parallel.rs`): each worker thread gets a full replica of the stack (`ReplicaPool`, copied weights via the NNFW round-trip, own recurrent state and grad accumulators) plus a disjoint slice of the shared forward cache, and after a parallel backward phase the replica grads are reduced into the master (`NnLayer::add_grads_from`). Replicas are rebuilt lazily after each optimizer step. Only the backbone sweep is serial (it carries cross-word state). Layers that appear in a parallel-trained stack must implement `add_grads_from`; `tests/parallel_parity.rs` checks the parallel path against single-threaded execution.
 
+### The stabilizer must stay invisible (both cells)
+
+Both recurrent cells carry a running stabilizer `m` and store **stabilized** state:
+`c = c_true·exp(−m)`, `n = n_true·exp(−m)` (and `C` likewise in the mLSTM). `m` is a
+pure numerical reparametrization — it must not change what the model computes. Any
+clamp applied to a *stabilized* quantity breaks that, because the clamp threshold
+then sits at `exp(m)` in unstabilized terms. Both cells used to get this wrong (a
+`max(…, 1)` on the stabilized normalizer); both are now fixed, and the rule is:
+
+- **sLSTM**: `h = o·c/n`, with **no clamp** — the `exp(−m)` cancels in the ratio, which
+  is what makes it invariant. On the first step of a sequence `n == 0`, so `m` is set
+  to `ĩ` (not `max(logσ(f̃)+m_prev, ĩ)`), making `i'` exactly 1 and keeping `c/n` off
+  `0/0`. State resets per word here, so that case is hit constantly.
+- **mLSTM**: `ψ = max(|nᵀq|, exp(−m))` — *not* `max(|nᵀq|, 1)`. This is xLSTM's
+  `max(|n_trueᵀq|, 1)` with the `exp(m)` cancelled against the numerator.
+
+Both match `NX-AI/xlstm` (`slstm/src/vanilla/slstm.py`) and `NX-AI/mlstm_kernels`.
+**Finite-difference tests cannot catch this class of bug** — the backward correctly
+differentiates the wrong forward, so FD stays green either way. Only comparing
+against the reference finds it. Treat any new `max(…, 1)` on a stabilized value as a
+bug.
+
 ### Optimizer (`src/optimizers/mod.rs`)
 
 `pub type Optimizer = Muon` selects the active optimizer (Muon for 2D hidden weights, aux-Adam for embeddings and 1D params). All layers use the type aliases `GradMatrix` / `GradVec` from this module, so swapping optimizers only requires changing that one type alias. `BATCH_SIZE` in `config.rs` accumulates gradients over that many windows before each optimizer step.

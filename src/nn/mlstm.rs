@@ -75,6 +75,9 @@ pub struct MLSTMCache {
     pub cq: Box<[f32]>,      // d
     pub nq: Box<[f32]>,      // H
     pub psi: Box<[f32]>,     // H
+    /// The lower clamp of ψ, `exp(−m)` — saved because backward needs to know
+    /// which argument the `max` picked, and `m` is overwritten by the next step.
+    pub psi_floor: Box<[f32]>, // H
     pub h_tilde: Box<[f32]>, // d
     pub head_norm: HeadwiseRMSNormCache,
 
@@ -415,7 +418,13 @@ impl MLSTMLayer {
             // SIMD lanes, a fused serial `nq +=` would keep the loop scalar.
             let nq = dot(n_h, q_h);
             cache.nq[hd] = nq;
-            let psi = nq.abs().max(1.0);
+            // ψ = max(|nᵀq|, exp(−m)), not max(|nᵀq|, 1): `n` is the STABILIZED
+            // normalizer (n_true·exp(−m)), and xLSTM's max(|n_trueᵀq|, 1) becomes
+            // max(|nᵀq|, exp(−m)) once the exp(m) is cancelled against the numerator.
+            // See the same note in `nn2::mlstm`.
+            let floor = (-mh).exp();
+            let psi = nq.abs().max(floor);
+            cache.psi_floor[hd] = floor;
             cache.psi[hd] = psi;
             let inv_psi = 1.0 / psi;
 
@@ -492,7 +501,7 @@ impl MLSTMLayer {
             let inv_psi = 1.0 / cache.psi[hd];
             let psi_sq = inv_psi * inv_psi;
             let dpsi = -psi_sq * dot(dht_h, cq_h);
-            let dnq_h = if cache.nq[hd].abs() > 1.0 {
+            let dnq_h = if cache.nq[hd].abs() > cache.psi_floor[hd] {
                 cache.nq[hd].signum() * dpsi
             } else {
                 0.0
@@ -714,6 +723,7 @@ impl MLSTMLayer {
             cq: vec![0.0; d].into(),
             nq: vec![0.0; h].into(),
             psi: vec![1.0; h].into(),
+            psi_floor: vec![1.0; h].into(),
             h_tilde: vec![0.0; d].into(),
             head_norm: self.head_norm.alloc_cache(),
             w_out: LinearCache::new(d, d),

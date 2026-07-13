@@ -7,12 +7,19 @@
 //   • stabilizer state            m_t = max(log f_t + m_{t-1}, ĩ_t)
 //   • stabilized gates            i'_t = exp(ĩ_t − m_t),  f'_t = exp(log f_t + m_{t-1} − m_t)
 //   • scalar cell                 c_t = f'_t·c_{t-1} + i'_t·z_t
-//   • normalized hidden           h_t = o_t · c_t / max(|n_t|, 1)
+//   • normalized hidden           h_t = o_t · c_t / n_t
+//
+// No clamp on n_t (the reference has none, and it would be wrong to add one here):
+// c_t and n_t are both STABILIZED, i.e. they carry a factor exp(−m_t), which cancels
+// exactly in the ratio c_t/n_t. That is what makes the stabilizer invisible to the
+// model. Clamping the stabilized n_t at 1 — as this code used to — leaves the floor
+// at exp(m_t) in unstabilized terms, so m_t leaks into the output. On the first step
+// of a sequence n is 0, and m is then set to ĩ (not max(log f + m_prev, ĩ)) so that
+// i' is exactly 1 and c/n cannot be 0/0.
 //
 // Gradient treatment of the stabilizer follows the paper / reference impl:
-// m_t is treated as a constant w.r.t. backprop (like the max in softmax).
-// For |n_t| > 1 this is exact because the exp(−m_t) factor cancels in c_t/n_t.
-// For |n_t| < 1 it's a standard approximation that works well in practice.
+// m_t is treated as a constant w.r.t. backprop (like the max in softmax). This is
+// exact for the c/n ratio, since the exp(−m_t) factors cancel.
 //
 // Code style mirrors lstm.rs: concat-trick xh=[x, h_{t-1}], one matrix per gate,
 // gradient accumulators inside the layer, scratch buffers pre-allocated.
@@ -63,7 +70,6 @@ pub struct SLSTMCache {
     m: Box<[f32]>,
     c: Box<[f32]>,
     n: Box<[f32]>,
-    psi: Box<[f32]>, // denominator max(|n|, 1)
     pub h: Box<[f32]>,
 
     /// dL/d(concat(x_t, h_{t-1})).  First `input_size` entries = dx.
@@ -277,17 +283,19 @@ impl SLSTMLayer {
             let ot = stable_sigmoid(cache.ot_pre[j]);
             let log_f = log_sigmoid(cache.ft_pre[j]);
 
-            // Stabilizer  m_t = max(log f_t + m_{t-1},  ĩ_t)
+            // Stabilizer  m_t = max(log f_t + m_{t-1},  ĩ_t), except on the first
+            // step of a sequence (n == 0), where m = ĩ so that i' is exactly 1 and
+            // n starts at 1 — otherwise i' can underflow to 0 and h = c/n is 0/0.
             let fm = log_f + cache.m_prev[j];
-            let m = fm.max(cache.it_pre[j]);
+            let np = cache.n_prev[j];
+            let m = if np == 0.0 { cache.it_pre[j] } else { fm.max(cache.it_pre[j]) };
 
             // Stabilized exponential gates
             let i_prime = (cache.it_pre[j] - m).exp();
             let f_prime = (fm - m).exp();
 
             let c = f_prime * cache.c_prev[j] + i_prime * zt;
-            let n = f_prime * cache.n_prev[j] + i_prime;
-            let psi = n.abs().max(1.0);
+            let n = f_prime * np + i_prime;
 
             cache.zt[j] = zt;
             cache.ot[j] = ot;
@@ -297,8 +305,8 @@ impl SLSTMLayer {
             cache.f_prime[j] = f_prime;
             cache.c[j] = c;
             cache.n[j] = n;
-            cache.psi[j] = psi;
-            cache.h[j] = ot * c / psi;
+            // h = o·c/n — c and n both carry exp(−m), so it cancels in the ratio.
+            cache.h[j] = ot * c / n;
         }
 
         // Propagate persistent state
@@ -336,24 +344,17 @@ impl SLSTMLayer {
         for j in 0..h {
             let d = delta[j] + self.dh_bptt[j];
             delta[j] = d;
-            let psi = cache.psi[j];
             let ot = cache.ot[j];
+            let n = cache.n[j];
 
-            //   h = o · (c / ψ)   →   do/dõ = δh · c/ψ · o·(1-o)
-            dob[j] = d * (cache.c[j] / psi) * ot * (1.0 - ot);
-
-            // dψ through max(|n|, 1):  only active when |n| > 1
-            let dn_from_h = if cache.n[j].abs() > 1.0 {
-                let dpsi = d * ot * (-cache.c[j]) / (psi * psi);
-                dpsi * cache.n[j].signum()
-            } else {
-                0.0
-            };
+            //   h = o · (c / n)   →   do/dõ = δh · c/n · o·(1-o)
+            dob[j] = d * (cache.c[j] / n) * ot * (1.0 - ot);
 
             //   c = f'·c_prev + i'·z
             //   n = f'·n_prev + i'
-            let dc = d * ot / psi + self.dc_bptt[j];
-            let dn = dn_from_h + self.dn_bptt[j];
+            // No clamp on n, so ∂h/∂n = −o·c/n² unconditionally (no branch).
+            let dc = d * ot / n + self.dc_bptt[j];
+            let dn = d * ot * (-cache.c[j]) / (n * n) + self.dn_bptt[j];
 
             let df_prime = dc * cache.c_prev[j] + dn * cache.n_prev[j];
             let di_prime = dc * cache.zt[j] + dn;
@@ -491,7 +492,7 @@ impl SLSTMLayer {
             m: vec![0.0; h].into(),
             c: vec![0.0; h].into(),
             n: vec![0.0; h].into(),
-            psi: vec![0.0; h].into(),
+
             h: vec![0.0; h].into(),
             dconcat: vec![0.0; r].into(),
         }

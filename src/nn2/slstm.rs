@@ -49,7 +49,6 @@ struct Step {
     f_prime: Tensor,
     c: Tensor,
     n: Tensor,
-    psi: Tensor, // max(|n|, 1)
 }
 
 impl Step {
@@ -58,7 +57,7 @@ impl Step {
         let z = || Tensor::zeros(&[0, 0]);
         Self {
             xh: z(), c_prev: z(), n_prev: z(), ft_pre: z(), zt: z(), ot: z(),
-            i_prime: z(), f_prime: z(), c: z(), n: z(), psi: z(),
+            i_prime: z(), f_prime: z(), c: z(), n: z(),
         }
     }
 
@@ -68,7 +67,7 @@ impl Step {
         for t in [
             &mut self.c_prev, &mut self.n_prev, &mut self.ft_pre, &mut self.zt,
             &mut self.ot, &mut self.i_prime, &mut self.f_prime, &mut self.c,
-            &mut self.n, &mut self.psi,
+            &mut self.n,
         ] {
             t.fit(&[b, h]);
         }
@@ -243,12 +242,16 @@ impl SLstm {
                 let o = stable_sigmoid(ot_pre.data[k]);
                 let log_f = log_sigmoid(st.ft_pre.data[k]);
                 let fm = log_f + m_state.data[k];
-                let m = fm.max(it_pre.data[k]);
+                let np = st.n_prev.data[k];
+                // n == 0 is the first step of a sequence: take m = ĩ so that i' is
+                // exactly 1 and n starts at 1. With m = max(fm, ĩ) instead, i' can
+                // underflow to 0 and leave h = c/n as 0/0. The reference guards the
+                // same case, and state resets per word here, so it is hit constantly.
+                let m = if np == 0.0 { it_pre.data[k] } else { fm.max(it_pre.data[k]) };
                 let ip = (it_pre.data[k] - m).exp();
                 let fp = (fm - m).exp();
                 let c = fp * st.c_prev.data[k] + ip * z;
-                let n = fp * st.n_prev.data[k] + ip;
-                let p = n.abs().max(1.0);
+                let n = fp * np + ip;
 
                 st.zt.data[k] = z;
                 st.ot.data[k] = o;
@@ -256,13 +259,14 @@ impl SLstm {
                 st.f_prime.data[k] = fp;
                 st.c.data[k] = c;
                 st.n.data[k] = n;
-                st.psi.data[k] = p;
 
                 // Advance the recurrent state for the next step.
                 c_state.data[k] = c;
                 n_state.data[k] = n;
                 m_state.data[k] = m;
-                let hh = o * c / p;
+                // h = o·c/n, no clamp: c and n both carry exp(−m), so it cancels in
+                // the ratio and the stabilizer stays invisible to the model.
+                let hh = o * c / n;
                 h_state.data[k] = hh;
 
                 let bi_ = k / h;
@@ -322,22 +326,14 @@ impl SLstm {
                 let bi = k / h;
                 let j = k % h;
                 let d = dy.data[(bi * t + step) * h + j] + dh_bptt.data[k];
-                let psi = st.psi.data[k];
                 let o = st.ot.data[k];
                 let c = st.c.data[k];
                 let n = st.n.data[k];
 
-                dob.data[k] = d * (c / psi) * o * (1.0 - o);
-
-                let dn_from_h = if n.abs() > 1.0 {
-                    let dpsi = d * o * (-c) / (psi * psi);
-                    dpsi * n.signum()
-                } else {
-                    0.0
-                };
-
-                let dc = d * o / psi + dc_bptt.data[k];
-                let dn = dn_from_h + dn_bptt.data[k];
+                // h = o·c/n — no clamp, so dn has no branch: ∂h/∂n = −o·c/n².
+                dob.data[k] = d * (c / n) * o * (1.0 - o);
+                let dc = d * o / n + dc_bptt.data[k];
+                let dn = d * o * (-c) / (n * n) + dn_bptt.data[k];
 
                 let df_prime = dc * st.c_prev.data[k] + dn * st.n_prev.data[k];
                 let di_prime = dc * st.zt.data[k] + dn;

@@ -450,7 +450,6 @@ pub struct SlstmSaved {
     pub f_prime: DTensor,
     pub c: DTensor,
     pub n: DTensor,
-    pub psi: DTensor,
 }
 
 /// One forward sLSTM step: advances `(c,n,m,h)_state` in place from the four gate
@@ -482,7 +481,7 @@ pub fn slstm_cell_step(
         .arg(&mut c_state.buf).arg(&mut n_state.buf).arg(&mut m_state.buf).arg(&mut h_state.buf)
         .arg(&mut saved.c_prev.buf).arg(&mut saved.n_prev.buf).arg(&mut saved.zt.buf).arg(&mut saved.ot.buf)
         .arg(&mut saved.i_prime.buf).arg(&mut saved.f_prime.buf).arg(&mut saved.c.buf)
-        .arg(&mut saved.n.buf).arg(&mut saved.psi.buf)
+        .arg(&mut saved.n.buf)
         .arg(&mut out.buf).arg(&t_i).arg(&bigt_i).arg(&h_i).arg(&bh_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slstm_cell_step");
 }
@@ -513,7 +512,7 @@ pub fn slstm_cell_step_bwd(
     let f = gpu.kernels.get("slstm_cell_step_bwd");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&dy.buf).arg(&t_i).arg(&bigt_i).arg(&dh_bptt.buf)
-        .arg(&saved.psi.buf).arg(&saved.ot.buf).arg(&saved.c.buf).arg(&saved.n.buf)
+        .arg(&saved.ot.buf).arg(&saved.c.buf).arg(&saved.n.buf)
         .arg(&saved.c_prev.buf).arg(&saved.n_prev.buf).arg(&saved.zt.buf)
         .arg(&saved.i_prime.buf).arg(&saved.f_prime.buf).arg(&ft_pre.buf)
         .arg(&mut dc_bptt.buf).arg(&mut dn_bptt.buf)
@@ -624,7 +623,6 @@ pub struct SlstmSlabs {
     pub f_prime: DTensor,
     pub c: DTensor,
     pub n: DTensor,
-    pub psi: DTensor,
     pub h_prev: DTensor,
 }
 
@@ -655,7 +653,7 @@ pub fn slstm_step_fused(
         .arg(&mut c_state.buf).arg(&mut n_state.buf).arg(&mut m_state.buf).arg(&mut h_state.buf)
         .arg(&mut slabs.c_prev.buf).arg(&mut slabs.n_prev.buf).arg(&mut slabs.zt.buf)
         .arg(&mut slabs.ot.buf).arg(&mut slabs.i_prime.buf).arg(&mut slabs.f_prime.buf)
-        .arg(&mut slabs.c.buf).arg(&mut slabs.n.buf).arg(&mut slabs.psi.buf)
+        .arg(&mut slabs.c.buf).arg(&mut slabs.n.buf)
         .arg(&mut out.buf).arg(&t_i).arg(&bigt_i).arg(&h_i).arg(&bh_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slstm_step_fused");
 }
@@ -681,7 +679,7 @@ pub fn slstm_step_fused_bwd(
     let f = gpu.kernels.get("slstm_step_fused_bwd");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&dy.buf).arg(&mut g.buf).arg(&mut dgh.buf).arg(&dh_bptt.buf)
-        .arg(&slabs.psi.buf).arg(&slabs.ot.buf).arg(&slabs.c.buf).arg(&slabs.n.buf)
+        .arg(&slabs.ot.buf).arg(&slabs.c.buf).arg(&slabs.n.buf)
         .arg(&slabs.c_prev.buf).arg(&slabs.n_prev.buf).arg(&slabs.zt.buf)
         .arg(&slabs.i_prime.buf).arg(&slabs.f_prime.buf)
         .arg(&mut dc_bptt.buf).arg(&mut dn_bptt.buf)
@@ -886,13 +884,13 @@ pub fn mul_rows_add(gpu: &Gpu, out: &mut DTensor, x: &DTensor, s: &DTensor, w: u
 }
 
 /// `ψ = max(|qn|, 1)` — needed once the inter-chunk term has been folded into `qn`.
-pub fn psi_from_qn(gpu: &Gpu, qn: &DTensor) -> DTensor {
+pub fn psi_from_qn(gpu: &Gpu, qn: &DTensor, m: &DTensor) -> DTensor {
     let n = qn.len();
     let n_i = n as i32;
     let mut psi = DTensor::uninit(gpu, qn.dims());
     let f = gpu.kernels.get("psi_from_qn");
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&qn.buf).arg(&mut psi.buf).arg(&n_i);
+    lb.arg(&qn.buf).arg(&m.buf).arg(&mut psi.buf).arg(&n_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("psi_from_qn");
     psi
 }
@@ -1003,15 +1001,17 @@ pub fn ogate_bwd(gpu: &Gpu, d_hconcat: &DTensor, o: &DTensor, yhat: &DTensor) ->
 }
 
 /// Backward of `ytil = num/ψ` → `(d_num, d_qn)`. `num` `[BH,T,dhv]`, `psi`/`qn` `[BH,T]`.
-pub fn div_rows_bwd(gpu: &Gpu, d_ytil: &DTensor, num: &DTensor, psi: &DTensor, qn: &DTensor, dhv: usize)
-    -> (DTensor, DTensor) {
+pub fn div_rows_bwd(
+    gpu: &Gpu, d_ytil: &DTensor, num: &DTensor, psi: &DTensor, qn: &DTensor, m: &DTensor,
+    dhv: usize,
+) -> (DTensor, DTensor) {
     let (bh, t) = (psi.rows(), psi.cols());
     let mut d_num = DTensor::uninit(gpu, num.dims());
     let mut d_qn = DTensor::uninit(gpu, &[bh, t]);
     let (dhv_i, bht) = (dhv as i32, (bh * t) as i32);
     let f = gpu.kernels.get("div_rows_bwd");
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&d_ytil.buf).arg(&num.buf).arg(&psi.buf).arg(&qn.buf)
+    lb.arg(&d_ytil.buf).arg(&num.buf).arg(&psi.buf).arg(&qn.buf).arg(&m.buf)
         .arg(&mut d_num.buf).arg(&mut d_qn.buf).arg(&dhv_i).arg(&bht);
     unsafe { lb.launch(LaunchConfig::for_num_elems((bh * t) as u32)) }.expect("div_rows_bwd");
     (d_num, d_qn)

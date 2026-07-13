@@ -327,7 +327,7 @@ impl SLstm {
                 let slab = || DTensor::uninit(gpu, &[b, t, h]);
                 SlstmSlabs {
                     c_prev: slab(), n_prev: slab(), zt: slab(), ot: slab(), i_prime: slab(),
-                    f_prime: slab(), c: slab(), n: slab(), psi: slab(), h_prev: slab(),
+                    f_prime: slab(), c: slab(), n: slab(), h_prev: slab(),
                 }
             }
         };
