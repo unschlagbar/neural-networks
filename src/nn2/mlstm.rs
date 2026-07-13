@@ -20,6 +20,8 @@
 //! backward (reference approximation), so grads use the directional whole-tensor
 //! finite-difference check.
 
+use rand::random_range;
+
 use crate::nn2::optim::{AdamCfg, AdamState, ensure_states};
 use crate::tensor::{Tensor, gemm};
 
@@ -27,12 +29,21 @@ const EPS: f32 = 1e-6;
 
 #[inline]
 fn stable_sigmoid(x: f32) -> f32 {
-    if x >= 0.0 { 1.0 / (1.0 + (-x).exp()) } else { let e = x.exp(); e / (1.0 + e) }
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
 }
 
 #[inline]
 fn log_sigmoid(x: f32) -> f32 {
-    if x >= 0.0 { -(1.0 + (-x).exp()).ln() } else { x - (1.0 + x.exp()).ln() }
+    if x >= 0.0 {
+        -(1.0 + (-x).exp()).ln()
+    } else {
+        x - (1.0 + x.exp()).ln()
+    }
 }
 
 /// Lane-accumulated dot product. `f32` addition doesn't reassociate, so a plain
@@ -58,8 +69,17 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// `out = Xt·W + bias`, optionally scaled and/or sigmoid'd. Writes into `out`.
-fn project(b: usize, inp: usize, out_w: usize, xt: &[f32], w: &[f32], bias: &[f32],
-           scale: f32, sigmoid: bool, out: &mut [f32]) {
+fn project(
+    b: usize,
+    inp: usize,
+    out_w: usize,
+    xt: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    scale: f32,
+    sigmoid: bool,
+    out: &mut [f32],
+) {
     gemm::gemm_nn(b, inp, out_w, xt, w, out, 0.0);
     for row in out.chunks_mut(out_w) {
         for (o, &bv) in row.iter_mut().zip(bias) {
@@ -93,7 +113,16 @@ impl Step {
         }
     }
 
-    fn fit(&mut self, b: usize, inp: usize, d: usize, d_qk: usize, h: usize, dhv: usize, dqk: usize) {
+    fn fit(
+        &mut self,
+        b: usize,
+        inp: usize,
+        d: usize,
+        d_qk: usize,
+        h: usize,
+        dhv: usize,
+        dqk: usize,
+    ) {
         let cdim = h * dhv * dqk;
         let ndim = h * dqk;
         self.xt.fit(&[b, inp]);
@@ -127,27 +156,71 @@ pub struct MLstm {
     pub dhv: usize,
     inv_sqrt_dqk: f32,
 
-    pub wq: Tensor, pub wk: Tensor, pub wv: Tensor, pub wo: Tensor, pub wi: Tensor, pub wf: Tensor,
-    pub bq: Tensor, pub bk: Tensor, pub bv: Tensor, pub bo: Tensor, pub bi: Tensor, pub bf: Tensor,
-    pub w_out: Tensor, pub b_out: Tensor, pub gamma: Tensor,
+    pub wq: Tensor,
+    pub wk: Tensor,
+    pub wv: Tensor,
+    pub wo: Tensor,
+    pub wi: Tensor,
+    pub wf: Tensor,
+    pub bq: Tensor,
+    pub bk: Tensor,
+    pub bv: Tensor,
+    pub bo: Tensor,
+    pub bi: Tensor,
+    pub bf: Tensor,
+    pub w_out: Tensor,
+    pub b_out: Tensor,
+    pub gamma: Tensor,
 
-    pub dwq: Tensor, pub dwk: Tensor, pub dwv: Tensor, pub dwo: Tensor, pub dwi: Tensor, pub dwf: Tensor,
-    pub dbq: Tensor, pub dbk: Tensor, pub dbv: Tensor, pub dbo: Tensor, pub dbi: Tensor, pub dbf: Tensor,
-    pub dw_out: Tensor, pub db_out: Tensor, pub dgamma: Tensor,
+    pub dwq: Tensor,
+    pub dwk: Tensor,
+    pub dwv: Tensor,
+    pub dwo: Tensor,
+    pub dwi: Tensor,
+    pub dwf: Tensor,
+    pub dbq: Tensor,
+    pub dbk: Tensor,
+    pub dbv: Tensor,
+    pub dbo: Tensor,
+    pub dbi: Tensor,
+    pub dbf: Tensor,
+    pub dw_out: Tensor,
+    pub db_out: Tensor,
+    pub dgamma: Tensor,
 
     // --- pooled buffers ----------------------------------------------------
     steps: Vec<Step>,
-    c_state: Tensor,   // [b, h*dhv*dqk]
-    n_state: Tensor,   // [b, h*dqk]
-    m_state: Tensor,   // [b, h]
+    c_state: Tensor, // [b, h*dhv*dqk]
+    n_state: Tensor, // [b, h*dqk]
+    m_state: Tensor, // [b, h]
     // forward transient scratch
-    i_pre: Tensor, f_pre: Tensor, h_tilde: Tensor, out_t: Tensor,
+    i_pre: Tensor,
+    f_pre: Tensor,
+    h_tilde: Tensor,
+    out_t: Tensor,
     // backward transient scratch
-    delta: Tensor, d_hconcat: Tensor, do_pre: Tensor, d_yhat: Tensor, d_ht: Tensor,
-    dq: Tensor, dk: Tensor, dv: Tensor, di_pre: Tensor, df_pre: Tensor, dxt: Tensor,
-    dc_bptt: Tensor, dn_bptt: Tensor, tmp: Vec<f32>,
+    delta: Tensor,
+    d_hconcat: Tensor,
+    do_pre: Tensor,
+    d_yhat: Tensor,
+    d_ht: Tensor,
+    dq: Tensor,
+    dk: Tensor,
+    dv: Tensor,
+    di_pre: Tensor,
+    df_pre: Tensor,
+    dxt: Tensor,
+    dc_bptt: Tensor,
+    dn_bptt: Tensor,
+    tmp: Vec<f32>,
     // transposed weights for the fast dx path
-    wqt: Tensor, wkt: Tensor, wvt: Tensor, wot: Tensor, wit: Tensor, wft: Tensor, w_out_t: Tensor,
+    wqt: Tensor,
+    wkt: Tensor,
+    wvt: Tensor,
+    wot: Tensor,
+    wit: Tensor,
+    wft: Tensor,
+    w_out_t: Tensor,
     opt: Vec<AdamState>,
     batch: usize,
 }
@@ -158,12 +231,16 @@ impl MLstm {
         let dhv = d / heads;
         let d_qk = heads * dqk;
         let sq = |fi: usize, fo: usize| (6.0 / (fi as f32 + fo as f32)).sqrt();
-        let bf: Vec<f32> = (0..heads).map(|_| 4.5).collect();
-        let bi: Vec<f32> = (0..heads).map(|_| -4.5).collect();
+        let bf: Vec<f32> = (0..heads).map(|_| random_range(4.0..6.0)).collect();
+        let bi: Vec<f32> = (0..heads).map(|_| -10.0).collect();
         let z = || Tensor::zeros(&[0, 0]);
 
         Self {
-            input_size, d, heads, dqk, dhv,
+            input_size,
+            d,
+            heads,
+            dqk,
+            dhv,
             inv_sqrt_dqk: 1.0 / (dqk as f32).sqrt(),
             wq: Tensor::random(&[input_size, d_qk], sq(input_size, d_qk)),
             wk: Tensor::random(&[input_size, d_qk], sq(input_size, d_qk)),
@@ -171,26 +248,59 @@ impl MLstm {
             wo: Tensor::random(&[input_size, d], sq(input_size, d)),
             wi: Tensor::zeros(&[input_size, heads]),
             wf: Tensor::zeros(&[input_size, heads]),
-            bq: Tensor::zeros(&[d_qk]), bk: Tensor::zeros(&[d_qk]),
-            bv: Tensor::zeros(&[d]), bo: Tensor::zeros(&[d]),
-            bi: Tensor::new(&[heads], bi), bf: Tensor::new(&[heads], bf),
-            w_out: Tensor::random(&[d, d], sq(d, d)), b_out: Tensor::zeros(&[d]),
+            bq: Tensor::zeros(&[d_qk]),
+            bk: Tensor::zeros(&[d_qk]),
+            bv: Tensor::zeros(&[d]),
+            bo: Tensor::zeros(&[d]),
+            bi: Tensor::new(&[heads], bi),
+            bf: Tensor::new(&[heads], bf),
+            w_out: Tensor::random(&[d, d], sq(d, d)),
+            b_out: Tensor::zeros(&[d]),
             gamma: Tensor::new(&[d], vec![1.0; d]),
-            dwq: Tensor::zeros(&[input_size, d_qk]), dwk: Tensor::zeros(&[input_size, d_qk]),
-            dwv: Tensor::zeros(&[input_size, d]), dwo: Tensor::zeros(&[input_size, d]),
-            dwi: Tensor::zeros(&[input_size, heads]), dwf: Tensor::zeros(&[input_size, heads]),
-            dbq: Tensor::zeros(&[d_qk]), dbk: Tensor::zeros(&[d_qk]),
-            dbv: Tensor::zeros(&[d]), dbo: Tensor::zeros(&[d]),
-            dbi: Tensor::zeros(&[heads]), dbf: Tensor::zeros(&[heads]),
-            dw_out: Tensor::zeros(&[d, d]), db_out: Tensor::zeros(&[d]),
+            dwq: Tensor::zeros(&[input_size, d_qk]),
+            dwk: Tensor::zeros(&[input_size, d_qk]),
+            dwv: Tensor::zeros(&[input_size, d]),
+            dwo: Tensor::zeros(&[input_size, d]),
+            dwi: Tensor::zeros(&[input_size, heads]),
+            dwf: Tensor::zeros(&[input_size, heads]),
+            dbq: Tensor::zeros(&[d_qk]),
+            dbk: Tensor::zeros(&[d_qk]),
+            dbv: Tensor::zeros(&[d]),
+            dbo: Tensor::zeros(&[d]),
+            dbi: Tensor::zeros(&[heads]),
+            dbf: Tensor::zeros(&[heads]),
+            dw_out: Tensor::zeros(&[d, d]),
+            db_out: Tensor::zeros(&[d]),
             dgamma: Tensor::zeros(&[d]),
             steps: Vec::new(),
-            c_state: z(), n_state: z(), m_state: z(),
-            i_pre: z(), f_pre: z(), h_tilde: z(), out_t: z(),
-            delta: z(), d_hconcat: z(), do_pre: z(), d_yhat: z(), d_ht: z(),
-            dq: z(), dk: z(), dv: z(), di_pre: z(), df_pre: z(), dxt: z(),
-            dc_bptt: z(), dn_bptt: z(), tmp: Vec::new(),
-            wqt: z(), wkt: z(), wvt: z(), wot: z(), wit: z(), wft: z(), w_out_t: z(),
+            c_state: z(),
+            n_state: z(),
+            m_state: z(),
+            i_pre: z(),
+            f_pre: z(),
+            h_tilde: z(),
+            out_t: z(),
+            delta: z(),
+            d_hconcat: z(),
+            do_pre: z(),
+            d_yhat: z(),
+            d_ht: z(),
+            dq: z(),
+            dk: z(),
+            dv: z(),
+            di_pre: z(),
+            df_pre: z(),
+            dxt: z(),
+            dc_bptt: z(),
+            dn_bptt: z(),
+            tmp: Vec::new(),
+            wqt: z(),
+            wkt: z(),
+            wvt: z(),
+            wot: z(),
+            wit: z(),
+            wft: z(),
+            w_out_t: z(),
             opt: Vec::new(),
             batch: 0,
         }
@@ -205,7 +315,10 @@ impl MLstm {
     pub fn forward(&mut self, x: &Tensor) -> Tensor {
         assert_eq!(x.rank(), 3, "MLstm::forward expects [B, T, in]");
         let (b, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);
-        assert_eq!(inp, self.input_size, "MLstm::forward — input width mismatch");
+        assert_eq!(
+            inp, self.input_size,
+            "MLstm::forward — input width mismatch"
+        );
         let (d, h, dqk, dhv) = (self.d, self.heads, self.dqk, self.dhv);
         let d_qk = self.d_qk();
         let inv_sqrt = self.inv_sqrt_dqk;
@@ -231,8 +344,30 @@ impl MLstm {
         let mut out = Tensor::zeros(&[b, t, d]);
 
         let Self {
-            steps, wq, wk, wv, wo, wi, wf, bq, bk, bv, bo, bi, bf, w_out, b_out, gamma,
-            c_state, n_state, m_state, i_pre, f_pre, h_tilde, out_t, ..
+            steps,
+            wq,
+            wk,
+            wv,
+            wo,
+            wi,
+            wf,
+            bq,
+            bk,
+            bv,
+            bo,
+            bi,
+            bf,
+            w_out,
+            b_out,
+            gamma,
+            c_state,
+            n_state,
+            m_state,
+            i_pre,
+            f_pre,
+            h_tilde,
+            out_t,
+            ..
         } = self;
 
         for step in 0..t {
@@ -243,12 +378,72 @@ impl MLstm {
                 st.xt.data[bi_ * inp..(bi_ + 1) * inp].copy_from_slice(src);
             }
 
-            project(b, inp, d_qk, &st.xt.data, &wq.data, &bq.data, 1.0, false, &mut st.q.data);
-            project(b, inp, d_qk, &st.xt.data, &wk.data, &bk.data, inv_sqrt, false, &mut st.k.data);
-            project(b, inp, d, &st.xt.data, &wv.data, &bv.data, 1.0, false, &mut st.v.data);
-            project(b, inp, d, &st.xt.data, &wo.data, &bo.data, 1.0, true, &mut st.o.data);
-            project(b, inp, h, &st.xt.data, &wi.data, &bi.data, 1.0, false, &mut i_pre.data);
-            project(b, inp, h, &st.xt.data, &wf.data, &bf.data, 1.0, false, &mut f_pre.data);
+            project(
+                b,
+                inp,
+                d_qk,
+                &st.xt.data,
+                &wq.data,
+                &bq.data,
+                1.0,
+                false,
+                &mut st.q.data,
+            );
+            project(
+                b,
+                inp,
+                d_qk,
+                &st.xt.data,
+                &wk.data,
+                &bk.data,
+                inv_sqrt,
+                false,
+                &mut st.k.data,
+            );
+            project(
+                b,
+                inp,
+                d,
+                &st.xt.data,
+                &wv.data,
+                &bv.data,
+                1.0,
+                false,
+                &mut st.v.data,
+            );
+            project(
+                b,
+                inp,
+                d,
+                &st.xt.data,
+                &wo.data,
+                &bo.data,
+                1.0,
+                true,
+                &mut st.o.data,
+            );
+            project(
+                b,
+                inp,
+                h,
+                &st.xt.data,
+                &wi.data,
+                &bi.data,
+                1.0,
+                false,
+                &mut i_pre.data,
+            );
+            project(
+                b,
+                inp,
+                h,
+                &st.xt.data,
+                &wf.data,
+                &bf.data,
+                1.0,
+                false,
+                &mut f_pre.data,
+            );
 
             st.c_prev.data.copy_from_slice(&c_state.data);
             st.n_prev.data.copy_from_slice(&n_state.data);
@@ -366,7 +561,11 @@ impl MLstm {
         self.dc_bptt.zero_();
         self.dn_bptt.zero_();
         for buf in [
-            &mut self.delta, &mut self.d_hconcat, &mut self.do_pre, &mut self.d_yhat, &mut self.d_ht,
+            &mut self.delta,
+            &mut self.d_hconcat,
+            &mut self.do_pre,
+            &mut self.d_yhat,
+            &mut self.d_ht,
         ] {
             buf.fit(&[b, d]);
         }
@@ -379,19 +578,61 @@ impl MLstm {
         self.tmp.resize(dqk, 0.0);
 
         // Transpose weights once (reused across all T steps).
-        self.wqt.fit(&[d_qk, inp]); gemm::transpose(inp, d_qk, &self.wq.data, &mut self.wqt.data);
-        self.wkt.fit(&[d_qk, inp]); gemm::transpose(inp, d_qk, &self.wk.data, &mut self.wkt.data);
-        self.wvt.fit(&[d, inp]); gemm::transpose(inp, d, &self.wv.data, &mut self.wvt.data);
-        self.wot.fit(&[d, inp]); gemm::transpose(inp, d, &self.wo.data, &mut self.wot.data);
-        self.wit.fit(&[h, inp]); gemm::transpose(inp, h, &self.wi.data, &mut self.wit.data);
-        self.wft.fit(&[h, inp]); gemm::transpose(inp, h, &self.wf.data, &mut self.wft.data);
-        self.w_out_t.fit(&[d, d]); gemm::transpose(d, d, &self.w_out.data, &mut self.w_out_t.data);
+        self.wqt.fit(&[d_qk, inp]);
+        gemm::transpose(inp, d_qk, &self.wq.data, &mut self.wqt.data);
+        self.wkt.fit(&[d_qk, inp]);
+        gemm::transpose(inp, d_qk, &self.wk.data, &mut self.wkt.data);
+        self.wvt.fit(&[d, inp]);
+        gemm::transpose(inp, d, &self.wv.data, &mut self.wvt.data);
+        self.wot.fit(&[d, inp]);
+        gemm::transpose(inp, d, &self.wo.data, &mut self.wot.data);
+        self.wit.fit(&[h, inp]);
+        gemm::transpose(inp, h, &self.wi.data, &mut self.wit.data);
+        self.wft.fit(&[h, inp]);
+        gemm::transpose(inp, h, &self.wf.data, &mut self.wft.data);
+        self.w_out_t.fit(&[d, d]);
+        gemm::transpose(d, d, &self.w_out.data, &mut self.w_out_t.data);
 
         let Self {
-            steps, gamma, dwq, dwk, dwv, dwo, dwi, dwf, dbq, dbk, dbv, dbo, dbi, dbf,
-            dw_out, db_out, dgamma, delta, d_hconcat, do_pre, d_yhat, d_ht,
-            dq, dk, dv, di_pre, df_pre, dxt, dc_bptt, dn_bptt, tmp,
-            wqt, wkt, wvt, wot, wit, wft, w_out_t, ..
+            steps,
+            gamma,
+            dwq,
+            dwk,
+            dwv,
+            dwo,
+            dwi,
+            dwf,
+            dbq,
+            dbk,
+            dbv,
+            dbo,
+            dbi,
+            dbf,
+            dw_out,
+            db_out,
+            dgamma,
+            delta,
+            d_hconcat,
+            do_pre,
+            d_yhat,
+            d_ht,
+            dq,
+            dk,
+            dv,
+            di_pre,
+            df_pre,
+            dxt,
+            dc_bptt,
+            dn_bptt,
+            tmp,
+            wqt,
+            wkt,
+            wvt,
+            wot,
+            wit,
+            wft,
+            w_out_t,
+            ..
         } = self;
 
         for step in (0..t).rev() {
@@ -403,13 +644,29 @@ impl MLstm {
             }
 
             // W_out backward.
-            gemm::gemm_tn(d, b, d, &st.hconcat.data, &delta.data, &mut dw_out.data, 1.0);
+            gemm::gemm_tn(
+                d,
+                b,
+                d,
+                &st.hconcat.data,
+                &delta.data,
+                &mut dw_out.data,
+                1.0,
+            );
             for row in delta.data.chunks(d) {
                 for (o, v) in db_out.data.iter_mut().zip(row) {
                     *o += *v;
                 }
             }
-            gemm::gemm_nn(b, d, d, &delta.data, &w_out_t.data, &mut d_hconcat.data, 0.0);
+            gemm::gemm_nn(
+                b,
+                d,
+                d,
+                &delta.data,
+                &w_out_t.data,
+                &mut d_hconcat.data,
+                0.0,
+            );
 
             for idx in 0..b * d {
                 let dch = d_hconcat.data[idx];
@@ -551,9 +808,21 @@ impl MLstm {
 
     pub fn zero_grad(&mut self) {
         for g in [
-            &mut self.dwq, &mut self.dwk, &mut self.dwv, &mut self.dwo, &mut self.dwi, &mut self.dwf,
-            &mut self.dbq, &mut self.dbk, &mut self.dbv, &mut self.dbo, &mut self.dbi, &mut self.dbf,
-            &mut self.dw_out, &mut self.db_out, &mut self.dgamma,
+            &mut self.dwq,
+            &mut self.dwk,
+            &mut self.dwv,
+            &mut self.dwo,
+            &mut self.dwi,
+            &mut self.dwf,
+            &mut self.dbq,
+            &mut self.dbk,
+            &mut self.dbv,
+            &mut self.dbo,
+            &mut self.dbi,
+            &mut self.dbf,
+            &mut self.dw_out,
+            &mut self.db_out,
+            &mut self.dgamma,
         ] {
             g.zero_();
         }
@@ -595,15 +864,25 @@ fn accum(dbias: &mut [f32], grad: &[f32], b: usize, width: usize) {
 mod tests {
     use super::*;
 
-    struct Ctx { cell: MLstm, x: Tensor, g: Tensor }
+    struct Ctx {
+        cell: MLstm,
+        x: Tensor,
+        g: Tensor,
+    }
 
     fn loss(c: &mut Ctx) -> f32 {
         let y = c.cell.forward(&c.x);
         y.data.iter().zip(&c.g.data).map(|(a, b)| a * b).sum()
     }
 
-    fn check(state: &mut Ctx, grad: &[f32], name: &str, eps: f32, tol: f32,
-             mut perturb: impl FnMut(&mut Ctx, f32, &[f32])) {
+    fn check(
+        state: &mut Ctx,
+        grad: &[f32],
+        name: &str,
+        eps: f32,
+        tol: f32,
+        mut perturb: impl FnMut(&mut Ctx, f32, &[f32]),
+    ) {
         let norm: f32 = grad.iter().map(|g| g * g).sum::<f32>().sqrt();
         assert!(norm > 1e-6, "{name}: analytic grad ~zero");
         let u: Vec<f32> = grad.iter().map(|g| g / norm).collect();
@@ -613,7 +892,10 @@ mod tests {
         let minus = loss(state);
         perturb(state, eps, &u);
         let fd = (plus - minus) / (2.0 * eps);
-        assert!((fd - norm).abs() <= tol * norm + 1e-3, "{name}: ‖G‖ {norm} vs fd {fd}");
+        assert!(
+            (fd - norm).abs() <= tol * norm + 1e-3,
+            "{name}: ‖G‖ {norm} vs fd {fd}"
+        );
     }
 
     #[test]
@@ -634,13 +916,25 @@ mod tests {
         let eps = 2e-4;
         let tol = 0.3;
 
-        check(&mut ctx, &dwq.data, "dwq", eps, tol,
-            |c, s, u| for (w, &ui) in c.cell.wq.data.iter_mut().zip(u) { *w += s * ui; });
-        check(&mut ctx, &dwv.data, "dwv", eps, tol,
-            |c, s, u| for (w, &ui) in c.cell.wv.data.iter_mut().zip(u) { *w += s * ui; });
-        check(&mut ctx, &dwo_out.data, "dw_out", eps, tol,
-            |c, s, u| for (w, &ui) in c.cell.w_out.data.iter_mut().zip(u) { *w += s * ui; });
-        check(&mut ctx, &dx.data, "dx", eps, tol,
-            |c, s, u| for (v, &ui) in c.x.data.iter_mut().zip(u) { *v += s * ui; });
+        check(&mut ctx, &dwq.data, "dwq", eps, tol, |c, s, u| {
+            for (w, &ui) in c.cell.wq.data.iter_mut().zip(u) {
+                *w += s * ui;
+            }
+        });
+        check(&mut ctx, &dwv.data, "dwv", eps, tol, |c, s, u| {
+            for (w, &ui) in c.cell.wv.data.iter_mut().zip(u) {
+                *w += s * ui;
+            }
+        });
+        check(&mut ctx, &dwo_out.data, "dw_out", eps, tol, |c, s, u| {
+            for (w, &ui) in c.cell.w_out.data.iter_mut().zip(u) {
+                *w += s * ui;
+            }
+        });
+        check(&mut ctx, &dx.data, "dx", eps, tol, |c, s, u| {
+            for (v, &ui) in c.x.data.iter_mut().zip(u) {
+                *v += s * ui;
+            }
+        });
     }
 }
