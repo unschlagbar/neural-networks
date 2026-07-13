@@ -42,10 +42,12 @@ use rand::random_range;
 
 use crate::{
     nn::{
+        GRAD_BLOCK,
         activations::{log_sigmoid, stable_sigmoid},
-        GRAD_BLOCK, dot, matvec_acc, matvec_into, outer_acc_block,
+        dot,
         headwise_rms_norm::{HeadwiseRMSNorm, HeadwiseRMSNormCache},
         linear::{LinearCache, LinearLayer},
+        matvec_acc, matvec_into, outer_acc_block,
     },
     nn_layer::{DynCache, NnLayer},
     optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps, add_grad_matrix, add_grad_vec},
@@ -212,7 +214,7 @@ impl MLSTMLayer {
         let scale_v = (6.0 / (input_size as f32 + d as f32)).sqrt();
 
         let bf: Box<[f32]> = (0..heads).map(|_| random_range(3.0..6.0)).collect();
-        let bi: Box<[f32]> = (0..heads).map(|_| random_range(-6.0..-3.0)).collect();
+        let bi: Box<[f32]> = (0..heads).map(|_| -10.0).collect();
 
         Self {
             input_size,
@@ -447,7 +449,11 @@ impl MLSTMLayer {
             cache.w_out.input[i] = cache.o[i] * cache.head_norm.output[i];
         }
         cache.w_out.output.copy_from_slice(&self.w_out.biases);
-        matvec_acc(&self.w_out.weights, &cache.w_out.input, &mut cache.w_out.output);
+        matvec_acc(
+            &self.w_out.weights,
+            &cache.w_out.input,
+            &mut cache.w_out.output,
+        );
     }
 
     // Incoming `delta` = dL/d(cell-output), size d.
