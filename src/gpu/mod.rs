@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use cudarc::cublas::CudaBlas;
+use cudarc::cublas::sys::{cublasMath_t, cublasSetMathMode};
 use cudarc::driver::{CudaContext, CudaStream};
 
 pub mod block;
@@ -97,8 +98,51 @@ impl Gpu {
             .new_stream()
             .map_err(|e| format!("stream creation failed: {e:?}"))?;
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS init failed: {e:?}"))?;
+        set_tf32(&blas)?;
         let kernels = Kernels::load(&context)?;
         Ok(Self { context, stream, blas: Arc::new(blas), kernels: Arc::new(kernels) })
+    }
+}
+
+/// Let cuBLAS run our f32 GEMMs on the tensor cores in TF32.
+///
+/// A plain `sgemm` in the default math mode uses the FP32 CUDA cores and nothing
+/// else — on Ampere and later that leaves the tensor cores, i.e. most of the
+/// machine's matmul throughput, idle. `CUBLAS_TF32_TENSOR_OP_MATH` keeps the
+/// interface fp32 (our buffers, the accumulator and the result stay fp32) and only
+/// rounds the *multiplicand mantissas* to TF32's 10 bits before they enter the
+/// tensor core. Dynamic range is fp32's — TF32 keeps all 8 exponent bits — so no
+/// value here can overflow or flush that would not have in fp32; the products just
+/// carry ~10 mantissa bits instead of 24, which is why this is a knob and not a
+/// silent default.
+///
+/// That is a real precision cut, and the reason it is safe for us is that the
+/// error lands where we already tolerate it: gradients and activations, summed in
+/// fp32 over long K, whose per-step noise is orders of magnitude above 2^-11
+/// relative. What must *not* go through it is the stabilizer's own arithmetic
+/// (`m`, `exp(-m)`) — but that lives in the fused kernels, not in cuBLAS, so it is
+/// untouched by this.
+///
+/// **Opt-in** (`GPU_TF32=1`), unlike the tensor cores in the mLSTM kernels, which
+/// are on by default. The reason is what each one buys: the fused kernels' dots are
+/// where the model's own arithmetic lives, and the reference (`mlstm_kernels`) puts
+/// them on the tensor cores too. cuBLAS's math mode, by contrast, reaches *every*
+/// GEMM in the backend — including the ones the parity tests use as an exact-fp32
+/// oracle — and measures at ~1.35x on the GEMMs but only ~4% on a training step,
+/// because the step is dominated by the backbone's sLSTM, not by matmul. That is a
+/// poor trade to take silently, so it is a switch rather than a default.
+fn set_tf32(blas: &CudaBlas) -> Result<(), String> {
+    let mode = if std::env::var("GPU_TF32").as_deref() == Ok("1") {
+        cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH
+    } else {
+        cublasMath_t::CUBLAS_DEFAULT_MATH
+    };
+    // SAFETY: `blas` owns a live cuBLAS handle; setting its math mode is a
+    // handle-local property and touches no device memory.
+    let status = unsafe { cublasSetMathMode(*blas.handle(), mode) };
+    match status {
+        cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS => Ok(()),
+        e => Err(format!("cublasSetMathMode({mode:?}) failed: {e:?}")),
     }
 }
 

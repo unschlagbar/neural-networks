@@ -165,6 +165,51 @@ op-at-a-time path, which is retained as the A/B baseline and as the oracle for
 (dqk=dhv=64, T ending on a short chunk) and requires identical forward, `dx` and
 weight updates.
 
+#### Tensor cores (`mma.sync`, TF32)
+
+Every contraction in the two *parallel* kernels runs on the **tensor cores**, which
+is what the reference gets from Triton (`tl.dot` on fp32 inputs is TF32 by default).
+`mlstm_fw_parallel_mma` / `mlstm_bw_parallel_mma` are drop-in twins of the scalar
+kernels — same algorithm, same shared-memory plan — with the dots issued as
+`mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32` (SASS: `HMMA.1688.F32.TF32`).
+The forward's three dots are `Q·Kᵀ`, `(D̄⊙S)·V` and `Q·C_prevᵀ`; the backward's seven
+are grouped so that dots writing the *same* output tile share one warp pass and one
+epilogue (dV/`st`/`pre` all land on `[L, dhv]`; dQ/dK all land on `[L, dqk]`).
+
+Three things this buys and costs:
+
+- **Speed.** The fused core goes 1.89 → 1.43 ms fwd+bwd at the backbone shape (1.32x;
+  backward alone 1.37 → 1.00 ms). End-to-end that is only ~1% of a training window —
+  the backbone is dominated by its **sLSTM** blocks (~124 ms of a ~260 ms window,
+  against ~50 ms for all the mLSTMs). The mLSTM core is no longer where the time is.
+- **Precision.** TF32 keeps fp32's exponent and accumulator but rounds the
+  multiplicands to 10 mantissa bits, so the dots carry ~4e-4 relative error (measured,
+  and exactly what `mlstm_kernels` carries). `mlstm_fused_mma_matches_scalar` pins the
+  tensor-core path against the scalar one at that tolerance and must not be tightened
+  into an exactness check. `MLSTM_NO_MMA=1` selects the scalar kernels — the A/B
+  baseline and the fp32 oracle.
+- **Padding, not special cases.** Shapes are padded up to the mma tile (rows to 16,
+  contraction to 8, columns to 8) and the pad is zero-filled, so a short final chunk
+  and an odd `dqk`/`dhv` need no separate code path: a zero row contributes nothing to
+  a dot. `fused_smem("*_mma", ..)` must track the kernel's `LP`/`KP`/`VP` exactly.
+
+`kernels.rs` compiles `SRC` **twice**, on purpose. `mma.sync` does not exist at
+NVRTC's default target arch, so the tensor-core kernels need `--gpu-architecture`
+pointed at the real device — but that flag also changes how ptxas contracts FMAs in
+every *other* kernel, shifting their last bits. So the base module is compiled exactly
+as before (default arch, `MMA_TF32` undefined, the `#if` blocks preprocessed away) and
+every pre-existing kernel is taken from it bit-for-bit; a second module, compiled for
+the device arch with `MMA_TF32`, supplies only the two mma kernels. Devices below
+sm_80 simply skip the second compile and run the scalar path.
+
+> **Known-flaky test.** `mlstm_fused_matches_legacy` fails ~50% of runs *on `main`*,
+> and has nothing to do with the tensor cores. It compares weights after **one** Adam
+> step, where the update is `lr·g/(√(g²)+ε)` — for a weight whose gradient is near
+> zero that ratio is hypersensitive, so a 1e-7 difference in gradient becomes ~1e-4 in
+> the weight, past the 2e-5 tolerance. The test data is randomly redrawn each run,
+> hence the coin flip. Comparing the *gradients* instead of the post-step weights
+> would fix it.
+
 **VRAM.** Word batching is what dominates a window, and it has a knob:
 - *Word batching.* The encoder/decoder run words as `[words, tmax]` rectangles and
   `tmax` is the longest word in the group, so a single 16-byte word would pad every
@@ -191,6 +236,14 @@ fused kernels were tuned — run it with `MLSTM_LEGACY=1` for the before picture
 `GPU_PROF=1` prints per-phase timings; `GPU_MEM=1` adds device memory in use after
 each phase. `cargo run --release --features cuda --example gpu_fit -- <corpus> [words]`
 runs a corpus's worst-shaped window and reports peak VRAM and s/window.
+
+`GPU_TF32=1` (**off by default**) puts cuBLAS's math mode on the tensor cores, so
+every GEMM in the backend runs in TF32 instead of fp32 SGEMM. It is worth ~1.35x on
+the GEMMs (18 → 25 TFLOP/s at the backbone's shapes) but only ~4% on a training step,
+because a step is dominated by the backbone's sLSTM rather than by matmul — and it
+reaches *every* GEMM, including the ones the parity tests use as an exact-fp32 oracle
+(8 of them fail with it on). Hence a switch, not a default. This is independent of the
+mLSTM kernels' own tensor-core dots, which are on by default.
 
 ### Persistence (`src/saving.rs`, `src/loading.rs`)
 

@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaFunction};
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{CompileOptions, compile_ptx, compile_ptx_with_opts};
 
 const SRC: &str = r#"
 extern "C" __global__ void softcap_forward(const float* x, float* y, float cap, int n) {
@@ -1128,6 +1128,234 @@ extern "C" __global__ void mlstm_fw_parallel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tensor-core dot (MMA_TF32, sm_80+)
+// ---------------------------------------------------------------------------
+//
+// The scalar kernels above give every output element to one thread, which then
+// walks the contraction with an FMA loop. That is the one thing our chunkwise core
+// does differently from the reference (nx-ai/mlstm_kernels): every contraction
+// there is a `tl.dot`, and Triton lowers `tl.dot` on fp32 inputs to the tensor
+// cores in TF32 (`allow_tf32` defaults to true). Below is that same `dot`, written
+// out as the PTX Triton would emit.
+//
+// The unit is `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`: a whole WARP
+// cooperates to compute D(16x8) += A(16x8)·B(8x8), with the operands rounded to
+// TF32 (fp32's 8 exponent bits, 10 mantissa bits) and the product accumulated in
+// full fp32. Precision-wise it sits exactly where cuBLAS's TF32 math mode does,
+// and where the reference already is.
+//
+// A warp's 32 lanes each hold a fixed slice of every fragment. With
+//   g = lane / 4   (the "group")      c = lane % 4   (the index within it)
+// the layouts the instruction requires are:
+//   A (16x8, row): a0=(g, c)   a1=(g+8, c)   a2=(g, c+4)   a3=(g+8, c+4)
+//   B (8x8, col):  b0=(c, g)   b1=(c+4, g)                  [(row=k, col=n)]
+//   D (16x8):      d0=(g, 2c)  d1=(g, 2c+1)  d2=(g+8, 2c)  d3=(g+8, 2c+1)
+// The `ld_*` helpers below are just those tables, applied to a shared-memory tile.
+// Nothing here is allowed to diverge inside a warp — `mma.sync` is warp-wide.
+#if MMA_TF32
+
+__device__ __forceinline__ unsigned tf32_of(float x) {
+    unsigned r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+    return r;
+}
+
+// D += A·B for one warp. Accumulates in place, so a K-loop just calls it again.
+__device__ __forceinline__ void mma_16x8x8(float* d, const unsigned* a, const unsigned* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// A from a row-major [M, K] tile: A[m][k] = s[m*ld + k].
+__device__ __forceinline__ void ld_a_mk(unsigned* a, const float* s, int ld, int m0, int k0) {
+    int lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
+    a[0] = tf32_of(s[(m0 + g)     * ld + k0 + c]);
+    a[1] = tf32_of(s[(m0 + g + 8) * ld + k0 + c]);
+    a[2] = tf32_of(s[(m0 + g)     * ld + k0 + c + 4]);
+    a[3] = tf32_of(s[(m0 + g + 8) * ld + k0 + c + 4]);
+}
+
+// A from a row-major [K, M] tile, i.e. Aᵀ is what is in memory: A[m][k] = s[k*ld + m].
+// This is how `dS` is contracted over `t` for dK without ever transposing it.
+__device__ __forceinline__ void ld_a_km(unsigned* a, const float* s, int ld, int m0, int k0) {
+    int lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
+    a[0] = tf32_of(s[(k0 + c)     * ld + m0 + g]);
+    a[1] = tf32_of(s[(k0 + c)     * ld + m0 + g + 8]);
+    a[2] = tf32_of(s[(k0 + c + 4) * ld + m0 + g]);
+    a[3] = tf32_of(s[(k0 + c + 4) * ld + m0 + g + 8]);
+}
+
+// B from a row-major [N, K] tile: B[k][n] = s[n*ld + k]. (`Q·Kᵀ`: K is stored
+// [j, q] and is wanted as [q, j].)
+__device__ __forceinline__ void ld_b_nk(unsigned* b, const float* s, int ld, int k0, int n0) {
+    int lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
+    b[0] = tf32_of(s[(n0 + g) * ld + k0 + c]);
+    b[1] = tf32_of(s[(n0 + g) * ld + k0 + c + 4]);
+}
+
+// B from a row-major [K, N] tile: B[k][n] = s[k*ld + n]. (`(D̄⊙S)·V`.)
+__device__ __forceinline__ void ld_b_kn(unsigned* b, const float* s, int ld, int k0, int n0) {
+    int lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
+    b[0] = tf32_of(s[(k0 + c)     * ld + n0 + g]);
+    b[1] = tf32_of(s[(k0 + c + 4) * ld + n0 + g]);
+}
+
+// Where accumulator register `i` lands in the 16x8 output tile.
+__device__ __forceinline__ int mma_row(int i) { return ((threadIdx.x & 31) >> 2) + ((i & 2) ? 8 : 0); }
+__device__ __forceinline__ int mma_col(int i) { return (((threadIdx.x & 31) & 3) << 1) + (i & 1); }
+
+// The tensor-core twin of `mlstm_fw_parallel`. Same algorithm, same shared-memory
+// plan, same numbers up to TF32 rounding of the three contractions:
+//   S    = Q·Kᵀ        (over dqk)   -> masked/decayed in the mma epilogue
+//   H    = (D̄⊙S)·V    (over j)
+//   Hinter = Q·C_prevᵀ (over dqk)   -> scaled by b[t] and added to H
+// The decay mask is applied as the epilogue of the first mma rather than in a pass
+// of its own, so `S` never lands in shared memory unmasked.
+//
+// Shapes are padded UP to the mma tile (rows to 16, contractions to 8, columns to
+// 8) and the pad is zero-filled, so a short last chunk, an odd `dqk` or an odd
+// `dhv` all fall out for free: a zero row contributes nothing to a dot, and the
+// out-of-range outputs are simply not written. `LP`/`KP`/`VP` are those padded
+// dims and must match `fused_smem("fw_parallel_mma", ..)` on the host exactly.
+extern "C" __global__ void mlstm_fw_parallel_mma(
+    const float* qq, const float* kk, const float* vv, const float* ig, const float* fcb,
+    const float* cst, const float* nst, const float* mst,
+    float* ytil, float* msv, float* psiv, float* qnv,
+    int T, int L, int NC, int dqk, int dhv) {
+    int k = blockIdx.x, bh = blockIdx.y;
+    int tid = threadIdx.x, nthreads = blockDim.x;
+    int warp = tid >> 5, nwarps = nthreads >> 5;
+    int c0 = k * L;
+    int len = min(L, T - c0);
+
+    int LP = (L + 15) & ~15;    // rows      -> multiple of the mma M
+    int KP = (dqk + 7) & ~7;    // dqk       -> multiple of the mma K
+    int VP = (dhv + 7) & ~7;    // dhv       -> multiple of the mma N
+    int LQ = KP + 1, LV = VP + 1, LS = LP + 1;   // +1: the bank-conflict pad
+
+    extern __shared__ float sh[];
+    float* sQ  = sh;                  // [LP, LQ]
+    float* sK  = sQ + LP * LQ;        // [LP, LQ]
+    float* sV  = sK + LP * LQ;        // [LP, LV]
+    float* sC  = sV + LP * LV;        // [VP, LQ]
+    float* sDS = sC + VP * LQ;        // [LP, LS]
+    float* sN  = sDS + LP * LS;       // [KP]
+    float* sFc = sN + KP;             // [LP]
+    float* sIg = sFc + LP;            // [LP]
+    float* sM  = sIg + LP;            // [LP]
+    float* sB  = sM + LP;             // [LP]
+    float* sQn = sB + LP;             // [LP]
+
+    for (int e = tid; e < LP * KP; e += nthreads) {
+        int t = e / KP, q = e - t * KP;
+        int ok = (t < len) && (q < dqk);
+        sQ[t * LQ + q] = ok ? qq[((long)bh * T + c0 + t) * dqk + q] : 0.0f;
+        sK[t * LQ + q] = ok ? kk[((long)bh * T + c0 + t) * dqk + q] : 0.0f;
+    }
+    for (int e = tid; e < LP * VP; e += nthreads) {
+        int t = e / VP, v = e - t * VP;
+        sV[t * LV + v] = ((t < len) && (v < dhv))
+            ? vv[((long)bh * T + c0 + t) * dhv + v] : 0.0f;
+    }
+    for (int e = tid; e < VP * KP; e += nthreads) {
+        int v = e / KP, q = e - v * KP;
+        sC[v * LQ + q] = ((v < dhv) && (q < dqk))
+            ? cst[((long)bh * (NC + 1) + k) * dhv * dqk + (long)v * dqk + q] : 0.0f;
+    }
+    for (int e = tid; e < KP; e += nthreads)
+        sN[e] = (e < dqk) ? nst[((long)bh * (NC + 1) + k) * dqk + e] : 0.0f;
+    for (int j = tid; j < LP; j += nthreads) {
+        sFc[j] = (j < L)   ? fcb[((long)bh * NC + k) * L + j] : 0.0f;
+        sIg[j] = (j < len) ? ig[(long)bh * T + c0 + j]        : 0.0f;
+    }
+    float m_prev = mst[(long)bh * (NC + 1) + k];
+    __syncthreads();
+
+    for (int t = tid; t < LP; t += nthreads) {
+        float mx = 0.0f, b = 0.0f;
+        if (t < len) {
+            float fct = sFc[t];
+            mx = fct + m_prev;
+            for (int j = 0; j <= t; ++j) mx = fmaxf(mx, fct - sFc[j] + sIg[j]);
+            b = expf(fct + m_prev - mx);
+        }
+        sM[t] = mx;
+        sB[t] = b;
+    }
+    __syncthreads();
+
+    // S = Q·Kᵀ, with D̄ and the causal mask folded into the epilogue. Rows/cols in
+    // the pad get 0, which is what the next dot needs anyway.
+    int mtile = LP >> 4, ntile = LP >> 3;
+    for (int tile = warp; tile < mtile * ntile; tile += nwarps) {
+        int m0 = (tile / ntile) << 4, n0 = (tile % ntile) << 3;
+        float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        unsigned a[4], b[2];
+        for (int k0 = 0; k0 < KP; k0 += 8) {
+            ld_a_mk(a, sQ, LQ, m0, k0);
+            ld_b_nk(b, sK, LQ, k0, n0);
+            mma_16x8x8(d, a, b);
+        }
+        for (int i = 0; i < 4; ++i) {
+            int t = m0 + mma_row(i), j = n0 + mma_col(i);
+            float val = 0.0f;
+            if (t < len && j <= t) val = expf(sFc[t] - sFc[j] + sIg[j] - sM[t]) * d[i];
+            sDS[t * LS + j] = val;
+        }
+    }
+    __syncthreads();
+
+    // qn: the row sum of D̄⊙S plus the b·(Q·n_prev) read-out. A matrix-VECTOR
+    // product, so it stays scalar — there is no dot for the tensor cores here.
+    for (int t = tid; t < len; t += nthreads) {
+        float acc = 0.0f;
+        for (int j = 0; j <= t; ++j) acc += sDS[t * LS + j];
+        float qi = 0.0f;
+        for (int q = 0; q < dqk; ++q) qi += sQ[t * LQ + q] * sN[q];
+        acc += sB[t] * qi;
+        sQn[t] = acc;
+        long gt = (long)bh * T + c0 + t;
+        qnv[gt] = acc;
+        msv[gt] = sM[t];
+        psiv[gt] = fmaxf(fabsf(acc), expf(-sM[t]));
+    }
+    __syncthreads();
+
+    // The two output dots share an output tile, so they share a warp: intra over j,
+    // inter over q, combined as num = intra + b[t]·inter in the epilogue.
+    int vtile = VP >> 3;
+    for (int tile = warp; tile < mtile * vtile; tile += nwarps) {
+        int m0 = (tile / vtile) << 4, n0 = (tile % vtile) << 3;
+        float dintra[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float dinter[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        unsigned a[4], b[2];
+        for (int k0 = 0; k0 < LP; k0 += 8) {   // (D̄⊙S)·V, contracting j
+            ld_a_mk(a, sDS, LS, m0, k0);
+            ld_b_kn(b, sV, LV, k0, n0);
+            mma_16x8x8(dintra, a, b);
+        }
+        for (int k0 = 0; k0 < KP; k0 += 8) {   // Q·C_prevᵀ, contracting q
+            ld_a_mk(a, sQ, LQ, m0, k0);
+            ld_b_nk(b, sC, LQ, k0, n0);
+            mma_16x8x8(dinter, a, b);
+        }
+        for (int i = 0; i < 4; ++i) {
+            int t = m0 + mma_row(i), v = n0 + mma_col(i);
+            if (t < len && v < dhv) {
+                float acc = dintra[i] + sB[t] * dinter[i];
+                ytil[((long)bh * T + c0 + t) * dhv + v] =
+                    acc / fmaxf(fabsf(sQn[t]), expf(-sM[t]));
+            }
+        }
+    }
+}
+
+#endif // MMA_TF32
+
 // Backward over the chunk states: the mirror of `mlstm_fw_C`, walking chunks in
 // reverse with the chunk loop inside the kernel. `dcst[k]` is the gradient wrt the
 // state ENTERING chunk k (so it lines up index-for-index with `cst`):
@@ -1479,6 +1707,311 @@ extern "C" __global__ void mlstm_bw_parallel(
         }
     }
 }
+
+#if MMA_TF32
+
+// The tensor-core twin of `mlstm_bw_parallel`. Every contraction in the backward
+// is a dot, so every one of them goes to the tensor cores:
+//
+//   phase 1   S     = Q·Kᵀ         over dqk   -> masked+decayed into sDS (as fwd)
+//   phase 2   dVnum = DSᵀ·dN       over t     |
+//             st    = K·dCᵀ        over dqk   |- all three land on [L, dhv], so one
+//             pre   = Q·Cᵀ         over dqk   |  warp pass computes all three
+//   phase 4   dds   = dN·Vᵀ        over dhv   -> [L, L], epilogue makes dS in place
+//   phase 5   dQint = dS·K         over j     |
+//             dQinx = dN·C         over dhv   |- all four land on [L, dqk], so again
+//             dKint = dSᵀ·Q        over t     |  one warp pass
+//             dKst  = V·dC         over dhv   |
+//
+// Grouping by output tile is the point: an accumulator lives in registers for the
+// whole K-loop, so two dots that write the same tile cost one tile's worth of
+// epilogue and one set of shared-memory reads for the shared operand.
+//
+// `da`/`db` still reduce with shared atomics — they contract the SAME products the
+// tiles already hold (`st` over v, `pre` over v), so they ride along in the epilogue
+// instead of getting a pass of their own, exactly as in the scalar kernel.
+//
+// Everything else — the dg reduction, the a/b/g -> (dfc, dig) fold, the reverse
+// cumsum tail — is elementwise or a scan, has no dot in it, and is unchanged.
+extern "C" __global__ void mlstm_bw_parallel_mma(
+    const float* qq, const float* kk, const float* vv,
+    const float* ig, const float* fg, const float* fcb,
+    const float* cst, const float* nst, const float* mst,
+    const float* dcst, const float* dnst,
+    const float* ytil, const float* dytil, const float* psiv,
+    const float* qnv, const float* msv,
+    float* dq, float* dk, float* dv, float* dig, float* dfg,
+    int T, int L, int NC, int dqk, int dhv) {
+    int k = blockIdx.x, bh = blockIdx.y;
+    int tid = threadIdx.x, nthreads = blockDim.x;
+    int warp = tid >> 5, nwarps = nthreads >> 5;
+    int c0 = k * L;
+    int len = min(L, T - c0);
+    int is_last = (k == NC - 1);
+
+    int LP = (L + 15) & ~15;
+    int KP = (dqk + 7) & ~7;
+    int VP = (dhv + 7) & ~7;
+    int LQ = KP + 1, LV = VP + 1, LS = LP + 1;
+
+    extern __shared__ float sh[];
+    float* sQ   = sh;                  // [LP, LQ]
+    float* sK   = sQ + LP * LQ;        // [LP, LQ]
+    float* sV   = sK + LP * LQ;        // [LP, LV]
+    float* sDN  = sV + LP * LV;        // [LP, LV]   d_num
+    float* sDS  = sDN + LP * LV;       // [LP, LS]   DS, then dS
+    float* sC   = sDS + LP * LS;       // [VP, LQ]   C_{k-1}
+    float* sdC  = sC + VP * LQ;        // [VP, LQ]   dC_k
+    float* sN   = sdC + VP * LQ;       // [KP]
+    float* sdN  = sN + KP;             // [KP]
+    float* sFc  = sdN + KP;            // [LP]
+    float* sIg  = sFc + LP;            // [LP]
+    float* sM   = sIg + LP;            // [LP]
+    float* sB   = sM + LP;             // [LP]
+    float* sA   = sB + LP;             // [LP]
+    float* sQn  = sA + LP;             // [LP]
+    float* sDQn = sQn + LP;            // [LP]
+    float* sDfc = sDQn + LP;           // [LP]
+    float* sDig = sDfc + LP;           // [LP]
+    float* sDa  = sDig + LP;           // [LP]
+    float* sDb  = sDa + LP;            // [LP]
+    __shared__ float sRed[512]; // must cover FUSED_THREADS_PAR
+
+    for (int e = tid; e < LP * KP; e += nthreads) {
+        int t = e / KP, q = e - t * KP;
+        int ok = (t < len) && (q < dqk);
+        sQ[t * LQ + q] = ok ? qq[((long)bh * T + c0 + t) * dqk + q] : 0.0f;
+        sK[t * LQ + q] = ok ? kk[((long)bh * T + c0 + t) * dqk + q] : 0.0f;
+    }
+    for (int e = tid; e < LP * VP; e += nthreads) {
+        int t = e / VP, v = e - t * VP;
+        sV[t * LV + v] = ((t < len) && (v < dhv))
+            ? vv[((long)bh * T + c0 + t) * dhv + v] : 0.0f;
+        sDN[t * LV + v] = 0.0f; // filled below for t < len
+    }
+    for (int e = tid; e < VP * KP; e += nthreads) {
+        int v = e / KP, q = e - v * KP;
+        int ok = (v < dhv) && (q < dqk);
+        sC[v * LQ + q] =
+            ok ? cst[((long)bh * (NC + 1) + k) * dhv * dqk + (long)v * dqk + q] : 0.0f;
+        // The last chunk's outgoing state is never read, so its gradient is zero.
+        sdC[v * LQ + q] = (ok && !is_last)
+            ? dcst[((long)bh * (NC + 1) + (k + 1)) * dhv * dqk + (long)v * dqk + q] : 0.0f;
+    }
+    for (int e = tid; e < KP; e += nthreads) {
+        int ok = e < dqk;
+        sN[e] = ok ? nst[((long)bh * (NC + 1) + k) * dqk + e] : 0.0f;
+        sdN[e] = (ok && !is_last) ? dnst[((long)bh * (NC + 1) + (k + 1)) * dqk + e] : 0.0f;
+    }
+    for (int j = tid; j < LP; j += nthreads) {
+        sFc[j] = (j < L)   ? fcb[((long)bh * NC + k) * L + j] : 0.0f;
+        sIg[j] = (j < len) ? ig[(long)bh * T + c0 + j]        : 0.0f;
+        sM[j] = 0.0f; sB[j] = 0.0f; sA[j] = 0.0f; sQn[j] = 0.0f; sDQn[j] = 0.0f;
+        sDfc[j] = 0.0f; sDig[j] = 0.0f; sDa[j] = 0.0f; sDb[j] = 0.0f;
+    }
+    float m_prev = mst[(long)bh * (NC + 1) + k];
+    __syncthreads();
+
+    float fc_last = sFc[len - 1];
+    float m_last = msv[(long)bh * T + c0 + len - 1];
+    float gsca = expf(fc_last + m_prev - m_last);
+
+    for (int t = tid; t < len; t += nthreads) {
+        long gt = (long)bh * T + c0 + t;
+        sM[t] = msv[gt];
+        sB[t] = expf(sFc[t] + m_prev - sM[t]);
+        sA[t] = expf(fc_last - sFc[t] + sIg[t] - m_last);
+        sQn[t] = qnv[gt];
+
+        float inv = 1.0f / psiv[gt];
+        float red = 0.0f;
+        for (int v = 0; v < dhv; ++v) {
+            float dy = dytil[gt * dhv + v];
+            sDN[t * LV + v] = dy * inv;
+            red += dy * ytil[gt * dhv + v];
+        }
+        float dpsi = -red * inv;
+        float qn = sQn[t];
+        // Grad flows through qn only where it, not the exp(−m) floor, won the max.
+        sDQn[t] = (fabsf(qn) > expf(-sM[t])) ? ((qn > 0.0f ? 1.0f : -1.0f) * dpsi) : 0.0f;
+    }
+    __syncthreads();
+
+    int mtile = LP >> 4, ltile = LP >> 3, vtile = VP >> 3, ktile = KP >> 3;
+
+    // Phase 1: recompute DS = D̄ ⊙ (Q·Kᵀ), exactly as the forward built it.
+    for (int tile = warp; tile < mtile * ltile; tile += nwarps) {
+        int m0 = (tile / ltile) << 4, n0 = (tile % ltile) << 3;
+        float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        unsigned a[4], b[2];
+        for (int k0 = 0; k0 < KP; k0 += 8) {
+            ld_a_mk(a, sQ, LQ, m0, k0);
+            ld_b_nk(b, sK, LQ, k0, n0);
+            mma_16x8x8(d, a, b);
+        }
+        for (int i = 0; i < 4; ++i) {
+            int t = m0 + mma_row(i), j = n0 + mma_col(i);
+            float val = 0.0f;
+            if (t < len && j <= t) val = expf(sFc[t] - sFc[j] + sIg[j] - sM[t]) * d[i];
+            sDS[t * LS + j] = val;
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: dV, plus the `st` and `pre` products that `da`/`db` reduce over v.
+    // Three dots, one [L, dhv] output tile, one warp pass.
+    for (int tile = warp; tile < mtile * vtile; tile += nwarps) {
+        int m0 = (tile / vtile) << 4, n0 = (tile % vtile) << 3;
+        float dnum[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_t DS[t][j]·dN[t][v]
+        float dst[4]  = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_q dC[v][q]·K[j][q]
+        float dpre[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_q Q[t][q]·C[v][q]
+        unsigned a[4], b[2];
+        // DS[t][j] is zero for j > t, so contracting over ALL t is the same as t >= j.
+        for (int k0 = 0; k0 < LP; k0 += 8) {
+            ld_a_km(a, sDS, LS, m0, k0);   // Aᵀ in memory: DS is [t, j], we want [j, t]
+            ld_b_kn(b, sDN, LV, k0, n0);
+            mma_16x8x8(dnum, a, b);
+        }
+        for (int k0 = 0; k0 < KP; k0 += 8) {
+            ld_a_mk(a, sK, LQ, m0, k0);
+            ld_b_nk(b, sdC, LQ, k0, n0);
+            mma_16x8x8(dst, a, b);
+            ld_a_mk(a, sQ, LQ, m0, k0);
+            ld_b_nk(b, sC, LQ, k0, n0);
+            mma_16x8x8(dpre, a, b);
+        }
+        for (int i = 0; i < 4; ++i) {
+            int r = m0 + mma_row(i), v = n0 + mma_col(i); // r is `j` for dv, `t` for db
+            if (r < len && v < dhv) {
+                float st = dst[i];
+                dv[((long)bh * T + c0 + r) * dhv + v] = dnum[i] + sA[r] * st;
+                atomicAdd(&sDa[r], sV[r * LV + v] * st);
+                atomicAdd(&sDb[r], sDN[r * LV + v] * dpre[i]);
+            }
+        }
+    }
+    __syncthreads();
+
+    // The n-side of da/db: both contract over dqk only — a matrix-vector product, so
+    // there is no dot here for the tensor cores and `len` threads is enough.
+    for (int j = tid; j < len; j += nthreads) {
+        float acc = 0.0f, pre_qn = 0.0f;
+        for (int q = 0; q < dqk; ++q) {
+            acc += sdN[q] * sK[j * LQ + q];
+            pre_qn += sQ[j * LQ + q] * sN[q];
+        }
+        sDa[j] += acc;
+        sDb[j] += sDQn[j] * pre_qn;
+    }
+    __syncthreads();
+
+    // Phase 4: dDS -> (dS, P). dS overwrites DS in place; the warp that owns an
+    // output tile is the only one that reads or writes those elements, and the
+    // barrier above guarantees phase 2 is done reading DS.
+    for (int tile = warp; tile < mtile * ltile; tile += nwarps) {
+        int m0 = (tile / ltile) << 4, n0 = (tile % ltile) << 3;
+        float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};   // Σ_v dN[t][v]·V[j][v]
+        unsigned a[4], b[2];
+        for (int k0 = 0; k0 < VP; k0 += 8) {
+            ld_a_mk(a, sDN, LV, m0, k0);
+            ld_b_nk(b, sV, LV, k0, n0);
+            mma_16x8x8(d, a, b);
+        }
+        for (int i = 0; i < 4; ++i) {
+            int t = m0 + mma_row(i), j = n0 + mma_col(i);
+            float out = 0.0f;
+            if (t < len && j <= t) {
+                float dds = d[i] + sDQn[t];
+                float p = dds * sDS[t * LS + j];
+                atomicAdd(&sDfc[t], p);
+                atomicAdd(&sDfc[j], -p);
+                atomicAdd(&sDig[j], p);
+                out = dds * expf(sFc[t] - sFc[j] + sIg[j] - sM[t]);
+            }
+            sDS[t * LS + j] = out;
+        }
+    }
+    __syncthreads();
+
+    // Phase 5: dQ and dK. Four dots, one [L, dqk] output tile, one warp pass.
+    for (int tile = warp; tile < mtile * ktile; tile += nwarps) {
+        int m0 = (tile / ktile) << 4, n0 = (tile % ktile) << 3;
+        float dqi[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_j dS[t][j]·K[j][q]
+        float dqx[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_v dN[t][v]·C[v][q]
+        float dki[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_t dS[t][j]·Q[t][q]
+        float dks[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_v V[j][v]·dC[v][q]
+        unsigned a[4], b[2];
+        for (int k0 = 0; k0 < LP; k0 += 8) {
+            ld_a_mk(a, sDS, LS, m0, k0);   // dS as [t, j], contracting j
+            ld_b_kn(b, sK, LQ, k0, n0);
+            mma_16x8x8(dqi, a, b);
+            ld_a_km(a, sDS, LS, m0, k0);   // dSᵀ, contracting t
+            ld_b_kn(b, sQ, LQ, k0, n0);
+            mma_16x8x8(dki, a, b);
+        }
+        for (int k0 = 0; k0 < VP; k0 += 8) {
+            ld_a_mk(a, sDN, LV, m0, k0);
+            ld_b_kn(b, sC, LQ, k0, n0);
+            mma_16x8x8(dqx, a, b);
+            ld_a_mk(a, sV, LV, m0, k0);
+            ld_b_kn(b, sdC, LQ, k0, n0);
+            mma_16x8x8(dks, a, b);
+        }
+        for (int i = 0; i < 4; ++i) {
+            int r = m0 + mma_row(i), q = n0 + mma_col(i); // r is `t` for dq, `j` for dk
+            if (r < len && q < dqk) {
+                dq[((long)bh * T + c0 + r) * dqk + q] =
+                    dqi[i] + sB[r] * (dqx[i] + sDQn[r] * sN[q]);
+                dk[((long)bh * T + c0 + r) * dqk + q] =
+                    dki[i] + sA[r] * (dks[i] + sdN[q]);
+            }
+        }
+    }
+    __syncthreads();
+
+    // dg = Σ dC_k⊙C_{k-1} + Σ dn_k⊙n_{k-1}, a block-wide reduction. The pad is zero
+    // in both operands, so it contributes nothing and needs no masking.
+    float loc = 0.0f;
+    for (int e = tid; e < VP * KP; e += nthreads) {
+        int v = e / KP, q = e - v * KP;
+        loc += sdC[v * LQ + q] * sC[v * LQ + q];
+    }
+    for (int e = tid; e < KP; e += nthreads) loc += sdN[e] * sN[e];
+    sRed[tid] = loc;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) sRed[tid] += sRed[tid + s];
+        __syncthreads();
+    }
+    float dg = sRed[0];
+
+    // a/b/g -> (dfc, dig), accumulating onto the intra-chunk D̄ contribution
+    // (m held constant, as everywhere).
+    for (int j = tid; j < len; j += nthreads) {
+        float pa = sDa[j] * sA[j];
+        atomicAdd(&sDig[j], pa);
+        atomicAdd(&sDfc[j], sDb[j] * sB[j] - pa);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float acc = dg * gsca;
+        for (int j = 0; j < len; ++j) acc += sDa[j] * sA[j];
+        sDfc[len - 1] += acc;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float acc = 0.0f;
+        for (int j = len - 1; j >= 0; --j) {
+            acc += sDfc[j];
+            long gt = (long)bh * T + c0 + j;
+            dfg[gt] = acc * (1.0f - stable_sigmoid(fg[gt]));
+            dig[gt] = sDig[j];
+        }
+    }
+}
+
+#endif // MMA_TF32
 "#;
 
 /// Names of every kernel in [`SRC`], loaded into [`Kernels`].
@@ -1539,25 +2072,76 @@ const NAMES: &[&str] = &[
     "masked_softmax_ce",
 ];
 
+/// Kernels that exist only when the device has tensor cores (`MMA_TF32`, sm_80+).
+/// Each is a drop-in twin of the same-named kernel without the suffix.
+const MMA_NAMES: &[&str] = &["mlstm_fw_parallel_mma", "mlstm_bw_parallel_mma"];
+
 /// All compiled kernels, held by name. Cloneable (each `CudaFunction` is an
 /// `Arc`-backed handle) and cheap to look up.
 pub struct Kernels {
     funcs: std::collections::HashMap<&'static str, CudaFunction>,
+    /// Whether [`MMA_NAMES`] were compiled — i.e. the device is sm_80 or later.
+    pub has_mma: bool,
 }
 
 impl Kernels {
-    /// Compile [`SRC`] with NVRTC and load every kernel in [`NAMES`].
+    /// Compile [`SRC`] with NVRTC and load every kernel in [`NAMES`], plus — on a
+    /// device that has tensor cores — the [`MMA_NAMES`] kernels.
+    ///
+    /// [`SRC`] is compiled **twice**, and deliberately so. `mma.sync` does not exist
+    /// at NVRTC's default target arch, so the tensor-core kernels need
+    /// `--gpu-architecture` pointed at the real device. But that flag is not free of
+    /// consequences for the kernels around them: at a newer arch ptxas contracts
+    /// FMAs differently, which shifts every scalar kernel's rounding in the last
+    /// bits. That is harmless in itself — but `mlstm_fused_matches_legacy` compares
+    /// weights after ONE Adam step, where the update is `lr·g/(√(g²)+ε)` and so
+    /// amplifies a 1e-7 gradient wobble on a near-zero-gradient weight into ~1e-4.
+    /// The test is right to be tight; the arch flag simply has no business changing
+    /// the numerics of kernels that did not ask for it.
+    ///
+    /// So: module `base` is compiled exactly as before (default arch, no define) and
+    /// every pre-existing kernel is taken from it, bit-for-bit unchanged. Module
+    /// `mma` is compiled for the device arch with `MMA_TF32` defined, and *only* the
+    /// two tensor-core kernels are taken from it. The second compile costs a few
+    /// hundred ms once, at startup.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<Self, String> {
-        let ptx = compile_ptx(SRC).map_err(|e| format!("NVRTC compile failed: {e:?}"))?;
-        let module = ctx.load_module(ptx).map_err(|e| format!("load_module failed: {e:?}"))?;
+        let (major, minor) = ctx
+            .compute_capability()
+            .map_err(|e| format!("compute capability query failed: {e:?}"))?;
+        let has_mma = major >= 8;
+
+        let base = compile_ptx(SRC).map_err(|e| format!("NVRTC compile failed: {e:?}"))?;
+        let base = ctx.load_module(base).map_err(|e| format!("load_module failed: {e:?}"))?;
+
         let mut funcs = std::collections::HashMap::new();
         for &name in NAMES {
-            let f = module
+            let f = base
                 .load_function(name)
                 .map_err(|e| format!("load_function {name} failed: {e:?}"))?;
             funcs.insert(name, f);
         }
-        Ok(Self { funcs })
+
+        if has_mma {
+            let opts = CompileOptions {
+                options: vec![
+                    format!("--gpu-architecture=compute_{major}{minor}"),
+                    "-DMMA_TF32=1".to_string(),
+                ],
+                ..Default::default()
+            };
+            let ptx = compile_ptx_with_opts(SRC, opts)
+                .map_err(|e| format!("NVRTC compile (mma) failed: {e:?}"))?;
+            let module =
+                ctx.load_module(ptx).map_err(|e| format!("load_module (mma) failed: {e:?}"))?;
+            for &name in MMA_NAMES {
+                let f = module
+                    .load_function(name)
+                    .map_err(|e| format!("load_function {name} failed: {e:?}"))?;
+                funcs.insert(name, f);
+            }
+        }
+
+        Ok(Self { funcs, has_mma })
     }
 
     /// Look up a kernel by name (panics if it was not in [`NAMES`]).

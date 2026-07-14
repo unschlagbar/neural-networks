@@ -857,12 +857,93 @@ mod tests {
             (y, dx, wf, wout)
         };
 
+        // The fusion algebra is what is on trial here, so this runs the SCALAR fused
+        // kernels: their dots are fp32 and the comparison against the op-at-a-time
+        // path stays exact to fp32 tolerance. The tensor-core dots are a separate,
+        // deliberately looser question — see `mlstm_fused_mma_matches_scalar`.
+        let _mma = with_mma(false);
+
         let (y0, dx0, wf0, wo0) = run(0); // op-at-a-time, single chunk
         let (y1, dx1, wf1, wo1) = run(32); // fused
         assert_close(&y1, &y0, 2e-3, "y");
         assert_close(&dx1, &dx0, 2e-3, "dx");
         assert_close(&wf1, &wf0, 2e-5, "wf");
         assert_close(&wo1, &wo0, 2e-5, "w_out");
+    }
+
+    /// Restores the tensor-core path on scope exit, panic or not, so one test's A/B
+    /// cannot leak its setting into whichever test the harness runs next.
+    struct MmaGuard;
+    impl Drop for MmaGuard {
+        fn drop(&mut self) {
+            super::ops::set_mma_enabled(true);
+        }
+    }
+    fn with_mma(on: bool) -> MmaGuard {
+        super::ops::set_mma_enabled(on);
+        MmaGuard
+    }
+
+    /// The tensor-core (`mma.sync`, TF32) forward against the scalar fp32 one, at
+    /// the backbone's real shape and with a short final chunk.
+    ///
+    /// The two kernels implement the *same* algorithm on the same shared-memory
+    /// plan; the only difference is that the three contractions (`Q·Kᵀ`, `(D̄⊙S)·V`,
+    /// `Q·C_prevᵀ`) run on the tensor cores, which round their inputs to TF32 — 10
+    /// mantissa bits instead of 24, fp32 exponent and fp32 accumulate. So this is
+    /// not an exactness check and must not be tightened into one: it asserts that
+    /// the mma fragment layouts, the zero-padding of the ragged chunk, and the
+    /// fused decay/mask epilogue are all *right*, to a tolerance that a wrong
+    /// fragment index (which garbles the result outright, not by 1e-3) cannot pass.
+    ///
+    /// It also covers what the scalar path cannot reach on its own: a `dhv`/`dqk`
+    /// that is not a multiple of the mma tile, and a `len` shorter than one tile.
+    #[test]
+    fn mlstm_fused_mma_matches_scalar() {
+        let Some(gpu) = super::super::test_gpu() else { return };
+        if !gpu.kernels.has_mma {
+            eprintln!("skipping: device has no tensor cores (needs sm_80+)");
+            return;
+        }
+        let (b, t, inp, d, heads, dqk) = (2, 200, 64, 512, 8, 64); // dhv = 64
+        assert!(t % super::ops::FUSED_MAX_L != 0, "the last chunk must be short");
+
+        let mut proto = CpuMLstm::new(inp, d, heads, dqk);
+        proto.wi = Tensor::random(&[inp, heads], 0.3);
+        proto.wf = Tensor::random(&[inp, heads], 0.3);
+
+        let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, inp], 0.5));
+        let g = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
+
+        let run = |mma: bool| {
+            let _guard = with_mma(mma);
+            let mut dev = MLstm::from_cpu(&gpu, &proto);
+            dev.set_chunk(32);
+            let y = dev.forward(&gpu, &x).to_host(&gpu).data;
+            let dx = dev.backward(&gpu, &g).to_host(&gpu).data;
+            (y, dx)
+        };
+
+        let (y0, dx0) = run(false); // scalar fp32 dots — the oracle
+        let (y1, dx1) = run(true); // tensor-core TF32 dots
+
+        // TF32 error is relative to the size of the DOT, not of the element, so the
+        // scale to divide by is the tensor's own magnitude — a per-element relative
+        // check would explode on the elements that happen to sit near zero.
+        let close = |got: &[f32], want: &[f32], tol: f32, what: &str| {
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let worst = got
+                .iter()
+                .zip(want)
+                .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
+            println!("{what}: worst |mma - scalar| {worst:.3e} on a scale of {scale:.3e} -> {:.2e} relative", worst / scale);
+            assert!(
+                worst / scale < tol,
+                "{what}: worst |mma - scalar| {worst:.3e} vs scale {scale:.3e} exceeds {tol:.0e}"
+            );
+        };
+        close(&y1, &y0, 5e-3, "y");
+        close(&dx1, &dx0, 5e-3, "dx");
     }
 
     /// The chunked path vs the CPU scalar recurrence — the same check as

@@ -1153,7 +1153,73 @@ fn fused_smem(kind: &str, l: usize, dqk: usize, dhv: usize) -> usize {
         "fw_parallel" => 2 * l * lq + l * lv + dhv * lq + l * ls + dqk + 5 * l,
         "bw_dC" => l * lq + l * lvt + tv * lq + dqk + 2 * l,
         "bw_parallel" => 2 * l * lq + 2 * l * lv + l * ls + 2 * dhv * lq + 2 * dqk + 11 * l,
+        // The mma kernels pad every dim up to the tensor-core tile (rows to the
+        // mma M=16, the contraction to K=8, the columns to N=8) and zero-fill the
+        // pad, which is what lets one code path serve a short last chunk and an odd
+        // dqk/dhv alike. Must match the `LP`/`KP`/`VP` the kernel recomputes.
+        "fw_parallel_mma" => {
+            let (lp, kp, vp) = (mma_pad(l, 16), mma_pad(dqk, 8), mma_pad(dhv, 8));
+            let (lq, lv, ls) = (kp + 1, vp + 1, lp + 1);
+            2 * lp * lq + lp * lv + vp * lq + lp * ls + kp + 5 * lp
+        }
+        "bw_parallel_mma" => {
+            let (lp, kp, vp) = (mma_pad(l, 16), mma_pad(dqk, 8), mma_pad(dhv, 8));
+            let (lq, lv, ls) = (kp + 1, vp + 1, lp + 1);
+            2 * lp * lq + 2 * lp * lv + lp * ls + 2 * vp * lq + 2 * kp + 11 * lp
+        }
         _ => unreachable!(),
+    }
+}
+
+/// Round `n` up to a multiple of `to` (a power of two): the mma tile padding.
+fn mma_pad(n: usize, to: usize) -> usize {
+    n.div_ceil(to) * to
+}
+
+/// Whether the tensor-core kernels are *selected* (as opposed to merely compiled).
+///
+/// `MLSTM_NO_MMA=1` forces the scalar path: the A/B baseline for benchmarking, the
+/// exact-fp32 oracle `mlstm_fused_mma_matches_scalar` pins the tensor-core path
+/// against, and the escape hatch if a tensor-core kernel ever misbehaves.
+static MMA_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static MMA_INIT: std::sync::Once = std::sync::Once::new();
+
+fn mma_enabled() -> bool {
+    MMA_INIT.call_once(|| {
+        let on = std::env::var("MLSTM_NO_MMA").is_err();
+        MMA_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+    });
+    MMA_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Flip the tensor-core path on/off at runtime. Only for the A/B tests, which run
+/// the same input down both paths in one process; production reads the env once.
+#[cfg(test)]
+pub fn set_mma_enabled(on: bool) {
+    mma_enabled(); // run the Once first, so it cannot clobber us afterwards
+    MMA_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The parallel forward kernel to run: the tensor-core one where the device has
+/// tensor cores, else the scalar one.
+///
+/// They compute the same thing; only the three contractions differ, and only in
+/// that the tensor-core path rounds their inputs to TF32 — as the reference
+/// `mlstm_kernels` does, Triton's `tl.dot` being TF32 on fp32 inputs by default.
+fn fw_parallel_kernel(gpu: &Gpu) -> (&'static str, &'static str) {
+    if gpu.kernels.has_mma && mma_enabled() {
+        ("mlstm_fw_parallel_mma", "fw_parallel_mma")
+    } else {
+        ("mlstm_fw_parallel", "fw_parallel")
+    }
+}
+
+/// The parallel backward kernel to run. See [`fw_parallel_kernel`].
+fn bw_parallel_kernel(gpu: &Gpu) -> (&'static str, &'static str) {
+    if gpu.kernels.has_mma && mma_enabled() {
+        ("mlstm_bw_parallel_mma", "bw_parallel_mma")
+    } else {
+        ("mlstm_bw_parallel", "bw_parallel")
     }
 }
 
@@ -1221,11 +1287,16 @@ pub fn mlstm_fused_kernels(
     let nc = t.div_ceil(l) as u32;
     let ntv = dhv.div_ceil(fused_tv(dhv)) as u32;
     let bh = bh as u32;
+    // The two parallel kernels are reported as whichever variant would actually be
+    // launched — asking the driver about the scalar one while the tensor-core one
+    // runs would be reporting the wrong kernel's registers and shared memory.
+    let (fw_par, fw_kind) = fw_parallel_kernel(gpu);
+    let (bw_par, bw_kind) = bw_parallel_kernel(gpu);
     [
         ("fw_C", "mlstm_fw_C", (ntv, bh)),
-        ("fw_parallel", "mlstm_fw_parallel", (nc, bh)),
+        (fw_kind, fw_par, (nc, bh)),
         ("bw_dC", "mlstm_bw_dC", (ntv, bh)),
-        ("bw_parallel", "mlstm_bw_parallel", (nc, bh)),
+        (bw_kind, bw_par, (nc, bh)),
     ]
     .into_iter()
     .map(|(kind, name, grid)| {
@@ -1279,7 +1350,8 @@ pub fn mlstm_fused_fw(
         .arg(&t_i).arg(&l_i).arg(&nc_i).arg(&dqk_i).arg(&dhv_i).arg(&tv_i);
     unsafe { lb.launch(fused_cfg((ntv, bh as u32, 1), FUSED_THREADS_REC, smem)) }.expect("mlstm_fw_C");
 
-    let (f, smem) = fused_kernel(gpu, "mlstm_fw_parallel", fused_smem("fw_parallel", l, dqk, dhv));
+    let (name, kind) = fw_parallel_kernel(gpu);
+    let (f, smem) = fused_kernel(gpu, name, fused_smem(kind, l, dqk, dhv));
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&qh.buf).arg(&kh.buf).arg(&vh.buf).arg(&igh.buf).arg(&fcb.buf)
         .arg(&cst.buf).arg(&nst.buf).arg(&mst.buf)
@@ -1331,8 +1403,8 @@ pub fn mlstm_fused_bw(
     let mut dig = DTensor::uninit(gpu, &[bh, t]);
     let mut dfg = DTensor::uninit(gpu, &[bh, t]);
 
-    let (f, smem) =
-        fused_kernel(gpu, "mlstm_bw_parallel", fused_smem("bw_parallel", l, dqk, dhv));
+    let (name, kind) = bw_parallel_kernel(gpu);
+    let (f, smem) = fused_kernel(gpu, name, fused_smem(kind, l, dqk, dhv));
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&qh.buf).arg(&kh.buf).arg(&vh.buf).arg(&igh.buf).arg(&fgh.buf).arg(&sv.fcb.buf)
         .arg(&sv.cst.buf).arg(&sv.nst.buf).arg(&sv.mst.buf)
