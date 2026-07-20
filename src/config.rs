@@ -106,7 +106,7 @@ pub const ENC_W_EOS: bool = true;
 /// dataset memory scales with this constant — not with the corpus size.
 pub const CHUNK_BYTES: usize = 32 * 1024 * 1024;
 
-pub const TRAIN_DATA: &str = "C:/Erik/TinyStoriesV2-GPT4-train.txt";
+pub const TRAIN_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-train.txt";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
 // Wake Word

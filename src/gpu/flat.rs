@@ -106,7 +106,14 @@ impl Flat {
         let rms = self.rms.as_ref().expect("forward before backward");
         let d_pre = ops::softcap_backward(gpu, dlogits, logits, self.cap);
         let d_rmsout = self.head.backward(gpu, &d_pre);
-        let d_h = ops::rms_norm_backward(gpu, &d_rmsout, rms, &self.gamma, &mut self.dgamma, self.hidden);
+        let d_h = ops::rms_norm_backward(
+            gpu,
+            &d_rmsout,
+            rms,
+            &self.gamma,
+            &mut self.dgamma,
+            self.hidden,
+        );
         let d_e = self.lin1.backward(gpu, &d_h);
         ops::embedding_scatter_add(gpu, &mut self.dtable, &self.ids, &d_e, self.dim);
     }
@@ -114,16 +121,38 @@ impl Flat {
     /// AdamW step for every parameter (embedding/scale/head undecayed, interior
     /// Linear decayed), then clear the accumulators.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        ops::adamw(gpu, &mut self.table, &self.dtable, &mut self.m_tbl, &mut self.v_tbl, cfg, false);
+        ops::adamw(
+            gpu,
+            &mut self.table,
+            &self.dtable,
+            &mut self.m_tbl,
+            &mut self.v_tbl,
+            cfg,
+            false,
+        );
         self.dtable.zero_(gpu);
         self.lin1.step(gpu, cfg);
-        ops::adamw(gpu, &mut self.gamma, &self.dgamma, &mut self.m_g, &mut self.v_g, cfg, false);
+        ops::adamw(
+            gpu,
+            &mut self.gamma,
+            &self.dgamma,
+            &mut self.m_g,
+            &mut self.v_g,
+            cfg,
+            false,
+        );
         self.dgamma.zero_(gpu);
         self.head.step_wd(gpu, cfg, false);
     }
 
     /// Convenience: one full train step, returning the mean CE loss.
-    pub fn train_step(&mut self, gpu: &Gpu, ids: &[usize], targets: &[usize], cfg: &AdamCfg) -> f32 {
+    pub fn train_step(
+        &mut self,
+        gpu: &Gpu,
+        ids: &[usize],
+        targets: &[usize],
+        cfg: &AdamCfg,
+    ) -> f32 {
         let logits = self.forward(gpu, ids);
         let (loss, dlogits) = ops::softmax_cross_entropy(gpu, &logits, targets);
         self.backward(gpu, &dlogits);
@@ -152,8 +181,10 @@ mod tests {
     /// loss → backward → one AdamW step, from the same initial weights.
     #[test]
     fn flat_stack_matches_cpu() {
-        let Some(gpu) = super::super::test_gpu() else { return };
-        let (vocab, dim, hidden, batch) = (17, 8, 12, 6);
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let (vocab, dim, hidden, _batch) = (17, 8, 12, 6);
         let cap = 30.0;
 
         // Shared initial parameters.
@@ -164,8 +195,14 @@ mod tests {
         let head_w = Tensor::xavier(hidden, vocab);
         let head_b = Tensor::random(&[vocab], 0.1);
 
-        let ids: Vec<usize> = vec![3, 1, 4, 1, 5, 9].into_iter().map(|v| v % vocab).collect();
-        let targets: Vec<usize> = vec![2, 7, 1, 8, 2, 8].into_iter().map(|v| v % vocab).collect();
+        let ids: Vec<usize> = vec![3, 1, 4, 1, 5, 9]
+            .into_iter()
+            .map(|v| v % vocab)
+            .collect();
+        let targets: Vec<usize> = vec![2, 7, 1, 8, 2, 8]
+            .into_iter()
+            .map(|v| v % vocab)
+            .collect();
 
         // --- CPU reference stack (nn2 layers), same init ---
         let mut c_emb = CpuEmb::new(vocab, dim);
@@ -196,14 +233,39 @@ mod tests {
         c_head.step_wd(&cfg, false);
 
         // --- GPU stack, same init, one train step ---
-        let mut dev = Flat::from_parts(&gpu, &table, &lin1_w, &lin1_b, &gamma, &head_w, &head_b, cap);
+        let mut dev = Flat::from_parts(
+            &gpu, &table, &lin1_w, &lin1_b, &gamma, &head_w, &head_b, cap,
+        );
         let gpu_loss = dev.train_step(&gpu, &ids, &targets, &cfg);
 
-        assert!((cpu_loss - gpu_loss).abs() < 1e-4, "loss: cpu {cpu_loss} vs gpu {gpu_loss}");
+        assert!(
+            (cpu_loss - gpu_loss).abs() < 1e-4,
+            "loss: cpu {cpu_loss} vs gpu {gpu_loss}"
+        );
         // Updated parameters must match after the step.
-        assert_close(&dev.table.to_host(&gpu).data, &c_emb.table.data, 1e-5, "table");
-        assert_close(&dev.lin1.w.to_host(&gpu).data, &c_lin1.w.data, 1e-5, "lin1.w");
-        assert_close(&dev.gamma.to_host(&gpu).data, &c_rms.gamma.data, 1e-5, "gamma");
-        assert_close(&dev.head.w.to_host(&gpu).data, &c_head.w.data, 1e-5, "head.w");
+        assert_close(
+            &dev.table.to_host(&gpu).data,
+            &c_emb.table.data,
+            1e-5,
+            "table",
+        );
+        assert_close(
+            &dev.lin1.w.to_host(&gpu).data,
+            &c_lin1.w.data,
+            1e-5,
+            "lin1.w",
+        );
+        assert_close(
+            &dev.gamma.to_host(&gpu).data,
+            &c_rms.gamma.data,
+            1e-5,
+            "gamma",
+        );
+        assert_close(
+            &dev.head.w.to_host(&gpu).data,
+            &c_head.w.data,
+            1e-5,
+            "head.w",
+        );
     }
 }
