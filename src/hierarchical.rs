@@ -252,14 +252,14 @@ impl Hierarchical {
         // encoded and the backbone turns it into the context for word w+1.
         let decode_words = n.saturating_sub(1);
 
-        // --- PHASE 1: ENCODER — encode every word w → e_w. ---
+        // PHASE 1: ENCODER — encode every word w → e_w.
         // Each word resets its own state, so the words are fully independent —
         // they run data-parallel across the encoder's replica pool.
         self.encoder
             .encode_words(tokens, &self.word_segments[..decode_words]);
 
-        // --- PHASE 2: BACKBONE — autoregress e_0 … e_{n-2}, carrying recurrent
-        // state across words. Step w consumes e_w and emits o_{w+1}. ---
+        // PHASE 2: BACKBONE — autoregress e_0 … e_{n-2}, carrying recurrent
+        // state across words. Step w consumes e_w and emits o_{w+1}.
         for w in 0..decode_words {
             // Probe: drop cross-word recurrent state so o reflects only this word.
             if self.backbone_mode == BackboneMode::ResetEachWord {
@@ -284,10 +284,10 @@ impl Hierarchical {
             }
         }
 
-        // --- PHASE 3: DECODER — predict the chars of word w+1, conditioned on
+        // PHASE 3: DECODER — predict the chars of word w+1, conditioned on
         // o_{w+1}, injected as the word's first sequence step (paper eq. 3–4:
         // p_i takes the BOS slot). Each word's decode is reset and independent
-        // of the others. ---
+        // of the others.
         // inputs  o, c1, …, cn   →   targets c1, …, cn, [W]
         //
         // Serial pre-pass: fix every word's cache slot range and targets (cheap
@@ -404,7 +404,7 @@ impl Hierarchical {
             }
         }
 
-        // --- PHASE 3': DECODER backward → grad w.r.t. each word's context o. ---
+        // PHASE 3': DECODER backward → grad w.r.t. each word's context o.
         // Words decode independently; each worker backprops its words on its own
         // replica (own grad accumulators), stashes d_o per word (slot 0 — the
         // injected context — carries the whole word-context gradient) and
@@ -495,7 +495,7 @@ impl Hierarchical {
             }
         }
 
-        // --- PHASE 2': BACKBONE backward → grad w.r.t. each word embedding e_w. ---
+        // PHASE 2': BACKBONE backward → grad w.r.t. each word embedding e_w.
         // Reverse word order so the backbone's cross-word BPTT state carries.
         for w in (0..words).rev() {
             self.delta_buf[..context].copy_from_slice(&self.d_o_words[w][..context]);
@@ -513,8 +513,8 @@ impl Hierarchical {
             layer.reset_bptt_state();
         }
 
-        // --- PHASE 1': ENCODER backward — per word, independent, data-parallel
-        // across the encoder's replica pool. ---
+        // PHASE 1': ENCODER backward — per word, independent, data-parallel
+        // across the encoder's replica pool.
         let char1_grad_accum = self.encoder.backward_words(&self.d_ew_words[..words]);
 
         let denom = words.max(1) as f32;
@@ -757,7 +757,7 @@ impl Hierarchical {
         self.reset();
         let w_tok = self.w_token as usize;
 
-        // --- Bootstrap the backbone from the prefix --------------------------
+        // Bootstrap the backbone from the prefix
         // Segment the prefix and encode every complete word to advance the
         // backbone, exactly like the encode words in training. The prefix's
         // trailing word may be cut off mid-token (`fn ma`), so it is not encoded
@@ -781,7 +781,7 @@ impl Hierarchical {
 
         let mut forced = tail.into_iter();
 
-        // --- Generation ------------------------------------------------------
+        // Generation
         let mut out = Vec::with_capacity(max_len);
         let mut word_chars: Vec<u16> = Vec::new();
         let mut empty_words = 0;
@@ -987,7 +987,14 @@ mod tests {
             .linear_no_bias(vocab)
             .soft_cap(30.0)
             .build();
-        Hierarchical::new(encoder_fwd, encoder_bwd, char2_model, word_model, vocab, tok)
+        Hierarchical::new(
+            encoder_fwd,
+            encoder_bwd,
+            char2_model,
+            word_model,
+            vocab,
+            tok,
+        )
     }
 
     /// All-sLSTM stacks (the pre-mLSTM hierarchical layout): adds the
@@ -1014,7 +1021,14 @@ mod tests {
             .linear_no_bias(vocab)
             .soft_cap(30.0)
             .build();
-        Hierarchical::new(encoder_fwd, encoder_bwd, char2_model, word_model, vocab, tok)
+        Hierarchical::new(
+            encoder_fwd,
+            encoder_bwd,
+            char2_model,
+            word_model,
+            vocab,
+            tok,
+        )
     }
 
     /// A small window with forward + backward already run on a fresh model.
@@ -1175,11 +1189,7 @@ mod tests {
     /// (2·H) → `e_w` (H). It is the only path by which `e_w`'s gradient reaches
     /// the two encoder stacks, so a wrong concat order or a missing direction
     /// breaks the match.
-    fn check_combine(
-        build: fn(usize, Rc<Utf8Tokenizer>) -> Hierarchical,
-        name: &str,
-        tol: f64,
-    ) {
+    fn check_combine(build: fn(usize, Rc<Utf8Tokenizer>) -> Hierarchical, name: &str, tol: f64) {
         let mut s = setup(build);
         let grad = s
             .model

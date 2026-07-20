@@ -123,7 +123,11 @@ pub fn gemm_nt(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]
                 acc += arow[p] * brow[p];
             }
             let idx = i * n + j;
-            c[idx] = if beta == 0.0 { acc } else { beta * c[idx] + acc };
+            c[idx] = if beta == 0.0 {
+                acc
+            } else {
+                beta * c[idx] + acc
+            };
         }
         i += 1;
     }
@@ -200,7 +204,7 @@ pub fn transpose(rows: usize, cols: usize, src: &[f32], dst: &mut [f32]) {
     }
 }
 
-// --- Tensor-level convenience wrappers (fresh allocation) ---------------------
+// Tensor-level convenience wrappers (fresh allocation)
 
 /// Y = A · B for 2D tensors A(M×K), B(K×N).
 pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
@@ -295,7 +299,10 @@ mod tests {
         let (m, k, n) = (10, 7, 6);
         let a = Tensor::random(&[m, k], 1.0);
         let b = Tensor::random(&[k, n], 1.0);
-        assert_close(&matmul(&a, &b).data, &naive(m, k, n, &a.data, &b.data, false, false));
+        assert_close(
+            &matmul(&a, &b).data,
+            &naive(m, k, n, &a.data, &b.data, false, false),
+        );
     }
 
     #[test]
@@ -305,7 +312,10 @@ mod tests {
         let (m, k, n) = (19, 11, 43);
         let a = Tensor::random(&[m, k], 1.0);
         let b = Tensor::random(&[k, n], 1.0);
-        assert_close(&matmul(&a, &b).data, &naive(m, k, n, &a.data, &b.data, false, false));
+        assert_close(
+            &matmul(&a, &b).data,
+            &naive(m, k, n, &a.data, &b.data, false, false),
+        );
     }
 
     #[test]
@@ -313,7 +323,10 @@ mod tests {
         let (m, k, n) = (10, 7, 6); // A is K×M
         let a = Tensor::random(&[k, m], 1.0);
         let b = Tensor::random(&[k, n], 1.0);
-        assert_close(&matmul_tn(&a, &b).data, &naive(m, k, n, &a.data, &b.data, true, false));
+        assert_close(
+            &matmul_tn(&a, &b).data,
+            &naive(m, k, n, &a.data, &b.data, true, false),
+        );
     }
 
     #[test]

@@ -204,7 +204,7 @@ mod tests {
             .map(|v| v % vocab)
             .collect();
 
-        // --- CPU reference stack (nn2 layers), same init ---
+        // CPU reference stack (nn2 layers), same init
         let mut c_emb = CpuEmb::new(vocab, dim);
         c_emb.table = table.clone();
         let mut c_lin1 = CpuLinear::from_parts(lin1_w.clone(), lin1_b.clone());
@@ -232,7 +232,7 @@ mod tests {
         c_rms.step(&cfg);
         c_head.step_wd(&cfg, false);
 
-        // --- GPU stack, same init, one train step ---
+        // GPU stack, same init, one train step
         let mut dev = Flat::from_parts(
             &gpu, &table, &lin1_w, &lin1_b, &gamma, &head_w, &head_b, cap,
         );

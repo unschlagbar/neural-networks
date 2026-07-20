@@ -207,7 +207,7 @@ impl WordEncoder {
         let vocab = self.fwd.input_size;
         let enc_ranges = &self.enc_ranges;
 
-        // --- fwd: c1 … cn [W]  |  bwd: [W] cn … c1 ---
+        // fwd: c1 … cn [W]  |  bwd: [W] cn … c1
         self.fwd_pool.sync(&self.fwd);
         let fwd_chunks = chunk_words(
             &mut self.fwd_pool.replicas,
@@ -230,7 +230,7 @@ impl WordEncoder {
             encode_dir(chunk, tokens, words, enc_ranges, w_token, vocab, true);
         });
 
-        // --- combine: e_w = W·[fwd_readout ; bwd_readout] + b  (serial, cheap) ---
+        // combine: e_w = W·[fwd_readout ; bwd_readout] + b  (serial, cheap)
         // LinearLayer::forward copies its input into the cache, so build the
         // concatenated readout in a scratch buffer and hand it in. Destructure
         // so `combine` and `combine_cache` borrow disjointly.
@@ -275,7 +275,7 @@ impl WordEncoder {
 
         let char_out = self.output_size;
 
-        // --- combine backward: d_ew → [d_fwd_ro ; d_bwd_ro] (serial, cheap). ---
+        // combine backward: d_ew → [d_fwd_ro ; d_bwd_ro] (serial, cheap).
         // Stash each direction's readout gradient per word.
         let mut d_fwd: Vec<Box<[f32]>> = (0..n).map(|_| vec![0.0; char_out].into()).collect();
         let mut d_bwd: Vec<Box<[f32]>> = (0..n).map(|_| vec![0.0; char_out].into()).collect();
@@ -299,7 +299,7 @@ impl WordEncoder {
         }
         self.combine.flush_grads();
 
-        // --- fwd / bwd BPTT, data-parallel per word. ---
+        // fwd / bwd BPTT, data-parallel per word.
         self.backward_dir(false, &d_fwd);
         self.backward_dir(true, &d_bwd);
 
@@ -387,7 +387,11 @@ impl WordEncoder {
             .chain(ENC_W_EOS.then_some(self.w_token));
         for (k, tok) in fwd_toks.enumerate() {
             self.char_input[tok as usize] = 1.0;
-            forward_sample_step(&mut self.fwd.layers, &mut self.fwd.cache[k], &self.char_input);
+            forward_sample_step(
+                &mut self.fwd.layers,
+                &mut self.fwd.cache[k],
+                &self.char_input,
+            );
             self.char_input[tok as usize] = 0.0;
         }
 
@@ -401,7 +405,11 @@ impl WordEncoder {
             .chain(word.iter().rev().copied());
         for (k, tok) in bwd_toks.enumerate() {
             self.char_input[tok as usize] = 1.0;
-            forward_sample_step(&mut self.bwd.layers, &mut self.bwd.cache[k], &self.char_input);
+            forward_sample_step(
+                &mut self.bwd.layers,
+                &mut self.bwd.cache[k],
+                &self.char_input,
+            );
             self.char_input[tok as usize] = 0.0;
         }
 

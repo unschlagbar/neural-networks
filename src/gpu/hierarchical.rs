@@ -84,11 +84,18 @@ impl WordEncoder {
             (0..n)
                 .map(|i| {
                     if i == 0 {
-                        Box::new(Block::from_cell(gpu, hc, up_of(hc), SLstm::new_rand(gpu, hc, hc)))
-                            as Box<dyn BlockLike>
+                        Box::new(Block::from_cell(
+                            gpu,
+                            hc,
+                            up_of(hc),
+                            SLstm::new_rand(gpu, hc, hc),
+                        )) as Box<dyn BlockLike>
                     } else {
                         Box::new(Block::from_cell(
-                            gpu, hc, up_of(hc), MLstm::new_rand(gpu, hc, hc, 16, dqk),
+                            gpu,
+                            hc,
+                            up_of(hc),
+                            MLstm::new_rand(gpu, hc, hc, 16, dqk),
                         )) as Box<dyn BlockLike>
                     }
                 })
@@ -122,7 +129,10 @@ fn group_by_len(lens: &[usize]) -> Vec<Vec<usize>> {
     }
     let mut buckets: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
     for (w, &l) in lens.iter().enumerate() {
-        buckets.entry(l.max(1).next_power_of_two()).or_default().push(w);
+        buckets
+            .entry(l.max(1).next_power_of_two())
+            .or_default()
+            .push(w);
     }
     buckets.into_values().collect()
 }
@@ -144,9 +154,9 @@ pub struct Hierarchical {
 
     pub encoder: WordEncoder,
 
-    pub bb_front: Linear,               // HC → WH
+    pub bb_front: Linear,                   // HC → WH
     pub bb_blocks: Vec<Box<dyn BlockLike>>, // WH
-    pub bb_back: Linear,                // WH → HC (context)
+    pub bb_back: Linear,                    // WH → HC (context)
 
     pub dec_blocks: Vec<Box<dyn BlockLike>>, // HC
     pub dec_norm: RmsNorm,                   // HC — the only stage-level norm
@@ -162,11 +172,16 @@ impl Hierarchical {
             .map(|i| {
                 if i % 2 == 0 {
                     Box::new(Block::from_cell(
-                        gpu, cfg.wh, up_of(cfg.wh), SLstm::new_rand(gpu, cfg.wh, cfg.wh),
+                        gpu,
+                        cfg.wh,
+                        up_of(cfg.wh),
+                        SLstm::new_rand(gpu, cfg.wh, cfg.wh),
                     )) as Box<dyn BlockLike>
                 } else {
                     Box::new(Block::from_cell(
-                        gpu, cfg.wh, up_of(cfg.wh),
+                        gpu,
+                        cfg.wh,
+                        up_of(cfg.wh),
                         MLstm::new_rand(gpu, cfg.wh, cfg.wh, cfg.heads, cfg.dqk),
                     )) as Box<dyn BlockLike>
                 }
@@ -176,11 +191,16 @@ impl Hierarchical {
             .map(|i| {
                 if i == 0 {
                     Box::new(Block::from_cell(
-                        gpu, cfg.hc, up_of(cfg.hc), SLstm::new_rand(gpu, cfg.hc, cfg.hc),
+                        gpu,
+                        cfg.hc,
+                        up_of(cfg.hc),
+                        SLstm::new_rand(gpu, cfg.hc, cfg.hc),
                     )) as Box<dyn BlockLike>
                 } else {
                     Box::new(Block::from_cell(
-                        gpu, cfg.hc, up_of(cfg.hc),
+                        gpu,
+                        cfg.hc,
+                        up_of(cfg.hc),
                         MLstm::new_rand(gpu, cfg.hc, cfg.hc, 16, cfg.hc / 16),
                     )) as Box<dyn BlockLike>
                 }
@@ -210,7 +230,12 @@ impl Hierarchical {
     /// Forward + backward over one window; accumulates all grads and returns the
     /// mean decode cross-entropy. `tokens` are char ids; `words` are `(start,
     /// end)` char ranges. Word 0 is encode-only; words 1..n are decoded.
-    pub fn forward_backward(&mut self, gpu: &Gpu, tokens: &[usize], words: &[(usize, usize)]) -> f32 {
+    pub fn forward_backward(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[usize],
+        words: &[(usize, usize)],
+    ) -> f32 {
         let loss = self.forward_backward_window(gpu, tokens, words);
         // The window's temporaries have dropped by now, so their `cuMemFreeAsync`
         // frees are queued on the stream. CUDA's stream-ordered pool only hands
@@ -239,8 +264,12 @@ impl Hierarchical {
                 gpu.stream.synchronize().expect("sync");
                 let mut line = format!("  {name:<22} {:>8.1?}", t0.elapsed());
                 if memp {
-                    let (free, total) = cudarc::driver::result::mem_get_info().expect("mem_get_info");
-                    line.push_str(&format!("  |  in use {:>6.0} MB", (total - free) as f64 / 1e6));
+                    let (free, total) =
+                        cudarc::driver::result::mem_get_info().expect("mem_get_info");
+                    line.push_str(&format!(
+                        "  |  in use {:>6.0} MB",
+                        (total - free) as f64 / 1e6
+                    ));
                 }
                 println!("{line}");
                 t0 = std::time::Instant::now();
@@ -254,7 +283,7 @@ impl Hierarchical {
         let (hc, wh) = (self.cfg.hc, self.cfg.wh);
         let w_token = self.cfg.w_token;
 
-        // ---- PHASE 1: ENCODER ----------------------------------------------
+        // PHASE 1: ENCODER
         // Words are batched as [words, tmax] rectangles, and `tmax` is set by the
         // LONGEST word — so one 16-byte word would pad every 2-byte word out to 17
         // steps (~4.5x wasted rows on Rust source, in both FLOPs and VRAM). Instead
@@ -293,17 +322,21 @@ impl Hierarchical {
         }
         mark("encoder fwd");
 
-        // ---- PHASE 2: BACKBONE ---------------------------------------------
+        // PHASE 2: BACKBONE
         let bb_in = self.bb_front.forward(gpu, &e_w); // [dw, WH]
         let mut hb = bb_in.reshaped(&[1, dw, wh]);
         for (i, blk) in self.bb_blocks.iter_mut().enumerate() {
             hb = blk.forward(gpu, &hb);
-            mark(if i % 2 == 0 { "  bb sLSTM fwd" } else { "  bb mLSTM fwd" });
+            mark(if i % 2 == 0 {
+                "  bb sLSTM fwd"
+            } else {
+                "  bb mLSTM fwd"
+            });
         }
         let o = self.bb_back.forward(gpu, &hb.reshaped(&[dw, wh])); // [dw, HC]
         mark("backbone fwd");
 
-        // ---- PHASE 3: DECODER (forward + backward, per length group) ---------
+        // PHASE 3: DECODER (forward + backward, per length group)
         // Word w's decode target is word w+1, so groups are keyed on the length of
         // the DECODED word. Each group runs forward and straight back again: the
         // decoder's backward needs nothing from the backbone's, so a group's
@@ -384,12 +417,16 @@ impl Hierarchical {
         let mut d_hb = d_bb_out.reshaped(&[1, dw, wh]);
         for (i, blk) in self.bb_blocks.iter_mut().enumerate().rev() {
             d_hb = blk.backward(gpu, &d_hb);
-            mark(if i % 2 == 0 { "  bb sLSTM bwd" } else { "  bb mLSTM bwd" });
+            mark(if i % 2 == 0 {
+                "  bb sLSTM bwd"
+            } else {
+                "  bb mLSTM bwd"
+            });
         }
         let d_e_w = self.bb_front.backward(gpu, &d_hb.reshaped(&[dw, wh])); // [dw, HC]
         mark("backbone bwd");
 
-        // ---- ENCODER BACKWARD (per group, re-forwarded) ----------------------
+        // ENCODER BACKWARD (per group, re-forwarded)
         // Each encoder group's forward cache was overwritten by the group after it
         // (and by the OTHER direction), so re-run that group's fwd+bwd stacks and
         // the combine forward to refill their caches, then backward immediately.
@@ -495,12 +532,25 @@ impl Hierarchical {
     /// AdamW across every stage. Tied table and the logit head are undecayed;
     /// interior projections decay (matching the project's optimizer convention).
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        ops::adamw(gpu, &mut self.table, &self.dtable, &mut self.m_tbl, &mut self.v_tbl, cfg, false);
+        ops::adamw(
+            gpu,
+            &mut self.table,
+            &self.dtable,
+            &mut self.m_tbl,
+            &mut self.v_tbl,
+            cfg,
+            false,
+        );
         self.dtable.zero_(gpu);
         // Backward encoder's own char table (undecayed, like the tied table).
         ops::adamw(
-            gpu, &mut self.bwd_table, &self.d_bwd_table, &mut self.m_bwd_tbl, &mut self.v_bwd_tbl,
-            cfg, false,
+            gpu,
+            &mut self.bwd_table,
+            &self.d_bwd_table,
+            &mut self.m_bwd_tbl,
+            &mut self.v_bwd_tbl,
+            cfg,
+            false,
         );
         self.d_bwd_table.zero_(gpu);
         for b in self.encoder.fwd.iter_mut() {
@@ -526,7 +576,7 @@ impl Hierarchical {
         self.step_count += 1;
     }
 
-    // --- checkpointing ------------------------------------------------------
+    // checkpointing
 
     /// Export every stage into CPU `nn` `Sequential`s / layers laid out exactly
     /// like `model::build_hierarchical_model`, so the result serializes to the
@@ -535,7 +585,13 @@ impl Hierarchical {
     fn to_sequentials(
         &mut self,
         gpu: &Gpu,
-    ) -> (Sequential, Sequential, Box<dyn crate::nn_layer::NnLayer>, Sequential, Sequential) {
+    ) -> (
+        Sequential,
+        Sequential,
+        Box<dyn crate::nn_layer::NnLayer>,
+        Sequential,
+        Sequential,
+    ) {
         use super::{dt_matrix, dt_vec};
         use crate::nn::{
             embedding::EmbeddingLayer, linear::LinearLayer, linear_nb::LinearNBLayer,
@@ -546,21 +602,30 @@ impl Hierarchical {
 
         // Encoder fwd: Embedding(tied table) → blocks.
         let mut enc: Vec<Box<dyn NnLayer>> = Vec::new();
-        enc.push(Box::new(EmbeddingLayer::from_loaded(vocab, hc, dt_matrix(gpu, &self.table))));
+        enc.push(Box::new(EmbeddingLayer::from_loaded(
+            vocab,
+            hc,
+            dt_matrix(gpu, &self.table),
+        )));
         for b in self.encoder.fwd.iter_mut() {
             enc.push(b.to_nn_layer(gpu));
         }
 
         // Encoder bwd: Embedding(own table) → blocks.
         let mut enc_b: Vec<Box<dyn NnLayer>> = Vec::new();
-        enc_b.push(Box::new(EmbeddingLayer::from_loaded(vocab, hc, dt_matrix(gpu, &self.bwd_table))));
+        enc_b.push(Box::new(EmbeddingLayer::from_loaded(
+            vocab,
+            hc,
+            dt_matrix(gpu, &self.bwd_table),
+        )));
         for b in self.encoder.bwd.iter_mut() {
             enc_b.push(b.to_nn_layer(gpu));
         }
 
         // combine: Linear(2·HC → HC).
         let combine: Box<dyn NnLayer> = Box::new(LinearLayer::from_loaded(
-            2 * hc, hc,
+            2 * hc,
+            hc,
             dt_matrix(gpu, &self.encoder.combine.w),
             dt_vec(gpu, &self.encoder.combine.b),
         ));
@@ -568,13 +633,19 @@ impl Hierarchical {
         // Backbone: Linear(HC→WH) → blocks → Linear(WH→HC).
         let mut wm: Vec<Box<dyn NnLayer>> = Vec::new();
         wm.push(Box::new(LinearLayer::from_loaded(
-            hc, wh, dt_matrix(gpu, &self.bb_front.w), dt_vec(gpu, &self.bb_front.b),
+            hc,
+            wh,
+            dt_matrix(gpu, &self.bb_front.w),
+            dt_vec(gpu, &self.bb_front.b),
         )));
         for b in self.bb_blocks.iter_mut() {
             wm.push(b.to_nn_layer(gpu));
         }
         wm.push(Box::new(LinearLayer::from_loaded(
-            wh, hc, dt_matrix(gpu, &self.bb_back.w), dt_vec(gpu, &self.bb_back.b),
+            wh,
+            hc,
+            dt_matrix(gpu, &self.bb_back.w),
+            dt_vec(gpu, &self.bb_back.b),
         )));
 
         // Decoder: sLSTM blocks → RMSNorm → LinearNoBias(head) → SoftCap.
@@ -582,8 +653,15 @@ impl Hierarchical {
         for b in self.dec_blocks.iter_mut() {
             dec.push(b.to_nn_layer(gpu));
         }
-        dec.push(Box::new(RMSNorm::from_loaded(hc, dt_vec(gpu, &self.dec_norm.gamma))));
-        dec.push(Box::new(LinearNBLayer::from_loaded(hc, vocab, dt_matrix(gpu, &self.dec_head.w))));
+        dec.push(Box::new(RMSNorm::from_loaded(
+            hc,
+            dt_vec(gpu, &self.dec_norm.gamma),
+        )));
+        dec.push(Box::new(LinearNBLayer::from_loaded(
+            hc,
+            vocab,
+            dt_matrix(gpu, &self.dec_head.w),
+        )));
         dec.push(Box::new(SoftCapLayer::new(vocab, self.cfg.cap)));
 
         (
@@ -602,8 +680,7 @@ impl Hierarchical {
     pub fn save(&mut self, gpu: &Gpu, path: &str, _boundary_token_ids: &[u16]) -> io::Result<()> {
         use crate::format::{Meta, ModelKind, Writer};
 
-        let (encoder_fwd, encoder_bwd, combine, word_model, char2_model) =
-            self.to_sequentials(gpu);
+        let (encoder_fwd, encoder_bwd, combine, word_model, char2_model) = self.to_sequentials(gpu);
 
         // context_size == the backbone's output width == HC (the decoder's input),
         // exactly what `Hierarchical::new` recomputes and debug-asserts on load.
@@ -640,17 +717,18 @@ impl Hierarchical {
         let stacks = crate::hierarchical::Hierarchical::load_stacks(path)?;
 
         let err = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-        let to_block = |gpu: &Gpu, l: &Box<dyn crate::nn_layer::NnLayer>| -> io::Result<Box<dyn BlockLike>> {
-            if let Some(s) = l.as_any().downcast_ref::<SLSTMBlock>() {
-                Ok(Box::new(Block::<SLstm>::from_nn_block(gpu, s)))
-            } else if let Some(m) = l.as_any().downcast_ref::<MLSTMBlock>() {
-                Ok(Box::new(Block::<MLstm>::from_nn_block(gpu, m)))
-            } else {
-                Err(err("expected an sLSTM/mLSTM block in the checkpoint".into()))
-            }
-        };
+        let to_block =
+            |gpu: &Gpu, l: &Box<dyn crate::nn_layer::NnLayer>| -> io::Result<Box<dyn BlockLike>> {
+                if let Some(s) = l.as_any().downcast_ref::<SLSTMBlock>() {
+                    Ok(Box::new(Block::<SLstm>::from_nn_block(gpu, s)))
+                } else if let Some(m) = l.as_any().downcast_ref::<MLSTMBlock>() {
+                    Ok(Box::new(Block::<MLstm>::from_nn_block(gpu, m)))
+                } else {
+                    Err(err("expected an sLSTM/mLSTM block in the checkpoint".into()))
+                }
+            };
 
-        // --- Encoder fwd: Embedding(tied table) + blocks -------------------
+        // Encoder fwd: Embedding(tied table) + blocks
         let enc = &stacks.encoder_fwd.layers;
         let emb = enc[0]
             .as_any()
@@ -659,20 +737,24 @@ impl Hierarchical {
         let vocab = emb.input_size();
         let hc = emb.output_size();
         let table = DTensor::from_host(gpu, &tensor_from_matrix(&emb.weights));
-        let enc_blocks: Vec<Box<dyn BlockLike>> =
-            enc[1..].iter().map(|l| to_block(gpu, l)).collect::<io::Result<_>>()?;
+        let enc_blocks: Vec<Box<dyn BlockLike>> = enc[1..]
+            .iter()
+            .map(|l| to_block(gpu, l))
+            .collect::<io::Result<_>>()?;
 
-        // --- Encoder bwd: Embedding(own table) + blocks --------------------
+        // Encoder bwd: Embedding(own table) + blocks
         let enc_b = &stacks.encoder_bwd.layers;
         let emb_b = enc_b[0]
             .as_any()
             .downcast_ref::<EmbeddingLayer>()
             .ok_or_else(|| err("encoder_bwd must start with an Embedding".into()))?;
         let bwd_table = DTensor::from_host(gpu, &tensor_from_matrix(&emb_b.weights));
-        let enc_bwd_blocks: Vec<Box<dyn BlockLike>> =
-            enc_b[1..].iter().map(|l| to_block(gpu, l)).collect::<io::Result<_>>()?;
+        let enc_bwd_blocks: Vec<Box<dyn BlockLike>> = enc_b[1..]
+            .iter()
+            .map(|l| to_block(gpu, l))
+            .collect::<io::Result<_>>()?;
 
-        // --- Combine: Linear(2·HC → HC) ------------------------------------
+        // Combine: Linear(2·HC → HC)
         let combine_layer = stacks
             .combine
             .as_any()
@@ -680,7 +762,7 @@ impl Hierarchical {
             .ok_or_else(|| err("combine must be a Linear".into()))?;
         let combine = linear_layer_to_gpu(gpu, combine_layer);
 
-        // --- Backbone: Linear + blocks + Linear ----------------------------
+        // Backbone: Linear + blocks + Linear
         let wm = &stacks.word_model.layers;
         let front = wm[0]
             .as_any()
@@ -705,14 +787,16 @@ impl Hierarchical {
             .map(|m| (m.cell.num_heads, m.cell.dqk))
             .unwrap_or((8, wh / 8));
 
-        // --- Decoder: sLSTM blocks + RMSNorm + LinearNoBias + SoftCap ------
+        // Decoder: sLSTM blocks + RMSNorm + LinearNoBias + SoftCap
         let dl = &stacks.char2_model.layers;
         let norm_idx = dl
             .iter()
             .position(|l| l.as_any().downcast_ref::<RMSNorm>().is_some())
             .ok_or_else(|| err("decoder is missing its RMSNorm".into()))?;
-        let dec_blocks: Vec<Box<dyn BlockLike>> =
-            dl[..norm_idx].iter().map(|l| to_block(gpu, l)).collect::<io::Result<_>>()?;
+        let dec_blocks: Vec<Box<dyn BlockLike>> = dl[..norm_idx]
+            .iter()
+            .map(|l| to_block(gpu, l))
+            .collect::<io::Result<_>>()?;
         let rms = dl[norm_idx].as_any().downcast_ref::<RMSNorm>().unwrap();
         let dec_norm = super::rms_norm::RmsNorm::from_parts(gpu, &tensor_from_slice(&rms.gamma));
         let head = dl
@@ -782,11 +866,20 @@ mod tests {
     /// Then round-trip a checkpoint and confirm the loss is unchanged.
     #[test]
     fn hierarchical_memorizes_and_checkpoints() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let cfg = HierCfg {
-            vocab: 9, hc: 16, wh: 24,
-            enc_blocks: 1, bb_blocks: 2, dec_blocks: 1,
-            heads: 2, dqk: 8, w_token: 8, cap: 30.0,
+            vocab: 9,
+            hc: 16,
+            wh: 24,
+            enc_blocks: 1,
+            bb_blocks: 2,
+            dec_blocks: 1,
+            heads: 2,
+            dqk: 8,
+            w_token: 8,
+            cap: 30.0,
         };
         let mut model = Hierarchical::new(&gpu, &cfg);
 
@@ -801,7 +894,10 @@ mod tests {
             model.step(&gpu, &opt);
         }
         let last = model.forward_backward(&gpu, &tokens, &words);
-        assert!(last < first * 0.4, "decode loss did not fall: {first} -> {last}");
+        assert!(
+            last < first * 0.4,
+            "decode loss did not fall: {first} -> {last}"
+        );
 
         // Checkpoint round-trip: reloading must reproduce the exact same loss.
         // Saves in the CPU HIER format; `w_token` is supplied on load.
@@ -828,11 +924,20 @@ mod tests {
     /// afterwards means the reduced grads agreed, not just the loss.
     #[test]
     fn grouping_matches_single_rectangle() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let cfg = HierCfg {
-            vocab: 12, hc: 16, wh: 24,
-            enc_blocks: 2, bb_blocks: 2, dec_blocks: 2,
-            heads: 2, dqk: 8, w_token: 11, cap: 30.0,
+            vocab: 12,
+            hc: 16,
+            wh: 24,
+            enc_blocks: 2,
+            bb_blocks: 2,
+            dec_blocks: 2,
+            heads: 2,
+            dqk: 8,
+            w_token: 11,
+            cap: 30.0,
         };
         // Word lengths 1, 3, 2, 6, 4 — four distinct power-of-two buckets.
         let tokens: Vec<usize> = (0..16).map(|i| 1 + i % 9).collect();

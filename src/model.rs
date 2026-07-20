@@ -47,8 +47,8 @@ pub fn build_hierarchical_model(vocab: usize, tokenizer: Rc<Utf8Tokenizer>) -> H
     let encoder_fwd = SequentialBuilder::new(vocab)
         .embedding(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
-        //.mlstm_block(16, CHAR_HIDDEN / 16)
-        //.slstm_block(CHAR_HIDDEN)
+        .slstm_block(CHAR_HIDDEN)
+        .slstm_block(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
         .build();
     let encoder_bwd = SequentialBuilder::new(vocab)
@@ -65,7 +65,7 @@ pub fn build_hierarchical_model(vocab: usize, tokenizer: Rc<Utf8Tokenizer>) -> H
     // embedding-like tables and logit heads.
     let mut word_model = SequentialBuilder::new(CHAR_HIDDEN).linear(WORD_HIDDEN);
     for i in 0..WORD_BLOCKS {
-        if i.is_multiple_of(2) {
+        if i.is_multiple_of(4) {
             word_model = word_model.slstm_block(WORD_HIDDEN)
         } else {
             word_model = word_model.mlstm_block(heads, dqk)
@@ -79,9 +79,9 @@ pub fn build_hierarchical_model(vocab: usize, tokenizer: Rc<Utf8Tokenizer>) -> H
     // CHAR_HIDDEN == OUT_HIDDEN for the tie; asserted in `Hierarchical::new`.
     let char2_model = SequentialBuilder::new(OUT_HIDDEN)
         .slstm_block(OUT_HIDDEN)
-        //.mlstm_block(16, OUT_HIDDEN / 16)
+        .mlstm_block(16, OUT_HIDDEN / 16)
         .slstm_block(OUT_HIDDEN)
-        //.slstm_block(OUT_HIDDEN)
+        .slstm_block(OUT_HIDDEN)
         .rms_norm()
         .linear_no_bias(vocab)
         .soft_cap(LOGIT_SOFTCAP)

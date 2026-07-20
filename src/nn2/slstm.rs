@@ -56,8 +56,16 @@ impl Step {
     fn new() -> Self {
         let z = || Tensor::zeros(&[0, 0]);
         Self {
-            xh: z(), c_prev: z(), n_prev: z(), ft_pre: z(), zt: z(), ot: z(),
-            i_prime: z(), f_prime: z(), c: z(), n: z(),
+            xh: z(),
+            c_prev: z(),
+            n_prev: z(),
+            ft_pre: z(),
+            zt: z(),
+            ot: z(),
+            i_prime: z(),
+            f_prime: z(),
+            c: z(),
+            n: z(),
         }
     }
 
@@ -65,8 +73,14 @@ impl Step {
     fn fit(&mut self, b: usize, h: usize, rows: usize) {
         self.xh.fit(&[b, rows]);
         for t in [
-            &mut self.c_prev, &mut self.n_prev, &mut self.ft_pre, &mut self.zt,
-            &mut self.ot, &mut self.i_prime, &mut self.f_prime, &mut self.c,
+            &mut self.c_prev,
+            &mut self.n_prev,
+            &mut self.ft_pre,
+            &mut self.zt,
+            &mut self.ot,
+            &mut self.i_prime,
+            &mut self.f_prime,
+            &mut self.c,
             &mut self.n,
         ] {
             t.fit(&[b, h]);
@@ -99,7 +113,7 @@ pub struct SLstm {
     pub dbf: Tensor,
     pub dbo: Tensor,
 
-    // --- pooled buffers, reused across forward/backward calls ---------------
+    // pooled buffers, reused across forward/backward calls
     steps: Vec<Step>,
     // Recurrent state carried across timesteps within one call, [B, H].
     h_state: Tensor,
@@ -156,11 +170,25 @@ impl SLstm {
             dbf: Tensor::zeros(&[hidden_size]),
             dbo: Tensor::zeros(&[hidden_size]),
             steps: Vec::new(),
-            h_state: z(), c_state: z(), n_state: z(), m_state: z(),
-            zt_pre: z(), it_pre: z(), ot_pre: z(),
-            dz: z(), di: z(), df: z(), dob: z(), dxh: z(),
-            dh_bptt: z(), dc_bptt: z(), dn_bptt: z(),
-            wtz: z(), wti: z(), wtf: z(), wto: z(),
+            h_state: z(),
+            c_state: z(),
+            n_state: z(),
+            m_state: z(),
+            zt_pre: z(),
+            it_pre: z(),
+            ot_pre: z(),
+            dz: z(),
+            di: z(),
+            df: z(),
+            dob: z(),
+            dxh: z(),
+            dh_bptt: z(),
+            dc_bptt: z(),
+            dn_bptt: z(),
+            wtz: z(),
+            wti: z(),
+            wtf: z(),
+            wto: z(),
             opt: Vec::new(),
             batch: 0,
         }
@@ -177,7 +205,10 @@ impl SLstm {
     pub fn forward(&mut self, x: &Tensor) -> Tensor {
         assert_eq!(x.rank(), 3, "SLstm::forward expects [B, T, in]");
         let (b, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);
-        assert_eq!(inp, self.input_size, "SLstm::forward — input width mismatch");
+        assert_eq!(
+            inp, self.input_size,
+            "SLstm::forward — input width mismatch"
+        );
         let h = self.hidden_size;
         let rows = self.rows();
         self.batch = b;
@@ -206,8 +237,23 @@ impl SLstm {
         // Disjoint field borrows so the per-step loop can hold several buffers
         // mutably at once without going through `self` methods.
         let Self {
-            steps, wz, wi, wf, wo, bz, bi, bf, bo, zt_pre, it_pre, ot_pre,
-            h_state, c_state, n_state, m_state, ..
+            steps,
+            wz,
+            wi,
+            wf,
+            wo,
+            bz,
+            bi,
+            bf,
+            bo,
+            zt_pre,
+            it_pre,
+            ot_pre,
+            h_state,
+            c_state,
+            n_state,
+            m_state,
+            ..
         } = self;
 
         for step in 0..t {
@@ -247,7 +293,11 @@ impl SLstm {
                 // exactly 1 and n starts at 1. With m = max(fm, ĩ) instead, i' can
                 // underflow to 0 and leave h = c/n as 0/0. The reference guards the
                 // same case, and state resets per word here, so it is hit constantly.
-                let m = if np == 0.0 { it_pre.data[k] } else { fm.max(it_pre.data[k]) };
+                let m = if np == 0.0 {
+                    it_pre.data[k]
+                } else {
+                    fm.max(it_pre.data[k])
+                };
                 let ip = (it_pre.data[k] - m).exp();
                 let fp = (fm - m).exp();
                 let c = fp * st.c_prev.data[k] + ip * z;
@@ -292,8 +342,13 @@ impl SLstm {
 
         // Size (reuse) backward scratch; zero the BPTT channels (start at 0).
         for buf in [
-            &mut self.dz, &mut self.di, &mut self.df, &mut self.dob,
-            &mut self.dh_bptt, &mut self.dc_bptt, &mut self.dn_bptt,
+            &mut self.dz,
+            &mut self.di,
+            &mut self.df,
+            &mut self.dob,
+            &mut self.dh_bptt,
+            &mut self.dc_bptt,
+            &mut self.dn_bptt,
         ] {
             buf.fit(&[b, h]);
         }
@@ -314,9 +369,28 @@ impl SLstm {
         gemm::transpose(rows, h, &self.wo.data, &mut self.wto.data);
 
         let Self {
-            steps, dwz, dwi, dwf, dwo, dbz, dbi, dbf, dbo,
-            dz, di, df, dob, dxh, dh_bptt, dc_bptt, dn_bptt,
-            wtz, wti, wtf, wto, ..
+            steps,
+            dwz,
+            dwi,
+            dwf,
+            dwo,
+            dbz,
+            dbi,
+            dbf,
+            dbo,
+            dz,
+            di,
+            df,
+            dob,
+            dxh,
+            dh_bptt,
+            dc_bptt,
+            dn_bptt,
+            wtz,
+            wti,
+            wtf,
+            wto,
+            ..
         } = self;
 
         for step in (0..t).rev() {
@@ -380,8 +454,14 @@ impl SLstm {
 
     pub fn zero_grad(&mut self) {
         for g in [
-            &mut self.dwz, &mut self.dwi, &mut self.dwf, &mut self.dwo,
-            &mut self.dbz, &mut self.dbi, &mut self.dbf, &mut self.dbo,
+            &mut self.dwz,
+            &mut self.dwi,
+            &mut self.dwf,
+            &mut self.dwo,
+            &mut self.dbz,
+            &mut self.dbi,
+            &mut self.dbf,
+            &mut self.dbo,
         ] {
             g.zero_();
         }
@@ -451,7 +531,10 @@ mod tests {
         mut loss: impl FnMut(&mut S) -> f32,
     ) {
         let norm: f32 = grad.iter().map(|g| g * g).sum::<f32>().sqrt();
-        assert!(norm > 1e-6, "{name}: analytic gradient ~zero, check is vacuous");
+        assert!(
+            norm > 1e-6,
+            "{name}: analytic gradient ~zero, check is vacuous"
+        );
         let u: Vec<f32> = grad.iter().map(|g| g / norm).collect();
 
         perturb(state, eps, &u);
@@ -492,22 +575,46 @@ mod tests {
         let tol = 0.3; // stabilizer kinks — same tolerance as the hierarchical sLSTM FD tests
 
         check_direction(
-            &mut ctx, &dwz.data, "dwz", eps, tol,
-            |c, step, u| for (w, &ui) in c.cell.wz.data.iter_mut().zip(u) { *w += step * ui; },
+            &mut ctx,
+            &dwz.data,
+            "dwz",
+            eps,
+            tol,
+            |c, step, u| {
+                for (w, &ui) in c.cell.wz.data.iter_mut().zip(u) {
+                    *w += step * ui;
+                }
+            },
             loss,
         );
 
         // Forget-gate weights, exercising the log-sigmoid / stabilizer path.
         check_direction(
-            &mut ctx, &dwf.data, "dwf", eps, tol,
-            |c, step, u| for (w, &ui) in c.cell.wf.data.iter_mut().zip(u) { *w += step * ui; },
+            &mut ctx,
+            &dwf.data,
+            "dwf",
+            eps,
+            tol,
+            |c, step, u| {
+                for (w, &ui) in c.cell.wf.data.iter_mut().zip(u) {
+                    *w += step * ui;
+                }
+            },
             loss,
         );
 
         // dx: perturb the input along its gradient direction.
         check_direction(
-            &mut ctx, &dx.data, "dx", eps, tol,
-            |c, step, u| for (v, &ui) in c.x.data.iter_mut().zip(u) { *v += step * ui; },
+            &mut ctx,
+            &dx.data,
+            "dx",
+            eps,
+            tol,
+            |c, step, u| {
+                for (v, &ui) in c.x.data.iter_mut().zip(u) {
+                    *v += step * ui;
+                }
+            },
             loss,
         );
     }

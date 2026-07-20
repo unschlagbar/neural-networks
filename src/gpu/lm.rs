@@ -114,7 +114,15 @@ impl Lm {
     /// AdamW step for every parameter (table / norm / head undecayed; the blocks'
     /// interior projections decay), then clear the accumulators.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        ops::adamw(gpu, &mut self.table, &self.dtable, &mut self.m_tbl, &mut self.v_tbl, cfg, false);
+        ops::adamw(
+            gpu,
+            &mut self.table,
+            &self.dtable,
+            &mut self.m_tbl,
+            &mut self.v_tbl,
+            cfg,
+            false,
+        );
         self.dtable.zero_(gpu);
         for blk in self.blocks.iter_mut() {
             blk.step(gpu, cfg);
@@ -125,7 +133,13 @@ impl Lm {
 
     /// One full training step; returns the mean CE loss.
     pub fn train_step(
-        &mut self, gpu: &Gpu, ids: &[usize], targets: &[usize], b: usize, t: usize, cfg: &AdamCfg,
+        &mut self,
+        gpu: &Gpu,
+        ids: &[usize],
+        targets: &[usize],
+        b: usize,
+        t: usize,
+        cfg: &AdamCfg,
     ) -> f32 {
         let logits = self.forward(gpu, ids, b, t);
         let (loss, dlogits) = ops::softmax_cross_entropy(gpu, &logits, targets);
@@ -141,7 +155,9 @@ mod tests {
     use crate::gpu::block::Block;
     use crate::gpu::{mlstm::MLstm, slstm::SLstm};
     use crate::nn2::loss;
-    use crate::nn2::{Embedding, Linear as CpuLinear, MLstmBlock, RmsNorm as CpuRms, SLstmBlock, SoftCap};
+    use crate::nn2::{
+        Embedding, Linear as CpuLinear, MLstmBlock, RmsNorm as CpuRms, SLstmBlock, SoftCap,
+    };
 
     fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
         assert_eq!(got.len(), want.len(), "{what}: length mismatch");
@@ -156,13 +172,15 @@ mod tests {
     /// exercises every ported kernel composed in the real architecture.
     #[test]
     fn lm_matches_cpu() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let (vocab, hidden, up, heads, dqk) = (13, 8, 12, 2, 4);
         let (b, t) = (2, 5);
         let n = b * t;
         let cap = 30.0;
 
-        // --- shared initial parameters -------------------------------------
+        // shared initial parameters
         let table = Tensor::random(&[vocab, hidden], 0.1);
         let gamma = Tensor::random(&[hidden], 1.0);
         let head_w = Tensor::xavier(hidden, vocab);
@@ -191,7 +209,7 @@ mod tests {
         ];
         let mut dev = Lm::from_parts(&gpu, &table, blocks, &gamma, &head_w, &head_b, cap);
 
-        // --- CPU reference: forward → loss → backward → step ----------------
+        // CPU reference: forward → loss → backward → step
         let e = c_emb.forward(&ids); // [N, H]
         let h1 = c_blk1.forward(&e.reshape(&[b, t, hidden]));
         let h2 = c_blk2.forward(&h1);
@@ -215,12 +233,30 @@ mod tests {
         c_norm.step(&cfg);
         c_head.step_wd(&cfg, false);
 
-        // --- GPU: same init, one train step ---------------------------------
+        // GPU: same init, one train step
         let gpu_loss = dev.train_step(&gpu, &ids, &targets, b, t, &cfg);
 
-        assert!((cpu_loss - gpu_loss).abs() < 1e-3, "loss: cpu {cpu_loss} vs gpu {gpu_loss}");
-        assert_close(&dev.table.to_host(&gpu).data, &c_emb.table.data, 3e-3, "table");
-        assert_close(&dev.norm.gamma.to_host(&gpu).data, &c_norm.gamma.data, 3e-3, "gamma");
-        assert_close(&dev.head.w.to_host(&gpu).data, &c_head.w.data, 3e-3, "head.w");
+        assert!(
+            (cpu_loss - gpu_loss).abs() < 1e-3,
+            "loss: cpu {cpu_loss} vs gpu {gpu_loss}"
+        );
+        assert_close(
+            &dev.table.to_host(&gpu).data,
+            &c_emb.table.data,
+            3e-3,
+            "table",
+        );
+        assert_close(
+            &dev.norm.gamma.to_host(&gpu).data,
+            &c_norm.gamma.data,
+            3e-3,
+            "gamma",
+        );
+        assert_close(
+            &dev.head.w.to_host(&gpu).data,
+            &c_head.w.data,
+            3e-3,
+            "head.w",
+        );
     }
 }

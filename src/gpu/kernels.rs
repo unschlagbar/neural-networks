@@ -153,7 +153,7 @@ extern "C" __global__ void adamw(float* param, const float* grad, float* m, floa
     param[k] = p;
 }
 
-// --- sLSTM cell (recurrent core) -------------------------------------------
+// sLSTM cell (recurrent core)
 // Numerically-stable sigmoid / log-sigmoid, matching the CPU helpers in
 // nn2/slstm.rs (branch on the sign to avoid overflow of exp).
 __device__ __forceinline__ float stable_sigmoid(float x) {
@@ -276,7 +276,7 @@ extern "C" __global__ void slstm_cell_step_bwd(
     dn_bptt[k] = dn * fp;
 }
 
-// --- fused-gate sLSTM (see gpu/slstm.rs) -----------------------------------
+// fused-gate sLSTM (see gpu/slstm.rs)
 // The kernels above run one gate GEMM per gate per timestep. These run the four
 // gates as one [.., 4H] block, so a timestep costs one GEMM + one kernel. The
 // weights of record stay the four [rows, H] gate matrices (checkpoint layout);
@@ -458,7 +458,7 @@ extern "C" __global__ void slstm_step_fused_bwd(
     dn_bptt[k] = dn * fp;
 }
 
-// --- residual block / SwiGLU (nn2/block.rs) --------------------------------
+// residual block / SwiGLU (nn2/block.rs)
 // Elementwise add: out = a + b. Used for the two residual adds and the grad
 // accumulations that are plain sums (d_zn, d_z, dx).
 extern "C" __global__ void add(float* out, const float* a, const float* b, int n) {
@@ -478,7 +478,7 @@ extern "C" __global__ void swiglu_forward(const float* gate_pre, const float* va
     mixed[i] = ga * value[i];
 }
 
-// --- mLSTM projections (nn2/mlstm.rs `project`) ----------------------------
+// mLSTM projections (nn2/mlstm.rs `project`)
 // In-place multiply by a scalar (the k-projection's 1/√dqk scale).
 extern "C" __global__ void scale_inplace(float* x, float s, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -491,7 +491,7 @@ extern "C" __global__ void sigmoid_inplace(float* x, int n) {
     if (i < n) x[i] = stable_sigmoid(x[i]);
 }
 
-// --- mLSTM parallel/chunkwise core (nn2/mlstm.rs) --------------------------
+// mLSTM parallel/chunkwise core (nn2/mlstm.rs)
 // Reorganize a position-major [N, H*W] tensor (N=B*T, row=b*T+t) into a
 // head-major [B*H, T, W] tensor for the per-(batch,head) batched matmuls.
 // The flat output index idx == ((b*H+h)*T+t)*W+c, so it decomposes cleanly.
@@ -585,7 +585,7 @@ extern "C" __global__ void mul(float* out, const float* a, const float* b, int n
     if (i < n) out[i] = a[i] * b[i];
 }
 
-// --- mLSTM chunking (inter-chunk state carry; see gpu/mlstm.rs) ------------
+// mLSTM chunking (inter-chunk state carry; see gpu/mlstm.rs)
 // A chunk is a contiguous T-range [c0, c0+L) of a [BH, T, W] head-major tensor.
 // Within a group g the range is contiguous (g*T*W + c0*W, length L*W), so both
 // directions are plain index math.
@@ -697,7 +697,7 @@ extern "C" __global__ void mlstm_chunk_ab_bwd(const float* db, const float* da,
     dfc[idx] += acc;
 }
 
-// --- hierarchical model ----------------------------------------------------
+// hierarchical model
 // Copy rows of `src` into arbitrary rows of `dst`: dst[row_ids[i], :] = src[i, :].
 // The inverse (gathering those rows back out) is just `embedding_gather` with the
 // same row ids, so the hierarchical model needs no separate gather kernel.
@@ -760,7 +760,7 @@ extern "C" __global__ void masked_softmax_ce(const float* logits, const unsigned
     }
 }
 
-// --- mLSTM parallel-form backward ------------------------------------------
+// mLSTM parallel-form backward
 // o-gate backward: hconcat = o ⊙ yhat with o = σ(o_pre).
 //   d_yhat = d_hconcat ⊙ o ;  do_pre = d_hconcat ⊙ yhat ⊙ o(1-o).
 extern "C" __global__ void ogate_bwd(const float* d_hconcat, const float* o, const float* yhat,
@@ -1149,10 +1149,7 @@ extern "C" __global__ void mlstm_fw_parallel(
             acc / fmaxf(fabsf(sQn[t]), expf(-sM[t]));
     }
 }
-
-// ---------------------------------------------------------------------------
 // Tensor-core dot (MMA_TF32, sm_80+)
-// ---------------------------------------------------------------------------
 //
 // The scalar kernels above give every output element to one thread, which then
 // walks the contraction with an FMA loop. That is the one thing our chunkwise core
@@ -2135,7 +2132,9 @@ impl Kernels {
         let has_mma = major >= 8;
 
         let base = compile_ptx(SRC).map_err(|e| format!("NVRTC compile failed: {e:?}"))?;
-        let base = ctx.load_module(base).map_err(|e| format!("load_module failed: {e:?}"))?;
+        let base = ctx
+            .load_module(base)
+            .map_err(|e| format!("load_module failed: {e:?}"))?;
 
         let mut funcs = std::collections::HashMap::new();
         for &name in NAMES {
@@ -2155,8 +2154,9 @@ impl Kernels {
             };
             let ptx = compile_ptx_with_opts(SRC, opts)
                 .map_err(|e| format!("NVRTC compile (mma) failed: {e:?}"))?;
-            let module =
-                ctx.load_module(ptx).map_err(|e| format!("load_module (mma) failed: {e:?}"))?;
+            let module = ctx
+                .load_module(ptx)
+                .map_err(|e| format!("load_module (mma) failed: {e:?}"))?;
             for &name in MMA_NAMES {
                 let f = module
                     .load_function(name)
@@ -2170,6 +2170,9 @@ impl Kernels {
 
     /// Look up a kernel by name (panics if it was not in [`NAMES`]).
     pub fn get(&self, name: &str) -> CudaFunction {
-        self.funcs.get(name).unwrap_or_else(|| panic!("unknown kernel {name}")).clone()
+        self.funcs
+            .get(name)
+            .unwrap_or_else(|| panic!("unknown kernel {name}"))
+            .clone()
     }
 }

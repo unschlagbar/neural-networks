@@ -19,9 +19,7 @@
 
 use crate::tensor::Tensor;
 
-// ---------------------------------------------------------------------------
 // Elementwise
-// ---------------------------------------------------------------------------
 
 /// SoftCap forward: `y = cap · tanh(x / cap)`, element-wise. Kernel: map.
 pub fn softcap_forward(x: &Tensor, cap: f32) -> Tensor {
@@ -43,9 +41,7 @@ pub fn softcap_backward(dy: &Tensor, y: &Tensor, cap: f32) -> Tensor {
     dx
 }
 
-// ---------------------------------------------------------------------------
 // Linear helpers (the matmuls themselves stay in tensor::gemm)
-// ---------------------------------------------------------------------------
 
 /// Copy `bias` (`[N]`) into every row of `out` (`[B, N]`). Used to seed a
 /// Linear's output before the `beta = 1` matmul accumulates on top. Kernel:
@@ -69,9 +65,7 @@ pub fn add_col_sum(db: &mut Tensor, dy: &Tensor) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Embedding gather / scatter
-// ---------------------------------------------------------------------------
 
 /// Gather rows of `table` (`[vocab, dim]`) by `ids` into a `[B, dim]` tensor.
 /// Kernel: indexed row copy.
@@ -96,9 +90,7 @@ pub fn embedding_scatter_add(dtable: &mut Tensor, ids: &[usize], dy: &Tensor, di
     }
 }
 
-// ---------------------------------------------------------------------------
 // (Head-wise) RMSNorm
-// ---------------------------------------------------------------------------
 
 /// Saved intermediates from an RMSNorm forward, consumed by its backward.
 pub struct RmsForward {
@@ -140,7 +132,11 @@ pub fn rms_norm_forward(x: &Tensor, gamma: &Tensor, group: usize, eps: f32) -> R
             }
         }
     }
-    RmsForward { out, x_hat, inv_rms }
+    RmsForward {
+        out,
+        x_hat,
+        inv_rms,
+    }
 }
 
 /// Grouped RMSNorm backward. Accumulates the γ gradient into `dgamma` and
@@ -160,7 +156,11 @@ pub fn rms_norm_backward(
 ) -> Tensor {
     let (b, f) = (dy.rows(), dy.cols());
     let groups_per_row = f / group;
-    debug_assert_eq!(inv_rms.len(), b * groups_per_row, "rms inv_rms len mismatch");
+    debug_assert_eq!(
+        inv_rms.len(),
+        b * groups_per_row,
+        "rms inv_rms len mismatch"
+    );
 
     let mut dx = Tensor::zeros(&[b, f]);
     for r in 0..b {
@@ -176,8 +176,8 @@ pub fn rms_norm_backward(
             }
             let s_over_g = s / group as f32;
             for i in 0..group {
-                dx.data[off + i] =
-                    inv * (gamma.data[g_off + i] * dy.data[off + i] - x_hat.data[off + i] * s_over_g);
+                dx.data[off + i] = inv
+                    * (gamma.data[g_off + i] * dy.data[off + i] - x_hat.data[off + i] * s_over_g);
             }
         }
     }

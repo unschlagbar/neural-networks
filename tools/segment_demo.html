@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Word segmentation demo</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #fff;
+      --fg: #111;
+      --line: #d5d5d5;
+      --field: #f7f7f7;
+      --sat: 62%;
+      --lum: 86%;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #16181c;
+        --fg: #e6e6e6;
+        --line: #33373d;
+        --field: #1c1f24;
+        --sat: 38%;
+        --lum: 30%;
+      }
+    }
+
+    body {
+      margin: 0;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+    }
+
+    h1 {
+      font-size: 16px;
+      margin: 0 0 4px;
+    }
+
+    p.sub {
+      margin: 0 0 16px;
+      opacity: .65;
+    }
+
+    textarea,
+    #out {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 10px;
+      font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: var(--field);
+      color: var(--fg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+    }
+
+    textarea {
+      height: 180px;
+      resize: vertical;
+    }
+
+    #stats {
+      margin: 14px 0 8px;
+      opacity: .7;
+    }
+
+    /* The segmented view is plain text — every word just gets its own
+     background, so the original layout (indentation, line breaks) survives. */
+    #out {
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 60px;
+    }
+
+    #out span {
+      border-radius: 3px;
+    }
+
+    label.opt {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Word segmentation demo</h1>
+  <p class="sub">Exact port of <code>src/segment.rs</code> (<code>word_ends</code>), operating on UTF-8 bytes.</p>
+
+  <textarea id="in" spellcheck="false">fn main() {
+    let x: Vec&lt;u8&gt; = vec![1_000u32, 0..=9];
+    println!("Größe: {}", x.len()); // it's fine, can't fail
+}</textarea>
+
+  <label class="opt"><input type="checkbox" id="showws"> show spaces as ·</label>
+
+  <div id="stats"></div>
+  <div id="out"></div>
+
+  <script>
+    // port of src/segment.rs
+    // The Rust code runs over token ids where 0..256 are raw UTF-8 bytes; here the
+    // sequence IS the byte array, which is equivalent for every predicate used.
+
+    const enc = new TextEncoder(), dec = new TextDecoder();
+
+    const MAX_WORD_BYTES = 16;   // config::MAX_WORD_BYTES
+    const MAX_WS_SUFFIX = 16;   // segment::MAX_WS_SUFFIX
+
+    // Multi-byte operators, longest first (the scanner takes the first match).
+    const OPERATORS = [
+      "..=", "...", "<<=", ">>=", "///", "//!", "#![", "::", "->", "=>", "==", "!=",
+      "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<",
+      ">>", "..", "//", "/*", "*/", "#[",
+    ].map(s => Array.from(s, c => c.charCodeAt(0)));
+
+    const SP = 32, TAB = 9, LF = 10, CR = 13, UND = 95, DOT = 46, QUOTE = 39, DASH = 45;
+
+    const isWs = b => b === SP || b === TAB || b === LF || b === CR;
+    const isDigit = b => b >= 48 && b <= 57;
+    const isAlnum = b => (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+    // ASCII identifier byte. Non-ASCII goes through nonAscii, which needs context.
+    const isIdent = b => isAlnum(b) || b === UND;
+    const isIdentStart = b => isIdent(b) && !isDigit(b);
+
+    // Matches Rust's u8::is_ascii_punctuation: the four ASCII punctuation ranges.
+    const isPunct = b => (b >= 0x21 && b <= 0x2F) || (b >= 0x3A && b <= 0x40) ||
+      (b >= 0x5B && b <= 0x60) || (b >= 0x7B && b <= 0x7E);
+
+    const ALNUM_RE = /\p{L}|\p{N}/u;
+
+    // Decode the non-ASCII UTF-8 character at `i` → [byteLen, isAlphanumeric].
+    // Deciding per character (not per byte) is what keeps `Größe` whole while
+    // letting typographic punctuation (`“ ” — …`) stand alone like `"` does.
+    function nonAscii(seq, i) {
+      const b0 = seq[i];
+      let len;
+      if (b0 >= 0xC0 && b0 <= 0xDF) len = 2;
+      else if (b0 >= 0xE0 && b0 <= 0xEF) len = 3;
+      else if (b0 >= 0xF0 && b0 <= 0xF7) len = 4;
+      else return null; // ASCII, stray continuation byte, or invalid lead
+      if (i + len > seq.length) return null;
+      const ch = dec.decode(Uint8Array.from(seq.slice(i, i + len)));
+      if (ch === "�") return null;
+      return [len, ALNUM_RE.test(ch)];
+    }
+
+    // Length of the identifier run at `e`: ASCII bytes plus whole non-ASCII
+    // alphanumeric characters. 0 if none starts there.
+    function identRun(seq, e) {
+      const start = e;
+      while (e < seq.length) {
+        if (isIdent(seq[e])) { e++; continue; }
+        const na = nonAscii(seq, e);
+        if (na && na[1]) { e += na[0]; continue; }
+        break;
+      }
+      return e - start;
+    }
+
+    function operatorLen(seq, i) {
+      for (const op of OPERATORS) {
+        const end = i + op.length;
+        if (end > seq.length) continue;
+        let ok = true;
+        for (let k = 0; k < op.length; k++) if (seq[i + k] !== op[k]) { ok = false; break; }
+        if (ok) return op.length;
+      }
+      return null;
+    }
+
+    // Scan one core word (no leading whitespace) starting at `i`. Always advances.
+    function coreEnd(seq, i) {
+      const tok = seq[i];
+
+      // An identifier starts at an ASCII ident-start byte or a non-ASCII
+      // alphanumeric character (`Größe`, `日本語`); non-ASCII punctuation does not.
+      const na0 = nonAscii(seq, i);
+      if (isIdentStart(tok) || (na0 && na0[1])) {
+        let e = i + Math.max(identRun(seq, i), 1);
+        // Absorb an English contraction / possessive suffix.
+        while (e + 1 < seq.length && seq[e] === QUOTE && isIdent(seq[e + 1])) {
+          e++;
+          e += identRun(seq, e);
+        }
+        // A hyphen BETWEEN identifier bytes closes the word instead of standing
+        // alone: `cross-entropy` → `cross-` + `entropy`.
+        if (e + 1 < seq.length && seq[e] === DASH && isIdent(seq[e + 1])) e++;
+        return e;
+      }
+
+      if (isDigit(tok)) {
+        let e = i + 1;
+        while (e < seq.length) {
+          if (isIdent(seq[e])) e++;
+          else if (seq[e] === DOT && e + 1 < seq.length && isDigit(seq[e + 1])) e += 2;
+          else break;
+        }
+        return e;
+      }
+
+      // Lifetime `'a`: quote, identifier, and no closing quote.
+      if (tok === QUOTE && i + 1 < seq.length && isIdentStart(seq[i + 1])) {
+        let e = i + 1;
+        while (e < seq.length && isIdent(seq[e])) e++;
+        if (e >= seq.length || seq[e] !== QUOTE) return e;
+      }
+
+      // A run of 3+ of the same punctuation byte is a divider (`--------`, `====`),
+      // not a stack of operators. Checked BEFORE operatorLen so the run wins over
+      // the `--`/`==`/`///` prefixes it would otherwise be chewed into.
+      if (isPunct(tok)) {
+        let run = 0;
+        while (i + run < seq.length && seq[i + run] === tok) run++;
+        if (run >= 3) return i + run;
+      }
+
+      const len = operatorLen(seq, i);
+      if (len !== null) return i + len;
+
+      // Non-ASCII punctuation (`“`, `—`, `…`) is its own word — but one word per
+      // character, never one per byte.
+      const na = nonAscii(seq, i);
+      if (na && !na[1]) return i + na[0];
+
+      return i + 1;
+    }
+
+    function pushCapped(ends, start, end) {
+      let s = start;
+      while (end - s > MAX_WORD_BYTES) { s += MAX_WORD_BYTES; ends.push(s); }
+      ends.push(end);
+    }
+
+    function wordEnds(seq) {
+      const n = seq.length, ends = [];
+      let i = 0;
+      while (i < n) {
+        const start = i;
+
+        if (isWs(seq[i])) {
+          let ws = i;
+          while (ws < n && isWs(seq[ws])) ws++;
+          pushCapped(ends, i, ws);
+          i = ws;
+          continue;
+        }
+
+        const core = coreEnd(seq, i);
+
+        let end = core;
+        while (end < n && isWs(seq[end]) && end - core < MAX_WS_SUFFIX) end++;
+        if (end < n && isWs(seq[end])) end = core; // run longer than the cap
+
+        pushCapped(ends, start, end);
+        i = end;
+      }
+      return ends;
+    }
+
+    const inEl = document.getElementById("in");
+    const outEl = document.getElementById("out");
+    const statsEl = document.getElementById("stats");
+    const wsEl = document.getElementById("showws");
+
+    // Cycle hues by a large step so adjacent words never land on similar colors.
+    const hue = i => (i * 67) % 360;
+
+    function render() {
+      const seq = enc.encode(inEl.value);
+      const ends = wordEnds(seq);
+      outEl.textContent = "";
+      let start = 0;
+      const dots = wsEl.checked;
+      ends.forEach((e, i) => {
+        let text = dec.decode(seq.slice(start, e));
+        if (dots) text = text.replace(/ /g, "·");
+        const span = document.createElement("span");
+        span.textContent = text;
+        span.style.background = `hsl(${hue(i)} var(--sat) var(--lum))`;
+        span.title = `word ${i} · bytes ${start}..${e} (len ${e - start})`;
+        outEl.appendChild(span);
+        start = e;
+      });
+      const bytes = seq.length;
+      statsEl.textContent =
+        `${ends.length} words · ${bytes} bytes · ` +
+        `${ends.length ? (bytes / ends.length).toFixed(2) : "0"} bytes/word`;
+    }
+
+    inEl.addEventListener("input", render);
+    wsEl.addEventListener("change", render);
+    render();
+  </script>
+</body>
+
+</html>

@@ -93,23 +93,55 @@ fn project(
 
 /// Per-timestep forward cache; pooled and reused across calls.
 struct Step {
-    xt: Tensor, q: Tensor, k: Tensor, v: Tensor, o: Tensor,
-    log_f: Tensor, i_prime: Tensor, f_prime: Tensor, nq: Tensor, psi: Tensor,
+    xt: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    o: Tensor,
+    log_f: Tensor,
+    i_prime: Tensor,
+    f_prime: Tensor,
+    nq: Tensor,
+    psi: Tensor,
     /// The lower clamp of ψ, `exp(−m)`. Saved rather than re-derived because
     /// backward needs to know which of the two arguments the `max` picked, and `m`
     /// itself is a running value that the next timestep overwrites.
     psi_floor: Tensor,
-    cq: Tensor, c: Tensor, c_prev: Tensor, n: Tensor, n_prev: Tensor,
-    yhat: Tensor, x_hat: Tensor, inv_rms: Tensor, hconcat: Tensor,
+    cq: Tensor,
+    c: Tensor,
+    c_prev: Tensor,
+    n: Tensor,
+    n_prev: Tensor,
+    yhat: Tensor,
+    x_hat: Tensor,
+    inv_rms: Tensor,
+    hconcat: Tensor,
 }
 
 impl Step {
     fn new() -> Self {
         let z = || Tensor::zeros(&[0, 0]);
         Self {
-            xt: z(), q: z(), k: z(), v: z(), o: z(), log_f: z(), i_prime: z(),
-            f_prime: z(), nq: z(), psi: z(), psi_floor: z(), cq: z(), c: z(), c_prev: z(),
-            n: z(), n_prev: z(), yhat: z(), x_hat: z(), inv_rms: z(), hconcat: z(),
+            xt: z(),
+            q: z(),
+            k: z(),
+            v: z(),
+            o: z(),
+            log_f: z(),
+            i_prime: z(),
+            f_prime: z(),
+            nq: z(),
+            psi: z(),
+            psi_floor: z(),
+            cq: z(),
+            c: z(),
+            c_prev: z(),
+            n: z(),
+            n_prev: z(),
+            yhat: z(),
+            x_hat: z(),
+            inv_rms: z(),
+            hconcat: z(),
         }
     }
 
@@ -188,7 +220,7 @@ pub struct MLstm {
     pub db_out: Tensor,
     pub dgamma: Tensor,
 
-    // --- pooled buffers ----------------------------------------------------
+    // pooled buffers
     steps: Vec<Step>,
     c_state: Tensor, // [b, h*dhv*dqk]
     n_state: Tensor, // [b, h*dqk]

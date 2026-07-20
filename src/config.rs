@@ -56,9 +56,9 @@ pub const TOP_P: f32 = 0.9;
 
 // Modell-Dimensions
 
-pub const CHAR_HIDDEN: usize = 192;
-pub const OUT_HIDDEN: usize = 192;
-pub const WORD_HIDDEN: usize = 384;
+pub const CHAR_HIDDEN: usize = 256;
+pub const OUT_HIDDEN: usize = 256;
+pub const WORD_HIDDEN: usize = 768;
 
 /// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).
 /// Bounds the logits and removes the cross-entropy incentive for unbounded
@@ -66,7 +66,7 @@ pub const WORD_HIDDEN: usize = 384;
 pub const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 6;
+pub const WORD_BLOCKS: usize = 16;
 
 /// GPU mLSTM: chunk length for the chunkwise formulation, or `0` for the
 /// single-chunk (whole-sequence) form.

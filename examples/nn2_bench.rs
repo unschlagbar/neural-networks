@@ -17,8 +17,8 @@ use std::time::Instant;
 use neural_networks::nn::linear::{LinearCache, LinearLayer};
 use neural_networks::nn::mlstm::MLSTMLayer;
 use neural_networks::nn::slstm::SLSTMLayer;
-use neural_networks::nn2;
 use neural_networks::nn_layer::NnLayer; // reset_state / clear_grads (trait methods)
+use neural_networks::nn2;
 use neural_networks::tensor::Tensor;
 
 /// Run `f` `iters` times, return seconds elapsed. `warmup` runs are untimed.
@@ -43,7 +43,7 @@ fn bench_linear(inp: usize, out: usize, batch: usize) {
     // FLOPs for one forward over the whole batch: 2·B·in·out (multiply-add).
     let flops = 2.0 * batch as f64 * inp as f64 * out as f64;
 
-    // --- old: B separate matrix-vector products (per-timestep path) ---------
+    // old: B separate matrix-vector products (per-timestep path)
     let old = LinearLayer::new(inp, out);
     let mut cache = LinearCache::new(inp, out);
     let x: Vec<f32> = (0..batch * inp).map(|i| (i as f32 * 0.001).sin()).collect();
@@ -54,7 +54,7 @@ fn bench_linear(inp: usize, out: usize, batch: usize) {
         }
     });
 
-    // --- new: one batched [B,in]·[in,out] GEMM -----------------------------
+    // new: one batched [B,in]·[in,out] GEMM
     let mut new = nn2::Linear::new(inp, out);
     let xt = Tensor::new(&[batch, inp], x.clone());
     let secs_new = time(20, iters, || {
@@ -64,7 +64,7 @@ fn bench_linear(inp: usize, out: usize, batch: usize) {
 
     report("forward", secs_old, secs_new, iters, flops);
 
-    // --- forward + backward -------------------------------------------------
+    // forward + backward
     let mut oldb = LinearLayer::new(inp, out);
     let mut delta = vec![0.1f32; out];
     let secs_old_b = time(20, iters, || {
@@ -92,10 +92,12 @@ fn bench_slstm(inp: usize, hidden: usize, batch: usize, seq: usize) {
     let rows = inp + hidden;
     let flops = 4.0 * 2.0 * batch as f64 * rows as f64 * hidden as f64 * seq as f64;
 
-    // --- old: B sequences × T steps of single-vector forward ---------------
+    // old: B sequences × T steps of single-vector forward
     let mut old = SLSTMLayer::new(inp, hidden);
     let mut cache = old.alloc_cache();
-    let x: Vec<f32> = (0..batch * seq * inp).map(|i| (i as f32 * 0.001).sin()).collect();
+    let x: Vec<f32> = (0..batch * seq * inp)
+        .map(|i| (i as f32 * 0.001).sin())
+        .collect();
     let secs_old = time(3, iters, || {
         for b in 0..batch {
             old.reset_state();
@@ -107,7 +109,7 @@ fn bench_slstm(inp: usize, hidden: usize, batch: usize, seq: usize) {
         }
     });
 
-    // --- new: one batched [B,T,in] sequence forward ------------------------
+    // new: one batched [B,T,in] sequence forward
     let mut new = nn2::SLstm::new(inp, hidden);
     let xt = Tensor::new(&[batch, seq, inp], x.clone());
     let secs_new = time(3, iters, || {
@@ -117,7 +119,7 @@ fn bench_slstm(inp: usize, hidden: usize, batch: usize, seq: usize) {
 
     report("forward", secs_old, secs_new, iters, flops);
 
-    // --- forward + backward (BPTT) -----------------------------------------
+    // forward + backward (BPTT)
     // Old path: T caches per sequence (backward walks them in reverse).
     let mut oldb = SLSTMLayer::new(inp, hidden);
     let mut caches: Vec<_> = (0..seq).map(|_| oldb.alloc_cache()).collect();
@@ -154,11 +156,14 @@ fn bench_mlstm(inp: usize, d: usize, heads: usize, dqk: usize, batch: usize, seq
     // Rough proxy: projection + output GEMMs only (ignores the per-head recurrence),
     // so GFLOP/s understates work — read the ms and speedup as the real comparison.
     let d_qk = heads * dqk;
-    let proj = 2.0 * batch as f64 * inp as f64 * (2.0 * d_qk as f64 + 2.0 * d as f64 + 2.0 * heads as f64);
+    let proj =
+        2.0 * batch as f64 * inp as f64 * (2.0 * d_qk as f64 + 2.0 * d as f64 + 2.0 * heads as f64);
     let wout = 2.0 * batch as f64 * d as f64 * d as f64;
     let flops = 3.0 * (proj + wout) * seq as f64;
 
-    let x: Vec<f32> = (0..batch * seq * inp).map(|i| (i as f32 * 0.001).sin()).collect();
+    let x: Vec<f32> = (0..batch * seq * inp)
+        .map(|i| (i as f32 * 0.001).sin())
+        .collect();
 
     // Old: B sequences × T steps, T caches per sequence for BPTT.
     let mut old = MLSTMLayer::new(inp, d, heads, dqk);

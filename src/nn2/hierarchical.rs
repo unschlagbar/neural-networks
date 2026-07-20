@@ -112,7 +112,9 @@ impl Hierarchical {
             bb_front: Linear::new(c.hc, c.wh),
             bb_blocks,
             bb_back: Linear::new(c.wh, c.hc),
-            dec_blocks: (0..c.dec_blocks).map(|_| SLstmBlock::new_slstm(c.hc, c.up)).collect(),
+            dec_blocks: (0..c.dec_blocks)
+                .map(|_| SLstmBlock::new_slstm(c.hc, c.up))
+                .collect(),
             dec_norm: RmsNorm::new(c.hc),
             dec_head: Linear::new(c.hc, c.vocab),
             softcap: SoftCap::new(LOGIT_SOFTCAP),
@@ -138,7 +140,7 @@ impl Hierarchical {
         let vocab = self.vocab;
         self.o_dims = (dw,);
 
-        // ---- PHASE 1: ENCODER ----------------------------------------------
+        // PHASE 1: ENCODER
         // Encode words 0..dw. Sequence = chars + [W]; readout at the [W] step.
         let enc_lens: Vec<usize> = (0..dw).map(|w| words[w].1 - words[w].0).collect();
         let enc_tmax = enc_lens.iter().map(|&l| l + 1).max().unwrap();
@@ -153,9 +155,11 @@ impl Hierarchical {
             readout[w] = enc_lens[w];
         }
         let embedded = self.char_embed.forward(&enc_ids); // [dw*enc_tmax, HC]
-        let e_w = self.encoder.forward(&embedded.reshape(&[dw, enc_tmax, hc]), &readout); // [dw, HC]
+        let e_w = self
+            .encoder
+            .forward(&embedded.reshape(&[dw, enc_tmax, hc]), &readout); // [dw, HC]
 
-        // ---- PHASE 2: BACKBONE ---------------------------------------------
+        // PHASE 2: BACKBONE
         // Autoregress e_w as one sequence; o[w] is the context for word w+1.
         let bb_in = self.bb_front.forward(&e_w); // [dw, WH]
         let wh = bb_in.cols();
@@ -165,7 +169,7 @@ impl Hierarchical {
         }
         let o = self.bb_back.forward(&h.reshape(&[dw, wh])); // [dw, HC]  o[w] decodes word w+1
 
-        // ---- PHASE 3: DECODER ----------------------------------------------
+        // PHASE 3: DECODER
         // Word w's decode target is word w+1. Slot 0 = o[w]; slot k = embed(prev char).
         let dec_lens: Vec<usize> = (0..dw).map(|w| words[w + 1].1 - words[w + 1].0).collect();
         let dec_tmax = dec_lens.iter().map(|&l| l + 1).max().unwrap();
@@ -190,7 +194,8 @@ impl Hierarchical {
                 let cid = self.dec_ids[w][k - 1];
                 let src = cid * hc;
                 let dst = (w * dec_tmax + k) * hc;
-                dec_in.data[dst..dst + hc].copy_from_slice(&self.char_embed.table.data[src..src + hc]);
+                dec_in.data[dst..dst + hc]
+                    .copy_from_slice(&self.char_embed.table.data[src..src + hc]);
             }
             for k in 0..m {
                 targets[w * dec_tmax + k] = self.dec_ids[w][k];
@@ -211,7 +216,7 @@ impl Hierarchical {
         // Masked cross-entropy.
         let (loss, d_capped) = masked_ce(&capped, &targets, &mask, vocab);
 
-        // ---- BACKWARD ------------------------------------------------------
+        // BACKWARD
         let d_logits = self.softcap.backward(&d_capped);
         let d_hdn = self.dec_head.backward(&d_logits);
         let d_hd_flat = self.dec_norm.backward(&d_hdn);
@@ -245,7 +250,8 @@ impl Hierarchical {
 
         // Encoder backward → grad w.r.t. embedded input → tied char table.
         let d_embedded = self.encoder.backward(&d_e_w); // [dw, enc_tmax, HC]
-        self.char_embed.backward(&d_embedded.reshape(&[dw * enc_tmax, hc]));
+        self.char_embed
+            .backward(&d_embedded.reshape(&[dw * enc_tmax, hc]));
 
         loss
     }
@@ -299,14 +305,23 @@ mod tests {
     fn hierarchical_memorizes_window() {
         // vocab 0..7 chars, 8 = [W]. Four short words in one window.
         let cfg = HierCfg {
-            vocab: 9, hc: 16, wh: 24, up: 24,
-            enc_blocks: 1, bb_blocks: 2, dec_blocks: 1,
-            heads: 2, dqk: 8, w_token: 8,
+            vocab: 9,
+            hc: 16,
+            wh: 24,
+            up: 24,
+            enc_blocks: 1,
+            bb_blocks: 2,
+            dec_blocks: 1,
+            heads: 2,
+            dqk: 8,
+            w_token: 8,
         };
         let mut model = Hierarchical::new(&cfg);
 
         // tokens + word ranges (variable lengths, to exercise padding/masking).
-        let tokens = vec![1, 2, 3, /*|*/ 4, 5, /*|*/ 6, 7, 1, /*|*/ 2, 3];
+        let tokens = vec![
+            1, 2, 3, /*|*/ 4, 5, /*|*/ 6, 7, 1, /*|*/ 2, 3,
+        ];
         let words = vec![(0, 3), (3, 5), (5, 8), (8, 10)];
 
         let mut opt = AdamCfg::new(5e-3, 0.0);
@@ -319,6 +334,9 @@ mod tests {
             model.step(&opt);
         }
         let last = model.forward_backward(&tokens, &words);
-        assert!(last < first * 0.4, "decode loss did not fall enough: {first} -> {last}");
+        assert!(
+            last < first * 0.4,
+            "decode loss did not fall enough: {first} -> {last}"
+        );
     }
 }

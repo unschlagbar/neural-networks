@@ -68,15 +68,15 @@ fn chunk_len() -> usize {
 ///
 /// Everything else is at most [BH, L, dhv].
 struct Chunk {
-    c0: usize,  // chunk start in T
-    len: usize, // chunk length (the last chunk may be short)
+    c0: usize,     // chunk start in T
+    len: usize,    // chunk length (the last chunk may be short)
     bvec: DTensor, // [BH, L]  b_t: carried state → row t
     avec: DTensor, // [BH, L]  a_j: row j → outgoing state
     qn: DTensor,   // [BH, L]  (intra + inter)
     psi: DTensor,  // [BH, L]
     /// Per-row stabilizer. Backward needs it because ψ = max(|qn|, exp(−m)), so the
     /// branch "did qn win the max?" is against exp(−m), not against 1.
-    m: DTensor,    // [BH, L]
+    m: DTensor, // [BH, L]
     num: DTensor,  // [BH, L, dhv]  (intra + inter)
     dbar: DTensor, // [BH, L, L]  D̄
     ds: DTensor,   // [BH, L, L]  D̄⊙S
@@ -104,15 +104,15 @@ struct Inter {
 struct Saved {
     b: usize,
     t: usize,
-    qh: DTensor,  // [BH, T, dqk]
-    kh: DTensor,  // [BH, T, dqk]  (already ×1/√dqk)
-    vh: DTensor,  // [BH, T, dhv]
+    qh: DTensor, // [BH, T, dqk]
+    kh: DTensor, // [BH, T, dqk]  (already ×1/√dqk)
+    vh: DTensor, // [BH, T, dhv]
     // The forget-gate logit is still needed in backward (`revcumsum_dlogsig` chains
     // dfc through logσ'); the input-gate logit is not — it only ever fed the D̄
     // build, which now happens once, in forward.
     fgh: DTensor, // [BH, T]  forget-gate logit (head-major)
     chunks: Vec<Chunk>,
-    o: DTensor,   // [N, d]  (post-sigmoid)
+    o: DTensor,    // [N, d]  (post-sigmoid)
     yhat: DTensor, // [N, d]
 }
 
@@ -174,14 +174,33 @@ impl MLstm {
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         gpu: &Gpu,
-        input_size: usize, d: usize, heads: usize, dqk: usize,
-        wq: &Tensor, wk: &Tensor, wv: &Tensor, wo: &Tensor, wi: &Tensor, wf: &Tensor,
-        bq: &Tensor, bk: &Tensor, bv: &Tensor, bo: &Tensor, bi: &Tensor, bf: &Tensor,
-        w_out: &Tensor, b_out: &Tensor, gamma: &Tensor,
+        input_size: usize,
+        d: usize,
+        heads: usize,
+        dqk: usize,
+        wq: &Tensor,
+        wk: &Tensor,
+        wv: &Tensor,
+        wo: &Tensor,
+        wi: &Tensor,
+        wf: &Tensor,
+        bq: &Tensor,
+        bk: &Tensor,
+        bv: &Tensor,
+        bo: &Tensor,
+        bi: &Tensor,
+        bf: &Tensor,
+        w_out: &Tensor,
+        b_out: &Tensor,
+        gamma: &Tensor,
     ) -> Self {
         let dhv = d / heads;
         Self {
-            input_size, d, heads, dqk, dhv,
+            input_size,
+            d,
+            heads,
+            dqk,
+            dhv,
             inv_sqrt_dqk: 1.0 / (dqk as f32).sqrt(),
             chunk: chunk_len(),
             lin_q: Linear::from_parts(gpu, wq, bq),
@@ -242,8 +261,18 @@ impl MLstm {
             c.hidden_size,
             c.num_heads,
             c.dqk,
-            &m(&c.wq), &m(&c.wk), &m(&c.wv), &m(&c.wo), &m(&c.wi), &m(&c.wf),
-            &v(&c.bq), &v(&c.bk), &v(&c.bv), &v(&c.bo), &v(&c.bi), &v(&c.bf),
+            &m(&c.wq),
+            &m(&c.wk),
+            &m(&c.wv),
+            &m(&c.wo),
+            &m(&c.wi),
+            &m(&c.wf),
+            &v(&c.bq),
+            &v(&c.bk),
+            &v(&c.bv),
+            &v(&c.bo),
+            &v(&c.bi),
+            &v(&c.bf),
             &m(&c.w_out.weights),
             &v(&c.w_out.biases),
             &v(&c.head_norm.gamma),
@@ -253,10 +282,26 @@ impl MLstm {
     /// Upload a CPU cell (weights are copied; grads/moments start at zero).
     pub fn from_cpu(gpu: &Gpu, c: &crate::nn2::MLstm) -> Self {
         Self::from_parts(
-            gpu, c.input_size, c.d, c.heads, c.dqk,
-            &c.wq, &c.wk, &c.wv, &c.wo, &c.wi, &c.wf,
-            &c.bq, &c.bk, &c.bv, &c.bo, &c.bi, &c.bf,
-            &c.w_out, &c.b_out, &c.gamma,
+            gpu,
+            c.input_size,
+            c.d,
+            c.heads,
+            c.dqk,
+            &c.wq,
+            &c.wk,
+            &c.wv,
+            &c.wo,
+            &c.wi,
+            &c.wf,
+            &c.bq,
+            &c.bk,
+            &c.bv,
+            &c.bo,
+            &c.bi,
+            &c.bf,
+            &c.w_out,
+            &c.b_out,
+            &c.gamma,
         )
     }
 
@@ -304,7 +349,10 @@ impl MLstm {
     pub fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
         assert_eq!(x.rank, 3, "MLstm::forward expects [B, T, in]");
         let (b, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);
-        assert_eq!(inp, self.input_size, "MLstm::forward — input width mismatch");
+        assert_eq!(
+            inp, self.input_size,
+            "MLstm::forward — input width mismatch"
+        );
         let (d, h, dqk, dhv) = (self.d, self.heads, self.dqk, self.dhv);
         let (n, bh) = (b * t, b * h);
 
@@ -336,7 +384,16 @@ impl MLstm {
             let hconcat = ops::mul(gpu, &o, &yhat);
             let out = self.lin_out.forward(gpu, &hconcat);
             self.saved = Some(Cache::Fused(SavedFused {
-                b, t, qh, kh, vh, igh, fgh, fused, o, yhat,
+                b,
+                t,
+                qh,
+                kh,
+                vh,
+                igh,
+                fgh,
+                fused,
+                o,
+                yhat,
             }));
             return out.reshaped(&[b, t, d]);
         }
@@ -417,7 +474,19 @@ impl MLstm {
                     .reshaped(&[bh]);
             }
 
-            chunks.push(Chunk { c0, len, bvec, avec, qn, psi, m, num, dbar, ds, inter });
+            chunks.push(Chunk {
+                c0,
+                len,
+                bvec,
+                avec,
+                qn,
+                psi,
+                m,
+                num,
+                dbar,
+                ds,
+                inter,
+            });
         }
 
         // Back to position-major, head-norm, o-gate, output projection.
@@ -427,7 +496,17 @@ impl MLstm {
         let out = self.lin_out.forward(gpu, &hconcat); // [N, d]
 
         // `o`/`yhat` are unused after `mul`, so move (not dup) them into the cache.
-        self.saved = Some(Cache::Legacy(Saved { b, t, qh, kh, vh, fgh, chunks, o, yhat }));
+        self.saved = Some(Cache::Legacy(Saved {
+            b,
+            t,
+            qh,
+            kh,
+            vh,
+            fgh,
+            chunks,
+            o,
+            yhat,
+        }));
         out.reshaped(&[b, t, d])
     }
 
@@ -519,7 +598,8 @@ impl MLstm {
             let d_ytil_c = ops::slice_t(gpu, &d_ytil, c0, len); // [BH, L, dhv]
 
             // ỹ = num/ψ  → d_num, d_qn  (num/ψ/qn all include the inter term).
-            let (d_num, d_qn) = ops::div_rows_bwd(gpu, &d_ytil_c, &ch.num, &ch.psi, &ch.qn, &ch.m, dhv);
+            let (d_num, d_qn) =
+                ops::div_rows_bwd(gpu, &d_ytil_c, &ch.num, &ch.psi, &ch.qn, &ch.m, dhv);
 
             // The [BH, L, L] tensors, from forward's cache. Everything derived from
             // them below is at most [BH, L, dqk].
@@ -546,7 +626,7 @@ impl MLstm {
             let mut db = DTensor::zeros(gpu, &[bh, len]); // grad wrt b_t
             let mut da = DTensor::zeros(gpu, &[bh, len]); // grad wrt a_j
 
-            // --- state-update path: how this chunk fed the NEXT chunk's state -----
+            // state-update path: how this chunk fed the NEXT chunk's state
             //   C_out = g·C_in + (a⊙V)ᵀ·K ,  n_out = g·n_in + Σ_j a_j k_j
             // Skipped for the last chunk (dc_carry / dn_carry are zero there).
             let (mut dc_in, mut dn_in) = (None, None);
@@ -571,9 +651,9 @@ impl MLstm {
                 // chunk 0 the state is zero, so g contributes nothing and there is no
                 // predecessor to hand dC_in to.
                 if let Some(it) = &ch.inter {
-                    let g = ops::slice_t(
-                        gpu, &ch.bvec.dup(gpu).reshaped(&[bh, len, 1]), len - 1, 1,
-                    ).reshaped(&[bh]);
+                    let g =
+                        ops::slice_t(gpu, &ch.bvec.dup(gpu).reshaped(&[bh, len, 1]), len - 1, 1)
+                            .reshaped(&[bh]);
                     let mut dg = DTensor::zeros(gpu, &[bh]);
                     ops::group_dot_add(gpu, &mut dg, &dc_carry, &it.c_prev);
                     ops::group_dot_add(gpu, &mut dg, &dn_carry, &it.n_prev);
@@ -592,7 +672,7 @@ impl MLstm {
                 }
             }
 
-            // --- inter path: how this chunk READ its incoming state ---------------
+            // inter path: how this chunk READ its incoming state
             //   num += b⊙(Q·C_inᵀ) ,  qn += b⊙(Q·n_inᵀ)
             if let Some(it) = &ch.inter {
                 // db from both products (they are saved pre-b, which is what db needs).
@@ -603,8 +683,16 @@ impl MLstm {
                 let d_inter_qn = ops::mul_rows(gpu, &d_qn, &ch.bvec, 1).reshaped(&[bh, len, 1]);
 
                 // dQ from both readouts.
-                dqc = ops::add(gpu, &dqc, &ops::matmul_batched_nn(gpu, &d_inter_num, &it.c_prev));
-                dqc = ops::add(gpu, &dqc, &ops::matmul_batched_nn(gpu, &d_inter_qn, &it.n_prev));
+                dqc = ops::add(
+                    gpu,
+                    &dqc,
+                    &ops::matmul_batched_nn(gpu, &d_inter_num, &it.c_prev),
+                );
+                dqc = ops::add(
+                    gpu,
+                    &dqc,
+                    &ops::matmul_batched_nn(gpu, &d_inter_qn, &it.n_prev),
+                );
 
                 // dC_in / dn_in from both readouts (adding to the g·state term above).
                 let dc_r = ops::matmul_batched_tn(gpu, &d_inter_num, &qc); // [BH, dhv, dqk]
@@ -658,8 +746,15 @@ impl MLstm {
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
     pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
         let mut v = Vec::new();
-        for l in [&mut self.lin_q, &mut self.lin_k, &mut self.lin_v, &mut self.lin_o,
-                  &mut self.lin_i, &mut self.lin_f, &mut self.lin_out] {
+        for l in [
+            &mut self.lin_q,
+            &mut self.lin_k,
+            &mut self.lin_v,
+            &mut self.lin_o,
+            &mut self.lin_i,
+            &mut self.lin_f,
+            &mut self.lin_out,
+        ] {
             v.extend(l.params_mut());
         }
         v.extend(self.headnorm.params_mut());
@@ -667,8 +762,15 @@ impl MLstm {
     }
 
     pub fn zero_grad(&mut self, gpu: &Gpu) {
-        for l in [&mut self.lin_q, &mut self.lin_k, &mut self.lin_v, &mut self.lin_o,
-                  &mut self.lin_i, &mut self.lin_f, &mut self.lin_out] {
+        for l in [
+            &mut self.lin_q,
+            &mut self.lin_k,
+            &mut self.lin_v,
+            &mut self.lin_o,
+            &mut self.lin_i,
+            &mut self.lin_f,
+            &mut self.lin_out,
+        ] {
             l.zero_grad(gpu);
         }
         self.headnorm.zero_grad(gpu);
@@ -677,8 +779,15 @@ impl MLstm {
     /// AdamW step: projection + output matrices decay; biases and head-norm γ
     /// don't (all handled by the sub-layers). Clears the grads.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        for l in [&mut self.lin_q, &mut self.lin_k, &mut self.lin_v, &mut self.lin_o,
-                  &mut self.lin_i, &mut self.lin_f, &mut self.lin_out] {
+        for l in [
+            &mut self.lin_q,
+            &mut self.lin_k,
+            &mut self.lin_v,
+            &mut self.lin_o,
+            &mut self.lin_i,
+            &mut self.lin_f,
+            &mut self.lin_out,
+        ] {
             l.step(gpu, cfg);
         }
         self.headnorm.step(gpu, cfg);
@@ -686,12 +795,24 @@ impl MLstm {
 }
 
 impl Cell for MLstm {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor { MLstm::forward(self, gpu, x) }
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor { MLstm::backward(self, gpu, dy) }
-    fn zero_grad(&mut self, gpu: &Gpu) { MLstm::zero_grad(self, gpu) }
-    fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) { MLstm::step(self, gpu, cfg) }
-    fn params_mut(&mut self) -> Vec<&mut DTensor> { MLstm::params_mut(self) }
-    fn wants_post_cell_norm(&self) -> bool { false }
+    fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+        MLstm::forward(self, gpu, x)
+    }
+    fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+        MLstm::backward(self, gpu, dy)
+    }
+    fn zero_grad(&mut self, gpu: &Gpu) {
+        MLstm::zero_grad(self, gpu)
+    }
+    fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
+        MLstm::step(self, gpu, cfg)
+    }
+    fn params_mut(&mut self) -> Vec<&mut DTensor> {
+        MLstm::params_mut(self)
+    }
+    fn wants_post_cell_norm(&self) -> bool {
+        false
+    }
     fn to_nn_block(
         &self,
         gpu: &Gpu,
@@ -736,7 +857,9 @@ mod tests {
     /// itself FD-verified, so a GPU-vs-CPU grad match is the (tighter) check.
     #[test]
     fn mlstm_matches_cpu() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let (b, t, inp, d, heads, dqk) = (2, 6, 5, 8, 2, 4); // dhv = 4
 
         let mut cpu = CpuMLstm::new(inp, d, heads, dqk);
@@ -766,8 +889,18 @@ mod tests {
         // (weights live in the Linear sub-layers; check q, v, out projections + γ)
         assert_close(&dev.lin_q.w.to_host(&gpu).data, &cpu.wq.data, 3e-3, "wq");
         assert_close(&dev.lin_v.w.to_host(&gpu).data, &cpu.wv.data, 3e-3, "wv");
-        assert_close(&dev.lin_out.w.to_host(&gpu).data, &cpu.w_out.data, 3e-3, "w_out");
-        assert_close(&dev.headnorm.gamma.to_host(&gpu).data, &cpu.gamma.data, 3e-3, "gamma");
+        assert_close(
+            &dev.lin_out.w.to_host(&gpu).data,
+            &cpu.w_out.data,
+            3e-3,
+            "w_out",
+        );
+        assert_close(
+            &dev.headnorm.gamma.to_host(&gpu).data,
+            &cpu.gamma.data,
+            3e-3,
+            "gamma",
+        );
     }
 
     /// Chunking is an exact refactoring of the single-chunk form, so every chunk
@@ -781,7 +914,9 @@ mod tests {
     /// reaches.
     #[test]
     fn mlstm_chunking_matches_single_chunk() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let (b, t, inp, d, heads, dqk) = (2, 20, 5, 8, 2, 4);
 
         let mut proto = CpuMLstm::new(inp, d, heads, dqk);
@@ -831,9 +966,14 @@ mod tests {
     /// the ragged final chunk. A bug in any of those is invisible at the toy dims.
     #[test]
     fn mlstm_fused_matches_legacy() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let (b, t, inp, d, heads, dqk) = (2, 200, 64, 512, 8, 64); // dhv = 64
-        assert!(t % super::ops::FUSED_MAX_L != 0, "the last chunk must be short");
+        assert!(
+            t % super::ops::FUSED_MAX_L != 0,
+            "the last chunk must be short"
+        );
 
         let mut proto = CpuMLstm::new(inp, d, heads, dqk);
         proto.wi = Tensor::random(&[inp, heads], 0.3);
@@ -900,13 +1040,18 @@ mod tests {
     /// that is not a multiple of the mma tile, and a `len` shorter than one tile.
     #[test]
     fn mlstm_fused_mma_matches_scalar() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         if !gpu.kernels.has_mma {
             eprintln!("skipping: device has no tensor cores (needs sm_80+)");
             return;
         }
         let (b, t, inp, d, heads, dqk) = (2, 200, 64, 512, 8, 64); // dhv = 64
-        assert!(t % super::ops::FUSED_MAX_L != 0, "the last chunk must be short");
+        assert!(
+            t % super::ops::FUSED_MAX_L != 0,
+            "the last chunk must be short"
+        );
 
         let mut proto = CpuMLstm::new(inp, d, heads, dqk);
         proto.wi = Tensor::random(&[inp, heads], 0.3);
@@ -936,7 +1081,10 @@ mod tests {
                 .iter()
                 .zip(want)
                 .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
-            println!("{what}: worst |mma - scalar| {worst:.3e} on a scale of {scale:.3e} -> {:.2e} relative", worst / scale);
+            println!(
+                "{what}: worst |mma - scalar| {worst:.3e} on a scale of {scale:.3e} -> {:.2e} relative",
+                worst / scale
+            );
             assert!(
                 worst / scale < tol,
                 "{what}: worst |mma - scalar| {worst:.3e} vs scale {scale:.3e} exceeds {tol:.0e}"
@@ -952,7 +1100,9 @@ mod tests {
     /// (not just against the GPU's own single-chunk form).
     #[test]
     fn mlstm_chunked_matches_cpu() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let (b, t, inp, d, heads, dqk) = (2, 20, 5, 8, 2, 4);
 
         let mut cpu = CpuMLstm::new(inp, d, heads, dqk);
@@ -978,6 +1128,11 @@ mod tests {
         dev.step(&gpu, &cfg);
         assert_close(&dev.lin_q.w.to_host(&gpu).data, &cpu.wq.data, 3e-3, "wq");
         assert_close(&dev.lin_f.w.to_host(&gpu).data, &cpu.wf.data, 3e-3, "wf");
-        assert_close(&dev.lin_out.w.to_host(&gpu).data, &cpu.w_out.data, 3e-3, "w_out");
+        assert_close(
+            &dev.lin_out.w.to_host(&gpu).data,
+            &cpu.w_out.data,
+            3e-3,
+            "w_out",
+        );
     }
 }
