@@ -952,6 +952,38 @@ pub fn scatter_rows(gpu: &Gpu, dst: &mut DTensor, src: &DTensor, row_ids: &[usiz
     unsafe { lb.launch(LaunchConfig::for_num_elems((rows * dim) as u32)) }.expect("scatter_rows");
 }
 
+/// Column-concatenate `a` `[R, C]` and `b` `[R, C]` into a fresh `[R, 2C]`
+/// tensor `[a | b]`. Used by the bidirectional encoder to build
+/// `[fwd_readout ; bwd_readout]` before the combine projection.
+pub fn concat_cols(gpu: &Gpu, a: &DTensor, b: &DTensor) -> DTensor {
+    let (r, c) = (a.rows(), a.cols());
+    assert_eq!(b.rows(), r, "concat_cols: row mismatch");
+    assert_eq!(b.cols(), c, "concat_cols: col mismatch");
+    let mut out = DTensor::uninit(gpu, &[r, 2 * c]);
+    let (r_i, c_i) = (r as i32, c as i32);
+    let f = gpu.kernels.get("concat_cols");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut out.buf).arg(&a.buf).arg(&b.buf).arg(&r_i).arg(&c_i);
+    unsafe { lb.launch(LaunchConfig::for_num_elems((r * 2 * c) as u32)) }.expect("concat_cols");
+    out
+}
+
+/// Inverse of [`concat_cols`]: split `d_out` `[R, 2C]` into `(da, db)`, each
+/// `[R, C]` (the first and last `C` columns).
+pub fn split_cols(gpu: &Gpu, d_out: &DTensor) -> (DTensor, DTensor) {
+    let (r, cc) = (d_out.rows(), d_out.cols());
+    debug_assert_eq!(cc % 2, 0, "split_cols: odd width");
+    let c = cc / 2;
+    let mut da = DTensor::uninit(gpu, &[r, c]);
+    let mut db = DTensor::uninit(gpu, &[r, c]);
+    let (r_i, c_i) = (r as i32, c as i32);
+    let f = gpu.kernels.get("split_cols");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&d_out.buf).arg(&mut da.buf).arg(&mut db.buf).arg(&r_i).arg(&c_i);
+    unsafe { lb.launch(LaunchConfig::for_num_elems((r * 2 * c) as u32)) }.expect("split_cols");
+    (da, db)
+}
+
 /// Masked softmax cross-entropy (the hierarchical decode loss). `mask[r] == false`
 /// marks a padding row: zero loss, zero grad. Normalized by the number of valid
 /// rows. Returns `(mean_loss, dlogits)`.

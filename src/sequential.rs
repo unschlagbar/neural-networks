@@ -32,8 +32,8 @@ pub struct Sequential {
 
 impl Sequential {
     /// Assemble a stack from already-built layers (input/output/scratch derived
-    /// from them, no forward cache). Mirrors what `load_from` produces, so the
-    /// result serializes identically via `write_to`.
+    /// from them, no forward cache). Mirrors what `load_stack` produces, so the
+    /// result serializes identically via `write_stack`.
     pub fn from_layers(layers: Vec<Box<dyn NnLayer>>) -> Self {
         let input_size = layers.first().map(|l| l.input_size()).unwrap_or(0);
         let output_size = layers.last().map(|l| l.output_size()).unwrap_or(0);
@@ -66,7 +66,7 @@ impl Sequential {
             .unwrap_or(0)
     }
 
-    /// Deep-copy the layer stack `n` times by round-tripping the NNFW blob:
+    /// Deep-copy the layer stack `n` times by round-tripping a stack blob:
     /// weights are copied, grad accumulators start zeroed, no forward cache.
     /// Used to give each worker thread its own recurrent state and gradient
     /// accumulators during data-parallel training. Serialized once,
@@ -74,15 +74,35 @@ impl Sequential {
     /// cost is on the training hot path).
     pub fn replicas(&self, n: usize) -> Vec<Sequential> {
         let mut blob = Vec::new();
-        self.write_to(&mut blob)
+        self.write_stack(&mut blob)
             .expect("in-memory model serialization cannot fail");
         (0..n)
             .into_par_iter()
             .map(|_| {
                 let mut r = Cursor::new(blob.as_slice());
-                Sequential::load_from(&mut r).expect("model blob failed to round-trip")
+                Sequential::load_stack(&mut r).expect("model blob failed to round-trip")
             })
             .collect()
+    }
+
+    /// Save this flat model to a file as an `NNM1` container (kind = Flat).
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        crate::format::Writer::new(crate::format::ModelKind::Flat, crate::format::Meta::default())
+            .section("model", &self.layers)
+            .save(path)
+    }
+
+    /// Load a flat model from an `NNM1` container file. Errors if the file is a
+    /// different model kind.
+    pub fn load(path: &str) -> std::io::Result<Self> {
+        let mut reader = crate::format::Reader::load(path)?;
+        if reader.kind != crate::format::ModelKind::Flat {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("expected a Flat model, got {:?}", reader.kind),
+            ));
+        }
+        reader.take_stack("model")
     }
 
     /// Fold a replica's accumulated gradients into this stack (element-wise
@@ -95,7 +115,7 @@ impl Sequential {
 
     /// Overwrite this stack's weights with `master`'s, layer by layer (plain
     /// memcpy). Refreshes an existing replica after an optimizer step without
-    /// the NNFW round-trip of [`replicas`](Self::replicas): no serialization,
+    /// the stack-blob round-trip of [`replicas`](Self::replicas): no serialization,
     /// no allocation, grad accumulators and caches stay as they are.
     pub fn copy_weights_from(&mut self, master: &Sequential) {
         debug_assert_eq!(self.layers.len(), master.layers.len());

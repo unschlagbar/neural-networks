@@ -1,5 +1,6 @@
 pub mod batches;
 pub mod config;
+pub mod format;
 pub mod hierarchical;
 pub mod inspect;
 pub mod loading;

@@ -1,12 +1,11 @@
 use std::{
-    fs::File,
     io::{BufRead, stdin},
     path::{Path, PathBuf},
 };
 
 use crate::{
+    format::{ModelKind, Reader},
     hierarchical::Hierarchical,
-    loading::read_u32,
     nn::{
         causal_conv1d::CausalConv1dLayer, dropout::DropoutLayer, embedding::EmbeddingLayer,
         linear::LinearLayer, linear_nb::LinearNBLayer, lstm::LSTMLayer, mlstm::MLSTMLayer,
@@ -14,7 +13,6 @@ use crate::{
         slstm_block::SLSTMBlock, soft_cap::SoftCapLayer,
     },
     nn_layer::NnLayer,
-    saving::{HIER_MAGIC, MAGIC},
     sequential::Sequential,
 };
 
@@ -33,32 +31,37 @@ pub fn inspect_model() {
     };
     let path = path.to_string_lossy();
 
-    let magic = read_u32(&mut File::open(path.as_ref()).unwrap()).unwrap_or(0);
-    match magic {
-        MAGIC => {
+    let kind = match Reader::peek_kind(&path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("{path}: not an NNM1 model file ({e})");
+            std::process::exit(2);
+        }
+    };
+    match kind {
+        ModelKind::Flat => {
             let model = Sequential::load(&path).unwrap();
-            println!("\n{path}  (NNFW, flat)");
+            println!("\n{path}  (NNM1, flat)");
             print_sequential(&model);
         }
-        HIER_MAGIC => {
-            // Raw stacks, not `Hierarchical::load` — old decoder layouts stay
+        ModelKind::Hierarchical => {
+            // Raw stacks, not `Hierarchical::load` — old layouts stay
             // inspectable even though they fail the current-architecture asserts.
             let stacks = Hierarchical::load_stacks(&path).unwrap();
-            println!("\n{path}  (HIER, hierarchical)");
+            println!("\n{path}  (NNM1, hierarchical)");
             println!(
-                "vocab_size = {}, context_size = {}, boundary tokens = {:?}, step = {}",
-                stacks.vocab_size, stacks.context_size, stacks.boundary_token_ids, stacks.step,
+                "vocab_size = {}, context_size = {}, step = {}",
+                stacks.vocab_size, stacks.context_size, stacks.step,
             );
-            println!("\nencoder (char model):");
-            print_sequential(&stacks.encoder_chars);
+            println!("\nencoder fwd (char model):");
+            print_sequential(&stacks.encoder_fwd);
+            println!("\nencoder bwd (char model):");
+            print_sequential(&stacks.encoder_bwd);
+            println!("\ncombine: [fwd ; bwd] → e_w (Linear)");
             println!("\nword_model:");
             print_sequential(&stacks.word_model);
             println!("\nchar2_model:");
             print_sequential(&stacks.char2_model);
-        }
-        other => {
-            eprintln!("{path}: unknown magic 0x{other:08X} — not a NNFW or HIER model file");
-            std::process::exit(2);
         }
     }
 }

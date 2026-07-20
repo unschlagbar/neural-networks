@@ -1,7 +1,4 @@
-use std::{
-    fs::File,
-    io::{self, Read},
-};
+use std::io::{self, Read};
 
 use iron_oxide::collections::Matrix;
 
@@ -13,7 +10,7 @@ use crate::{
         slstm_block::SLSTMBlock, soft_cap::SoftCapLayer,
     },
     nn_layer::NnLayer,
-    saving::{MAGIC, VERSION},
+    saving::{STACK_MAGIC, STACK_VERSION},
     sequential::Sequential,
 };
 
@@ -51,6 +48,13 @@ pub fn read_matrix(r: &mut dyn Read) -> io::Result<Matrix> {
     let cols = read_u32(r)? as usize;
     let flat = read_f32_vec(r)?;
     Ok(Matrix::from_box(flat, rows, cols))
+}
+/// Length-prefixed UTF-8 string (u32 byte count + bytes).
+pub fn read_string(r: &mut dyn Read) -> io::Result<String> {
+    let len = read_u32(r)? as usize;
+    let mut bytes = vec![0u8; len];
+    r.read_exact(&mut bytes)?;
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 pub struct LoadCtx {
@@ -358,54 +362,61 @@ fn new_layer(r: &mut dyn Read, tag: u8, ctx: LoadCtx) -> io::Result<Option<Box<d
     Ok(Some(layer))
 }
 
-impl Sequential {
-    /// Load from any `Read` source.
-    /// Used by both `load()` and `HierarchicalSequential::load()`.
-    pub fn load_from(r: &mut dyn Read) -> io::Result<Self> {
-        if read_u32(r)? != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Wrong magic number",
-            ));
-        }
-        if read_u8(r)? != VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Unknown version",
-            ));
-        }
-        let n = read_u32(r)? as usize;
+/// Load a layer stack (arch header + weights) from a blob. The primitive behind
+/// [`Sequential::load_stack`]; used directly for single-layer stages.
+pub fn load_layers(r: &mut dyn Read) -> io::Result<Vec<Box<dyn NnLayer>>> {
+    if read_u32(r)? != STACK_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Wrong stack magic number",
+        ));
+    }
+    if read_u8(r)? != STACK_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unknown stack version",
+        ));
+    }
+    let n = read_u32(r)? as usize;
 
-        struct ArchEntry {
-            tag: u8,
-            input_size: usize,
-            out_size: usize,
-        }
+    struct ArchEntry {
+        tag: u8,
+        input_size: usize,
+        out_size: usize,
+    }
 
-        let arch: Vec<ArchEntry> = (0..n)
-            .map(|_| {
-                let tag = read_u8(r)?;
-                let input_size = read_u32(r)? as usize;
-                let out_size = read_u32(r)? as usize;
-                Ok(ArchEntry {
-                    tag,
-                    input_size,
-                    out_size,
-                })
+    let arch: Vec<ArchEntry> = (0..n)
+        .map(|_| {
+            let tag = read_u8(r)?;
+            let input_size = read_u32(r)? as usize;
+            let out_size = read_u32(r)? as usize;
+            Ok(ArchEntry {
+                tag,
+                input_size,
+                out_size,
             })
-            .collect::<io::Result<_>>()?;
+        })
+        .collect::<io::Result<_>>()?;
 
-        let mut layers: Vec<Box<dyn NnLayer>> = Vec::with_capacity(n);
-        for e in arch {
-            let ctx = LoadCtx {
-                input_size: e.input_size,
-                output_size: e.out_size,
-            };
-            if let Some(layer) = new_layer(r, e.tag, ctx)? {
-                layers.push(layer);
-            }
+    let mut layers: Vec<Box<dyn NnLayer>> = Vec::with_capacity(n);
+    for e in arch {
+        let ctx = LoadCtx {
+            input_size: e.input_size,
+            output_size: e.out_size,
+        };
+        if let Some(layer) = new_layer(r, e.tag, ctx)? {
+            layers.push(layer);
         }
+    }
+    Ok(layers)
+}
 
+impl Sequential {
+    /// Load a stack blob (arch header + weights) from any `Read` source. The
+    /// counterpart to [`Sequential::write_stack`]; the container in
+    /// `src/format.rs` calls this per section.
+    pub fn load_stack(r: &mut dyn Read) -> io::Result<Self> {
+        let layers = load_layers(r)?;
         let input_size = layers.first().map(|l| l.input_size()).unwrap_or(0);
         let output_size = layers.last().map(|l| l.output_size()).unwrap_or(0);
         let max_size = layers.iter().map(|l| l.output_size()).max().unwrap_or(0);
@@ -418,10 +429,5 @@ impl Sequential {
             delta_buf: vec![0.0; max_size].into(),
             input_buf: vec![0.0; input_size].into(),
         })
-    }
-
-    /// Load from a file path.
-    pub fn load(path: &str) -> io::Result<Self> {
-        Self::load_from(&mut File::open(path)?)
     }
 }

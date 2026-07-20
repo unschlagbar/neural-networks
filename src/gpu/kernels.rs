@@ -709,6 +709,28 @@ extern "C" __global__ void scatter_rows(float* dst, const float* src, const unsi
     dst[(long)row_ids[r] * dim + c] = src[i];
 }
 
+// Column-concatenate a[R,C] and b[R,C] into out[R,2C]: out[r,0..C]=a[r],
+// out[r,C..2C]=b[r]. One thread per element of out. Used by the bidirectional
+// encoder to build [fwd_readout ; bwd_readout] before the combine projection.
+extern "C" __global__ void concat_cols(float* out, const float* a, const float* b,
+                                        int R, int C) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= R * 2 * C) return;
+    int r = i / (2 * C), c = i % (2 * C);
+    out[i] = (c < C) ? a[(long)r * C + c] : b[(long)r * C + (c - C)];
+}
+
+// Inverse of concat_cols: split d_out[R,2C] into da[R,C] (first C cols) and
+// db[R,C] (last C cols). One thread per element of d_out.
+extern "C" __global__ void split_cols(const float* d_out, float* da, float* db,
+                                       int R, int C) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= R * 2 * C) return;
+    int r = i / (2 * C), c = i % (2 * C);
+    if (c < C) da[(long)r * C + c] = d_out[i];
+    else       db[(long)r * C + (c - C)] = d_out[i];
+}
+
 // Masked softmax cross-entropy (the hierarchical decode loss). Rows with mask==0
 // are padding: zero grad, zero loss. `inv` = 1/num_valid (computed host-side), so
 // the caller's loss is sum(row_loss)*inv and dlogits = (p − onehot)*inv.
@@ -2069,6 +2091,8 @@ const NAMES: &[&str] = &[
     "mlstm_bw_dC",
     "mlstm_bw_parallel",
     "scatter_rows",
+    "concat_cols",
+    "split_cols",
     "masked_softmax_ce",
 ];
 
