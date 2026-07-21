@@ -492,10 +492,11 @@ impl Hierarchical {
     /// readout row and the group's `tmax`. A word has `len+1` steps (its chars
     /// plus one `[W]`).
     ///
-    /// - `reversed == false` (fwd): `c1 … cn [W]`, readout at the `[W]` step
-    ///   (row `len`).
-    /// - `reversed == true` (bwd): `[W] cn … c1`, readout at the last real step
-    ///   (`c1`, also row `len`). Padding stays in the trailing rows either way.
+    /// - `reversed == false` (fwd): `c1 … cn [W]`, readout at the `[W]` step.
+    /// - `reversed == true` (bwd): `cn … c1 [W]`, also readout at the `[W]` step.
+    ///
+    /// Both directions end on `[W]` (row `len`), so each reads out at a step that
+    /// carries the end-of-word signal. Padding stays in the trailing rows.
     fn enc_group_rows(
         &self,
         tokens: &[usize],
@@ -511,19 +512,18 @@ impl Hierarchical {
             let (s, _) = words[w];
             let len = enc_lens[w];
             if reversed {
-                // [W] cn … c1
-                ids[i * tmax] = self.cfg.w_token;
+                // cn … c1 [W]
                 for k in 0..len {
-                    ids[i * tmax + 1 + k] = tokens[s + len - 1 - k];
+                    ids[i * tmax + k] = tokens[s + len - 1 - k];
                 }
             } else {
                 // c1 … cn [W]
                 for k in 0..len {
                     ids[i * tmax + k] = tokens[s + k];
                 }
-                ids[i * tmax + len] = self.cfg.w_token;
             }
-            // Both directions read out at row `len` (fwd's [W], bwd's c1).
+            // Both directions close on [W] and read out there.
+            ids[i * tmax + len] = self.cfg.w_token;
             readout[i] = i * tmax + len;
         }
         (ids, readout, tmax)

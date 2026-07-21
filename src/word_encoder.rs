@@ -6,8 +6,14 @@
 //   - `fwd` reads the word's characters in order `c1 … cn` plus a closing `[W]`
 //     end-of-word step, and reads out at that `[W]` step — the state has seen
 //     the whole word AND knows it is complete.
-//   - `bwd` reads the SAME word reversed, `[W] cn … c1`, and reads out at its
-//     final step (`c1`). It too has seen the whole word at its readout.
+//   - `bwd` reads the characters back-to-front, `cn … c1`, and then the SAME
+//     closing `[W]`, reading out there too.
+//
+// Both directions therefore end on `[W]` (`hallo` → fwd `h a l l o [W]`, bwd
+// `o l l a h [W]`), so each readout is taken at a step carrying the
+// end-of-word signal. Reversing the whole sequence instead (`[W] o l l a h`)
+// would read the backward direction out at an ordinary char step, an asymmetry
+// the two directions do not recover from.
 //
 // The two readouts are concatenated `[fwd ; bwd]` (width `2·char_out`) and a
 // `combine` Linear projects them back to `char_out`, which is `e_w`. Keeping
@@ -15,8 +21,8 @@
 // input width and the tied char-embedding width (CHAR_HIDDEN == OUT_HIDDEN).
 //
 // The `[W]` is fed virtually to each stack (the token slices never contain it)
-// and is gated by `ENC_W_EOS` in `config.rs`; disabled, `fwd` reads out at the
-// last char and `bwd` at the first char. State is reset per word, so words
+// and is gated by `ENC_W_EOS` in `config.rs`; disabled, each direction reads out
+// at its own last character (`cn` for `fwd`, `c1` for `bwd`). State is reset per word, so words
 // encode independently — and that independence is exploited: the words of a
 // window are split across replica pools (see `parallel.rs`) and encoded
 // data-parallel, each worker writing into its own slice of the shared caches.
@@ -44,7 +50,7 @@ use crate::{
 pub struct WordEncoder {
     /// Forward character stack (`c1 … cn [W]`, readout at `[W]`).
     pub fwd: Sequential,
-    /// Backward character stack (`[W] cn … c1`, readout at `c1`).
+    /// Backward character stack (`cn … c1 [W]`, readout at `[W]`).
     pub bwd: Sequential,
     /// Projection of the concatenated readouts `[fwd ; bwd]` → `e_w`.
     pub combine: LinearLayer,
@@ -381,11 +387,8 @@ impl WordEncoder {
         for layer in &mut self.fwd.layers {
             layer.reset_state();
         }
-        let fwd_toks = word
-            .iter()
-            .copied()
-            .chain(ENC_W_EOS.then_some(self.w_token));
-        for (k, tok) in fwd_toks.enumerate() {
+        let fwd_toks = dir_stream(word, self.w_token, false);
+        for (k, tok) in fwd_toks.into_iter().enumerate() {
             self.char_input[tok as usize] = 1.0;
             forward_sample_step(
                 &mut self.fwd.layers,
@@ -395,15 +398,12 @@ impl WordEncoder {
             self.char_input[tok as usize] = 0.0;
         }
 
-        // bwd: [W] cn … c1   (readout at the same slot index)
+        // bwd: cn … c1 [W]   (readout at the same slot index, on the [W] step)
         for layer in &mut self.bwd.layers {
             layer.reset_state();
         }
-        let bwd_toks = ENC_W_EOS
-            .then_some(self.w_token)
-            .into_iter()
-            .chain(word.iter().rev().copied());
-        for (k, tok) in bwd_toks.enumerate() {
+        let bwd_toks = dir_stream(word, self.w_token, true);
+        for (k, tok) in bwd_toks.into_iter().enumerate() {
             self.char_input[tok as usize] = 1.0;
             forward_sample_step(
                 &mut self.bwd.layers,
@@ -440,8 +440,17 @@ impl WordEncoder {
 }
 
 /// One direction's parallel encode over a worker's word chunk. `reversed` feeds
-/// `[W] cn … c1` instead of `c1 … cn [W]`; either way the readout lands in the
-/// chunk's last slot for the word.
+/// the word's characters back-to-front but keeps the closing `[W]` LAST, so
+/// both directions end on the end-of-word marker and read out there:
+///
+///   fwd:  h a l l o [W]
+///   bwd:  o l l a h [W]
+///
+/// The `[W]` step is what tells the cell the word is complete, so both readouts
+/// are taken at a step that carries that signal (the alternative — reversing the
+/// whole sequence to `[W] o l l a h` — reads the backward direction out at an
+/// ordinary char step with no completion marker). Either way the readout lands
+/// in the chunk's last slot for the word.
 fn encode_dir(
     chunk: WorkerChunk,
     tokens: &[u16],
@@ -464,27 +473,31 @@ fn encode_dir(
         }
         let base = enc_ranges[w].start - slot_base;
         let word = words[w];
-        // Build this direction's token stream.
-        let chars = (word.start..word.end).map(|u| tokens[u]);
-        let stream: Box<dyn Iterator<Item = u16>> = if reversed {
-            // [W] cn … c1
-            Box::new(
-                ENC_W_EOS
-                    .then_some(w_token)
-                    .into_iter()
-                    .chain((word.start..word.end).rev().map(|u| tokens[u])),
-            )
-        } else {
-            // c1 … cn [W]
-            Box::new(chars.chain(ENC_W_EOS.then_some(w_token)))
-        };
-        for (k, tok) in stream.enumerate() {
+        let stream = dir_stream(&tokens[word.start..word.end], w_token, reversed);
+        for (k, tok) in stream.into_iter().enumerate() {
             let tok = tok as usize;
             char_input[tok] = 1.0;
             Sequential::forward_step(&mut replica.layers, &mut cache[base + k], &char_input);
             char_input[tok] = 0.0;
         }
     }
+}
+
+/// The token stream one direction consumes for a word: its characters (reversed
+/// for `bwd`) followed by the closing `[W]`. Both directions end on `[W]`, so
+/// the readout — always the last step — carries the end-of-word signal.
+///
+///   `hallo` → fwd `h a l l o [W]` · bwd `o l l a h [W]`
+pub(crate) fn dir_stream(chars: &[u16], w_token: u16, reversed: bool) -> Vec<u16> {
+    let mut out: Vec<u16> = if reversed {
+        chars.iter().rev().copied().collect()
+    } else {
+        chars.to_vec()
+    };
+    if ENC_W_EOS {
+        out.push(w_token);
+    }
+    out
 }
 
 fn forward_sample_step(
@@ -496,5 +509,46 @@ fn forward_sample_step(
         let (left, right) = caches_t.split_at_mut(l);
         let inp: &[f32] = if l == 0 { input } else { left[l - 1].output() };
         layers[l].forward_sample(inp, right[0].as_mut());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tokenizer_utf8::Utf8Tokenizer;
+
+    /// Both encoder directions must end on the `[W]` marker, so each reads out
+    /// at a step that knows the word is complete:
+    ///   `hallo` → fwd `h a l l o [W]` · bwd `o l l a h [W]`
+    /// Reversing the WHOLE sequence instead (`[W] o l l a h`) would read the
+    /// backward direction out at a plain char step — that asymmetry is the bug
+    /// this pins against.
+    #[test]
+    fn both_directions_end_on_the_w_marker() {
+        let tok = Utf8Tokenizer::new();
+        let w = tok.w_token();
+        let chars = tok.to_tokens("hallo");
+
+        let fwd = dir_stream(&chars, w, false);
+        let bwd = dir_stream(&chars, w, true);
+
+        assert_eq!(tok.to_text(&fwd[..fwd.len() - 1]), "hallo");
+        assert_eq!(tok.to_text(&bwd[..bwd.len() - 1]), "ollah");
+        // The readout step (the last one) is the [W] marker in BOTH directions.
+        assert_eq!(*fwd.last().unwrap(), w);
+        assert_eq!(*bwd.last().unwrap(), w);
+        // Same length, so both share the cache slot range and readout index.
+        assert_eq!(fwd.len(), bwd.len());
+    }
+
+    /// A one-char word is its own reverse — the two directions differ only by
+    /// their weights, and the readout is still the [W] step.
+    #[test]
+    fn single_char_word_is_symmetric() {
+        let tok = Utf8Tokenizer::new();
+        let w = tok.w_token();
+        let chars = tok.to_tokens("x");
+        assert_eq!(dir_stream(&chars, w, false), dir_stream(&chars, w, true));
+        assert_eq!(*dir_stream(&chars, w, true).last().unwrap(), w);
     }
 }
