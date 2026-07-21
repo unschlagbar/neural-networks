@@ -92,8 +92,8 @@
   <h1>Word segmentation demo</h1>
   <p class="sub">Exact port of <code>src/segment.rs</code> (<code>word_ends</code>), operating on UTF-8 bytes.</p>
 
-  <textarea id="in" spellcheck="false">fn main() {
-    let x: Vec&lt;u8&gt; = vec![1_000u32, 0..=9];
+  <textarea id="in" spellcheck="false">fn build_hierarchical_model(vocab: usize) -> Hierarchical {
+    let x: Vec&lt;u8&gt; = vec![1_000u32, 0..=9, 128, 0xFF];
     println!("Größe: {}", x.len()); // it's fine, can't fail
 }</textarea>
 
@@ -183,6 +183,29 @@
       const na0 = nonAscii(seq, i);
       if (isIdentStart(tok) || (na0 && na0[1])) {
         let e = i + Math.max(identRun(seq, i), 1);
+        // An underscore BETWEEN identifier bytes closes the word, exactly like
+        // the hyphen rule below: `build_hierarchical_model` → `build_` +
+        // `hierarchical_` + `model`. A LEADING `_` (`_private`) has no word
+        // before it to close, so it stays glued to the one that follows.
+        let u = -1;
+        for (let k = i + 1; k < e; k++) if (seq[k] === UND) { u = k; break; }
+        if (u >= 0) {
+          // A run of underscores (`foo__bar`) closes as one separator.
+          while (u < e && seq[u] === UND) u++;
+          if (u < e) return u;
+        }
+        // Digits inside the identifier pair off like a standalone number, and a
+        // letter after them closes the word (`1u32` → `1` + `u32`). Digits
+        // FOLLOWING letters do not open a new word — `Vec2` and `u32` are one
+        // name — so the leading letters ride along with the run's first pair
+        // (`sha256` → `sha25` + `6`).
+        let d = -1;
+        for (let k = i; k < e; k++) if (isDigit(seq[k])) { d = k; break; }
+        if (d >= 0) {
+          let run = 0;
+          while (d + run < e && isDigit(seq[d + run])) run++;
+          if (run > 2 || d + run < e) return d + Math.min(run, 2);
+        }
         // Absorb an English contraction / possessive suffix.
         while (e + 1 < seq.length && seq[e] === QUOTE && isIdent(seq[e + 1])) {
           e++;
@@ -195,13 +218,12 @@
       }
 
       if (isDigit(tok)) {
-        let e = i + 1;
-        while (e < seq.length) {
-          if (isIdent(seq[e])) e++;
-          else if (seq[e] === DOT && e + 1 < seq.length && isDigit(seq[e + 1])) e += 2;
-          else break;
-        }
-        return e;
+        // A digit run is emitted in PAIRS: `128` → `12` + `8`. A letter after
+        // them closes the word, so a hex prefix or type suffix comes out whole
+        // (`0xFF` → `0` + `xFF`, `3.14` → `3` + `.` + `14`).
+        let run = 0;
+        while (i + run < seq.length && isDigit(seq[i + run])) run++;
+        return i + Math.min(run, 2);
       }
 
       // Lifetime `'a`: quote, identifier, and no closing quote.

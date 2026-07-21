@@ -146,7 +146,7 @@ impl Hierarchical {
     pub fn new(gpu: &Gpu, cfg: &HierCfg) -> Self {
         let bb_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.bb_blocks)
             .map(|i| {
-                if i % 2 == 0 {
+                if i % 4 == 0 {
                     Box::new(Block::from_cell(
                         gpu,
                         cfg.wh,
@@ -165,7 +165,7 @@ impl Hierarchical {
             .collect();
         let dec_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.dec_blocks)
             .map(|i| {
-                if i == 0 {
+                if i != 1 {
                     Box::new(Block::from_cell(
                         gpu,
                         cfg.hc,

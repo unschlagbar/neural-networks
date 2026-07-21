@@ -26,9 +26,18 @@ use std::{
 
 use rand::{rng, seq::SliceRandom};
 
-use crate::{segment, tokenizer_utf8::Utf8Tokenizer};
+use crate::{
+    config::{ALLOWED_LANGUAGES, PARQUET_LANGUAGE_COLUMN},
+    parquet::ParquetColumnReader,
+    segment,
+    tokenizer_utf8::Utf8Tokenizer,
+};
 
 const SPLIT: &str = "<|endoftext|>";
+
+/// Column read from a parquet corpus. FineWeb-style dumps put the document body
+/// in `text`; override with the `PARQUET_TEXT_COLUMN` env var.
+const PARQUET_TEXT_COLUMN: &str = "text";
 //const SPLIT: &str = "---FILE---";
 
 #[derive(Clone, Copy, Debug)]
@@ -343,19 +352,40 @@ impl WordChunk {
     }
 }
 
-/// Streaming loader: reads `chunk_bytes` of raw text at a time, cuts at the
-/// last complete document, and hands out ready-to-train `WordChunk`s.
+/// Where raw documents come from. Both variants hand the loader the same thing
+/// — a batch of *complete* documents — so everything downstream (tokenizing,
+/// windowing, the guarantee that windows never cross a document border) is
+/// shared. A `.parquet` path selects `Parquet`, anything else `Text`.
+enum TextSource {
+    /// Plain text with `<|endoftext|>` separators, read `chunk_bytes` at a time
+    /// and cut at the last complete document.
+    Text {
+        reader: BufReader<File>,
+        /// Bytes after the last complete document of the previous read — they
+        /// become the prefix of the next chunk.
+        carry: Vec<u8>,
+        eof: bool,
+    },
+    /// One BYTE_ARRAY column, one row per document. Row groups are already
+    /// document-aligned, so no carry and no separator scanning is needed; a
+    /// chunk is however many row groups it takes to reach `chunk_bytes`.
+    Parquet {
+        reader: ParquetColumnReader,
+        /// Whether a second (language) column is being read alongside the text.
+        /// False when filtering is off or the corpus has no language column.
+        filter_language: bool,
+    },
+}
+
+/// Streaming loader: gathers roughly `chunk_bytes` of raw text at a time from
+/// the source and hands out ready-to-train `WordChunk`s.
 pub struct ChunkedWordDataSet {
     tokenizer: Rc<Utf8Tokenizer>,
     words_per_seq: usize,
     min_words: usize,
     max_tokens: usize,
     chunk_bytes: usize,
-    reader: BufReader<File>,
-    /// Bytes after the last complete document of the previous read — they
-    /// become the prefix of the next chunk.
-    carry: Vec<u8>,
-    eof: bool,
+    source: TextSource,
     /// Suppress the per-chunk summary line (used by counting passes).
     quiet: bool,
 }
@@ -372,7 +402,61 @@ impl ChunkedWordDataSet {
         assert!(words_per_seq >= 2, "words_per_seq must be >= 2");
         assert!(chunk_bytes > SPLIT.len(), "chunk_bytes is too small");
 
-        let file = File::open(path).unwrap_or_else(|e| panic!("could not open {path:?}: {e}"));
+        let source = if path.rsplit('.').next() == Some("parquet") {
+            let column = std::env::var("PARQUET_TEXT_COLUMN")
+                .unwrap_or_else(|_| PARQUET_TEXT_COLUMN.to_string());
+
+            // Read the language column alongside the text when filtering is on.
+            // A corpus without that column is not an error — it just means there
+            // is nothing to filter on, so fall back to reading the text alone.
+            let (reader, filter_language) = if ALLOWED_LANGUAGES.is_empty() {
+                (None, false)
+            } else {
+                match ParquetColumnReader::open_columns(
+                    path,
+                    &[&column, PARQUET_LANGUAGE_COLUMN],
+                ) {
+                    Ok(r) => (Some(r), true),
+                    Err(e) => {
+                        println!(
+                            "  parquet: no usable {PARQUET_LANGUAGE_COLUMN:?} column ({e}) \
+                             — keeping every document"
+                        );
+                        (None, false)
+                    }
+                }
+            };
+            let reader = reader.unwrap_or_else(|| {
+                ParquetColumnReader::open(path, &column)
+                    .unwrap_or_else(|e| panic!("could not open parquet corpus: {e}"))
+            });
+
+            if filter_language {
+                println!(
+                    "  parquet: {} rows in {} row groups, reading column {column:?}, \
+                     keeping languages {ALLOWED_LANGUAGES:?}",
+                    reader.num_rows(),
+                    reader.num_row_groups(),
+                );
+            } else {
+                println!(
+                    "  parquet: {} rows in {} row groups, reading column {column:?}",
+                    reader.num_rows(),
+                    reader.num_row_groups(),
+                );
+            }
+            TextSource::Parquet {
+                reader,
+                filter_language,
+            }
+        } else {
+            let file = File::open(path).unwrap_or_else(|e| panic!("could not open {path:?}: {e}"));
+            TextSource::Text {
+                reader: BufReader::new(file),
+                carry: Vec::new(),
+                eof: false,
+            }
+        };
 
         Self {
             tokenizer,
@@ -380,20 +464,23 @@ impl ChunkedWordDataSet {
             min_words,
             max_tokens,
             chunk_bytes,
-            reader: BufReader::new(file),
-            carry: Vec::new(),
-            eof: false,
+            source,
             quiet: false,
         }
     }
 
     /// Seek back to the start of the corpus. Call before every epoch.
     pub fn rewind(&mut self) {
-        self.reader
-            .seek(SeekFrom::Start(0))
-            .expect("could not seek corpus file");
-        self.carry.clear();
-        self.eof = false;
+        match &mut self.source {
+            TextSource::Text { reader, carry, eof } => {
+                reader
+                    .seek(SeekFrom::Start(0))
+                    .expect("could not seek corpus file");
+                carry.clear();
+                *eof = false;
+            }
+            TextSource::Parquet { reader, .. } => reader.rewind(),
+        }
     }
 
     /// Total window count of the whole corpus, via one streaming pass (memory
@@ -415,57 +502,10 @@ impl ChunkedWordDataSet {
     /// is exhausted; chunks that yield no windows are skipped transparently.
     pub fn next_chunk(&mut self) -> Option<WordChunk> {
         loop {
-            if self.eof && self.carry.is_empty() {
-                return None;
-            }
-
-            let mut buf = mem::take(&mut self.carry);
-
-            // Fill: normally one chunk-sized read. Keep growing only when a
-            // single document is larger than the chunk (no separator yet).
-            let mut last_split = None;
-            while !self.eof {
-                let want = if buf.len() < self.chunk_bytes {
-                    self.chunk_bytes - buf.len()
-                } else {
-                    last_split = find_last(&buf, SPLIT.as_bytes());
-                    if last_split.is_some() {
-                        break;
-                    }
-                    self.chunk_bytes
-                };
-                let got = (&mut self.reader)
-                    .take(want as u64)
-                    .read_to_end(&mut buf)
-                    .unwrap_or_else(|e| panic!("could not read corpus file: {e}"));
-                if got < want {
-                    self.eof = true;
-                }
-            }
-
-            // Cut right after the last separator; the tail is carried into the
-            // next chunk. The separator is ASCII, so the cut always lands on a
-            // UTF-8 boundary. At EOF the whole rest is the final chunk.
-            let cut = if self.eof {
-                buf.len()
-            } else {
-                last_split.expect("fill loop guarantees a separator") + SPLIT.len()
+            let sequences = match &mut self.source {
+                TextSource::Text { .. } => self.next_text_sequences()?,
+                TextSource::Parquet { .. } => self.next_parquet_sequences()?,
             };
-            self.carry.extend_from_slice(&buf[cut..]);
-            buf.truncate(cut);
-            let text = String::from_utf8(buf).expect("corpus is not valid UTF-8");
-
-            let mut sequences: Vec<Vec<u16>> = Vec::new();
-            for doc in text.split(SPLIT) {
-                let doc = doc.trim();
-                if doc.is_empty() {
-                    continue;
-                }
-                let toks = self.tokenizer.to_tokens(doc);
-                if toks.len() >= 2 {
-                    sequences.push(toks);
-                }
-            }
 
             let chunk = WordChunk::build(
                 sequences,
@@ -487,6 +527,143 @@ impl ChunkedWordDataSet {
             }
             return Some(chunk);
         }
+    }
+
+    /// Text source: read up to `chunk_bytes`, cut at the last complete document,
+    /// carry the tail, and tokenize each document. `None` at end of file.
+    fn next_text_sequences(&mut self) -> Option<Vec<Vec<u16>>> {
+        let chunk_bytes = self.chunk_bytes;
+        let TextSource::Text { reader, carry, eof } = &mut self.source else {
+            unreachable!("next_text_sequences on a non-text source");
+        };
+
+        if *eof && carry.is_empty() {
+            return None;
+        }
+
+        let mut buf = mem::take(carry);
+
+        // Fill: normally one chunk-sized read. Keep growing only when a
+        // single document is larger than the chunk (no separator yet).
+        let mut last_split = None;
+        while !*eof {
+            let want = if buf.len() < chunk_bytes {
+                chunk_bytes - buf.len()
+            } else {
+                last_split = find_last(&buf, SPLIT.as_bytes());
+                if last_split.is_some() {
+                    break;
+                }
+                chunk_bytes
+            };
+            let got = reader
+                .take(want as u64)
+                .read_to_end(&mut buf)
+                .unwrap_or_else(|e| panic!("could not read corpus file: {e}"));
+            if got < want {
+                *eof = true;
+            }
+        }
+
+        // Cut right after the last separator; the tail is carried into the
+        // next chunk. The separator is ASCII, so the cut always lands on a
+        // UTF-8 boundary. At EOF the whole rest is the final chunk.
+        let cut = if *eof {
+            buf.len()
+        } else {
+            last_split.expect("fill loop guarantees a separator") + SPLIT.len()
+        };
+        carry.extend_from_slice(&buf[cut..]);
+        buf.truncate(cut);
+        let text = String::from_utf8(buf).expect("corpus is not valid UTF-8");
+
+        let mut sequences: Vec<Vec<u16>> = Vec::new();
+        for doc in text.split(SPLIT) {
+            let doc = doc.trim();
+            if doc.is_empty() {
+                continue;
+            }
+            let toks = self.tokenizer.to_tokens(doc);
+            if toks.len() >= 2 {
+                sequences.push(toks);
+            }
+        }
+        Some(sequences)
+    }
+
+    /// Parquet source: pull row groups until roughly `chunk_bytes` of *kept*
+    /// text has accumulated. Each row is already one complete document, so
+    /// there is no separator to find and nothing to carry across chunks. `None`
+    /// once the last row group has been consumed.
+    ///
+    /// When language filtering is on, the language column decodes alongside the
+    /// text and rows whose code is not in `ALLOWED_LANGUAGES` are dropped here —
+    /// before tokenizing, which is the expensive part.
+    fn next_parquet_sequences(&mut self) -> Option<Vec<Vec<u16>>> {
+        let chunk_bytes = self.chunk_bytes;
+        let mut sequences: Vec<Vec<u16>> = Vec::new();
+        let mut bytes = 0usize;
+        let mut exhausted = false;
+
+        while bytes < chunk_bytes {
+            let TextSource::Parquet {
+                reader,
+                filter_language,
+            } = &mut self.source
+            else {
+                unreachable!("next_parquet_sequences on a non-parquet source");
+            };
+            let filter_language = *filter_language;
+
+            let group = reader
+                .next_row_group_columns()
+                .unwrap_or_else(|e| panic!("could not read parquet corpus: {e}"));
+            let Some(mut group) = group else {
+                exhausted = true;
+                break;
+            };
+
+            // Columns come back in the order requested: text first, language
+            // second when we asked for it.
+            let languages = if filter_language { group.pop() } else { None };
+            let texts = group.swap_remove(0);
+
+            for (i, raw) in texts.into_iter().enumerate() {
+                if let Some(langs) = &languages {
+                    // A row whose language is missing or not allowed is skipped.
+                    // Missing means the columns fell out of alignment (a null),
+                    // in which case dropping is the safe choice.
+                    let keep = langs
+                        .get(i)
+                        .map(|l| ALLOWED_LANGUAGES.iter().any(|a| a.as_bytes() == &l[..]))
+                        .unwrap_or(false);
+                    if !keep {
+                        continue;
+                    }
+                }
+
+                bytes += raw.len();
+                // A corpus row that is not valid UTF-8 is a broken document,
+                // not a broken file — drop it and keep streaming.
+                let Ok(doc) = String::from_utf8(raw) else {
+                    continue;
+                };
+                let doc = doc.trim();
+                if doc.is_empty() {
+                    continue;
+                }
+                let toks = self.tokenizer.to_tokens(doc);
+                if toks.len() >= 2 {
+                    sequences.push(toks);
+                }
+            }
+        }
+
+        if sequences.is_empty() && exhausted {
+            // Exhausted: no more row groups left to read.
+            return None;
+        }
+        Some(sequences)
     }
 }
 

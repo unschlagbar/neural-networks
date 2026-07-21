@@ -19,11 +19,17 @@
 //     `日本語`) and stands alone when it is punctuation (`“`, `—`, `…`), which
 //     is what its ASCII twin does. The decision is per *character*, so a UTF-8
 //     character never splits into stray bytes either way.
-//   - a hyphen between identifier bytes closes the word it follows, like a
-//     trailing space: `cross-entropy` → `cross-` + `entropy`. A `-` with no
-//     identifier before it (`a - b`, `-5`, `->`) is untouched.
-//   - numbers are one word, including suffixes and decimal points: `1_000u32`,
-//     `3.14`, `0xFF` — but `1..5` still splits at the range operator.
+//   - a hyphen or an underscore between identifier bytes closes the word it
+//     follows, like a trailing space: `cross-entropy` → `cross-` + `entropy`,
+//     `build_hierarchical_model` → `build_` + `hierarchical_` + `model`, so a
+//     snake_case name reaches the backbone as its parts. A separator with no
+//     identifier before it (`a - b`, `-5`, `_private`) is untouched.
+//   - digits come out in PAIRS — `128` → `12` + `8` — since a number is where
+//     byte-level spelling carries the meaning, and two digits per backbone step
+//     keeps magnitude legible without a step per digit. The digit/letter cut is
+//     one-directional: a letter AFTER digits closes the word, so a hex prefix
+//     or type suffix stays whole (`0xFF` → `0` + `xFF`, `1u32` → `1` + `u32`),
+//     while digits after letters stay in their name (`Vec2`, `u32`).
 //   - multi-byte operators are one word: `::`, `->`, `=>`, `==`, `..=`, `<<=`,
 //     `//`, `/*`, … Splitting `::` into two `:` words would make the backbone
 //     predict a path separator in two unrelated steps.
@@ -150,6 +156,38 @@ fn core_end(seq: &[u16], i: usize) -> usize {
     // alphanumeric character (`Größe`, `日本語`); non-ASCII punctuation does not.
     if is_ident_start(tok) || matches!(non_ascii(seq, i), Some((_, true))) {
         let mut e = i + ident_run(seq, i).max(1);
+        // An underscore BETWEEN identifier bytes closes the word, exactly like
+        // the hyphen rule below: `build_hierarchical_model` becomes `build_` +
+        // `hierarchical_` + `model`, so the backbone sees a snake_case name as
+        // its parts instead of one opaque blob. A leading `_` (`_private`) has
+        // no identifier before it and so never enters here; a trailing `_` has
+        // no identifier after it and stays glued to its word.
+        if let Some(u) = seq[i..e]
+            .iter()
+            .position(|&t| byte_of(t) == Some(b'_'))
+            .filter(|&p| p > 0)
+        {
+            let mut u = i + u;
+            // A run of underscores (`foo__bar`) closes as one separator.
+            while u < e && byte_of(seq[u]) == Some(b'_') {
+                u += 1;
+            }
+            if u < e {
+                return u;
+            }
+        }
+        // Digits inside the identifier pair off like a standalone number, and a
+        // letter after them closes the word (`0xFF` → `0` + `xFF`, `1u32` → `1`
+        // + `u32`). Digits FOLLOWING letters do not open a new word — `Vec2` and
+        // `u32` are one name — so the leading letters ride along with the run's
+        // first pair (`sha256` → `sha25` + `6`).
+        if let Some(d) = seq[i..e].iter().position(|&t| is_digit(t)) {
+            let d = i + d;
+            let run = seq[d..e].iter().take_while(|&&t| is_digit(t)).count();
+            if run > 2 || d + run < e {
+                return d + run.min(2);
+            }
+        }
         // Absorb an English contraction / possessive suffix: an apostrophe that
         // FOLLOWS identifier bytes and is itself followed by more identifier
         // bytes stays in the word (`can't`, `they've`, `o'clock`, `it's`).
@@ -173,19 +211,20 @@ fn core_end(seq: &[u16], i: usize) -> usize {
     }
 
     if is_digit(tok) {
-        // Digits, suffixes and separators (`0xFF`, `1_000u32`), plus a `.` only
-        // when a digit follows — so `1..5` and `x.0` keep their operators.
-        let mut e = i + 1;
-        while e < seq.len() {
-            if is_ident(seq[e]) {
-                e += 1;
-            } else if byte_of(seq[e]) == Some(b'.') && e + 1 < seq.len() && is_digit(seq[e + 1]) {
-                e += 2;
-            } else {
-                break;
-            }
-        }
-        return e;
+        // A digit run is emitted in PAIRS: `128` → `12` + `8`, `1234` → `12` +
+        // `34`. A number is the one place where byte-level spelling carries the
+        // meaning, and one backbone step per two digits keeps magnitude legible
+        // (the pairs line up with the decimal groups a reader sees) without
+        // spending a step per digit. Pairing runs from the left, so an odd
+        // count leaves the single digit last.
+        //
+        // Only the digits pair. A letter after them closes the word, so a hex
+        // prefix and a type suffix come out whole on the next entry: `0xFF` →
+        // `0` + `xFF`, `1u32` → `1` + `u32`, `3.14` → `3` + `.` + `14`. The cut
+        // is one-directional — digits *following* letters stay in their name
+        // (`Vec2`, `sha256`), handled in the identifier branch above.
+        let run = seq[i..].iter().take_while(|&&t| is_digit(t)).count();
+        return i + run.min(2);
     }
 
     // Lifetime `'a`: a quote, an identifier, and no closing quote (that would
@@ -344,11 +383,53 @@ mod tests {
         );
     }
 
+    /// Digits come out in pairs — a number is where byte-level spelling carries
+    /// the meaning, and two digits per backbone step keeps magnitude legible
+    /// without spending a step per digit. Pairing runs from the left, so an odd
+    /// count leaves the lone digit last.
     #[test]
-    fn numbers_keep_suffixes_but_not_ranges() {
-        assert_eq!(words("1_000u32"), ["1_000u32"]);
-        assert_eq!(words("3.14"), ["3.14"]);
+    fn digits_segment_into_pairs() {
+        assert_eq!(words("128"), ["12", "8"]);
+        assert_eq!(words("1234"), ["12", "34"]);
+        assert_eq!(words("7"), ["7"]);
+        assert_eq!(words("1000000"), ["10", "00", "00", "0"]);
+        assert_eq!(words("x = 42;"), ["x ", "= ", "42", ";"]);
+    }
+
+    /// The digit/letter cut is one-directional: a letter AFTER digits closes the
+    /// word, so a hex prefix or a type suffix comes out whole; digits after
+    /// letters stay inside the name they belong to.
+    #[test]
+    fn letters_after_digits_split_but_not_the_reverse() {
+        assert_eq!(words("0xFF"), ["0", "xFF"]);
+        assert_eq!(words("1u32"), ["1", "u32"]);
+        // The `_` rides along with the run's first pair, like the letters in
+        // `sha256` do — a lone `_` word would be a wasted backbone step.
+        assert_eq!(words("1_000u32"), ["1", "_00", "0", "u32"]);
+        assert_eq!(words("3.14"), ["3", ".", "14"]);
         assert_eq!(words("0..=9"), ["0", "..=", "9"]);
+        // Digits following letters do not open a new word.
+        assert_eq!(words("Vec2"), ["Vec2"]);
+        assert_eq!(words("u32"), ["u32"]);
+        assert_eq!(words("sha256"), ["sha25", "6"]);
+    }
+
+    /// An underscore between identifier bytes closes the word it follows, the
+    /// way the hyphen and a trailing space do — a snake_case name reaches the
+    /// backbone as its parts rather than as one opaque blob.
+    #[test]
+    fn underscore_cuts_the_word() {
+        assert_eq!(
+            words("build_hierarchical_model"),
+            ["build_", "hierarchical_", "model"]
+        );
+        assert_eq!(words("MAX_LEN"), ["MAX_", "LEN"]);
+        assert_eq!(words("foo__bar"), ["foo__", "bar"]);
+        // A leading underscore has no word before it to close; a trailing one
+        // has nothing after it, so both stay glued.
+        assert_eq!(words("_private"), ["_private"]);
+        assert_eq!(words("x_ = 1"), ["x_ ", "= ", "1"]);
+        assert_eq!(words("let x_y = 1;"), ["let ", "x_", "y ", "= ", "1", ";"]);
     }
 
     #[test]

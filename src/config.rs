@@ -106,6 +106,22 @@ pub const ENC_W_EOS: bool = true;
 /// dataset memory scales with this constant — not with the corpus size.
 pub const CHUNK_BYTES: usize = 32 * 1024 * 1024;
 
+/// Languages kept from a parquet corpus, as the ISO codes its `language` column
+/// uses (FineWeb-style dumps: `"en"`, `"de"`, ...). A document whose language is
+/// not listed is dropped before tokenizing.
+///
+/// An empty list disables filtering and keeps every row — which is also what
+/// happens for corpora with no `language` column, and for plain-text corpora,
+/// where there is no per-document language to filter on.
+pub const ALLOWED_LANGUAGES: &[&str] = &["en", "de"];
+
+/// Column holding the per-document language code. Only consulted when
+/// `ALLOWED_LANGUAGES` is non-empty; a corpus without it is read unfiltered.
+pub const PARQUET_LANGUAGE_COLUMN: &str = "language";
+
+/// Corpus path. A `.parquet` extension selects the parquet reader (one row per
+/// document, column `text` — override with `PARQUET_TEXT_COLUMN`); anything else
+/// is read as plain text with `<|endoftext|>` document separators.
 pub const TRAIN_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-train.txt";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 

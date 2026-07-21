@@ -96,7 +96,16 @@ bug.
 
 ### Dataset (`src/batches.rs`)
 
-Both training modes stream `DATA_FILE` (single file with `<|endoftext|>` document separators) through `ChunkedWordDataSet`: it reads `CHUNK_BYTES` of raw text at a time, cuts at the last complete document (the partial tail is carried into the next chunk), and tokenizes + word-windows each chunk into a `WordChunk`. Windows never cross document borders, so a streamed epoch yields exactly the windows a whole-file load would — but peak memory is bounded by `CHUNK_BYTES`, not corpus size (>1 GB corpora stream fine). Training loops call `rewind()` per epoch and grow the model cache on demand when a chunk's `max_window_tokens()` exceeds the current size; `count_windows()` does a cheap counting pass for resume arithmetic. `PreparedDataSet` (token-window loading from `DATA_DIR`) still exists but is currently unused by training.
+Both training modes stream `TRAIN_DATA` through `ChunkedWordDataSet`, which reads roughly `CHUNK_BYTES` of raw text at a time and tokenizes + word-windows it into a `WordChunk`. The raw documents come from a `TextSource`, picked by file extension:
+
+- **text** (anything but `.parquet`) — a single file with `<|endoftext|>` document separators; each read is cut at the last complete document and the partial tail is carried into the next chunk.
+- **`.parquet`** — one row per document, read from the `text` column (override with the `PARQUET_TEXT_COLUMN` env var). Row groups are already document-aligned, so there is no separator scanning and no carry; a chunk is however many row groups it takes to reach `CHUNK_BYTES`.
+
+`config::ALLOWED_LANGUAGES` filters a parquet corpus by its `language` column (`PARQUET_LANGUAGE_COLUMN`): rows whose ISO code is not listed are dropped *before* tokenizing, which is the expensive part. The language column decodes alongside the text in the same row group, so the two stay row-aligned. An empty list disables filtering; a corpus lacking the column is read unfiltered with a printed note rather than failing, and plain-text corpora are never filtered (no per-document language exists). Filtering out an entire row group is not end-of-corpus — the loader keeps advancing until the row groups actually run out.
+
+Both hand the loader the same thing — a batch of *complete* documents — so windows never cross a document border either way.
+
+`src/parquet.rs` is a dependency-free reader covering just the slice of the format these corpora use: flat schema, one BYTE_ARRAY column, REQUIRED or OPTIONAL (nulls skipped), UNCOMPRESSED/SNAPPY, data pages v1 and v2, PLAIN and dictionary encodings, RLE definition levels. Anything outside that returns an `Err` naming what it hit rather than silently decoding garbage. `cargo run --release --example parquet_demo -- <file.parquet> [column] [--all]` dumps row/group counts, the first documents, and decode throughput (`--all` streams the whole file — the end-to-end check for a new corpus). Windows never cross document borders, so a streamed epoch yields exactly the windows a whole-file load would — but peak memory is bounded by `CHUNK_BYTES`, not corpus size (>1 GB corpora stream fine). Training loops call `rewind()` per epoch and grow the model cache on demand when a chunk's `max_window_tokens()` exceeds the current size; `count_windows()` does a cheap counting pass for resume arithmetic. `PreparedDataSet` (token-window loading from `DATA_DIR`) still exists but is currently unused by training.
 
 ### GPU backend (`src/gpu/`, feature `cuda`, default-off)
 
