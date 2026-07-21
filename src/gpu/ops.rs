@@ -1540,6 +1540,12 @@ fn mma_pad(n: usize, to: usize) -> usize {
 static MMA_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static MMA_INIT: std::sync::Once = std::sync::Once::new();
 
+/// Public read of [`mma_enabled`] for the fused-vs-legacy dispatch, which must know
+/// which path's shared-memory footprint to compare against the device limit.
+pub fn mma_enabled_pub() -> bool {
+    mma_enabled()
+}
+
 fn mma_enabled() -> bool {
     MMA_INIT.call_once(|| {
         let on = std::env::var("MLSTM_NO_MMA").is_err();
@@ -1628,6 +1634,29 @@ pub fn fused_threads(name: &str) -> u32 {
 /// the fallback (and as the A/B baseline for `mlstm_fused_bench`).
 pub fn mlstm_fused_supported(l: usize, dqk: usize, dhv: usize) -> bool {
     l >= 1 && l <= FUSED_MAX_L && dqk >= 1 && dhv >= 1
+}
+
+/// Peak per-block shared memory (bytes) any fused kernel needs at this blocking,
+/// on the given path (`mma` = the tensor-core kernels are selected).
+///
+/// The kernels keep their whole `[L, L]` decay matrix — and, in the backward, two
+/// `[dhv, dqk]` state-staging tiles — resident in shared memory, so at large head
+/// dims (`dqk = dhv = 96` on the backbone) this crosses what a 100 KB-shared card
+/// can opt a single block into. `MLstm::fused_chunk` compares it against
+/// `Gpu::max_shared_optin` and drops to the op-at-a-time path when it does not fit;
+/// the scalar and mma paths carry the same footprint, so `MLSTM_NO_MMA` is not an
+/// escape from it.
+pub fn mlstm_fused_smem_bytes(l: usize, dqk: usize, dhv: usize, mma: bool) -> usize {
+    let kinds: &[&str] = if mma {
+        &["fw_C", "fw_parallel_mma", "bw_dC", "bw_parallel_mma"]
+    } else {
+        &["fw_C", "fw_parallel", "bw_dC", "bw_parallel"]
+    };
+    kinds
+        .iter()
+        .map(|k| fused_smem(k, l, dqk, dhv) * std::mem::size_of::<f32>())
+        .max()
+        .unwrap()
 }
 
 /// The four heavy fused kernels at a given blocking, each already opted into the

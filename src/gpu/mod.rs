@@ -69,6 +69,12 @@ pub struct Gpu {
     pub stream: Arc<CudaStream>,
     pub blas: Arc<CudaBlas>,
     pub kernels: Arc<Kernels>,
+    /// Most shared memory a single block may opt into on this device, in bytes
+    /// (`CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`). The fused mLSTM
+    /// kernels keep their whole decay matrix in shared memory, so at large head
+    /// dims they can exceed this — see `MLstm::fused_chunk`, which falls back to
+    /// the op-at-a-time path rather than failing the opt-in.
+    pub max_shared_optin: usize,
 }
 
 impl Gpu {
@@ -100,7 +106,18 @@ impl Gpu {
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS init failed: {e:?}"))?;
         set_tf32(&blas)?;
         let kernels = Kernels::load(&context)?;
-        Ok(Self { context, stream, blas: Arc::new(blas), kernels: Arc::new(kernels) })
+        let max_shared_optin = context
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            )
+            .map_err(|e| format!("querying max shared memory failed: {e:?}"))? as usize;
+        Ok(Self {
+            context,
+            stream,
+            blas: Arc::new(blas),
+            kernels: Arc::new(kernels),
+            max_shared_optin,
+        })
     }
 }
 

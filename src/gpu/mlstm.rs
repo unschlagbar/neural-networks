@@ -321,12 +321,24 @@ impl MLstm {
     /// chunk longer than `FUSED_MAX_L` *is* silently clamped: chunk length is a
     /// blocking choice with no effect on the result, which
     /// `mlstm_chunking_matches_single_chunk` pins.
-    fn fused_chunk(&self, t: usize) -> Option<usize> {
+    fn fused_chunk(&self, gpu: &Gpu, t: usize) -> Option<usize> {
         if legacy_forced() || self.chunk == 0 {
             return None;
         }
         let l = self.chunk.min(ops::FUSED_MAX_L).min(t).max(1);
-        ops::mlstm_fused_supported(l, self.dqk, self.dhv).then_some(l)
+        if !ops::mlstm_fused_supported(l, self.dqk, self.dhv) {
+            return None;
+        }
+        // The fused kernels hold their decay matrix (and backward's state tiles) in
+        // shared memory; at the backbone's head dims that can exceed what this device
+        // lets one block opt into. Fall back to the op-at-a-time path rather than
+        // failing the opt-in — reducing `l` barely helps, the `[dhv, dqk]` tiles
+        // dominate, and the scalar path has the same footprint.
+        let mma = gpu.kernels.has_mma && ops::mma_enabled_pub();
+        if ops::mlstm_fused_smem_bytes(l, self.dqk, self.dhv, mma) > gpu.max_shared_optin {
+            return None;
+        }
+        Some(l)
     }
 
     /// Chunk boundaries for a sequence of length `t`: `[(c0, len), …]`. A `t` that
@@ -377,7 +389,7 @@ impl MLstm {
         // The fused kernels do the whole chunkwise core — states and all chunks — in
         // three launches. Everything before and after (projections, head norm, the
         // o-gate, the output projection) is shared with the path below.
-        if let Some(l) = self.fused_chunk(t) {
+        if let Some(l) = self.fused_chunk(gpu, t) {
             let fused = ops::mlstm_fused_fw(gpu, &qh, &kh, &vh, &igh, &fgh, l);
             let h_tilde = ops::head_scatter(gpu, &fused.ytil, b, h, t, dhv); // [N, d]
             let yhat = self.headnorm.forward(gpu, &h_tilde);
