@@ -17,18 +17,18 @@ pub const MAX_WORD_BYTES: usize = 16;
 /// is meant to bind first — this only guards against a pathological run with no
 /// boundary token. Caches are sized to the *actual* longest window
 /// (`WordChunk::max_window_tokens`), never to this cap, so raising it is free.
-pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 6;
+pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 4;
 
 // Training-Schedule
 
-pub const LR: f32 = 3e-4;
-pub const MIN_LR: f32 = 3e-5;
+pub const LR: f32 = 1e-4;
+pub const MIN_LR: f32 = 1e-5;
 pub const WARMUP_STEPS: usize = 150;
 pub const DECAY_STEPS: usize = 150_000;
 // Windows whose gradients are accumulated before one optimizer step. Muon
 // (matrices) is scale-invariant via the Frobenius normalization and aux-Adam
 // (vectors) via its second moment, so summed grads need no manual rescaling.
-pub const BATCH_SIZE: usize = 8;
+pub const BATCH_SIZE: usize = 4;
 pub const EPOCHS: usize = 1;
 
 pub const SAVE_EVERY: usize = 100;
@@ -39,9 +39,9 @@ pub const LOG_EVERY: usize = 10;
 // interior projection matrices only — embeddings, logit heads, biases and norm
 // scales are never decayed). This lets the hierarchical character stacks
 // (encoder/decoder) train as Adam while the backbone stays AdamW.
-pub const ENCODER_WEIGHT_DECAY: f32 = 0.0;
+pub const ENCODER_WEIGHT_DECAY: f32 = 0.01;
 pub const BACKBONE_WEIGHT_DECAY: f32 = crate::optimizers::WEIGHT_DECAY;
-pub const DECODER_WEIGHT_DECAY: f32 = 0.0;
+pub const DECODER_WEIGHT_DECAY: f32 = 0.01;
 
 /// Weight decay for the flat (non-hierarchical) model's optimizer step. Kept at
 /// `0.0` to preserve the current plain-Adam behavior; raise it to run the flat
@@ -122,7 +122,7 @@ pub const PARQUET_LANGUAGE_COLUMN: &str = "language";
 /// Corpus path. A `.parquet` extension selects the parquet reader (one row per
 /// document, column `text` — override with `PARQUET_TEXT_COLUMN`); anything else
 /// is read as plain text with `<|endoftext|>` document separators.
-pub const TRAIN_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-train.txt";
+pub const TRAIN_DATA: &str = "../../training_data/000_00000.parquet";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
 // Wake Word

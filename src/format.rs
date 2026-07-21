@@ -25,8 +25,7 @@
 // `loading.rs` and are reused unchanged — this module only owns the container.
 
 use std::{
-    fs::File,
-    io::{self, Cursor, Read, Write},
+    fs::File, io::{self, BufReader, Cursor, Read, Write},
 };
 
 use crate::{
@@ -214,7 +213,7 @@ impl Reader {
 
     /// Read a whole container from a file path.
     pub fn load(path: &str) -> io::Result<Self> {
-        Self::read_from(&mut File::open(path)?)
+        Self::read_from(&mut BufReader::new(File::open(path)?))
     }
 
     /// Remove and return the layers of section `name`. Section order is fixed by
