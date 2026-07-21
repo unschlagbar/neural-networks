@@ -14,8 +14,8 @@ use std::time::Instant;
 
 use crate::batches::ChunkedWordDataSet;
 use crate::config::{
-    BATCH_SIZE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, LOG_EVERY, LOGIT_SOFTCAP, LR,
-    MIN_WORDS_PER_SEQ, MAX_WINDOW_TOKENS, TRAIN_DATA, WORD_BLOCKS, WORD_HIDDEN, WORDS_PER_SEQ,
+    BATCH_SIZE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, LOG_EVERY, LOGIT_SOFTCAP, LR, MAX_WINDOW_TOKENS,
+    MIN_WORDS_PER_SEQ, TRAIN_DATA, WORD_BLOCKS, WORD_HIDDEN, WORDS_PER_SEQ,
 };
 use crate::gpu::Gpu;
 use crate::gpu::hierarchical::{HierCfg, Hierarchical};
@@ -31,9 +31,9 @@ fn cfg_from_config(vocab: usize, w_token: usize) -> HierCfg {
         vocab,
         hc: CHAR_HIDDEN,
         wh: WORD_HIDDEN,
-        enc_blocks: 2,
+        enc_blocks: 4,
         bb_blocks: WORD_BLOCKS,
-        dec_blocks: 2,
+        dec_blocks: 4,
         heads,
         dqk: WORD_HIDDEN / heads,
         w_token,
@@ -102,7 +102,10 @@ pub fn train_hierarchical_gpu(model_path: &str) {
     let resume_windows = if model.step_count > 0 {
         let t0 = Instant::now();
         let total = data.count_windows();
-        println!("  {total} windows total (counting pass took {:.1?})", t0.elapsed());
+        println!(
+            "  {total} windows total (counting pass took {:.1?})",
+            t0.elapsed()
+        );
         model.step_count % total.max(1)
     } else {
         0
