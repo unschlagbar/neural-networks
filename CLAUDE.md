@@ -52,7 +52,7 @@ All comments need to be in englisch not in german
 
 `Hierarchical` (HAT-style, arXiv 2501.10322) couples three stages:
 
-- **encoder** (`WordEncoder`) — a **bidirectional** BiLSTM over the characters of one word plus a closing `[W]` end-of-word step (fed virtually — token slices never contain it). Two forward-only `Sequential` stacks (`Embedding → sLSTMBlock × 2` each): `fwd` reads `c1 … cn [W]`, `bwd` reads `cn … c1 [W]` — the characters are reversed but the closing `[W]` stays LAST in both, so **both directions read out at a `[W]` step** (`hallo` → fwd `h a l l o [W]`, bwd `o l l a h [W]`). Reversing the whole sequence instead (`[W] o l l a h`) would read `bwd` out at an ordinary char step with no end-of-word signal; `word_encoder::dir_stream` and its tests pin the correct alignment. The two readouts are concatenated `[fwd ; bwd]` (width `2·CHAR_HIDDEN`) and a `combine` Linear projects back to `CHAR_HIDDEN` → `e_w`, keeping the backbone input width and the tied char-table width unchanged. Only `fwd`'s embedding (layer 0) is the tied table; `bwd` keeps its own. State is reset per word. Each direction has its own replica pool; encode/backward run data-parallel over words on both.
+- **encoder** (`WordEncoder`) — a normal forward-only `Sequential` (`Embedding → sLSTMBlock × N`) over the characters of one word plus a closing `[W]` end-of-word step (fed virtually — token slices never contain it); the word embedding `e_w` is the output at the `[W]` step, where the state has seen the whole word and knows it is complete. State is reset per word; the words of a window encode data-parallel across a replica pool.
 - **word_model** (backbone) — `Linear → alternating sLSTM/mLSTM blocks × WORD_BLOCKS → Linear` — autoregresses over word embeddings, carrying recurrent state across words; its output is the context for decoding the *next* word.
 - **char2_model** (decoder) — `sLSTMBlock × 2 → RMSNorm → LinearNoBias → SoftCap`, input width OUT_HIDDEN — the decoder has no front layer; `Hierarchical` builds its inputs itself (paper eq. 3–4): a word's **first sequence step is the injected backbone context** (it takes the BOS slot), every later step feeds the previous char through the **encoder's char embedding** (tied table — requires CHAR_HIDDEN == OUT_HIDDEN; decoder-side embedding grads are reduced back into the encoder's table in `backwards_sequence`). Predicts the word's chars plus a trailing `[W]` (EOS). Reset per word.
 
@@ -251,11 +251,11 @@ One unified on-disk format, **`NNM1`** (magic `0x4E4E_4D31`), owned by `src/form
 
 Layout: `MAGIC u32`, `VERSION u8`, `KIND u8` (`0` = Flat, `1` = Hierarchical), a typed metadata head (Hierarchical carries `vocab u32`, `context u32`, `step u64`; Flat carries none), then `N_SECTIONS u32` followed by that many **named sections**, each a length-prefixed name string plus one *stack blob*.
 - **Flat** models write a single `"model"` section.
-- **Hierarchical** models write `"encoder_fwd"`, `"encoder_bwd"`, `"combine"`, `"word_model"`, `"char2_model"`. `combine` is a one-layer stack (the single projection Linear); every section is uniformly a stack blob.
+- **Hierarchical** models write `"encoder"`, `"word_model"`, `"char2_model"`.
 
 A **stack blob** (`saving::write_layers` / `loading::load_layers`, magic `STACK_MAGIC` = `0x4E4E_4657`) is one layer stack's architecture header (per-layer tag + in/out sizes) then its weights. It is the reusable building block: the container frames it as a section, and it is also used in-memory for the replica round-trip (`Sequential::replicas`) and for building GPU models. It is not a standalone file format.
 
-`format::Writer` builds a container fluently (`.section(name, &layers)` / `.section_layer(name, &layer)`); `format::Reader` reads one back and hands out sections by name (`take` / `take_stack`), with `peek_kind` for `inspect` to label a file. The GPU encoder is still unidirectional, so `gpu::Hierarchical::save` writes `encoder_bwd` as a copy of `encoder_fwd` and a fresh `combine` so the CPU bidirectional model can load and fine-tune it.
+`format::Writer` builds a container fluently (`.section(name, &layers)` / `.section_layer(name, &layer)`); `format::Reader` reads one back and hands out sections by name (`take` / `take_stack`), with `peek_kind` for `inspect` to label a file.
 
 Models are saved to `models/` (created automatically). Paths and all hyperparameters (LR, dims, sequence length, save/print intervals) live in `src/config.rs`.
 

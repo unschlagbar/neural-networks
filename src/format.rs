@@ -5,8 +5,8 @@
 // single version, and a `ModelKind` tag, followed by a small typed metadata
 // head and a count-prefixed list of NAMED SECTIONS. Each section is a name
 // string plus one layer-stack blob (arch header + weights, via
-// `saving::write_layers`). Single-layer stages (e.g. the encoder's combine
-// projection) are just a one-layer stack, so every section is uniform.
+// `saving::write_layers`). A single standalone layer is just a one-layer
+// stack, so every section is uniform.
 //
 // Layout
 // ┌──────────────────────────────────────────────────────────┐
@@ -46,7 +46,7 @@ pub const VERSION: u8 = 1;
 pub enum ModelKind {
     /// A flat `Sequential`.
     Flat,
-    /// The hierarchical (HAT) model: encoder (fwd/bwd/combine) + backbone + decoder.
+    /// The hierarchical (HAT) model: encoder + backbone + decoder.
     Hierarchical,
 }
 
@@ -77,8 +77,8 @@ pub struct Meta {
 }
 
 /// One named model stage to write: a stable name plus its layer stack. A stage
-/// may be a full `Sequential`'s layers or a single standalone layer (e.g. the
-/// encoder combine projection), so it holds a layer slice either way.
+/// may be a full `Sequential`'s layers or a single standalone layer, so it holds
+/// a layer slice either way.
 pub struct Section<'a> {
     pub name: &'a str,
     pub layers: SectionLayers<'a>,
@@ -283,11 +283,10 @@ mod tests {
     }
 
     /// A hierarchical container preserves metadata and every named section,
-    /// including a single-layer `combine` section.
+    /// including one written from a single standalone layer.
     #[test]
     fn hierarchical_container_roundtrips() {
         let fwd = SequentialBuilder::new(8).embedding(16).rms_norm().build();
-        let bwd = SequentialBuilder::new(8).embedding(16).rms_norm().build();
         let combine: Box<dyn NnLayer> = Box::new(LinearLayer::new(32, 16));
         let wm = SequentialBuilder::new(16).rms_norm().linear(16).build();
         let dec = SequentialBuilder::new(16).rms_norm().linear(8).build();
@@ -299,9 +298,8 @@ mod tests {
         };
         let mut buf = Cursor::new(Vec::new());
         Writer::new(ModelKind::Hierarchical, meta)
-            .section("encoder_fwd", &fwd.layers)
-            .section("encoder_bwd", &bwd.layers)
-            .section_layer("combine", &*combine)
+            .section("encoder", &fwd.layers)
+            .section_layer("extra", &*combine)
             .section("word_model", &wm.layers)
             .section("char2_model", &dec.layers)
             .write_to(&mut buf)
@@ -314,11 +312,11 @@ mod tests {
         assert_eq!(reader.meta.step, 4242);
 
         // Every section present and pullable by name.
-        for name in ["encoder_fwd", "encoder_bwd", "word_model", "char2_model"] {
+        for name in ["encoder", "word_model", "char2_model"] {
             assert!(reader.take_stack(name).is_ok(), "missing {name}");
         }
-        let combine_back = reader.take("combine").unwrap();
-        assert_eq!(combine_back.len(), 1, "combine is one layer");
+        let one = reader.take("extra").unwrap();
+        assert_eq!(one.len(), 1, "single-layer section round-trips as one layer");
         assert!(reader.take("nope").is_err(), "missing section must error");
     }
 

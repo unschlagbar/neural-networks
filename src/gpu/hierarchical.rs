@@ -24,9 +24,8 @@
 //! Checkpoints: `save`/`load` use the unified `NNM1` container (`src/format.rs`,
 //! kind = Hierarchical) — the same named-section layout the CPU model produces,
 //! so a GPU-trained model opens directly in the CPU sampler/probe (`hs` / `hp`).
-//! The GPU encoder is still unidirectional, so `save` writes `encoder_bwd` as a
-//! copy of `encoder_fwd` and a fresh `combine`. Weights only; the AdamW moments
-//! are not persisted, so a resumed run restarts them.
+//! Weights only; the AdamW moments are not persisted, so a resumed run restarts
+//! them.
 
 use std::io;
 
@@ -59,29 +58,17 @@ pub fn up_of(hidden: usize) -> usize {
     hidden * 8 / 3
 }
 
-/// Per-word **bidirectional** encoder (a BiLSTM): two block stacks read each
-/// word in opposite directions and their readouts are concatenated and projected
-/// back to width `hc` by `combine`.
-///
-///   - `fwd` reads `c1 … cn [W]`, readout at the `[W]` step.
-///   - `bwd` reads the reversed `[W] cn … c1`, readout at its last step (`c1`).
-///
-/// Each stack is `sLSTM block → mLSTM block×(N-1)` (16 heads). `fwd` embeds
-/// through the tied char table (`Hierarchical::table`); `bwd` keeps its own
-/// table (`Hierarchical::bwd_table`), matching the CPU model. `e_w =
-/// combine([fwd_ro ; bwd_ro])` has width `hc`, so the backbone input and the
-/// tied-table width are unchanged.
+/// Per-word encoder: first block sLSTM, remaining blocks mLSTM (16 heads),
+/// `e_w` read out at the `[W]` step.
 pub struct WordEncoder {
-    pub fwd: Vec<Box<dyn BlockLike>>,
-    pub bwd: Vec<Box<dyn BlockLike>>,
-    pub combine: Linear, // [2·hc → hc]
+    pub blocks: Vec<Box<dyn BlockLike>>,
 }
 
 impl WordEncoder {
     fn new(gpu: &Gpu, hc: usize, n: usize) -> Self {
-        let stack = |gpu: &Gpu| -> Vec<Box<dyn BlockLike>> {
-            let dqk = hc / 16;
-            (0..n)
+        let dqk = hc / 16;
+        Self {
+            blocks: (0..n)
                 .map(|i| {
                     if i == 0 {
                         Box::new(Block::from_cell(
@@ -99,12 +86,7 @@ impl WordEncoder {
                         )) as Box<dyn BlockLike>
                     }
                 })
-                .collect()
-        };
-        Self {
-            fwd: stack(gpu),
-            bwd: stack(gpu),
-            combine: Linear::new_rand(gpu, 2 * hc, hc),
+                .collect(),
         }
     }
 }
@@ -140,17 +122,11 @@ fn group_by_len(lens: &[usize]) -> Vec<Vec<usize>> {
 pub struct Hierarchical {
     pub cfg: HierCfg,
 
-    // Tied char table (fwd encoder input + decoder char slots) + grad/moments.
+    // Tied char table (encoder input + decoder char slots) + grad/moments.
     pub table: DTensor,
     dtable: DTensor,
     m_tbl: DTensor,
     v_tbl: DTensor,
-
-    // The backward encoder's own (untied) char table + grad/moments.
-    pub bwd_table: DTensor,
-    d_bwd_table: DTensor,
-    m_bwd_tbl: DTensor,
-    v_bwd_tbl: DTensor,
 
     pub encoder: WordEncoder,
 
@@ -212,10 +188,6 @@ impl Hierarchical {
             dtable: DTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
             m_tbl: DTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
             v_tbl: DTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
-            bwd_table: DTensor::from_host(gpu, &Tensor::random(&[cfg.vocab, cfg.hc], 0.02)),
-            d_bwd_table: DTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
-            m_bwd_tbl: DTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
-            v_bwd_tbl: DTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
             encoder: WordEncoder::new(gpu, cfg.hc, cfg.enc_blocks),
             bb_front: Linear::new_rand(gpu, cfg.hc, cfg.wh),
             bb_blocks,
@@ -295,29 +267,15 @@ impl Hierarchical {
 
         let mut e_w = DTensor::zeros(gpu, &[dw, hc]);
         for grp in &enc_groups {
-            // fwd: c1 … cn [W]   (readout at the [W] step)
-            let (ids, readout, tmax) = self.enc_group_rows(tokens, words, grp, &enc_lens, false);
+            let (ids, readout, tmax) = self.enc_group_rows(tokens, words, grp, &enc_lens);
             let embedded = ops::embedding_gather(gpu, &self.table, &ids, hc);
             let mut h = embedded.reshaped(&[grp.len(), tmax, hc]);
-            for blk in self.encoder.fwd.iter_mut() {
+            for blk in self.encoder.blocks.iter_mut() {
                 h = blk.forward(gpu, &h);
             }
             let h_flat = h.reshaped(&[grp.len() * tmax, hc]);
-            let fwd_ro = ops::embedding_gather(gpu, &h_flat, &readout, hc); // [n_g, HC]
-
-            // bwd: [W] cn … c1   (readout at the last real step, c1)
-            let (ids_b, readout_b, _) = self.enc_group_rows(tokens, words, grp, &enc_lens, true);
-            let embedded_b = ops::embedding_gather(gpu, &self.bwd_table, &ids_b, hc);
-            let mut hb = embedded_b.reshaped(&[grp.len(), tmax, hc]);
-            for blk in self.encoder.bwd.iter_mut() {
-                hb = blk.forward(gpu, &hb);
-            }
-            let hb_flat = hb.reshaped(&[grp.len() * tmax, hc]);
-            let bwd_ro = ops::embedding_gather(gpu, &hb_flat, &readout_b, hc); // [n_g, HC]
-
-            // combine([fwd_ro ; bwd_ro]) → e_w, scattered back to window slots.
-            let cat = ops::concat_cols(gpu, &fwd_ro, &bwd_ro); // [n_g, 2·HC]
-            let e_w_grp = self.encoder.combine.forward(gpu, &cat); // [n_g, HC]
+            // e_w = each word's [W]-step row, scattered back to its window slot.
+            let e_w_grp = ops::embedding_gather(gpu, &h_flat, &readout, hc); // [n_g, HC]
             ops::scatter_rows(gpu, &mut e_w, &e_w_grp, grp);
         }
         mark("encoder fwd");
@@ -434,54 +392,24 @@ impl Hierarchical {
         // is activation checkpointing, and it keeps just one group resident. The
         // cost is one extra encoder forward, over the SMALL grouped rectangles.
         for grp in &enc_groups {
-            let n_g = grp.len();
-            // Re-forward fwd.
-            let (ids, readout, tmax) = self.enc_group_rows(tokens, words, grp, &enc_lens, false);
+            let (ids, readout, tmax) = self.enc_group_rows(tokens, words, grp, &enc_lens);
             let embedded = ops::embedding_gather(gpu, &self.table, &ids, hc);
-            let mut h = embedded.reshaped(&[n_g, tmax, hc]);
-            for blk in self.encoder.fwd.iter_mut() {
+            let mut h = embedded.reshaped(&[grp.len(), tmax, hc]);
+            for blk in self.encoder.blocks.iter_mut() {
                 h = blk.forward(gpu, &h);
             }
-            let h_flat = h.reshaped(&[n_g * tmax, hc]);
-            let fwd_ro = ops::embedding_gather(gpu, &h_flat, &readout, hc);
+            drop(h);
 
-            // Re-forward bwd.
-            let (ids_b, readout_b, _) = self.enc_group_rows(tokens, words, grp, &enc_lens, true);
-            let embedded_b = ops::embedding_gather(gpu, &self.bwd_table, &ids_b, hc);
-            let mut hb = embedded_b.reshaped(&[n_g, tmax, hc]);
-            for blk in self.encoder.bwd.iter_mut() {
-                hb = blk.forward(gpu, &hb);
-            }
-            let hb_flat = hb.reshaped(&[n_g * tmax, hc]);
-            let bwd_ro = ops::embedding_gather(gpu, &hb_flat, &readout_b, hc);
-
-            // Re-forward combine to restore its saved input, then backward:
-            // d_e_w_grp → [d_fwd_ro ; d_bwd_ro].
-            let cat = ops::concat_cols(gpu, &fwd_ro, &bwd_ro);
-            let _ = self.encoder.combine.forward(gpu, &cat);
+            // Scatter this group's d_e_w onto its [W]-step rows, rest zero.
             let d_e_w_grp = ops::embedding_gather(gpu, &d_e_w, grp, hc); // [n_g, HC]
-            let d_cat = self.encoder.combine.backward(gpu, &d_e_w_grp); // [n_g, 2·HC]
-            let (d_fwd_ro, d_bwd_ro) = ops::split_cols(gpu, &d_cat);
-
-            // fwd backward: seed d_fwd_ro on the [W]-step rows, rest zero.
-            let mut d_h = DTensor::zeros(gpu, &[n_g * tmax, hc]);
-            ops::scatter_rows(gpu, &mut d_h, &d_fwd_ro, &readout);
-            let mut d_h = d_h.reshaped(&[n_g, tmax, hc]);
-            for blk in self.encoder.fwd.iter_mut().rev() {
+            let mut d_h = DTensor::zeros(gpu, &[grp.len() * tmax, hc]);
+            ops::scatter_rows(gpu, &mut d_h, &d_e_w_grp, &readout);
+            let mut d_h = d_h.reshaped(&[grp.len(), tmax, hc]);
+            for blk in self.encoder.blocks.iter_mut().rev() {
                 d_h = blk.backward(gpu, &d_h);
             }
-            let d_embedded = d_h.reshaped(&[n_g * tmax, hc]);
+            let d_embedded = d_h.reshaped(&[grp.len() * tmax, hc]);
             ops::embedding_scatter_add(gpu, &mut self.dtable, &ids, &d_embedded, hc);
-
-            // bwd backward: seed d_bwd_ro on its readout rows, grads → bwd_table.
-            let mut d_hb = DTensor::zeros(gpu, &[n_g * tmax, hc]);
-            ops::scatter_rows(gpu, &mut d_hb, &d_bwd_ro, &readout_b);
-            let mut d_hb = d_hb.reshaped(&[n_g, tmax, hc]);
-            for blk in self.encoder.bwd.iter_mut().rev() {
-                d_hb = blk.backward(gpu, &d_hb);
-            }
-            let d_embedded_b = d_hb.reshaped(&[n_g * tmax, hc]);
-            ops::embedding_scatter_add(gpu, &mut self.d_bwd_table, &ids_b, &d_embedded_b, hc);
         }
         mark("encoder bwd");
 
@@ -489,42 +417,24 @@ impl Hierarchical {
     }
 
     /// The `[words, tmax]` id rectangle for one encoder group, plus each word's
-    /// readout row and the group's `tmax`. A word has `len+1` steps (its chars
-    /// plus one `[W]`).
-    ///
-    /// - `reversed == false` (fwd): `c1 … cn [W]`, readout at the `[W]` step.
-    /// - `reversed == true` (bwd): `cn … c1 [W]`, also readout at the `[W]` step.
-    ///
-    /// Both directions end on `[W]` (row `len`), so each reads out at a step that
-    /// carries the end-of-word signal. Padding stays in the trailing rows.
+    /// `[W]`-step row (where `e_w` is read out) and the group's `tmax`.
     fn enc_group_rows(
         &self,
         tokens: &[usize],
         words: &[(usize, usize)],
         grp: &[usize],
         enc_lens: &[usize],
-        reversed: bool,
     ) -> (Vec<usize>, Vec<usize>, usize) {
         let tmax = grp.iter().map(|&w| enc_lens[w] + 1).max().unwrap();
         let mut ids = vec![0usize; grp.len() * tmax];
         let mut readout = vec![0usize; grp.len()];
         for (i, &w) in grp.iter().enumerate() {
             let (s, _) = words[w];
-            let len = enc_lens[w];
-            if reversed {
-                // cn … c1 [W]
-                for k in 0..len {
-                    ids[i * tmax + k] = tokens[s + len - 1 - k];
-                }
-            } else {
-                // c1 … cn [W]
-                for k in 0..len {
-                    ids[i * tmax + k] = tokens[s + k];
-                }
+            for k in 0..enc_lens[w] {
+                ids[i * tmax + k] = tokens[s + k];
             }
-            // Both directions close on [W] and read out there.
-            ids[i * tmax + len] = self.cfg.w_token;
-            readout[i] = i * tmax + len;
+            ids[i * tmax + enc_lens[w]] = self.cfg.w_token;
+            readout[i] = i * tmax + enc_lens[w];
         }
         (ids, readout, tmax)
     }
@@ -542,25 +452,9 @@ impl Hierarchical {
             false,
         );
         self.dtable.zero_(gpu);
-        // Backward encoder's own char table (undecayed, like the tied table).
-        ops::adamw(
-            gpu,
-            &mut self.bwd_table,
-            &self.d_bwd_table,
-            &mut self.m_bwd_tbl,
-            &mut self.v_bwd_tbl,
-            cfg,
-            false,
-        );
-        self.d_bwd_table.zero_(gpu);
-        for b in self.encoder.fwd.iter_mut() {
+        for b in self.encoder.blocks.iter_mut() {
             b.step(gpu, cfg);
         }
-        for b in self.encoder.bwd.iter_mut() {
-            b.step(gpu, cfg);
-        }
-        // combine is an interior projection — decays like the other linears.
-        self.encoder.combine.step(gpu, cfg);
         self.bb_front.step(gpu, cfg);
         for b in self.bb_blocks.iter_mut() {
             b.step(gpu, cfg);
@@ -578,20 +472,10 @@ impl Hierarchical {
 
     // checkpointing
 
-    /// Export every stage into CPU `nn` `Sequential`s / layers laid out exactly
-    /// like `model::build_hierarchical_model`, so the result serializes to the
-    /// same `NNM1` container a CPU-trained model would (readable by `hp` / `hs`).
-    /// Returns `(encoder_fwd, encoder_bwd, combine, word_model, char2_model)`.
-    fn to_sequentials(
-        &mut self,
-        gpu: &Gpu,
-    ) -> (
-        Sequential,
-        Sequential,
-        Box<dyn crate::nn_layer::NnLayer>,
-        Sequential,
-        Sequential,
-    ) {
+    /// Export the three stages into CPU `nn` `Sequential`s laid out exactly like
+    /// `model::build_hierarchical_model`, so the result serializes to the same
+    /// `NNM1` container a CPU-trained model would (readable by `hp` / `hs`).
+    fn to_sequentials(&mut self, gpu: &Gpu) -> (Sequential, Sequential, Sequential) {
         use super::{dt_matrix, dt_vec};
         use crate::nn::{
             embedding::EmbeddingLayer, linear::LinearLayer, linear_nb::LinearNBLayer,
@@ -600,35 +484,16 @@ impl Hierarchical {
         use crate::nn_layer::NnLayer;
         let (vocab, hc, wh) = (self.cfg.vocab, self.cfg.hc, self.cfg.wh);
 
-        // Encoder fwd: Embedding(tied table) → blocks.
+        // Encoder: Embedding(tied table) → blocks.
         let mut enc: Vec<Box<dyn NnLayer>> = Vec::new();
         enc.push(Box::new(EmbeddingLayer::from_loaded(
             vocab,
             hc,
             dt_matrix(gpu, &self.table),
         )));
-        for b in self.encoder.fwd.iter_mut() {
+        for b in self.encoder.blocks.iter_mut() {
             enc.push(b.to_nn_layer(gpu));
         }
-
-        // Encoder bwd: Embedding(own table) → blocks.
-        let mut enc_b: Vec<Box<dyn NnLayer>> = Vec::new();
-        enc_b.push(Box::new(EmbeddingLayer::from_loaded(
-            vocab,
-            hc,
-            dt_matrix(gpu, &self.bwd_table),
-        )));
-        for b in self.encoder.bwd.iter_mut() {
-            enc_b.push(b.to_nn_layer(gpu));
-        }
-
-        // combine: Linear(2·HC → HC).
-        let combine: Box<dyn NnLayer> = Box::new(LinearLayer::from_loaded(
-            2 * hc,
-            hc,
-            dt_matrix(gpu, &self.encoder.combine.w),
-            dt_vec(gpu, &self.encoder.combine.b),
-        ));
 
         // Backbone: Linear(HC→WH) → blocks → Linear(WH→HC).
         let mut wm: Vec<Box<dyn NnLayer>> = Vec::new();
@@ -666,8 +531,6 @@ impl Hierarchical {
 
         (
             Sequential::from_layers(enc),
-            Sequential::from_layers(enc_b),
-            combine,
             Sequential::from_layers(wm),
             Sequential::from_layers(dec),
         )
@@ -680,12 +543,11 @@ impl Hierarchical {
     pub fn save(&mut self, gpu: &Gpu, path: &str, _boundary_token_ids: &[u16]) -> io::Result<()> {
         use crate::format::{Meta, ModelKind, Writer};
 
-        let (encoder_fwd, encoder_bwd, combine, word_model, char2_model) = self.to_sequentials(gpu);
+        let (encoder, word_model, char2_model) = self.to_sequentials(gpu);
 
         // context_size == the backbone's output width == HC (the decoder's input),
         // exactly what `Hierarchical::new` recomputes and debug-asserts on load.
         let context_size = word_model.output_size;
-        let combine_layers = std::slice::from_ref(&combine);
 
         Writer::new(
             ModelKind::Hierarchical,
@@ -695,9 +557,7 @@ impl Hierarchical {
                 step: self.step_count as u64,
             },
         )
-        .section("encoder_fwd", &encoder_fwd.layers)
-        .section("encoder_bwd", &encoder_bwd.layers)
-        .section("combine", combine_layers)
+        .section("encoder", &encoder.layers)
         .section("word_model", &word_model.layers)
         .section("char2_model", &char2_model.layers)
         .save(path)
@@ -728,12 +588,12 @@ impl Hierarchical {
                 }
             };
 
-        // Encoder fwd: Embedding(tied table) + blocks
-        let enc = &stacks.encoder_fwd.layers;
+        // Encoder: Embedding + blocks
+        let enc = &stacks.encoder_chars.layers;
         let emb = enc[0]
             .as_any()
             .downcast_ref::<EmbeddingLayer>()
-            .ok_or_else(|| err("encoder_fwd must start with an Embedding".into()))?;
+            .ok_or_else(|| err("encoder must start with an Embedding".into()))?;
         let vocab = emb.input_size();
         let hc = emb.output_size();
         let table = DTensor::from_host(gpu, &tensor_from_matrix(&emb.weights));
@@ -741,26 +601,6 @@ impl Hierarchical {
             .iter()
             .map(|l| to_block(gpu, l))
             .collect::<io::Result<_>>()?;
-
-        // Encoder bwd: Embedding(own table) + blocks
-        let enc_b = &stacks.encoder_bwd.layers;
-        let emb_b = enc_b[0]
-            .as_any()
-            .downcast_ref::<EmbeddingLayer>()
-            .ok_or_else(|| err("encoder_bwd must start with an Embedding".into()))?;
-        let bwd_table = DTensor::from_host(gpu, &tensor_from_matrix(&emb_b.weights));
-        let enc_bwd_blocks: Vec<Box<dyn BlockLike>> = enc_b[1..]
-            .iter()
-            .map(|l| to_block(gpu, l))
-            .collect::<io::Result<_>>()?;
-
-        // Combine: Linear(2·HC → HC)
-        let combine_layer = stacks
-            .combine
-            .as_any()
-            .downcast_ref::<LinearLayer>()
-            .ok_or_else(|| err("combine must be a Linear".into()))?;
-        let combine = linear_layer_to_gpu(gpu, combine_layer);
 
         // Backbone: Linear + blocks + Linear
         let wm = &stacks.word_model.layers;
@@ -832,10 +672,7 @@ impl Hierarchical {
         let mut model = Hierarchical::new(gpu, &cfg);
         model.step_count = stacks.step;
         model.table = table;
-        model.bwd_table = bwd_table;
-        model.encoder.fwd = enc_blocks;
-        model.encoder.bwd = enc_bwd_blocks;
-        model.encoder.combine = combine;
+        model.encoder.blocks = enc_blocks;
         model.bb_front = bb_front;
         model.bb_blocks = bb_blocks;
         model.bb_back = bb_back;

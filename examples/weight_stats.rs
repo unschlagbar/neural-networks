@@ -25,10 +25,8 @@ fn main() {
         // Raw stacks so checkpoints of older decoder layouts stay readable.
         let stacks = Hierarchical::load_stacks(&path).unwrap();
         println!("\n================ {name} ================");
-        println!("--- encoder fwd ---");
-        print_stack(&stacks.encoder_fwd);
-        println!("--- encoder bwd ---");
-        print_stack(&stacks.encoder_bwd);
+        println!("--- encoder ---");
+        print_stack(&stacks.encoder_chars);
         println!("--- word_model ---");
         print_stack(&stacks.word_model);
         println!("--- char2_model ---");

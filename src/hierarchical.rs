@@ -98,15 +98,14 @@ impl Hierarchical {
     /// Words are segmented by `crate::segment` — the model itself only needs the
     /// `[W]` marker, which it takes from the tokenizer.
     pub fn new(
-        encoder_fwd: Sequential,
-        encoder_bwd: Sequential,
+        encoder_chars: Sequential,
         char2_model: Sequential,
         word_model: Sequential,
         vocab_size: usize,
         tokenizer: Rc<Utf8Tokenizer>,
     ) -> Self {
         let context_size = word_model.output_size;
-        let char_out = encoder_fwd.output_size;
+        let char_out = encoder_chars.output_size;
 
         assert_eq!(
             char2_model.output_size, vocab_size,
@@ -122,8 +121,8 @@ impl Hierarchical {
         );
 
         let w_token = tokenizer.w_token();
-        // The encoder validates its own input sizes against vocab_size.
-        let encoder = WordEncoder::new(encoder_fwd, encoder_bwd, vocab_size, w_token);
+        // The encoder validates its own input size against vocab_size.
+        let encoder = WordEncoder::new(encoder_chars, vocab_size, w_token);
         assert_eq!(
             encoder.char_embedding().output_size(),
             context_size,
@@ -847,8 +846,7 @@ impl Hierarchical {
     }
 
     pub fn save(&self, path: &str) -> io::Result<()> {
-        // NNM1 container, kind = Hierarchical. One named section per stage; the
-        // combine projection is a single standalone layer.
+        // NNM1 container, kind = Hierarchical: one named section per stage.
         Writer::new(
             ModelKind::Hierarchical,
             Meta {
@@ -857,9 +855,7 @@ impl Hierarchical {
                 step: self.step as u64,
             },
         )
-        .section("encoder_fwd", &self.encoder.fwd.layers)
-        .section("encoder_bwd", &self.encoder.bwd.layers)
-        .section_layer("combine", &self.encoder.combine)
+        .section("encoder", &self.encoder.chars.layers)
         .section("word_model", &self.word_model.layers)
         .section("char2_model", &self.char2_model.layers)
         .save(path)
@@ -877,21 +873,14 @@ impl Hierarchical {
             ));
         }
 
-        let encoder_fwd = reader.take_stack("encoder_fwd")?;
-        let encoder_bwd = reader.take_stack("encoder_bwd")?;
-        let mut combine = reader.take("combine")?;
-        let combine = combine.pop().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "combine section is empty")
-        })?;
+        let encoder_chars = reader.take_stack("encoder")?;
         let word_model = reader.take_stack("word_model")?;
         let char2_model = reader.take_stack("char2_model")?;
 
         Ok(HierStacks {
             vocab_size: reader.meta.vocab_size as usize,
             context_size: reader.meta.context_size as usize,
-            encoder_fwd,
-            encoder_bwd,
-            combine,
+            encoder_chars,
             word_model,
             char2_model,
             step: reader.meta.step as usize,
@@ -900,21 +889,13 @@ impl Hierarchical {
 
     pub fn load(path: &str, tokenizer: Rc<Utf8Tokenizer>) -> io::Result<Self> {
         let stacks = Self::load_stacks(path)?;
-        let combine = stacks
-            .combine
-            .as_any()
-            .downcast_ref::<crate::nn::linear::LinearLayer>()
-            .expect("combine section must be a LinearLayer");
-
         let mut model = Self::new(
-            stacks.encoder_fwd,
-            stacks.encoder_bwd,
+            stacks.encoder_chars,
             stacks.char2_model,
             stacks.word_model,
             stacks.vocab_size,
             tokenizer,
         );
-        model.encoder.combine.copy_weights(combine);
         debug_assert_eq!(model.context_size, stacks.context_size);
         model.step = stacks.step;
         Ok(model)
@@ -925,12 +906,8 @@ impl Hierarchical {
 pub struct HierStacks {
     pub vocab_size: usize,
     pub context_size: usize,
-    /// Forward encoder stack (the tied char table lives at its layer 0).
-    pub encoder_fwd: Sequential,
-    /// Backward encoder stack.
-    pub encoder_bwd: Sequential,
-    /// The `[fwd ; bwd]` → `e_w` projection (a single `LinearLayer`).
-    pub combine: Box<dyn NnLayer>,
+    /// Encoder stack (the tied char table lives at its layer 0).
+    pub encoder_chars: Sequential,
     pub word_model: Sequential,
     pub char2_model: Sequential,
     pub step: usize,
@@ -972,11 +949,7 @@ mod tests {
     /// accumulation and the slot-0 context extraction — from any recurrent
     /// layer's backward.
     fn build_stateless(vocab: usize, tok: Rc<Utf8Tokenizer>) -> Hierarchical {
-        let encoder_fwd = SequentialBuilder::new(vocab)
-            .embedding(H)
-            .rms_norm()
-            .build();
-        let encoder_bwd = SequentialBuilder::new(vocab)
+        let encoder = SequentialBuilder::new(vocab)
             .embedding(H)
             .rms_norm()
             .build();
@@ -987,24 +960,13 @@ mod tests {
             .linear_no_bias(vocab)
             .soft_cap(30.0)
             .build();
-        Hierarchical::new(
-            encoder_fwd,
-            encoder_bwd,
-            char2_model,
-            word_model,
-            vocab,
-            tok,
-        )
+        Hierarchical::new(encoder, char2_model, word_model, vocab, tok)
     }
 
     /// All-sLSTM stacks (the pre-mLSTM hierarchical layout): adds the
     /// recurrent per-word reset and BPTT handling on top of the plumbing.
     fn build_slstm(vocab: usize, tok: Rc<Utf8Tokenizer>) -> Hierarchical {
-        let encoder_fwd = SequentialBuilder::new(vocab)
-            .embedding(H)
-            .slstm_block(H)
-            .build();
-        let encoder_bwd = SequentialBuilder::new(vocab)
+        let encoder = SequentialBuilder::new(vocab)
             .embedding(H)
             .slstm_block(H)
             .build();
@@ -1021,14 +983,7 @@ mod tests {
             .linear_no_bias(vocab)
             .soft_cap(30.0)
             .build();
-        Hierarchical::new(
-            encoder_fwd,
-            encoder_bwd,
-            char2_model,
-            word_model,
-            vocab,
-            tok,
-        )
+        Hierarchical::new(encoder, char2_model, word_model, vocab, tok)
     }
 
     /// A small window with forward + backward already run on a fresh model.
@@ -1185,24 +1140,6 @@ mod tests {
         });
     }
 
-    /// The bidirectional combine projection maps `[fwd_readout ; bwd_readout]`
-    /// (2·H) → `e_w` (H). It is the only path by which `e_w`'s gradient reaches
-    /// the two encoder stacks, so a wrong concat order or a missing direction
-    /// breaks the match.
-    fn check_combine(build: fn(usize, Rc<Utf8Tokenizer>) -> Hierarchical, name: &str, tol: f64) {
-        let mut s = setup(build);
-        let grad = s
-            .model
-            .encoder
-            .combine
-            .grads
-            .weights
-            .matrix()
-            .as_slice()
-            .to_vec();
-        check_grad_direction(&mut s, grad, name, tol, |m| &mut m.encoder.combine.weights);
-    }
-
     // Stateless stacks are exactly differentiable, so the plumbing must match
     // FD tightly. Stacked sLSTMs are only subdifferentiable (the exp-gate
     // stabilizer `m_t = max(…)` has branch kinks, and the backward's branch
@@ -1213,16 +1150,6 @@ mod tests {
     #[test]
     fn tied_embedding_grads_match_fd_stateless() {
         check_tied_embedding(build_stateless, "emb_stateless", 0.03);
-    }
-
-    #[test]
-    fn combine_grads_match_fd_stateless() {
-        check_combine(build_stateless, "combine_stateless", 0.03);
-    }
-
-    #[test]
-    fn combine_grads_match_fd_slstm() {
-        check_combine(build_slstm, "combine_slstm", 0.3);
     }
 
     #[test]

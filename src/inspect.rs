@@ -53,11 +53,8 @@ pub fn inspect_model() {
                 "vocab_size = {}, context_size = {}, step = {}",
                 stacks.vocab_size, stacks.context_size, stacks.step,
             );
-            println!("\nencoder fwd (char model):");
-            print_sequential(&stacks.encoder_fwd);
-            println!("\nencoder bwd (char model):");
-            print_sequential(&stacks.encoder_bwd);
-            println!("\ncombine: [fwd ; bwd] → e_w (Linear)");
+            println!("\nencoder (char model):");
+            print_sequential(&stacks.encoder_chars);
             println!("\nword_model:");
             print_sequential(&stacks.word_model);
             println!("\nchar2_model:");

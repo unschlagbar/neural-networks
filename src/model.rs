@@ -41,18 +41,10 @@ pub fn build_normal_model(vocab: usize) -> Sequential {
 pub fn build_hierarchical_model(vocab: usize, tokenizer: Rc<Utf8Tokenizer>) -> Hierarchical {
     // No trailing norm: the decoder's pre-head RMSNorm is the only stage-level
     // norm in the whole hierarchical stack (the blocks keep their internal ones).
-    // Bidirectional encoder: two identically-shaped stacks read the word in
-    // opposite directions; `WordEncoder` concatenates their readouts and a
-    // combine Linear projects back to CHAR_HIDDEN (built inside `WordEncoder`).
-    let encoder_fwd = SequentialBuilder::new(vocab)
+    let encoder = SequentialBuilder::new(vocab)
         .embedding(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
-        .slstm_block(CHAR_HIDDEN)
-        .slstm_block(CHAR_HIDDEN)
-        .build();
-    let encoder_bwd = SequentialBuilder::new(vocab)
-        .embedding(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
         .build();
@@ -87,12 +79,5 @@ pub fn build_hierarchical_model(vocab: usize, tokenizer: Rc<Utf8Tokenizer>) -> H
         .soft_cap(LOGIT_SOFTCAP)
         .build();
 
-    Hierarchical::new(
-        encoder_fwd,
-        encoder_bwd,
-        char2_model,
-        word_model,
-        vocab,
-        tokenizer,
-    )
+    Hierarchical::new(encoder, char2_model, word_model, vocab, tokenizer)
 }
