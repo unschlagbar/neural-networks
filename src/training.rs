@@ -2,16 +2,14 @@ use std::{
     f32::consts::PI,
     fs::File,
     io::{BufWriter, Write},
-    rc::Rc,
     time::{Duration, Instant},
 };
 
 use crate::{
     batches::ChunkedWordDataSet,
     config::{
-        BATCH_SIZE, CHUNK_BYTES, DECAY_STEPS, EPOCHS, LOG_EVERY, LR, MAX_WINDOW_TOKENS,
-        MIN_LR, MIN_WORDS_PER_SEQ, SAVE_EVERY, SEQ_LEN, TRAIN_DATA, VAL_DATA, WARMUP_STEPS,
-        WORDS_PER_SEQ,
+        BATCH_SIZE, CHUNK_BYTES, DECAY_STEPS, EPOCHS, LOG_EVERY, LR, MAX_WINDOW_TOKENS, MIN_LR,
+        MIN_WORDS_PER_SEQ, SAVE_EVERY, SEQ_LEN, TRAIN_DATA, VAL_DATA, WARMUP_STEPS, WORDS_PER_SEQ,
     },
     hierarchical::{BackboneMode, Hierarchical},
     model::{build_hierarchical_model, build_normal_model},
@@ -21,7 +19,7 @@ use crate::{
 };
 
 pub fn train_normal(model_path: &str) {
-    let tokenizer = Rc::new(Utf8Tokenizer::new());
+    let tokenizer = Utf8Tokenizer::new();
     let vocab = tokenizer.vocab_size();
 
     // Existierendes Modell laden, sonst neu bauen.
@@ -39,7 +37,7 @@ pub fn train_normal(model_path: &str) {
     // so the two systems can be compared on exactly the same samples.
     println!("Streaming dataset from '{TRAIN_DATA}' in {CHUNK_BYTES}-byte chunks ...");
     let mut data = ChunkedWordDataSet::open(
-        tokenizer.clone(),
+        tokenizer,
         TRAIN_DATA,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
@@ -87,22 +85,22 @@ pub fn train_normal(model_path: &str) {
 }
 
 pub fn train_hierarchical(model_path: &str) {
-    let tokenizer = Rc::new(Utf8Tokenizer::new());
+    let tokenizer = Utf8Tokenizer::new();
     let vocab = tokenizer.vocab_size();
 
-    let mut model = match Hierarchical::load(model_path, tokenizer.clone()) {
+    let mut model = match Hierarchical::load(model_path, tokenizer) {
         Ok(m) => {
             println!("Loaded HM-RNN from '{model_path}'.");
             m
         }
         Err(e) => {
             println!("Could not load '{model_path}' ({e}) — creating new HM-RNN.");
-            build_hierarchical_model(vocab, tokenizer.clone())
+            build_hierarchical_model(vocab, tokenizer)
         }
     };
     println!("Streaming dataset from '{TRAIN_DATA}' in {CHUNK_BYTES}-byte chunks ...");
     let mut data = ChunkedWordDataSet::open(
-        tokenizer.clone(),
+        tokenizer,
         TRAIN_DATA,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
@@ -177,14 +175,14 @@ pub fn train_hierarchical(model_path: &str) {
 pub fn trace_hierarchical(model_path: &str) {
     const TRACE_WORDS: usize = 12;
 
-    let tokenizer = Rc::new(Utf8Tokenizer::new());
+    let tokenizer = Utf8Tokenizer::new();
 
-    let mut model = match Hierarchical::load(model_path, tokenizer.clone()) {
+    let mut model = match Hierarchical::load(model_path, tokenizer) {
         Ok(m) => m,
-        Err(_) => build_hierarchical_model(tokenizer.vocab_size(), tokenizer.clone()),
+        Err(_) => build_hierarchical_model(tokenizer.vocab_size(), tokenizer),
     };
     let mut data = ChunkedWordDataSet::open(
-        tokenizer.clone(),
+        tokenizer,
         TRAIN_DATA,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
@@ -222,9 +220,9 @@ pub fn probe_hierarchical(model_path: &str) {
     // modest — this is forward-only but still O(tokens) per mode.
     const PROBE_WINDOWS: usize = 10;
 
-    let tokenizer = Rc::new(Utf8Tokenizer::new());
+    let tokenizer = Utf8Tokenizer::new();
 
-    let mut model = match Hierarchical::load(model_path, tokenizer.clone()) {
+    let mut model = match Hierarchical::load(model_path, tokenizer) {
         Ok(m) => {
             println!("Loaded '{model_path}' (step {}).", m.step);
             m
@@ -236,7 +234,7 @@ pub fn probe_hierarchical(model_path: &str) {
     };
     println!("Preparing dataset from '{TRAIN_DATA}' ...");
     let mut data = ChunkedWordDataSet::open(
-        tokenizer.clone(),
+        tokenizer,
         TRAIN_DATA,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
@@ -405,9 +403,9 @@ pub fn probe_hierarchical(model_path: &str) {
 /// hierarchical model and reports mean decode char loss and word loss. No
 /// backward, no weight updates. Set via the `hv` mode.
 pub fn validate_hierarchical(model_path: &str) {
-    let tokenizer = Rc::new(Utf8Tokenizer::new());
+    let tokenizer = Utf8Tokenizer::new();
 
-    let mut model = match Hierarchical::load(model_path, tokenizer.clone()) {
+    let mut model = match Hierarchical::load(model_path, tokenizer) {
         Ok(m) => {
             println!("Loaded '{model_path}' (step {}).", m.step);
             m
@@ -419,7 +417,7 @@ pub fn validate_hierarchical(model_path: &str) {
     };
     println!("Streaming validation set from '{VAL_DATA}' in {CHUNK_BYTES}-byte chunks ...");
     let mut data = ChunkedWordDataSet::open(
-        tokenizer.clone(),
+        tokenizer,
         VAL_DATA,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,
@@ -455,7 +453,10 @@ pub fn validate_hierarchical(model_path: &str) {
     }
     let c_loss = c_total / windows as f32;
     let w_loss = w_total / windows as f32;
-    println!("\n── validation ({windows} windows, {:.0?}) ──", start.elapsed());
+    println!(
+        "\n── validation ({windows} windows, {:.0?}) ──",
+        start.elapsed()
+    );
     println!("  Char loss = {c_loss:.4} nats   ppl = {:.3}", c_loss.exp());
     println!("  Word loss = {w_loss:.4} nats   ppl = {:.3}", w_loss.exp());
 }

@@ -1,4 +1,4 @@
-use std::{io, range::Range, rc::Rc, time::Instant};
+use std::{io, range::Range, time::Instant};
 
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
@@ -48,7 +48,7 @@ pub struct Hierarchical {
     pub vocab_size: usize,
     pub context_size: usize,
 
-    pub tokenizer: Rc<Utf8Tokenizer>,
+    pub tokenizer: Utf8Tokenizer,
     /// The `[W]` marker id — the decoder's EOS target (and sampling stop token).
     w_token: u16,
 
@@ -102,7 +102,7 @@ impl Hierarchical {
         char2_model: Sequential,
         word_model: Sequential,
         vocab_size: usize,
-        tokenizer: Rc<Utf8Tokenizer>,
+        tokenizer: Utf8Tokenizer,
     ) -> Self {
         let context_size = word_model.output_size;
         let char_out = encoder_chars.output_size;
@@ -887,7 +887,7 @@ impl Hierarchical {
         })
     }
 
-    pub fn load(path: &str, tokenizer: Rc<Utf8Tokenizer>) -> io::Result<Self> {
+    pub fn load(path: &str, tokenizer: Utf8Tokenizer) -> io::Result<Self> {
         let stacks = Self::load_stacks(path)?;
         let mut model = Self::new(
             stacks.encoder_chars,
@@ -948,7 +948,7 @@ mod tests {
     /// `Hierarchical` gradient plumbing itself — the tied-embedding row
     /// accumulation and the slot-0 context extraction — from any recurrent
     /// layer's backward.
-    fn build_stateless(vocab: usize, tok: Rc<Utf8Tokenizer>) -> Hierarchical {
+    fn build_stateless(vocab: usize, tok: Utf8Tokenizer) -> Hierarchical {
         let encoder = SequentialBuilder::new(vocab)
             .embedding(H)
             .rms_norm()
@@ -965,7 +965,7 @@ mod tests {
 
     /// All-sLSTM stacks (the pre-mLSTM hierarchical layout): adds the
     /// recurrent per-word reset and BPTT handling on top of the plumbing.
-    fn build_slstm(vocab: usize, tok: Rc<Utf8Tokenizer>) -> Hierarchical {
+    fn build_slstm(vocab: usize, tok: Utf8Tokenizer) -> Hierarchical {
         let encoder = SequentialBuilder::new(vocab)
             .embedding(H)
             .slstm_block(H)
@@ -988,15 +988,15 @@ mod tests {
 
     /// A small window with forward + backward already run on a fresh model.
     struct Setup {
-        tokenizer: Rc<Utf8Tokenizer>,
+        tokenizer: Utf8Tokenizer,
         tokens: Vec<u16>,
         words: Vec<Range<usize>>,
         model: Hierarchical,
     }
 
-    fn setup(build: fn(usize, Rc<Utf8Tokenizer>) -> Hierarchical) -> Setup {
-        let tokenizer = Rc::new(Utf8Tokenizer::new());
-        let mut model = build(tokenizer.vocab_size(), tokenizer.clone());
+    fn setup(build: fn(usize, Utf8Tokenizer) -> Hierarchical) -> Setup {
+        let tokenizer = Utf8Tokenizer::new();
+        let mut model = build(tokenizer.vocab_size(), tokenizer);
 
         let tokens = tokenizer.to_tokens("let cat = sat(on, the).mat();");
         let mut words: Vec<Range<usize>> = Vec::new();
@@ -1092,11 +1092,7 @@ mod tests {
     /// The tied char embedding accumulates two contributions: encoder BPTT and
     /// the decoder char steps' input grads (the `dec_targets[slot-1]` row
     /// indexing). A wrong row or a missed contribution breaks the match.
-    fn check_tied_embedding(
-        build: fn(usize, Rc<Utf8Tokenizer>) -> Hierarchical,
-        name: &str,
-        tol: f64,
-    ) {
+    fn check_tied_embedding(build: fn(usize, Utf8Tokenizer) -> Hierarchical, name: &str, tol: f64) {
         let mut s = setup(build);
         let grad = s
             .model
@@ -1115,7 +1111,7 @@ mod tests {
     /// The backbone's output projection receives gradient exclusively through
     /// the injected slot-0 context, so this validates the d_o extraction.
     fn check_injected_context(
-        build: fn(usize, Rc<Utf8Tokenizer>) -> Hierarchical,
+        build: fn(usize, Utf8Tokenizer) -> Hierarchical,
         name: &str,
         tol: f64,
     ) {

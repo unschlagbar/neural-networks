@@ -48,7 +48,10 @@ fn main() {
         thr_sm / 32,
         smem_sm / 1024,
     );
-    println!("per block: {} KB shared max (opt-in)\n", smem_blk_opt / 1024);
+    println!(
+        "per block: {} KB shared max (opt-in)\n",
+        smem_blk_opt / 1024
+    );
 
     // The backbone's real shape: one window, WORD_HIDDEN wide, 8 heads.
     let (b, t, heads, dqk) = (1usize, 2047usize, 8usize, 64usize);

@@ -21,7 +21,14 @@ pub struct AdamCfg {
 
 impl AdamCfg {
     pub fn new(lr: f32, weight_decay: f32) -> Self {
-        Self { lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, weight_decay, t: 0 }
+        Self {
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay,
+            t: 0,
+        }
     }
 }
 

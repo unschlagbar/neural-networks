@@ -41,6 +41,8 @@
 //! A sequence already shorter than `L` (the encoder/decoder, where T is a word
 //! length) takes the single-chunk path with no inter-chunk work at all.
 
+use std::sync::OnceLock;
+
 use super::block::Cell;
 use super::{DTensor, Gpu, linear::Linear, ops, rms_norm::RmsNorm};
 use crate::nn2::optim::AdamCfg;
@@ -49,7 +51,7 @@ use crate::tensor::Tensor;
 /// Chunk length: `config::MLSTM_CHUNK`, overridable with `MLSTM_CHUNK=<L>` for A/B
 /// runs (0 = single-chunk). Resolved once — the env read must not sit in forward.
 fn chunk_len() -> usize {
-    static L: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static L: OnceLock<usize> = OnceLock::new();
     *L.get_or_init(|| {
         std::env::var("MLSTM_CHUNK")
             .ok()
@@ -141,7 +143,7 @@ enum Cache {
 /// `MLSTM_LEGACY=1` forces the op-at-a-time chunk loop — the A/B baseline for
 /// `mlstm_fused_bench`, and the escape hatch if a fused kernel ever misbehaves.
 fn legacy_forced() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static OFF: OnceLock<bool> = OnceLock::new();
     *OFF.get_or_init(|| std::env::var("MLSTM_LEGACY").is_ok())
 }
 

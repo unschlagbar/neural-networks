@@ -31,7 +31,11 @@ pub fn softmax_rows(logits: &Tensor) -> Tensor {
 /// averaged over the batch, ready to feed straight into `Linear::backward`.
 pub fn softmax_cross_entropy(logits: &Tensor, targets: &[usize]) -> (f32, Tensor) {
     let (b, c) = (logits.rows(), logits.cols());
-    assert_eq!(targets.len(), b, "softmax_cross_entropy — targets len != batch");
+    assert_eq!(
+        targets.len(),
+        b,
+        "softmax_cross_entropy — targets len != batch"
+    );
 
     let mut probs = softmax_rows(logits);
     let inv_b = 1.0 / b as f32;
@@ -82,7 +86,11 @@ mod tests {
             let lm = only_loss(&logits);
             logits.data[i] = orig;
             let num = (lp - lm) / (2.0 * eps);
-            assert!((num - grad.data[i]).abs() < 1e-3, "grad[{i}]: num {num} vs {}", grad.data[i]);
+            assert!(
+                (num - grad.data[i]).abs() < 1e-3,
+                "grad[{i}]: num {num} vs {}",
+                grad.data[i]
+            );
         }
     }
 }

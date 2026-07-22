@@ -21,7 +21,6 @@ use std::{
     mem,
     path::PathBuf,
     range::Range,
-    rc::Rc,
 };
 
 use rand::{rng, seq::SliceRandom};
@@ -380,7 +379,7 @@ enum TextSource {
 /// Streaming loader: gathers roughly `chunk_bytes` of raw text at a time from
 /// the source and hands out ready-to-train `WordChunk`s.
 pub struct ChunkedWordDataSet {
-    tokenizer: Rc<Utf8Tokenizer>,
+    tokenizer: Utf8Tokenizer,
     words_per_seq: usize,
     min_words: usize,
     max_tokens: usize,
@@ -392,7 +391,7 @@ pub struct ChunkedWordDataSet {
 
 impl ChunkedWordDataSet {
     pub fn open(
-        tokenizer: Rc<Utf8Tokenizer>,
+        tokenizer: Utf8Tokenizer,
         path: &str,
         words_per_seq: usize,
         min_words: usize,
@@ -412,10 +411,7 @@ impl ChunkedWordDataSet {
             let (reader, filter_language) = if ALLOWED_LANGUAGES.is_empty() {
                 (None, false)
             } else {
-                match ParquetColumnReader::open_columns(
-                    path,
-                    &[&column, PARQUET_LANGUAGE_COLUMN],
-                ) {
+                match ParquetColumnReader::open_columns(path, &[&column, PARQUET_LANGUAGE_COLUMN]) {
                     Ok(r) => (Some(r), true),
                     Err(e) => {
                         println!(
@@ -690,7 +686,7 @@ mod tests {
     /// load produces, and rewinding must reproduce them deterministically.
     #[test]
     fn tiny_chunks_match_whole_file() {
-        let tokenizer = Rc::new(Utf8Tokenizer::new());
+        let tokenizer = Utf8Tokenizer::new();
 
         // A few hundred small documents so many chunk cuts land mid-file.
         let mut text = String::new();
@@ -705,7 +701,7 @@ mod tests {
         let path = path.to_str().unwrap();
 
         let open = |chunk_bytes: usize| {
-            let mut l = ChunkedWordDataSet::open(tokenizer.clone(), path, 6, 2, 64, chunk_bytes);
+            let mut l = ChunkedWordDataSet::open(tokenizer, path, 6, 2, 64, chunk_bytes);
             l.quiet = true;
             l
         };

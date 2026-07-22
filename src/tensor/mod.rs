@@ -38,7 +38,11 @@ pub struct Tensor {
 /// Copy `dims` into a zero-filled `[usize; MAX_RANK]`, checking the rank bound.
 #[inline]
 fn shape_array(dims: &[usize]) -> [usize; MAX_RANK] {
-    assert!(dims.len() <= MAX_RANK, "rank {} exceeds MAX_RANK {MAX_RANK}", dims.len());
+    assert!(
+        dims.len() <= MAX_RANK,
+        "rank {} exceeds MAX_RANK {MAX_RANK}",
+        dims.len()
+    );
     let mut s = [0usize; MAX_RANK];
     s[..dims.len()].copy_from_slice(dims);
     s
@@ -54,20 +58,32 @@ impl Tensor {
             "Tensor::new — shape {dims:?} implies {n} elements but data has {}",
             data.len()
         );
-        Self { shape: shape_array(dims), rank: dims.len(), data }
+        Self {
+            shape: shape_array(dims),
+            rank: dims.len(),
+            data,
+        }
     }
 
     /// All-zeros tensor of the given shape.
     pub fn zeros(dims: &[usize]) -> Self {
         let n: usize = dims.iter().product();
-        Self { shape: shape_array(dims), rank: dims.len(), data: vec![0.0; n] }
+        Self {
+            shape: shape_array(dims),
+            rank: dims.len(),
+            data: vec![0.0; n],
+        }
     }
 
     /// Uniform `[-scale, scale)` init — used for weight matrices.
     pub fn random(dims: &[usize], scale: f32) -> Self {
         let n: usize = dims.iter().product();
         let data = (0..n).map(|_| random_range(-scale..scale)).collect();
-        Self { shape: shape_array(dims), rank: dims.len(), data }
+        Self {
+            shape: shape_array(dims),
+            rank: dims.len(),
+            data,
+        }
     }
 
     /// Xavier/Glorot-uniform init for a `[fan_in, fan_out]` weight matrix.
@@ -126,8 +142,17 @@ impl Tensor {
     /// no data is moved, since everything is row-major contiguous.
     pub fn reshape(&self, dims: &[usize]) -> Self {
         let n: usize = dims.iter().product();
-        assert_eq!(n, self.data.len(), "reshape {:?} -> {dims:?} changes element count", self.dims());
-        Self { shape: shape_array(dims), rank: dims.len(), data: self.data.clone() }
+        assert_eq!(
+            n,
+            self.data.len(),
+            "reshape {:?} -> {dims:?} changes element count",
+            self.dims()
+        );
+        Self {
+            shape: shape_array(dims),
+            rank: dims.len(),
+            data: self.data.clone(),
+        }
     }
 
     /// Row `r` of a 2D tensor as a slice.

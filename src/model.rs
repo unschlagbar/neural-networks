@@ -1,5 +1,3 @@
-use std::rc::Rc;
-
 use crate::{
     config::{CHAR_HIDDEN, LOGIT_SOFTCAP, OUT_HIDDEN, WORD_BLOCKS, WORD_HIDDEN},
     hierarchical::Hierarchical,
@@ -38,7 +36,7 @@ pub fn build_normal_model(vocab: usize) -> Sequential {
 //                            table, held by `Hierarchical`). Predicts the
 //                            word's chars followed by a trailing `[W]` (EOS).
 //                            Reset per word.
-pub fn build_hierarchical_model(vocab: usize, tokenizer: Rc<Utf8Tokenizer>) -> Hierarchical {
+pub fn build_hierarchical_model(vocab: usize, tokenizer: Utf8Tokenizer) -> Hierarchical {
     // No trailing norm: the decoder's pre-head RMSNorm is the only stage-level
     // norm in the whole hierarchical stack (the blocks keep their internal ones).
     let encoder = SequentialBuilder::new(vocab)

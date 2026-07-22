@@ -79,7 +79,15 @@ impl Linear {
         // (gemm beta=1) — avoids both the double-zero and a separate bias pass.
         let mut y = Tensor::zeros(&[b, output]);
         ops::broadcast_row(&mut y, &self.b);
-        gemm::gemm_nn(b, input, output, &self.x.data, &self.w.data, &mut y.data, 1.0);
+        gemm::gemm_nn(
+            b,
+            input,
+            output,
+            &self.x.data,
+            &self.w.data,
+            &mut y.data,
+            1.0,
+        );
         y
     }
 
@@ -89,10 +97,22 @@ impl Linear {
         let b = dy.rows();
         let (input, output) = (self.input_size(), self.output_size());
         assert_eq!(dy.cols(), output, "Linear::backward — grad width mismatch");
-        assert_eq!(self.x.rows(), b, "Linear::backward — batch mismatch with cached input");
+        assert_eq!(
+            self.x.rows(),
+            b,
+            "Linear::backward — batch mismatch with cached input"
+        );
 
         // dW += Xᵀ · dY   (accumulate, beta = 1.0)
-        gemm::gemm_tn(input, b, output, &self.x.data, &dy.data, &mut self.dw.data, 1.0);
+        gemm::gemm_tn(
+            input,
+            b,
+            output,
+            &self.x.data,
+            &dy.data,
+            &mut self.dw.data,
+            1.0,
+        );
 
         // db += Σ_batch dY
         ops::add_col_sum(&mut self.db, dy);
@@ -176,7 +196,11 @@ mod tests {
             let lm = loss(&mut lin, &x);
             lin.w.data[i] = orig;
             let num = (lp - lm) / (2.0 * eps);
-            assert!((num - dw.data[i]).abs() < tol, "dW[{i}]: num {num} vs analytic {}", dw.data[i]);
+            assert!(
+                (num - dw.data[i]).abs() < tol,
+                "dW[{i}]: num {num} vs analytic {}",
+                dw.data[i]
+            );
         }
 
         // db
@@ -188,7 +212,11 @@ mod tests {
             let lm = loss(&mut lin, &x);
             lin.b.data[o] = orig;
             let num = (lp - lm) / (2.0 * eps);
-            assert!((num - db.data[o]).abs() < tol, "db[{o}]: num {num} vs analytic {}", db.data[o]);
+            assert!(
+                (num - db.data[o]).abs() < tol,
+                "db[{o}]: num {num} vs analytic {}",
+                db.data[o]
+            );
         }
 
         // dX
@@ -201,7 +229,11 @@ mod tests {
             let lm = loss(&mut lin, &xp);
             xp.data[i] = orig;
             let num = (lp - lm) / (2.0 * eps);
-            assert!((num - dx.data[i]).abs() < tol, "dX[{i}]: num {num} vs analytic {}", dx.data[i]);
+            assert!(
+                (num - dx.data[i]).abs() < tol,
+                "dX[{i}]: num {num} vs analytic {}",
+                dx.data[i]
+            );
         }
     }
 }

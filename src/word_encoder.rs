@@ -174,7 +174,11 @@ impl WordEncoder {
                 for (k, tok) in toks.enumerate() {
                     let tok = tok as usize;
                     char_input[tok] = 1.0;
-                    Sequential::forward_step(&mut replica.layers, &mut cache[base + k], &char_input);
+                    Sequential::forward_step(
+                        &mut replica.layers,
+                        &mut cache[base + k],
+                        &char_input,
+                    );
                     char_input[tok] = 0.0;
                 }
             }
@@ -195,7 +199,12 @@ impl WordEncoder {
         let char_out = self.output_size;
         let max_dim = self.max_layer_dim;
         let enc_ranges = &self.enc_ranges;
-        let chunks = chunk_words(&mut self.pool.replicas, enc_ranges, n, &mut self.chars.cache);
+        let chunks = chunk_words(
+            &mut self.pool.replicas,
+            enc_ranges,
+            n,
+            &mut self.chars.cache,
+        );
 
         let signal: f32 = chunks
             .into_par_iter()

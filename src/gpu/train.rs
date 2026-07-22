@@ -9,7 +9,6 @@
 //! `<model_path>` every `SAVE_EVERY` steps and reloaded on startup, so a run can
 //! be stopped and resumed — and the same file opens in `hp` / `hs`.
 
-use std::rc::Rc;
 use std::time::Instant;
 
 use crate::batches::ChunkedWordDataSet;
@@ -50,7 +49,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         }
     };
 
-    let tokenizer = Rc::new(Utf8Tokenizer::new());
+    let tokenizer = Utf8Tokenizer::new();
     let vocab = tokenizer.vocab_size();
     let w_token = tokenizer.w_token() as usize;
     let cfg = cfg_from_config(vocab, w_token);
@@ -78,7 +77,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
 
     println!("Streaming dataset from '{TRAIN_DATA}' in {CHUNK_BYTES}-byte chunks ...");
     let mut data = ChunkedWordDataSet::open(
-        tokenizer.clone(),
+        tokenizer,
         TRAIN_DATA,
         WORDS_PER_SEQ,
         MIN_WORDS_PER_SEQ,

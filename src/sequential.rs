@@ -87,9 +87,12 @@ impl Sequential {
 
     /// Save this flat model to a file as an `NNM1` container (kind = Flat).
     pub fn save(&self, path: &str) -> std::io::Result<()> {
-        crate::format::Writer::new(crate::format::ModelKind::Flat, crate::format::Meta::default())
-            .section("model", &self.layers)
-            .save(path)
+        crate::format::Writer::new(
+            crate::format::ModelKind::Flat,
+            crate::format::Meta::default(),
+        )
+        .section("model", &self.layers)
+        .save(path)
     }
 
     /// Load a flat model from an `NNM1` container file. Errors if the file is a

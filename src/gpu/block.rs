@@ -13,7 +13,12 @@
 //! a generic GPU `Cell`.
 
 use super::{DTensor, Gpu, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm};
-use crate::nn2::optim::AdamCfg;
+use crate::{
+    nn::{linear::LinearLayer, rms_norm::RMSNorm, slstm_block::SLSTMBlock},
+    nn_layer::NnLayer,
+    nn2::optim::AdamCfg,
+    tensor::Tensor,
+};
 
 /// A recurrent cell operating on `[B, T, H]` device sequences (H in == H out).
 pub trait Cell {
@@ -34,36 +39,48 @@ pub trait Cell {
         gpu: &Gpu,
         hidden: usize,
         up: usize,
-        pre_norm1: crate::nn::rms_norm::RMSNorm,
-        post_cell_norm: Option<crate::nn::rms_norm::RMSNorm>,
-        pre_norm2: crate::nn::rms_norm::RMSNorm,
-        lin_gate: crate::nn::linear::LinearLayer,
-        lin_value: crate::nn::linear::LinearLayer,
-        lin_down: crate::nn::linear::LinearLayer,
-    ) -> Box<dyn crate::nn_layer::NnLayer>;
+        pre_norm1: RMSNorm,
+        post_cell_norm: Option<RMSNorm>,
+        pre_norm2: RMSNorm,
+        lin_gate: LinearLayer,
+        lin_value: LinearLayer,
+        lin_down: LinearLayer,
+    ) -> Box<dyn NnLayer>;
 }
 
 impl Cell for SLstm {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor { SLstm::forward(self, gpu, x) }
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor { SLstm::backward(self, gpu, dy) }
-    fn zero_grad(&mut self, gpu: &Gpu) { SLstm::zero_grad(self, gpu) }
-    fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) { SLstm::step(self, gpu, cfg) }
-    fn params_mut(&mut self) -> Vec<&mut DTensor> { SLstm::params_mut(self) }
-    fn wants_post_cell_norm(&self) -> bool { true }
+    fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+        SLstm::forward(self, gpu, x)
+    }
+    fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+        SLstm::backward(self, gpu, dy)
+    }
+    fn zero_grad(&mut self, gpu: &Gpu) {
+        SLstm::zero_grad(self, gpu)
+    }
+    fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
+        SLstm::step(self, gpu, cfg)
+    }
+    fn params_mut(&mut self) -> Vec<&mut DTensor> {
+        SLstm::params_mut(self)
+    }
+    fn wants_post_cell_norm(&self) -> bool {
+        true
+    }
     fn to_nn_block(
         &self,
         gpu: &Gpu,
         hidden: usize,
         up: usize,
-        pre_norm1: crate::nn::rms_norm::RMSNorm,
-        post_cell_norm: Option<crate::nn::rms_norm::RMSNorm>,
-        pre_norm2: crate::nn::rms_norm::RMSNorm,
-        lin_gate: crate::nn::linear::LinearLayer,
-        lin_value: crate::nn::linear::LinearLayer,
-        lin_down: crate::nn::linear::LinearLayer,
-    ) -> Box<dyn crate::nn_layer::NnLayer> {
+        pre_norm1: RMSNorm,
+        post_cell_norm: Option<RMSNorm>,
+        pre_norm2: RMSNorm,
+        lin_gate: LinearLayer,
+        lin_value: LinearLayer,
+        lin_down: LinearLayer,
+    ) -> Box<dyn NnLayer> {
         let post = post_cell_norm.expect("sLSTM block requires a post_cell_norm");
-        Box::new(crate::nn::slstm_block::SLSTMBlock::from_loaded(
+        Box::new(SLSTMBlock::from_loaded(
             hidden,
             up,
             pre_norm1,
@@ -89,16 +106,26 @@ pub trait BlockLike {
     fn params_mut(&mut self) -> Vec<&mut DTensor>;
     /// Export the block into the matching CPU `nn` block (`SLSTMBlock` /
     /// `MLSTMBlock`) for a `HIER` checkpoint.
-    fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn crate::nn_layer::NnLayer>;
+    fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn NnLayer>;
 }
 
 impl<C: Cell> BlockLike for Block<C> {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor { Block::forward(self, gpu, x) }
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor { Block::backward(self, gpu, dy) }
-    fn zero_grad(&mut self, gpu: &Gpu) { Block::zero_grad(self, gpu) }
-    fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) { Block::step(self, gpu, cfg) }
-    fn params_mut(&mut self) -> Vec<&mut DTensor> { Block::params_mut(self) }
-    fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn crate::nn_layer::NnLayer> {
+    fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+        Block::forward(self, gpu, x)
+    }
+    fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+        Block::backward(self, gpu, dy)
+    }
+    fn zero_grad(&mut self, gpu: &Gpu) {
+        Block::zero_grad(self, gpu)
+    }
+    fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
+        Block::step(self, gpu, cfg)
+    }
+    fn params_mut(&mut self) -> Vec<&mut DTensor> {
+        Block::params_mut(self)
+    }
+    fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn NnLayer> {
         Block::to_nn_layer(self, gpu)
     }
 }
@@ -126,7 +153,9 @@ impl<C: Cell> Block<C> {
     /// Assemble a block around a cell, with fresh norms (γ=1) and Xavier `Linear`
     /// weights. `hidden` is the model width, `up` the SwiGLU inner width.
     pub fn from_cell(gpu: &Gpu, hidden: usize, up: usize, cell: C) -> Self {
-        let post_cell_norm = cell.wants_post_cell_norm().then(|| RmsNorm::new(gpu, hidden));
+        let post_cell_norm = cell
+            .wants_post_cell_norm()
+            .then(|| RmsNorm::new(gpu, hidden));
         Self {
             hidden,
             up,
@@ -134,9 +163,13 @@ impl<C: Cell> Block<C> {
             cell,
             post_cell_norm,
             pre_norm2: RmsNorm::new(gpu, hidden),
-            lin_gate: Linear::from_parts(gpu, &crate::tensor::Tensor::xavier(hidden, up), &crate::tensor::Tensor::zeros(&[up])),
-            lin_value: Linear::from_parts(gpu, &crate::tensor::Tensor::xavier(hidden, up), &crate::tensor::Tensor::zeros(&[up])),
-            lin_down: Linear::from_parts(gpu, &crate::tensor::Tensor::xavier(up, hidden), &crate::tensor::Tensor::zeros(&[hidden])),
+            lin_gate: Linear::from_parts(gpu, &Tensor::xavier(hidden, up), &Tensor::zeros(&[up])),
+            lin_value: Linear::from_parts(gpu, &Tensor::xavier(hidden, up), &Tensor::zeros(&[up])),
+            lin_down: Linear::from_parts(
+                gpu,
+                &Tensor::xavier(up, hidden),
+                &Tensor::zeros(&[hidden]),
+            ),
             gate_pre: None,
             gate_act: None,
             value: None,
@@ -265,7 +298,6 @@ impl<C: Cell> Block<C> {
     /// the concrete `SLSTMBlock` / `MLSTMBlock`.
     pub fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn crate::nn_layer::NnLayer> {
         use super::{dt_matrix, dt_vec};
-        use crate::nn::{linear::LinearLayer, rms_norm::RMSNorm};
         let (h, u) = (self.hidden, self.up);
         let pre1 = RMSNorm::from_loaded(h, dt_vec(gpu, &self.pre_norm1.gamma));
         let pre2 = RMSNorm::from_loaded(h, dt_vec(gpu, &self.pre_norm2.gamma));
@@ -273,10 +305,26 @@ impl<C: Cell> Block<C> {
             .post_cell_norm
             .as_ref()
             .map(|nm| RMSNorm::from_loaded(h, dt_vec(gpu, &nm.gamma)));
-        let gate = LinearLayer::from_loaded(h, u, dt_matrix(gpu, &self.lin_gate.w), dt_vec(gpu, &self.lin_gate.b));
-        let value = LinearLayer::from_loaded(h, u, dt_matrix(gpu, &self.lin_value.w), dt_vec(gpu, &self.lin_value.b));
-        let down = LinearLayer::from_loaded(u, h, dt_matrix(gpu, &self.lin_down.w), dt_vec(gpu, &self.lin_down.b));
-        self.cell.to_nn_block(gpu, h, u, pre1, post, pre2, gate, value, down)
+        let gate = LinearLayer::from_loaded(
+            h,
+            u,
+            dt_matrix(gpu, &self.lin_gate.w),
+            dt_vec(gpu, &self.lin_gate.b),
+        );
+        let value = LinearLayer::from_loaded(
+            h,
+            u,
+            dt_matrix(gpu, &self.lin_value.w),
+            dt_vec(gpu, &self.lin_value.b),
+        );
+        let down = LinearLayer::from_loaded(
+            u,
+            h,
+            dt_matrix(gpu, &self.lin_down.w),
+            dt_vec(gpu, &self.lin_down.b),
+        );
+        self.cell
+            .to_nn_block(gpu, h, u, pre1, post, pre2, gate, value, down)
     }
 
     pub fn zero_grad(&mut self, gpu: &Gpu) {
@@ -306,7 +354,7 @@ impl<C: Cell> Block<C> {
 }
 
 /// Upload an `nn::LinearLayer` to the device.
-fn lin_from_nn(gpu: &Gpu, l: &crate::nn::linear::LinearLayer) -> Linear {
+fn lin_from_nn(gpu: &Gpu, l: &LinearLayer) -> Linear {
     use super::{tensor_from_matrix as m, tensor_from_slice as v};
     Linear::from_parts(gpu, &m(&l.weights), &v(&l.biases))
 }
@@ -383,7 +431,9 @@ mod tests {
     /// AdamW-step from identical parameters.
     #[test]
     fn slstm_block_matches_cpu() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let (b, t, h, u) = (2, 4, 8, 12);
 
         let mut cpu = CpuSLstmBlock::new_slstm(h, u);
@@ -407,9 +457,24 @@ mod tests {
         cfg.t = 1;
         cpu.step(&cfg);
         dev.step(&gpu, &cfg);
-        assert_close(&dev.lin_down.w.to_host(&gpu).data, &cpu.lin_down.w.data, 3e-3, "lin_down.w");
-        assert_close(&dev.pre_norm1.gamma.to_host(&gpu).data, &cpu.pre_norm1.gamma.data, 3e-3, "pre_norm1.gamma");
-        assert_close(&dev.cell.w[0].to_host(&gpu).data, &cpu.cell.wz.data, 3e-3, "cell.wz");
+        assert_close(
+            &dev.lin_down.w.to_host(&gpu).data,
+            &cpu.lin_down.w.data,
+            3e-3,
+            "lin_down.w",
+        );
+        assert_close(
+            &dev.pre_norm1.gamma.to_host(&gpu).data,
+            &cpu.pre_norm1.gamma.data,
+            3e-3,
+            "pre_norm1.gamma",
+        );
+        assert_close(
+            &dev.cell.w[0].to_host(&gpu).data,
+            &cpu.cell.wz.data,
+            3e-3,
+            "cell.wz",
+        );
     }
 
     /// GPU `Block<MLstm>` (parallel-form cell) must match `nn2::MLstmBlock` (scalar
@@ -418,7 +483,9 @@ mod tests {
     /// the mLSTM cell composes correctly inside the two residuals.
     #[test]
     fn mlstm_block_matches_cpu() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let (b, t, h, u, heads, dqk) = (2, 5, 8, 12, 2, 4); // dhv = 4
 
         let mut cpu = CpuMLstmBlock::new_mlstm(h, u, heads, dqk);
@@ -443,7 +510,17 @@ mod tests {
         cfg.t = 1;
         cpu.step(&cfg);
         dev.step(&gpu, &cfg);
-        assert_close(&dev.lin_down.w.to_host(&gpu).data, &cpu.lin_down.w.data, 3e-3, "lin_down.w");
-        assert_close(&dev.pre_norm1.gamma.to_host(&gpu).data, &cpu.pre_norm1.gamma.data, 3e-3, "pre_norm1.gamma");
+        assert_close(
+            &dev.lin_down.w.to_host(&gpu).data,
+            &cpu.lin_down.w.data,
+            3e-3,
+            "lin_down.w",
+        );
+        assert_close(
+            &dev.pre_norm1.gamma.to_host(&gpu).data,
+            &cpu.pre_norm1.gamma.data,
+            3e-3,
+            "pre_norm1.gamma",
+        );
     }
 }

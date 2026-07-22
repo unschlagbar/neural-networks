@@ -4,8 +4,6 @@
 // the words are partitioned. Training only differs in the order the per-word
 // gradients are summed, so trajectories may drift by float rounding, not more.
 
-use std::rc::Rc;
-
 use neural_networks::{
     batches::ChunkedWordDataSet, hierarchical::Hierarchical, model::build_hierarchical_model,
     tokenizer_utf8::Utf8Tokenizer, training::TrainingState,
@@ -21,9 +19,9 @@ const TRAIN_WINDOWS: usize = 8;
 /// (non-Send) state locally so it can run inside any rayon pool; the pool it
 /// runs under decides how many replicas the parallel word phases use.
 fn eval_train_eval(model_path: &str) -> (f32, f32, f32) {
-    let tokenizer = Rc::new(Utf8Tokenizer::new());
+    let tokenizer = Utf8Tokenizer::new();
     let mut loader = ChunkedWordDataSet::open(
-        tokenizer.clone(),
+        tokenizer,
         "alice.txt",
         WORDS_PER_SEQ,
         MIN_WORDS,
@@ -31,7 +29,10 @@ fn eval_train_eval(model_path: &str) -> (f32, f32, f32) {
         64 * 1024 * 1024, // alice.txt fits in one chunk
     );
     let data = loader.next_chunk().expect("alice.txt yields no windows");
-    assert!(data.len() >= TRAIN_WINDOWS, "alice.txt yields too few windows");
+    assert!(
+        data.len() >= TRAIN_WINDOWS,
+        "alice.txt yields too few windows"
+    );
 
     let mut model = Hierarchical::load(model_path, tokenizer).unwrap();
     model.make_cache(WORDS_PER_SEQ, data.max_window_tokens());
@@ -50,7 +51,7 @@ fn eval_train_eval(model_path: &str) -> (f32, f32, f32) {
 #[test]
 fn parallel_matches_single_thread() {
     // One set of random weights, shared by both runs via disk round-trip.
-    let tokenizer = Rc::new(Utf8Tokenizer::new());
+    let tokenizer = Utf8Tokenizer::new();
     let model = build_hierarchical_model(tokenizer.vocab_size(), tokenizer);
     let path = std::env::temp_dir().join("hier_parallel_parity.model");
     let path = path.to_str().unwrap();

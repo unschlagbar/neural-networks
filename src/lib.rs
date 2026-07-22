@@ -1,12 +1,12 @@
 pub mod batches;
 pub mod config;
 pub mod format;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod hierarchical;
 pub mod inspect;
 pub mod loading;
 pub mod model;
-#[cfg(feature = "cuda")]
-pub mod gpu;
 pub mod nn;
 pub mod nn2;
 pub mod nn_layer;

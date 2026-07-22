@@ -14,9 +14,16 @@ fn main() {
 
     let gpu = Gpu::new().expect("gpu");
     let cfg = HierCfg {
-        vocab: 100, hc: 256, wh: 512,
-        enc_blocks: 2, bb_blocks: 16, dec_blocks: 2,
-        heads: 8, dqk: 64, w_token: 99, cap: 30.0,
+        vocab: 100,
+        hc: 256,
+        wh: 512,
+        enc_blocks: 2,
+        bb_blocks: 16,
+        dec_blocks: 2,
+        heads: 8,
+        dqk: 64,
+        w_token: 99,
+        cap: 30.0,
     };
     let mut model = Hierarchical::new(&gpu, &cfg);
     let mut opt = AdamCfg::new(3e-4, 0.01);

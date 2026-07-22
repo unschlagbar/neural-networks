@@ -77,7 +77,10 @@ fn main() {
     println!("== sLSTM fwd+bwd, T={t} (graphs on) ==\n");
 
     println!("SWEEP B  (H={h0}; weight traffic & node count CONSTANT — only work grows)");
-    println!("{:>5} {:>10} {:>12} {:>12}", "B", "ms/iter", "vs B=1", "eff GB/s");
+    println!(
+        "{:>5} {:>10} {:>12} {:>12}",
+        "B", "ms/iter", "vs B=1", "eff GB/s"
+    );
     let mut base = 0.0;
     for &b in &[1usize, 2, 4, 8, 16, 32] {
         let (ms, gbs) = run(b, h0);
@@ -88,7 +91,10 @@ fn main() {
     }
 
     println!("\nSWEEP H  (B=1; node count CONSTANT — weight traffic grows as H^2)");
-    println!("{:>5} {:>10} {:>12} {:>12}", "H", "ms/iter", "vs H=128", "eff GB/s");
+    println!(
+        "{:>5} {:>10} {:>12} {:>12}",
+        "H", "ms/iter", "vs H=128", "eff GB/s"
+    );
     let mut base = 0.0;
     for &h in &[128usize, 256, 512, 1024] {
         let (ms, gbs) = run(1, h);

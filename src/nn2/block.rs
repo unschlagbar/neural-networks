@@ -14,7 +14,7 @@
 //! called exactly once per block forward) around a generic cell.
 
 use crate::nn2::optim::AdamCfg;
-use crate::nn2::{Linear, RmsNorm, MLstm, SLstm};
+use crate::nn2::{Linear, MLstm, RmsNorm, SLstm};
 use crate::tensor::Tensor;
 
 /// A recurrent cell operating on `[B, T, H]` sequences (H in == H out).
@@ -31,29 +31,59 @@ pub trait Cell {
 }
 
 impl Cell for SLstm {
-    fn forward(&mut self, x: &Tensor) -> Tensor { SLstm::forward(self, x) }
-    fn backward(&mut self, dy: &Tensor) -> Tensor { SLstm::backward(self, dy) }
-    fn zero_grad(&mut self) { SLstm::zero_grad(self) }
-    fn step(&mut self, cfg: &AdamCfg) { SLstm::step(self, cfg) }
-    fn wants_post_cell_norm(&self) -> bool { true }
+    fn forward(&mut self, x: &Tensor) -> Tensor {
+        SLstm::forward(self, x)
+    }
+    fn backward(&mut self, dy: &Tensor) -> Tensor {
+        SLstm::backward(self, dy)
+    }
+    fn zero_grad(&mut self) {
+        SLstm::zero_grad(self)
+    }
+    fn step(&mut self, cfg: &AdamCfg) {
+        SLstm::step(self, cfg)
+    }
+    fn wants_post_cell_norm(&self) -> bool {
+        true
+    }
 }
 
 impl Cell for MLstm {
-    fn forward(&mut self, x: &Tensor) -> Tensor { MLstm::forward(self, x) }
-    fn backward(&mut self, dy: &Tensor) -> Tensor { MLstm::backward(self, dy) }
-    fn zero_grad(&mut self) { MLstm::zero_grad(self) }
-    fn step(&mut self, cfg: &AdamCfg) { MLstm::step(self, cfg) }
-    fn wants_post_cell_norm(&self) -> bool { false }
+    fn forward(&mut self, x: &Tensor) -> Tensor {
+        MLstm::forward(self, x)
+    }
+    fn backward(&mut self, dy: &Tensor) -> Tensor {
+        MLstm::backward(self, dy)
+    }
+    fn zero_grad(&mut self) {
+        MLstm::zero_grad(self)
+    }
+    fn step(&mut self, cfg: &AdamCfg) {
+        MLstm::step(self, cfg)
+    }
+    fn wants_post_cell_norm(&self) -> bool {
+        false
+    }
 }
 
 #[inline]
 fn sigmoid(x: f32) -> f32 {
-    if x >= 0.0 { 1.0 / (1.0 + (-x).exp()) } else { let e = x.exp(); e / (1.0 + e) }
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
 }
 #[inline]
-fn silu(x: f32) -> f32 { x * sigmoid(x) }
+fn silu(x: f32) -> f32 {
+    x * sigmoid(x)
+}
 #[inline]
-fn silu_prime(x: f32) -> f32 { let s = sigmoid(x); s * (1.0 + x * (1.0 - s)) }
+fn silu_prime(x: f32) -> f32 {
+    let s = sigmoid(x);
+    s * (1.0 + x * (1.0 - s))
+}
 
 pub struct Block<C: Cell> {
     pub hidden: usize,
@@ -68,9 +98,9 @@ pub struct Block<C: Cell> {
     pub lin_down: Linear,
 
     // Saved for backward (single call per forward).
-    gate_pre: Tensor, // [N, U] pre-activation for SiLU'
-    gate_act: Tensor, // [N, U] SiLU(gate_pre)
-    value: Tensor,    // [N, U]
+    gate_pre: Tensor,    // [N, U] pre-activation for SiLU'
+    gate_act: Tensor,    // [N, U] SiLU(gate_pre)
+    value: Tensor,       // [N, U]
     seq: (usize, usize), // (B, T) of the last forward
 }
 
@@ -233,10 +263,12 @@ mod tests {
 
     /// Directional whole-tensor FD across the full block (contains a recurrent
     /// cell with stabilizer kinks, so loose tol like the cell tests).
-    fn check(cell_forward: impl Fn(&mut MLstmBlock, &Tensor) -> Tensor,
-             grad_of: impl Fn(&MLstmBlock) -> Vec<f32>,
-             mut perturb: impl FnMut(&mut MLstmBlock, f32, &[f32]),
-             name: &str) {
+    fn check(
+        cell_forward: impl Fn(&mut MLstmBlock, &Tensor) -> Tensor,
+        grad_of: impl Fn(&MLstmBlock) -> Vec<f32>,
+        mut perturb: impl FnMut(&mut MLstmBlock, f32, &[f32]),
+        name: &str,
+    ) {
         let (b, t, h, u) = (2, 3, 8, 12);
         let mut blk = MLstmBlock::new_mlstm(h, u, 2, 4);
         let x = Tensor::random(&[b, t, h], 0.5);
@@ -260,7 +292,10 @@ mod tests {
         let minus = loss(&mut blk);
         perturb(&mut blk, eps, &u_dir);
         let fd = (plus - minus) / (2.0 * eps);
-        assert!((fd - norm).abs() <= 0.3 * norm + 1e-3, "{name}: ‖G‖ {norm} vs fd {fd}");
+        assert!(
+            (fd - norm).abs() <= 0.3 * norm + 1e-3,
+            "{name}: ‖G‖ {norm} vs fd {fd}"
+        );
     }
 
     #[test]
@@ -268,7 +303,11 @@ mod tests {
         check(
             |blk, x| blk.forward(x),
             |blk| blk.lin_down.dw.data.clone(),
-            |blk, s, u| for (w, &ui) in blk.lin_down.w.data.iter_mut().zip(u) { *w += s * ui; },
+            |blk, s, u| {
+                for (w, &ui) in blk.lin_down.w.data.iter_mut().zip(u) {
+                    *w += s * ui;
+                }
+            },
             "lin_down.w",
         );
     }
@@ -278,7 +317,11 @@ mod tests {
         check(
             |blk, x| blk.forward(x),
             |blk| blk.pre_norm1.dgamma.data.clone(),
-            |blk, s, u| for (w, &ui) in blk.pre_norm1.gamma.data.iter_mut().zip(u) { *w += s * ui; },
+            |blk, s, u| {
+                for (w, &ui) in blk.pre_norm1.gamma.data.iter_mut().zip(u) {
+                    *w += s * ui;
+                }
+            },
             "pre_norm1.gamma",
         );
     }

@@ -11,6 +11,7 @@
 //! accumulate into shared outputs (`embedding_scatter_add`, RMSNorm `dgamma`)
 //! use `atomicAdd`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaFunction};
@@ -2112,7 +2113,7 @@ impl Kernels {
             .load_module(base)
             .map_err(|e| format!("load_module failed: {e:?}"))?;
 
-        let mut funcs = std::collections::HashMap::new();
+        let mut funcs = HashMap::new();
         for &name in NAMES {
             let f = base
                 .load_function(name)

@@ -31,7 +31,9 @@ pub struct WordEncoder {
 impl WordEncoder {
     pub fn new(hc: usize, up: usize, n_blocks: usize) -> Self {
         Self {
-            blocks: (0..n_blocks).map(|_| SLstmBlock::new_slstm(hc, up)).collect(),
+            blocks: (0..n_blocks)
+                .map(|_| SLstmBlock::new_slstm(hc, up))
+                .collect(),
             hc,
             dims: (0, 0),
             readout: Vec::new(),
@@ -42,7 +44,11 @@ impl WordEncoder {
     /// gathered from the tied char table. `readout[w]` is the step index of
     /// word `w`'s closing `[W]` token. Returns `e_w` `[W, Hc]`.
     pub fn forward(&mut self, embedded: &Tensor, readout: &[usize]) -> Tensor {
-        assert_eq!(embedded.rank(), 3, "WordEncoder::forward expects [W, T, Hc]");
+        assert_eq!(
+            embedded.rank(),
+            3,
+            "WordEncoder::forward expects [W, T, Hc]"
+        );
         let (w, t, hc) = (embedded.shape[0], embedded.shape[1], embedded.shape[2]);
         assert_eq!(hc, self.hc, "WordEncoder — width mismatch");
         assert_eq!(readout.len(), w, "WordEncoder — readout len != words");
@@ -68,7 +74,11 @@ impl WordEncoder {
     pub fn backward(&mut self, d_e_w: &Tensor) -> Tensor {
         let (w, t) = self.dims;
         let hc = self.hc;
-        assert_eq!(d_e_w.rows(), w, "WordEncoder::backward — word count mismatch");
+        assert_eq!(
+            d_e_w.rows(),
+            w,
+            "WordEncoder::backward — word count mismatch"
+        );
 
         // Scatter d_e_w back to the [W]-step rows; all other rows have zero grad.
         let mut d_h = Tensor::zeros(&[w, t, hc]);
@@ -125,11 +135,18 @@ mod tests {
         let u: Vec<f32> = grad.iter().map(|v| v / norm).collect();
         let eps = 2e-4;
         let mut xp = embedded.clone();
-        for (v, &ui) in xp.data.iter_mut().zip(&u) { *v += eps * ui; }
+        for (v, &ui) in xp.data.iter_mut().zip(&u) {
+            *v += eps * ui;
+        }
         let plus = loss(&mut enc, &xp);
-        for (v, &ui) in xp.data.iter_mut().zip(&u) { *v -= 2.0 * eps * ui; }
+        for (v, &ui) in xp.data.iter_mut().zip(&u) {
+            *v -= 2.0 * eps * ui;
+        }
         let minus = loss(&mut enc, &xp);
         let fd = (plus - minus) / (2.0 * eps);
-        assert!((fd - norm).abs() <= 0.3 * norm + 1e-3, "d_embedded: ‖G‖ {norm} vs fd {fd}");
+        assert!(
+            (fd - norm).abs() <= 0.3 * norm + 1e-3,
+            "d_embedded: ‖G‖ {norm} vs fd {fd}"
+        );
     }
 }

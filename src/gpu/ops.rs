@@ -19,9 +19,18 @@ use crate::nn2::optim::AdamCfg;
 
 /// Upload host indices (`usize`) as a `u32` device buffer for the gather /
 /// scatter / CE kernels.
+///
+/// The kernels take `u32`, so a `usize` slice has to be narrowed into a
+/// temporary first. Callers on a hot path build their ids as `u32` up front and
+/// use the `*_u32` entry points below, which skip that copy entirely.
 fn upload_ids(gpu: &Gpu, ids: &[usize]) -> CudaSlice<u32> {
     let u: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
-    gpu.stream.memcpy_stod(&u).expect("upload ids")
+    upload_ids_u32(gpu, &u)
+}
+
+/// Upload an already-narrowed id slice.
+pub fn upload_ids_u32(gpu: &Gpu, ids: &[u32]) -> CudaSlice<u32> {
+    gpu.stream.memcpy_stod(ids).expect("upload ids")
 }
 
 /// `C = A · B + beta·C` for row-major `A(M×K)`, `B(K×N)`, writing into an
@@ -294,14 +303,24 @@ pub fn add_col_sum(gpu: &Gpu, db: &mut DTensor, dy: &DTensor) {
 /// Gather rows of `table` (`[vocab, dim]`) by `ids` into a `[ids.len(), dim]`
 /// tensor.
 pub fn embedding_gather(gpu: &Gpu, table: &DTensor, ids: &[usize], dim: usize) -> DTensor {
-    let rows = ids.len();
+    embedding_gather_u32(gpu, table, &upload_ids(gpu, ids), ids.len(), dim)
+}
+
+/// [`embedding_gather`] against ids already resident on the device. `rows` is
+/// the id count, which the caller knows and a `CudaSlice` may over-allocate.
+pub fn embedding_gather_u32(
+    gpu: &Gpu,
+    table: &DTensor,
+    dids: &CudaSlice<u32>,
+    rows: usize,
+    dim: usize,
+) -> DTensor {
     let (dim_i, rows_i) = (dim as i32, rows as i32);
-    let dids = upload_ids(gpu, ids);
     let mut out = DTensor::uninit(gpu, &[rows, dim]);
     let f = gpu.kernels.get("embedding_gather");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&table.buf)
-        .arg(&dids)
+        .arg(dids)
         .arg(&mut out.buf)
         .arg(&dim_i)
         .arg(&rows_i);
@@ -318,13 +337,23 @@ pub fn embedding_scatter_add(
     dy: &DTensor,
     dim: usize,
 ) {
-    let rows = ids.len();
+    embedding_scatter_add_u32(gpu, dtable, &upload_ids(gpu, ids), ids.len(), dy, dim);
+}
+
+/// [`embedding_scatter_add`] against ids already resident on the device.
+pub fn embedding_scatter_add_u32(
+    gpu: &Gpu,
+    dtable: &mut DTensor,
+    dids: &CudaSlice<u32>,
+    rows: usize,
+    dy: &DTensor,
+    dim: usize,
+) {
     let (dim_i, rows_i) = (dim as i32, rows as i32);
-    let dids = upload_ids(gpu, ids);
     let f = gpu.kernels.get("embedding_scatter_add");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut dtable.buf)
-        .arg(&dids)
+        .arg(dids)
         .arg(&dy.buf)
         .arg(&dim_i)
         .arg(&rows_i);
@@ -1194,16 +1223,25 @@ pub fn mlstm_chunk_ab_bwd(
 /// The inverse (pulling those rows back out) is [`embedding_gather`] with the same
 /// row ids, treating the matrix as the "table".
 pub fn scatter_rows(gpu: &Gpu, dst: &mut DTensor, src: &DTensor, row_ids: &[usize]) {
+    assert_eq!(
+        src.rows(),
+        row_ids.len(),
+        "scatter_rows: row_ids len != src rows"
+    );
+    scatter_rows_u32(gpu, dst, src, &upload_ids(gpu, row_ids));
+}
+
+/// [`scatter_rows`] against row ids already resident on the device. The row
+/// count comes from `src`, so the id buffer may be a larger reused allocation.
+pub fn scatter_rows_u32(gpu: &Gpu, dst: &mut DTensor, src: &DTensor, ids: &CudaSlice<u32>) {
     let dim = src.cols();
     let rows = src.rows();
-    assert_eq!(rows, row_ids.len(), "scatter_rows: row_ids len != src rows");
-    let ids = upload_ids(gpu, row_ids);
     let (dim_i, rows_i) = (dim as i32, rows as i32);
     let f = gpu.kernels.get("scatter_rows");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut dst.buf)
         .arg(&src.buf)
-        .arg(&ids)
+        .arg(ids)
         .arg(&dim_i)
         .arg(&rows_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems((rows * dim) as u32)) }.expect("scatter_rows");
@@ -1233,20 +1271,34 @@ pub fn masked_softmax_cross_entropy_scaled(
     mask: &[bool],
     inv: f32,
 ) -> (f32, DTensor) {
-    let (r, c) = (logits.rows(), logits.cols());
+    let r = logits.rows();
     assert_eq!(targets.len(), r, "masked CE — targets len != rows");
     assert_eq!(mask.len(), r, "masked CE — mask len != rows");
     let dtargets = upload_ids(gpu, targets);
-    let mask_u: Vec<usize> = mask.iter().map(|&m| m as usize).collect();
-    let dmask = upload_ids(gpu, &mask_u);
+    let mask_u: Vec<u32> = mask.iter().map(|&m| m as u32).collect();
+    let dmask = upload_ids_u32(gpu, &mask_u);
+    masked_softmax_cross_entropy_u32(gpu, logits, &dtargets, &dmask, inv)
+}
+
+/// [`masked_softmax_cross_entropy_scaled`] against target/mask buffers already
+/// resident on the device — the hot path, where the caller builds both as `u32`
+/// once per group instead of narrowing a `usize`/`bool` pair per call.
+pub fn masked_softmax_cross_entropy_u32(
+    gpu: &Gpu,
+    logits: &DTensor,
+    dtargets: &CudaSlice<u32>,
+    dmask: &CudaSlice<u32>,
+    inv: f32,
+) -> (f32, DTensor) {
+    let (r, c) = (logits.rows(), logits.cols());
     let mut dlogits = DTensor::uninit(gpu, &[r, c]);
     let mut row_loss = gpu.stream.alloc_zeros::<f32>(r).expect("alloc row_loss");
     let (c_i, r_i) = (c as i32, r as i32);
     let f = gpu.kernels.get("masked_softmax_ce");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&logits.buf)
-        .arg(&dtargets)
-        .arg(&dmask)
+        .arg(dtargets)
+        .arg(dmask)
         .arg(&mut dlogits.buf)
         .arg(&mut row_loss)
         .arg(&c_i)

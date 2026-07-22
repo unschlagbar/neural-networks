@@ -6,12 +6,9 @@
 //!   cargo run --release --example e_w_cosine -- fable15 fable15_small
 
 use std::path::Path;
-use std::rc::Rc;
 
 use neural_networks::{
-    config::MAX_SEQ_LEN,
-    hierarchical::Hierarchical,
-    tokenizer_utf8::Utf8Tokenizer,
+    config::MAX_SEQ_LEN, hierarchical::Hierarchical, tokenizer_utf8::Utf8Tokenizer,
 };
 
 // `pu-` cluster first, then unrelated controls.
@@ -47,11 +44,11 @@ fn main() {
         std::process::exit(2);
     }
 
-    let tokenizer = Rc::new(Utf8Tokenizer::new());
+    let tokenizer = Utf8Tokenizer::new();
 
     for name in &args {
         let path = resolve(name);
-        let mut model = Hierarchical::load(&path, tokenizer.clone()).unwrap();
+        let mut model = Hierarchical::load(&path, tokenizer).unwrap();
         model.make_cache(1, MAX_SEQ_LEN);
 
         // Encode each word to its e_w (clone out of the borrowed cache).
@@ -63,7 +60,10 @@ fn main() {
             })
             .collect();
 
-        println!("\n================ {name} (dim {}) ================", embeddings[0].len());
+        println!(
+            "\n================ {name} (dim {}) ================",
+            embeddings[0].len()
+        );
         // Header row.
         print!("{:>9}", "");
         for w in WORDS {
