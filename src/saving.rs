@@ -84,7 +84,10 @@ impl Sequential {
 
 /// Write a layer stack as a blob (arch header + weights). The primitive behind
 /// [`Sequential::write_stack`]; used directly for multi-layer stages.
-pub fn write_layers(w: &mut dyn Write, layers: &[Box<dyn crate::nn_layer::NnLayer>]) -> io::Result<()> {
+pub fn write_layers(
+    w: &mut dyn Write,
+    layers: &[Box<dyn crate::nn_layer::NnLayer>],
+) -> io::Result<()> {
     write_stack_blob(w, layers.iter().map(|l| l.as_ref()))
 }
 

@@ -24,9 +24,7 @@ impl RingBuffer {
     pub fn last_n(&self, n: usize) -> Vec<f32> {
         let n = n.min(self.cap);
         let start = self.head.saturating_sub(n);
-        (0..n)
-            .map(|i| self.data[(start + i) % self.cap])
-            .collect()
+        (0..n).map(|i| self.data[(start + i) % self.cap]).collect()
     }
 
     /// Copy `len` samples starting at absolute position `start`.
@@ -38,7 +36,11 @@ impl RingBuffer {
         if start + self.cap < self.head {
             return None; // overwritten
         }
-        Some((0..len).map(|i| self.data[(start + i) % self.cap]).collect())
+        Some(
+            (0..len)
+                .map(|i| self.data[(start + i) % self.cap])
+                .collect(),
+        )
     }
 
     pub fn total_written(&self) -> usize {

@@ -39,7 +39,10 @@ impl RmsNorm {
     /// uses `γ[grp*group ..]`).
     pub fn from_parts_grouped(gpu: &Gpu, gamma: &Tensor, group: usize) -> Self {
         let size = gamma.len();
-        assert!(size.is_multiple_of(group), "RmsNorm: size {size} not divisible by group {group}");
+        assert!(
+            size.is_multiple_of(group),
+            "RmsNorm: size {size} not divisible by group {group}"
+        );
         Self {
             gamma: DTensor::from_host(gpu, gamma),
             dgamma: DTensor::zeros(gpu, &[size]),
@@ -83,7 +86,15 @@ impl RmsNorm {
 
     /// AdamW step (norm scale is never decayed). Clears the grad.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        ops::adamw(gpu, &mut self.gamma, &self.dgamma, &mut self.m, &mut self.v, cfg, false);
+        ops::adamw(
+            gpu,
+            &mut self.gamma,
+            &self.dgamma,
+            &mut self.m,
+            &mut self.v,
+            cfg,
+            false,
+        );
         self.zero_grad(gpu);
     }
 }

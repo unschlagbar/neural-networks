@@ -25,7 +25,8 @@
 // `loading.rs` and are reused unchanged — this module only owns the container.
 
 use std::{
-    fs::File, io::{self, BufReader, Cursor, Read, Write},
+    fs::File,
+    io::{self, BufReader, Cursor, Read, Write},
 };
 
 use crate::{
@@ -259,7 +260,11 @@ mod tests {
     /// preserved (checked via a re-save producing identical bytes).
     #[test]
     fn flat_container_roundtrips() {
-        let model = SequentialBuilder::new(8).embedding(16).rms_norm().linear(4).build();
+        let model = SequentialBuilder::new(8)
+            .embedding(16)
+            .rms_norm()
+            .linear(4)
+            .build();
         let mut buf = Cursor::new(Vec::new());
         Writer::new(ModelKind::Flat, Meta::default())
             .section("model", &model.layers)
@@ -315,7 +320,11 @@ mod tests {
             assert!(reader.take_stack(name).is_ok(), "missing {name}");
         }
         let one = reader.take("extra").unwrap();
-        assert_eq!(one.len(), 1, "single-layer section round-trips as one layer");
+        assert_eq!(
+            one.len(),
+            1,
+            "single-layer section round-trips as one layer"
+        );
         assert!(reader.take("nope").is_err(), "missing section must error");
     }
 

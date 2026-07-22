@@ -165,8 +165,14 @@ impl SLstm {
         gpu: &Gpu,
         input: usize,
         hidden: usize,
-        wz: &Tensor, wi: &Tensor, wf: &Tensor, wo: &Tensor,
-        bz: &Tensor, bi: &Tensor, bf: &Tensor, bo: &Tensor,
+        wz: &Tensor,
+        wi: &Tensor,
+        wf: &Tensor,
+        wo: &Tensor,
+        bz: &Tensor,
+        bi: &Tensor,
+        bf: &Tensor,
+        bo: &Tensor,
     ) -> Self {
         let rows = input + hidden;
         let up = |t: &Tensor| DTensor::from_host(gpu, t);
@@ -217,9 +223,17 @@ impl SLstm {
     /// Upload a CPU cell (weights are copied; grads/moments start at zero).
     pub fn from_cpu(gpu: &Gpu, cpu: &crate::nn2::SLstm) -> Self {
         Self::from_parts(
-            gpu, cpu.input_size, cpu.hidden_size,
-            &cpu.wz, &cpu.wi, &cpu.wf, &cpu.wo,
-            &cpu.bz, &cpu.bi, &cpu.bf, &cpu.bo,
+            gpu,
+            cpu.input_size,
+            cpu.hidden_size,
+            &cpu.wz,
+            &cpu.wi,
+            &cpu.wf,
+            &cpu.wo,
+            &cpu.bz,
+            &cpu.bi,
+            &cpu.bf,
+            &cpu.bo,
         )
     }
 
@@ -261,8 +275,14 @@ impl SLstm {
             gpu,
             c.input_size,
             c.hidden_size,
-            &m(&c.wz), &m(&c.wi), &m(&c.wf), &m(&c.wo),
-            &v(&c.bz), &v(&c.bi), &v(&c.bf), &v(&c.bo),
+            &m(&c.wz),
+            &m(&c.wi),
+            &m(&c.wf),
+            &m(&c.wo),
+            &v(&c.bz),
+            &v(&c.bi),
+            &v(&c.bf),
+            &v(&c.bo),
         )
     }
 
@@ -303,18 +323,32 @@ impl SLstm {
         fit_uninit(gpu, &mut self.whr, &[h, h4]);
         fit_uninit(gpu, &mut self.bcat, &[h4]);
         ops::slstm_pack(
-            gpu, &self.w, &self.bias, &mut self.wx, &mut self.whr, &mut self.bcat, inp, h,
+            gpu,
+            &self.w,
+            &self.bias,
+            &mut self.wx,
+            &mut self.whr,
+            &mut self.bcat,
+            inp,
+            h,
         );
 
         // Recurrent state starts at zero.
-        for s in [&mut self.h_state, &mut self.c_state, &mut self.n_state, &mut self.m_state] {
+        for s in [
+            &mut self.h_state,
+            &mut self.c_state,
+            &mut self.n_state,
+            &mut self.m_state,
+        ] {
             fit_zeros(gpu, s, &[b, h]);
         }
 
         // The input half of every gate pre-activation, for all timesteps at once —
         // it has no recurrent dependency, so it is one GEMM outside the loop.
         let mut x_flat = take_uninit(gpu, self.x_saved.take(), &[n, inp]);
-        gpu.stream.memcpy_dtod(&x.buf, &mut x_flat.buf).expect("copy x");
+        gpu.stream
+            .memcpy_dtod(&x.buf, &mut x_flat.buf)
+            .expect("copy x");
         // One buffer, two views: the GEMM wants [N, 4H], the time loop wants
         // [B, T, 4H]. `reshaped` is metadata-only, so the allocation is untouched.
         let mut g = take_uninit(gpu, self.g.take(), &[b, t, h4]).reshaped(&[n, h4]);
@@ -326,8 +360,15 @@ impl SLstm {
             _ => {
                 let slab = || DTensor::uninit(gpu, &[b, t, h]);
                 SlstmSlabs {
-                    c_prev: slab(), n_prev: slab(), zt: slab(), ot: slab(), i_prime: slab(),
-                    f_prime: slab(), c: slab(), n: slab(), h_prev: slab(),
+                    c_prev: slab(),
+                    n_prev: slab(),
+                    zt: slab(),
+                    ot: slab(),
+                    i_prime: slab(),
+                    f_prime: slab(),
+                    c: slab(),
+                    n: slab(),
+                    h_prev: slab(),
                 }
             }
         };
@@ -368,7 +409,11 @@ impl SLstm {
             self.fwd_steps(gpu, g, slabs, out, t);
             return;
         }
-        if self.fwd_graph.as_ref().map_or(true, |c| (c.b, c.t) != (b, t)) {
+        if self
+            .fwd_graph
+            .as_ref()
+            .map_or(true, |c| (c.b, c.t) != (b, t))
+        {
             // Drop the stale exec first: its nodes point into buffers that the shape
             // change above has just reallocated.
             self.fwd_graph = None;
@@ -384,12 +429,19 @@ impl SLstm {
             // the loop allocates nothing, so it is a no-op for us.
             let graph = gpu
                 .stream
-                .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                .end_capture(
+                    CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                )
                 .expect("end capture")
                 .expect("stream was not capturing");
             self.fwd_graph = Some(LoopGraph { b, t, graph });
         }
-        self.fwd_graph.as_ref().unwrap().graph.launch().expect("graph launch");
+        self.fwd_graph
+            .as_ref()
+            .unwrap()
+            .graph
+            .launch()
+            .expect("graph launch");
     }
 
     /// The loop body, issued eagerly. Called both to run the steps and — under
@@ -407,9 +459,17 @@ impl SLstm {
             // scratch), then the elementwise recurrence: two launches per timestep.
             ops::matmul_nn_into(gpu, &self.h_state, &self.whr, &mut self.gh, 0.0);
             ops::slstm_step_fused(
-                gpu, g, &self.gh, &self.bcat,
-                &mut self.c_state, &mut self.n_state, &mut self.m_state, &mut self.h_state,
-                slabs, out, step,
+                gpu,
+                g,
+                &self.gh,
+                &self.bcat,
+                &mut self.c_state,
+                &mut self.n_state,
+                &mut self.m_state,
+                &mut self.h_state,
+                slabs,
+                out,
+                step,
             );
         }
     }
@@ -440,7 +500,9 @@ impl SLstm {
         // `DTensor` each time — a pointer a captured graph cannot follow. Copy it
         // into a buffer whose address we own.
         let mut dy_buf = take_uninit(gpu, self.dy_buf.take(), &[b, t, h]);
-        gpu.stream.memcpy_dtod(&dy.buf, &mut dy_buf.buf).expect("copy dy");
+        gpu.stream
+            .memcpy_dtod(&dy.buf, &mut dy_buf.buf)
+            .expect("copy dy");
 
         // The only thing the loop must carry is BPTT: the gate deltas go straight
         // back into `g`, and everything derived from them waits until the loop ends.
@@ -489,7 +551,11 @@ impl SLstm {
             self.bwd_steps(gpu, dy, g, slabs, t);
             return;
         }
-        if self.bwd_graph.as_ref().map_or(true, |c| (c.b, c.t) != (b, t)) {
+        if self
+            .bwd_graph
+            .as_ref()
+            .map_or(true, |c| (c.b, c.t) != (b, t))
+        {
             self.bwd_graph = None;
             gpu.stream
                 .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
@@ -497,19 +563,40 @@ impl SLstm {
             self.bwd_steps(gpu, dy, g, slabs, t);
             let graph = gpu
                 .stream
-                .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                .end_capture(
+                    CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                )
                 .expect("end capture")
                 .expect("stream was not capturing");
             self.bwd_graph = Some(LoopGraph { b, t, graph });
         }
-        self.bwd_graph.as_ref().unwrap().graph.launch().expect("graph launch");
+        self.bwd_graph
+            .as_ref()
+            .unwrap()
+            .graph
+            .launch()
+            .expect("graph launch");
     }
 
-    fn bwd_steps(&mut self, gpu: &Gpu, dy: &DTensor, g: &mut DTensor, slabs: &SlstmSlabs, t: usize) {
+    fn bwd_steps(
+        &mut self,
+        gpu: &Gpu,
+        dy: &DTensor,
+        g: &mut DTensor,
+        slabs: &SlstmSlabs,
+        t: usize,
+    ) {
         for step in (0..t).rev() {
             ops::slstm_step_fused_bwd(
-                gpu, dy, g, &mut self.gh, &self.dh_bptt, slabs,
-                &mut self.dc_bptt, &mut self.dn_bptt, step,
+                gpu,
+                dy,
+                g,
+                &mut self.gh,
+                &self.dh_bptt,
+                slabs,
+                &mut self.dc_bptt,
+                &mut self.dn_bptt,
+                step,
             );
             // dh_{t-1} = dgates_t · Whᵀ — the one gradient BPTT cannot defer.
             ops::matmul_nt_into(gpu, &self.gh, &self.whr, &mut self.dh_bptt, 0.0);
@@ -530,10 +617,26 @@ impl SLstm {
     /// AdamW step: gate matrices decay, biases don't. Clears the grads.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
         for i in 0..4 {
-            ops::adamw(gpu, &mut self.w[i], &self.dw[i], &mut self.mw[i], &mut self.vw[i], cfg, true);
+            ops::adamw(
+                gpu,
+                &mut self.w[i],
+                &self.dw[i],
+                &mut self.mw[i],
+                &mut self.vw[i],
+                cfg,
+                true,
+            );
         }
         for i in 0..4 {
-            ops::adamw(gpu, &mut self.bias[i], &self.db[i], &mut self.mb[i], &mut self.vb[i], cfg, false);
+            ops::adamw(
+                gpu,
+                &mut self.bias[i],
+                &self.db[i],
+                &mut self.mb[i],
+                &mut self.vb[i],
+                cfg,
+                false,
+            );
         }
         self.zero_grad(gpu);
     }
@@ -554,9 +657,17 @@ mod tests {
 
     fn from_cpu(gpu: &Gpu, cpu: &CpuSLstm) -> SLstm {
         SLstm::from_parts(
-            gpu, cpu.input_size, cpu.hidden_size,
-            &cpu.wz, &cpu.wi, &cpu.wf, &cpu.wo,
-            &cpu.bz, &cpu.bi, &cpu.bf, &cpu.bo,
+            gpu,
+            cpu.input_size,
+            cpu.hidden_size,
+            &cpu.wz,
+            &cpu.wi,
+            &cpu.wf,
+            &cpu.wo,
+            &cpu.bz,
+            &cpu.bi,
+            &cpu.bf,
+            &cpu.bo,
         )
     }
 
@@ -566,7 +677,9 @@ mod tests {
     /// vs the CPU gemm), but the recurrence math is identical.
     #[test]
     fn slstm_matches_cpu_layer() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let (b, t, inp, h) = (2, 5, 4, 6);
 
         let mut cpu = CpuSLstm::new(inp, h);
@@ -613,7 +726,9 @@ mod tests {
     /// that a single-pass test would miss entirely.
     #[test]
     fn slstm_graph_path_matches_cpu() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         assert!(64 > GRAPH_MIN_T, "this test must exercise the graph path");
         let (b, t, inp, h) = (2, 64, 8, 12);
 
@@ -657,7 +772,9 @@ mod tests {
     /// document yields a short window. So: long, short-eager, long-again.
     #[test]
     fn slstm_graph_survives_shape_changes() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let (b, inp, h) = (1, 64, 64);
         let mut cpu = CpuSLstm::new(inp, h);
         let mut dev = from_cpu(&gpu, &cpu);

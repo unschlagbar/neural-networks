@@ -1,14 +1,13 @@
 // Sanity check against the real corpus: stream it in small chunks and verify
 // the pass completes with consistent counts. Ignored by default — run with
 // `cargo test --release --test chunked_real_corpus -- --ignored --nocapture`.
-use std::rc::Rc;
 
 use neural_networks::{batches::ChunkedWordDataSet, config, tokenizer_utf8::Utf8Tokenizer};
 
 #[test]
 #[ignore]
 fn stream_real_corpus() {
-    let tokenizer = Rc::new(Utf8Tokenizer::new());
+    let tokenizer = Utf8Tokenizer::new();
     let start = std::time::Instant::now();
     let mut loader = ChunkedWordDataSet::open(
         tokenizer,

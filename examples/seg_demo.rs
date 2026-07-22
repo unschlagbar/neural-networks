@@ -26,5 +26,10 @@ fn main() {
     let mut sorted = lens.clone();
     sorted.sort_unstable();
     println!("{path}: {total} bytes → {n} words");
-    println!("  bytes/word: mean {:.2}, median {}, max {}", total as f32 / n as f32, sorted[n / 2], sorted[n - 1]);
+    println!(
+        "  bytes/word: mean {:.2}, median {}, max {}",
+        total as f32 / n as f32,
+        sorted[n / 2],
+        sorted[n - 1]
+    );
 }

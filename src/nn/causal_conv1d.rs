@@ -35,7 +35,7 @@ fn sigmoid(x: f32) -> f32 {
 pub struct CausalConv1dCache {
     /// Snapshot of the K inputs used this timestep: slot 0 = x[t], slot k = x[t-k].
     /// Layout: inputs[k * channels + c].
-    pub inputs: Box<[f32]>,    // kernel_size * channels
+    pub inputs: Box<[f32]>, // kernel_size * channels
     pub pre_swish: Box<[f32]>, // channels
     pub output: Box<[f32]>,    // channels
     pub dx: Box<[f32]>,        // channels
@@ -191,8 +191,7 @@ impl CausalConv1dLayer {
                     } else {
                         0.0
                     };
-                    self.dx_bptt[ki * c + ch] =
-                        old_next + self.d_pre[ch] * w[ch * k + ki + 1];
+                    self.dx_bptt[ki * c + ch] = old_next + self.d_pre[ch] * w[ch * k + ki + 1];
                 }
             }
         }

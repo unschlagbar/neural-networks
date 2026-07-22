@@ -59,7 +59,13 @@ mod train_smoke {
             xs.push(b);
             // Three bands by the value of a+b.
             let s = a + b;
-            ys.push(if s < -1.0 { 0 } else if s < 1.0 { 1 } else { 2 });
+            ys.push(if s < -1.0 {
+                0
+            } else if s < 1.0 {
+                1
+            } else {
+                2
+            });
         }
         let x = Tensor::new(&[batch, features], xs);
 
@@ -72,7 +78,10 @@ mod train_smoke {
         }
         let last = softmax_cross_entropy(&lin.forward(&x), &ys).0;
 
-        assert!(last < first * 0.5, "loss did not fall enough: {first} -> {last}");
+        assert!(
+            last < first * 0.5,
+            "loss did not fall enough: {first} -> {last}"
+        );
         assert!(last < 0.7, "final loss too high: {last}");
     }
 }
@@ -135,7 +144,10 @@ mod train_e2e {
         }
 
         let last = softmax_cross_entropy(&forward(&mut emb, &mut block, &mut head), &targets).0;
-        assert!(last < first * 0.3, "loss did not fall enough: {first} -> {last}");
+        assert!(
+            last < first * 0.3,
+            "loss did not fall enough: {first} -> {last}"
+        );
         assert!(last < 0.3, "final loss too high: {last}");
     }
 }

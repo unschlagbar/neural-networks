@@ -249,9 +249,8 @@ fn snappy_decompress(src: &[u8]) -> Result<Vec<u8>> {
                     return Err("snappy: truncated copy4".into());
                 }
                 let len = ((tag >> 2) as usize) + 1;
-                let off =
-                    u32::from_le_bytes([src[pos], src[pos + 1], src[pos + 2], src[pos + 3]])
-                        as usize;
+                let off = u32::from_le_bytes([src[pos], src[pos + 1], src[pos + 2], src[pos + 3]])
+                    as usize;
                 pos += 4;
                 copy_from_back(&mut out, off, len)?;
             }
@@ -370,7 +369,11 @@ impl<'a> RleDecoder<'a> {
             self.pos += nbytes;
             self.run.reserve(count);
             let width = self.bit_width as usize;
-            let mask = if width == 32 { u32::MAX } else { (1u32 << width) - 1 };
+            let mask = if width == 32 {
+                u32::MAX
+            } else {
+                (1u32 << width) - 1
+            };
             for i in 0..count {
                 let bit = i * width;
                 let mut v = 0u64;
@@ -575,7 +578,9 @@ fn parse_footer(meta: &[u8], columns: &[&str]) -> Result<FileMeta> {
                 format!("column {column:?} not found; file has {names:?}")
             })?;
         if leaf.num_children != 0 {
-            return Err(format!("column {column:?} is nested, which is not supported"));
+            return Err(format!(
+                "column {column:?} is nested, which is not supported"
+            ));
         }
         // Type 6 = BYTE_ARRAY.
         if leaf.ty != Some(6) {
@@ -732,8 +737,7 @@ impl ParquetColumnReader {
     /// row.
     pub fn open_columns(path: &str, columns: &[&str]) -> Result<Self> {
         assert!(!columns.is_empty(), "need at least one column");
-        let mut file =
-            File::open(path).map_err(|e| format!("could not open {path:?}: {e}"))?;
+        let mut file = File::open(path).map_err(|e| format!("could not open {path:?}: {e}"))?;
         let size = file
             .metadata()
             .map_err(|e| format!("could not stat {path:?}: {e}"))?
@@ -760,7 +764,9 @@ impl ParquetColumnReader {
         }
         let meta_len = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as u64;
         if meta_len + 8 > size {
-            return Err(format!("{path:?}: footer length {meta_len} exceeds file size"));
+            return Err(format!(
+                "{path:?}: footer length {meta_len} exceeds file size"
+            ));
         }
 
         let mut meta_buf = vec![0u8; meta_len as usize];
@@ -882,8 +888,7 @@ impl ParquetColumnReader {
                         if body.len() < 4 {
                             return Err("v1 page: truncated definition levels".into());
                         }
-                        let n =
-                            u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+                        let n = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
                         if 4 + n > body.len() {
                             return Err("v1 page: definition levels run past page".into());
                         }
@@ -1054,6 +1059,9 @@ mod tests {
         }
         let mut out = Vec::new();
         plain_byte_arrays(&data, 3, &mut out).unwrap();
-        assert_eq!(out, vec![b"hello".to_vec(), b"".to_vec(), b"world!".to_vec()]);
+        assert_eq!(
+            out,
+            vec![b"hello".to_vec(), b"".to_vec(), b"world!".to_vec()]
+        );
     }
 }

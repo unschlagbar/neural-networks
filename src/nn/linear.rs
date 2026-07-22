@@ -229,7 +229,9 @@ impl NnLayer for LinearLayer {
 
     fn apply_grads(&mut self, lr: f32, weight_decay: f32) {
         self.flush_grads();
-        self.grads.weights.apply_to(&mut self.weights, lr, weight_decay);
+        self.grads
+            .weights
+            .apply_to(&mut self.weights, lr, weight_decay);
         self.grads.biases.apply_to(&mut self.biases, lr);
     }
 

@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::{rc::Rc, time::Duration};
+use std::time::Duration;
 
 use neural_networks::{
     batches::ChunkedWordDataSet, model::build_hierarchical_model, tokenizer_utf8::Utf8Tokenizer,
@@ -19,11 +19,11 @@ fn benchmark_hierarchical(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_nanos(1));
 
-    let tokenizer = Rc::new(Utf8Tokenizer::new());
+    let tokenizer = Utf8Tokenizer::new();
     let vocab = tokenizer.vocab_size();
 
     let mut loader = ChunkedWordDataSet::open(
-        tokenizer.clone(),
+        tokenizer,
         "alice.txt",
         WORDS_PER_SEQ,
         MIN_WORDS,

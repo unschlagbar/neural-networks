@@ -74,9 +74,9 @@ pub struct MLSTMCache {
     pub f_prime: Box<[f32]>, // H  exp(log_f + m_prev - m)
 
     // Output intermediates.
-    pub cq: Box<[f32]>,      // d
-    pub nq: Box<[f32]>,      // H
-    pub psi: Box<[f32]>,     // H
+    pub cq: Box<[f32]>,  // d
+    pub nq: Box<[f32]>,  // H
+    pub psi: Box<[f32]>, // H
     /// The lower clamp of ψ, `exp(−m)` — saved because backward needs to know
     /// which argument the `max` picked, and `m` is overwritten by the next step.
     pub psi_floor: Box<[f32]>, // H

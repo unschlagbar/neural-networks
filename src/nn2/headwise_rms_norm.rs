@@ -27,7 +27,11 @@ pub struct HeadwiseRmsNorm {
 
 impl HeadwiseRmsNorm {
     pub fn new(d: usize, num_heads: usize) -> Self {
-        assert_eq!(d % num_heads, 0, "HeadwiseRmsNorm: d must be divisible by heads");
+        assert_eq!(
+            d % num_heads,
+            0,
+            "HeadwiseRmsNorm: d must be divisible by heads"
+        );
         Self {
             gamma: Tensor::new(&[d], vec![1.0; d]),
             dgamma: Tensor::zeros(&[d]),
@@ -45,7 +49,11 @@ impl HeadwiseRmsNorm {
 
     /// `x` is `[B, d]`; returns `[B, d]`, each head-group normalized.
     pub fn forward(&mut self, x: &Tensor) -> Tensor {
-        assert_eq!(x.cols(), self.d(), "HeadwiseRmsNorm::forward — width mismatch");
+        assert_eq!(
+            x.cols(),
+            self.d(),
+            "HeadwiseRmsNorm::forward — width mismatch"
+        );
         // Head-wise RMSNorm is the grouped case with one group per head.
         let fwd = ops::rms_norm_forward(x, &self.gamma, self.dhv, EPS);
         self.x_hat = fwd.x_hat;
@@ -55,7 +63,11 @@ impl HeadwiseRmsNorm {
 
     /// Given `dY` `[B, d]`, accumulate `dγ` and return `dX` `[B, d]`.
     pub fn backward(&mut self, dy: &Tensor) -> Tensor {
-        assert_eq!(dy.cols(), self.d(), "HeadwiseRmsNorm::backward — width mismatch");
+        assert_eq!(
+            dy.cols(),
+            self.d(),
+            "HeadwiseRmsNorm::backward — width mismatch"
+        );
         ops::rms_norm_backward(
             dy,
             &self.x_hat,
@@ -108,7 +120,11 @@ mod tests {
             let lm = loss(&mut norm, &xp);
             xp.data[i] = orig;
             let num = (lp - lm) / (2.0 * eps);
-            assert!((num - dx.data[i]).abs() < tol, "dX[{i}]: {num} vs {}", dx.data[i]);
+            assert!(
+                (num - dx.data[i]).abs() < tol,
+                "dX[{i}]: {num} vs {}",
+                dx.data[i]
+            );
         }
         for i in 0..d {
             let orig = norm.gamma.data[i];
@@ -118,7 +134,11 @@ mod tests {
             let lm = loss(&mut norm, &x);
             norm.gamma.data[i] = orig;
             let num = (lp - lm) / (2.0 * eps);
-            assert!((num - dgamma.data[i]).abs() < tol, "dgamma[{i}]: {num} vs {}", dgamma.data[i]);
+            assert!(
+                (num - dgamma.data[i]).abs() < tol,
+                "dgamma[{i}]: {num} vs {}",
+                dgamma.data[i]
+            );
         }
     }
 }

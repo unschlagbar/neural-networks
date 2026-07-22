@@ -62,11 +62,17 @@ impl Linear {
     /// `Y = X · W + b`, `x` is `[B, in]`, result `[B, out]`. Saves `x` for backward.
     pub fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
         let b = x.rows();
-        assert_eq!(x.cols(), self.input, "Linear::forward — input width mismatch");
+        assert_eq!(
+            x.cols(),
+            self.input,
+            "Linear::forward — input width mismatch"
+        );
         // Reuse the saved-input buffer when the batch size is unchanged (steady
         // state), else reallocate — avoids a per-call device allocation.
         if self.x.rank == 2 && self.x.rows() == b {
-            gpu.stream.memcpy_dtod(&x.buf, &mut self.x.buf).expect("save x");
+            gpu.stream
+                .memcpy_dtod(&x.buf, &mut self.x.buf)
+                .expect("save x");
         } else {
             self.x = x.dup(gpu);
         }
@@ -80,8 +86,16 @@ impl Linear {
 
     /// Given `dY` `[B, out]`, accumulate `dW`/`db` and return `dX = dY · Wᵀ`.
     pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
-        assert_eq!(dy.cols(), self.output, "Linear::backward — grad width mismatch");
-        assert_eq!(self.x.rows(), dy.rows(), "Linear::backward — batch mismatch");
+        assert_eq!(
+            dy.cols(),
+            self.output,
+            "Linear::backward — grad width mismatch"
+        );
+        assert_eq!(
+            self.x.rows(),
+            dy.rows(),
+            "Linear::backward — batch mismatch"
+        );
         // dW += Xᵀ · dY ; db += Σ_batch dY
         ops::matmul_tn_into(gpu, &self.x, dy, &mut self.dw, 1.0);
         ops::add_col_sum(gpu, &mut self.db, dy);
@@ -115,8 +129,24 @@ impl Linear {
     /// AdamW step with explicit weight-decay control on `w` (pass `false` for an
     /// undecayed logit head).
     pub fn step_wd(&mut self, gpu: &Gpu, cfg: &AdamCfg, decay_w: bool) {
-        ops::adamw(gpu, &mut self.w, &self.dw, &mut self.mw, &mut self.vw, cfg, decay_w);
-        ops::adamw(gpu, &mut self.b, &self.db, &mut self.mb, &mut self.vb, cfg, false);
+        ops::adamw(
+            gpu,
+            &mut self.w,
+            &self.dw,
+            &mut self.mw,
+            &mut self.vw,
+            cfg,
+            decay_w,
+        );
+        ops::adamw(
+            gpu,
+            &mut self.b,
+            &self.db,
+            &mut self.mb,
+            &mut self.vb,
+            cfg,
+            false,
+        );
         self.zero_grad(gpu);
     }
 
@@ -124,7 +154,15 @@ impl Linear {
     /// a bias-free head: `b` stays at its (zero) init so the layer is equivalent
     /// to `nn::LinearNBLayer` and exports to the no-bias `HIER` head faithfully.
     pub fn step_w_only(&mut self, gpu: &Gpu, cfg: &AdamCfg, decay_w: bool) {
-        ops::adamw(gpu, &mut self.w, &self.dw, &mut self.mw, &mut self.vw, cfg, decay_w);
+        ops::adamw(
+            gpu,
+            &mut self.w,
+            &self.dw,
+            &mut self.mw,
+            &mut self.vw,
+            cfg,
+            decay_w,
+        );
         self.zero_grad(gpu);
     }
 }
@@ -146,7 +184,9 @@ mod tests {
     /// forward → backward → AdamW-step cycle, starting from identical weights.
     #[test]
     fn linear_matches_cpu_layer() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let (batch, input, output) = (12, 7, 5);
 
         let w = Tensor::xavier(input, output);

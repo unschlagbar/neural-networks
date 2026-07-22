@@ -43,7 +43,8 @@ impl RmsNorm {
 
     /// AdamW step (norm scale is never decayed). Clears the grad.
     pub fn step(&mut self, cfg: &AdamCfg) {
-        self.opt.step(&mut self.gamma.data, &self.dgamma.data, cfg, false);
+        self.opt
+            .step(&mut self.gamma.data, &self.dgamma.data, cfg, false);
         self.zero_grad();
     }
 
@@ -117,7 +118,11 @@ mod tests {
             let lm = loss(&mut norm, &xp);
             xp.data[i] = orig;
             let num = (lp - lm) / (2.0 * eps);
-            assert!((num - dx.data[i]).abs() < tol, "dX[{i}]: {num} vs {}", dx.data[i]);
+            assert!(
+                (num - dx.data[i]).abs() < tol,
+                "dX[{i}]: {num} vs {}",
+                dx.data[i]
+            );
         }
 
         // dgamma
@@ -129,7 +134,11 @@ mod tests {
             let lm = loss(&mut norm, &x);
             norm.gamma.data[i] = orig;
             let num = (lp - lm) / (2.0 * eps);
-            assert!((num - dgamma.data[i]).abs() < tol, "dgamma[{i}]: {num} vs {}", dgamma.data[i]);
+            assert!(
+                (num - dgamma.data[i]).abs() < tol,
+                "dgamma[{i}]: {num} vs {}",
+                dgamma.data[i]
+            );
         }
     }
 }

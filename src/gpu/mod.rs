@@ -103,7 +103,8 @@ impl Gpu {
         let stream = context
             .new_stream()
             .map_err(|e| format!("stream creation failed: {e:?}"))?;
-        let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS init failed: {e:?}"))?;
+        let blas =
+            CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS init failed: {e:?}"))?;
         set_tf32(&blas)?;
         let kernels = Kernels::load(&context)?;
         let max_shared_optin = context

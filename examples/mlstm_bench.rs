@@ -147,8 +147,5 @@ fn main() {
         bwd_ns / steps,
         bwd_ns as f64 / 1e6
     );
-    println!(
-        "  fwd+bwd   {:>7} ns/step",
-        (fwd_ns + bwd_ns) / steps
-    );
+    println!("  fwd+bwd   {:>7} ns/step", (fwd_ns + bwd_ns) / steps);
 }

@@ -15,7 +15,10 @@ pub struct SoftCap {
 impl SoftCap {
     pub fn new(cap: f32) -> Self {
         assert!(cap > 0.0, "SoftCap cap must be positive");
-        Self { cap, out: Tensor::zeros(&[0, 0]) }
+        Self {
+            cap,
+            out: Tensor::zeros(&[0, 0]),
+        }
     }
 
     pub fn forward(&mut self, x: &Tensor) -> Tensor {
@@ -51,11 +54,27 @@ mod tests {
         for i in 0..4 {
             let mut xp = x.clone();
             xp.data[i] += eps;
-            let lp: f32 = sc.forward(&xp).data.iter().zip(&g.data).map(|(a, b)| a * b).sum();
+            let lp: f32 = sc
+                .forward(&xp)
+                .data
+                .iter()
+                .zip(&g.data)
+                .map(|(a, b)| a * b)
+                .sum();
             xp.data[i] -= 2.0 * eps;
-            let lm: f32 = sc.forward(&xp).data.iter().zip(&g.data).map(|(a, b)| a * b).sum();
+            let lm: f32 = sc
+                .forward(&xp)
+                .data
+                .iter()
+                .zip(&g.data)
+                .map(|(a, b)| a * b)
+                .sum();
             let num = (lp - lm) / (2.0 * eps);
-            assert!((dx.data[i] - num).abs() < 1e-3, "dx[{i}] {} vs {num}", dx.data[i]);
+            assert!(
+                (dx.data[i] - num).abs() < 1e-3,
+                "dx[{i}] {} vs {num}",
+                dx.data[i]
+            );
         }
     }
 }

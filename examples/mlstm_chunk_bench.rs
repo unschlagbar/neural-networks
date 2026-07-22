@@ -50,7 +50,10 @@ fn main() {
          chunk = {}",
         std::env::var("MLSTM_CHUNK").unwrap_or_else(|_| "default".into()),
     );
-    println!("{:>7} {:>7} {:>12} {:>14} {:>12}", "T", "iters", "ms/iter", "live MB @peak", "MB/step");
+    println!(
+        "{:>7} {:>7} {:>12} {:>14} {:>12}",
+        "T", "iters", "ms/iter", "live MB @peak", "MB/step"
+    );
 
     for &t in &[128, 256, 512, 1024, 2048] {
         let mut dev = MLstm::new_rand(&gpu, d, d, heads, dqk);

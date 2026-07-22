@@ -62,7 +62,11 @@ fn main() {
             let _ = ops::matmul(&gpu, &a, &w);
         });
         let flops = 2.0 * m as f64 * k as f64 * nn as f64;
-        println!("{what}  {:>7.3} ms   {:>6.1} TFLOP/s", secs * 1e3, flops / secs / 1e12);
+        println!(
+            "{what}  {:>7.3} ms   {:>6.1} TFLOP/s",
+            secs * 1e3,
+            flops / secs / 1e12
+        );
     }
 
     // The whole cell, forward and backward, at the shape the backbone runs it at.
@@ -77,7 +81,11 @@ fn main() {
         // backward must consume the cache the forward built, or it grows unboundedly
         let _ = cell.backward(&gpu, &dy);
     });
-    println!("fwd+bwd (chunk {}):  {:>7.2} ms", neural_networks::config::MLSTM_CHUNK, fwd * 1e3);
+    println!(
+        "fwd+bwd (chunk {}):  {:>7.2} ms",
+        neural_networks::config::MLSTM_CHUNK,
+        fwd * 1e3
+    );
 
     // Forward alone, so the two halves can be separated.
     let f_only = timed(&gpu, 2, 10, || {
@@ -137,7 +145,11 @@ fn main() {
         let _ = ops::mlstm_fused_bw(&gpu, &sv, &qh, &kh, &vh, &igh, &fgh, &dyt);
     });
     println!("fused fwd only:      {:>7.2} ms", f_fw * 1e3);
-    println!("fused fwd+bwd:       {:>7.2} ms   (bwd {:>6.2} ms)", f_all * 1e3, (f_all - f_fw) * 1e3);
+    println!(
+        "fused fwd+bwd:       {:>7.2} ms   (bwd {:>6.2} ms)",
+        f_all * 1e3,
+        (f_all - f_fw) * 1e3
+    );
 
     // Everything in the cell that is NOT the chunkwise core: 7 projections, 5 head
     // reorgs, head-norm, o-gate, output projection -- and their backwards.

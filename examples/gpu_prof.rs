@@ -30,10 +30,14 @@ fn main() {
 
     /// GPU timer: queue `iters` launches, synchronize once at the end.
     fn gpu_time(gpu: &Gpu, warmup: usize, iters: usize, mut f: impl FnMut()) -> f64 {
-        for _ in 0..warmup { f(); }
+        for _ in 0..warmup {
+            f();
+        }
         gpu.stream.synchronize().unwrap();
         let t0 = Instant::now();
-        for _ in 0..iters { f(); }
+        for _ in 0..iters {
+            f();
+        }
         gpu.stream.synchronize().unwrap();
         t0.elapsed().as_secs_f64()
     }
@@ -46,8 +50,16 @@ fn main() {
         use neural_networks::gpu::hierarchical::{HierCfg, Hierarchical};
         let words_n = 2048usize;
         let cfg = HierCfg {
-            vocab: 100, hc: 256, wh: 512, enc_blocks: 2, bb_blocks: 16, dec_blocks: 2,
-            heads: 8, dqk: 64, w_token: 99, cap: 30.0,
+            vocab: 100,
+            hc: 256,
+            wh: 512,
+            enc_blocks: 2,
+            bb_blocks: 16,
+            dec_blocks: 2,
+            heads: 8,
+            dqk: 64,
+            w_token: 99,
+            cap: 30.0,
         };
         let mut model = Hierarchical::new(&gpu, &cfg);
         let mut tokens = Vec::new();
@@ -55,15 +67,22 @@ fn main() {
         for w in 0..words_n {
             let start = tokens.len();
             let len = 3 + (w % 5);
-            for k in 0..len { tokens.push(1 + (w + k) % 90); }
+            for k in 0..len {
+                tokens.push(1 + (w + k) % 90);
+            }
             words.push((start, tokens.len()));
         }
         let _ = model.forward_backward(&gpu, &tokens, &words);
         let t0 = Instant::now();
         let n_iter = 3;
-        for _ in 0..n_iter { let _ = model.forward_backward(&gpu, &tokens, &words); }
-        println!(">>> hierarchical window ({words_n} words, {} tokens): {:.1?} / window\n",
-                 tokens.len(), t0.elapsed() / n_iter);
+        for _ in 0..n_iter {
+            let _ = model.forward_backward(&gpu, &tokens, &words);
+        }
+        println!(
+            ">>> hierarchical window ({words_n} words, {} tokens): {:.1?} / window\n",
+            tokens.len(),
+            t0.elapsed() / n_iter
+        );
     }
 
     // Time a forward+backward over `iters` runs, synchronizing once at the end.
@@ -116,12 +135,27 @@ fn main() {
         let mut gh = DTensor::zeros(&gpu, &[1, h4]);
         let mut dh = DTensor::zeros(&gpu, &[1, h]);
         let iters = 2047;
-        let t = gpu_time(&gpu, 10, iters, || ops::matmul_nn_into(&gpu, &hs, &whr, &mut gh, 0.0));
-        println!("fwd gemm  [1,{h}]x[{h},{h4}]        {:>8.1?} for {iters}", std::time::Duration::from_secs_f64(t));
-        let t = gpu_time(&gpu, 10, iters, || ops::matmul_nn_into(&gpu, &gh, &whr_t, &mut dh, 0.0));
-        println!("bwd gemm  [1,{h4}]x[{h4},{h}]  (nn) {:>8.1?} for {iters}", std::time::Duration::from_secs_f64(t));
-        let t = gpu_time(&gpu, 10, iters, || ops::matmul_nt_into(&gpu, &gh, &whr, &mut dh, 0.0));
-        println!("bwd gemm  [1,{h4}]x[{h},{h4}]T (nt) {:>8.1?} for {iters}", std::time::Duration::from_secs_f64(t));
+        let t = gpu_time(&gpu, 10, iters, || {
+            ops::matmul_nn_into(&gpu, &hs, &whr, &mut gh, 0.0)
+        });
+        println!(
+            "fwd gemm  [1,{h}]x[{h},{h4}]        {:>8.1?} for {iters}",
+            std::time::Duration::from_secs_f64(t)
+        );
+        let t = gpu_time(&gpu, 10, iters, || {
+            ops::matmul_nn_into(&gpu, &gh, &whr_t, &mut dh, 0.0)
+        });
+        println!(
+            "bwd gemm  [1,{h4}]x[{h4},{h}]  (nn) {:>8.1?} for {iters}",
+            std::time::Duration::from_secs_f64(t)
+        );
+        let t = gpu_time(&gpu, 10, iters, || {
+            ops::matmul_nt_into(&gpu, &gh, &whr, &mut dh, 0.0)
+        });
+        println!(
+            "bwd gemm  [1,{h4}]x[{h},{h4}]T (nt) {:>8.1?} for {iters}",
+            std::time::Duration::from_secs_f64(t)
+        );
     }
 
     // Isolate the two per-timestep kernels (B=1, H=512, T=2047).
@@ -130,28 +164,70 @@ fn main() {
         let (b, t, h) = (1usize, 2047usize, 512usize);
         let h4 = 4 * h;
         let slab = || DTensor::zeros(&gpu, &[b, t, h]);
-        let mut slabs = SlstmSlabs { c_prev: slab(), n_prev: slab(), zt: slab(), ot: slab(),
-            i_prime: slab(), f_prime: slab(), c: slab(), n: slab(), h_prev: slab() };
+        let mut slabs = SlstmSlabs {
+            c_prev: slab(),
+            n_prev: slab(),
+            zt: slab(),
+            ot: slab(),
+            i_prime: slab(),
+            f_prime: slab(),
+            c: slab(),
+            n: slab(),
+            h_prev: slab(),
+        };
         let mut g = DTensor::zeros(&gpu, &[b, t, h4]);
         let mut gh = DTensor::zeros(&gpu, &[b, h4]);
         let bcat = DTensor::zeros(&gpu, &[h4]);
-        let (mut cs, mut ns, mut ms, mut hs2) = (DTensor::zeros(&gpu, &[b, h]), DTensor::zeros(&gpu, &[b, h]), DTensor::zeros(&gpu, &[b, h]), DTensor::zeros(&gpu, &[b, h]));
+        let (mut cs, mut ns, mut ms, mut hs2) = (
+            DTensor::zeros(&gpu, &[b, h]),
+            DTensor::zeros(&gpu, &[b, h]),
+            DTensor::zeros(&gpu, &[b, h]),
+            DTensor::zeros(&gpu, &[b, h]),
+        );
         let (mut dc, mut dn) = (DTensor::zeros(&gpu, &[b, h]), DTensor::zeros(&gpu, &[b, h]));
         let dhb = DTensor::zeros(&gpu, &[b, h]);
         let mut out = DTensor::zeros(&gpu, &[b, t, h]);
         let dy = DTensor::zeros(&gpu, &[b, t, h]);
         let mut step = 0usize;
         let tf = gpu_time(&gpu, 10, t, || {
-            ops::slstm_step_fused(&gpu, &mut g, &gh, &bcat, &mut cs, &mut ns, &mut ms, &mut hs2, &mut slabs, &mut out, step % t);
+            ops::slstm_step_fused(
+                &gpu,
+                &mut g,
+                &gh,
+                &bcat,
+                &mut cs,
+                &mut ns,
+                &mut ms,
+                &mut hs2,
+                &mut slabs,
+                &mut out,
+                step % t,
+            );
             step += 1;
         });
         let mut step = 0usize;
         let tb = gpu_time(&gpu, 10, t, || {
-            ops::slstm_step_fused_bwd(&gpu, &dy, &mut g, &mut gh, &dhb, &slabs, &mut dc, &mut dn, step % t);
+            ops::slstm_step_fused_bwd(
+                &gpu,
+                &dy,
+                &mut g,
+                &mut gh,
+                &dhb,
+                &slabs,
+                &mut dc,
+                &mut dn,
+                step % t,
+            );
             step += 1;
         });
-        println!("kernel fwd x{t}                    {:>8.1?}", std::time::Duration::from_secs_f64(tf));
-        println!("kernel bwd x{t}                    {:>8.1?}", std::time::Duration::from_secs_f64(tb));
+        println!(
+            "kernel fwd x{t}                    {:>8.1?}",
+            std::time::Duration::from_secs_f64(tf)
+        );
+        println!(
+            "kernel bwd x{t}                    {:>8.1?}",
+            std::time::Duration::from_secs_f64(tb)
+        );
     }
 
     // Bare cell (no block wrapper) at backbone shape, to separate cell cost from
@@ -170,34 +246,52 @@ fn main() {
         let t1 = Instant::now();
         let _ = cell.backward(&gpu, &g);
         gpu.stream.synchronize().unwrap();
-        println!("bare sLSTM cell x1          B=1     T={words}  H={wh}  fwd {:>8.1?}  bwd {:>8.1?}", f, t1.elapsed());
+        println!(
+            "bare sLSTM cell x1          B=1     T={words}  H={wh}  fwd {:>8.1?}  bwd {:>8.1?}",
+            f,
+            t1.elapsed()
+        );
     }
 
     let mut enc: Vec<Box<dyn BlockLike>> = (0..2)
         .map(|_| {
-            Box::new(Block::from_cell(&gpu, hc, up(hc), SLstm::new_rand(&gpu, hc, hc)))
-                as Box<dyn BlockLike>
+            Box::new(Block::from_cell(
+                &gpu,
+                hc,
+                up(hc),
+                SLstm::new_rand(&gpu, hc, hc),
+            )) as Box<dyn BlockLike>
         })
         .collect();
     run("encoder (2x sLSTM)", &mut enc, words, 8, hc);
 
     let mut dec: Vec<Box<dyn BlockLike>> = (0..2)
         .map(|_| {
-            Box::new(Block::from_cell(&gpu, hc, up(hc), SLstm::new_rand(&gpu, hc, hc)))
-                as Box<dyn BlockLike>
+            Box::new(Block::from_cell(
+                &gpu,
+                hc,
+                up(hc),
+                SLstm::new_rand(&gpu, hc, hc),
+            )) as Box<dyn BlockLike>
         })
         .collect();
     run("decoder (2x sLSTM)", &mut dec, words, 8, hc);
 
     let mut bb_s: Vec<Box<dyn BlockLike>> = (0..8)
         .map(|_| {
-            Box::new(Block::from_cell(&gpu, wh, up(wh), SLstm::new_rand(&gpu, wh, wh)))
-                as Box<dyn BlockLike>
+            Box::new(Block::from_cell(
+                &gpu,
+                wh,
+                up(wh),
+                SLstm::new_rand(&gpu, wh, wh),
+            )) as Box<dyn BlockLike>
         })
         .collect();
     run("backbone sLSTM half (8x)", &mut bb_s, 1, words, wh);
 
-    if std::env::var("SKIP_M").is_ok() { return; }
+    if std::env::var("SKIP_M").is_ok() {
+        return;
+    }
     let mut bb_m: Vec<Box<dyn BlockLike>> = (0..8)
         .map(|_| {
             Box::new(Block::from_cell(

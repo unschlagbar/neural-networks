@@ -29,8 +29,9 @@ use rand::random_range;
 
 use crate::{
     nn::{
+        GRAD_BLOCK,
         activations::{log_sigmoid, stable_sigmoid},
-        dot, matvec_acc, outer_acc_block, GRAD_BLOCK,
+        dot, matvec_acc, outer_acc_block,
     },
     nn_layer::{DynCache, NnLayer},
     optimizers::{GradMatrix, GradMatrixOps, GradVec, GradVecOps, add_grad_matrix, add_grad_vec},
@@ -288,7 +289,11 @@ impl SLSTMLayer {
             // n starts at 1 — otherwise i' can underflow to 0 and h = c/n is 0/0.
             let fm = log_f + cache.m_prev[j];
             let np = cache.n_prev[j];
-            let m = if np == 0.0 { cache.it_pre[j] } else { fm.max(cache.it_pre[j]) };
+            let m = if np == 0.0 {
+                cache.it_pre[j]
+            } else {
+                fm.max(cache.it_pre[j])
+            };
 
             // Stabilized exponential gates
             let i_prime = (cache.it_pre[j] - m).exp();

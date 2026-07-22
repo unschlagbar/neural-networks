@@ -23,7 +23,6 @@ fn main() {
 
 #[cfg(feature = "cuda")]
 fn main() {
-    use std::rc::Rc;
     use std::time::Instant;
 
     use neural_networks::batches::ChunkedWordDataSet;
@@ -33,11 +32,15 @@ fn main() {
     use neural_networks::nn2::optim::AdamCfg;
     use neural_networks::tokenizer_utf8::Utf8Tokenizer;
 
-    let path = std::env::args().nth(1).expect("usage: gpu_soak <corpus> [windows]");
-    let limit: usize = std::env::args().nth(3 - 1).map_or(400, |s| s.parse().unwrap_or(400));
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: gpu_soak <corpus> [windows]");
+    let limit: usize = std::env::args()
+        .nth(3 - 1)
+        .map_or(400, |s| s.parse().unwrap_or(400));
 
     let gpu = Gpu::new().expect("no GPU");
-    let tok = Rc::new(Utf8Tokenizer::new());
+    let tok = Utf8Tokenizer::new();
     let vocab = tok.vocab_size();
     let w_token = tok.w_token() as usize;
     let heads = 8;
@@ -57,7 +60,12 @@ fn main() {
     let mut opt = AdamCfg::new(LR, neural_networks::optimizers::WEIGHT_DECAY);
 
     let mut data = ChunkedWordDataSet::open(
-        tok.clone(), &path, WORDS_PER_SEQ, MIN_WORDS_PER_SEQ, MAX_WINDOW_TOKENS, CHUNK_BYTES,
+        tok,
+        &path,
+        WORDS_PER_SEQ,
+        MIN_WORDS_PER_SEQ,
+        MAX_WINDOW_TOKENS,
+        CHUNK_BYTES,
     );
 
     println!("soaking {limit} windows from '{path}' ...");
@@ -72,8 +80,7 @@ fn main() {
     'outer: while let Some(chunk) = data.next_chunk() {
         for batch in chunk.iter() {
             let tokens: Vec<usize> = batch.tokens.iter().map(|&t| t as usize).collect();
-            let words: Vec<(usize, usize)> =
-                batch.words.iter().map(|r| (r.start, r.end)).collect();
+            let words: Vec<(usize, usize)> = batch.words.iter().map(|r| (r.start, r.end)).collect();
             if words.len() < 2 {
                 continue;
             }

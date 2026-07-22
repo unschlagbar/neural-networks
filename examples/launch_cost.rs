@@ -82,7 +82,10 @@ fn main() {
     let raw_wall = t0.elapsed().as_secs_f64();
 
     let us = |t: f64| t / N as f64 * 1e6;
-    println!("{:<34} {:>10} {:>10} {:>9}", "", "issue us", "wall us", "issue/w");
+    println!(
+        "{:<34} {:>10} {:>10} {:>9}",
+        "", "issue us", "wall us", "issue/w"
+    );
     println!(
         "{:<34} {:>10.2} {:>10.2} {:>9.2}",
         "cuBLAS gemm [1,H]x[H,4H]",

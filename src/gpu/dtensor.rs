@@ -25,13 +25,21 @@ impl DTensor {
     /// Upload a host tensor to the device (blocking H2D copy on the stream).
     pub fn from_host(gpu: &Gpu, t: &Tensor) -> Self {
         let buf = gpu.stream.memcpy_stod(&t.data).expect("H2D upload");
-        Self { shape: t.shape, rank: t.rank, buf }
+        Self {
+            shape: t.shape,
+            rank: t.rank,
+            buf,
+        }
     }
 
     /// Download back to a host tensor (blocking D2H copy on the stream).
     pub fn to_host(&self, gpu: &Gpu) -> Tensor {
         let data = gpu.stream.memcpy_dtov(&self.buf).expect("D2H download");
-        Tensor { shape: self.shape, rank: self.rank, data }
+        Tensor {
+            shape: self.shape,
+            rank: self.rank,
+            data,
+        }
     }
 
     /// Allocate a zeroed device tensor of the given shape.
@@ -45,13 +53,21 @@ impl DTensor {
     /// the memset kernel); the caller must fully overwrite it before any read —
     /// used for op outputs that a kernel/GEMM writes in their entirety.
     pub fn uninit(gpu: &Gpu, dims: &[usize]) -> Self {
-        assert!(dims.len() <= MAX_RANK, "rank {} exceeds MAX_RANK", dims.len());
+        assert!(
+            dims.len() <= MAX_RANK,
+            "rank {} exceeds MAX_RANK",
+            dims.len()
+        );
         let n: usize = dims.iter().product();
         // SAFETY: contract above — every element is written before it is read.
         let buf = unsafe { gpu.stream.alloc::<f32>(n) }.expect("device alloc");
         let mut shape = [0usize; MAX_RANK];
         shape[..dims.len()].copy_from_slice(dims);
-        Self { shape, rank: dims.len(), buf }
+        Self {
+            shape,
+            rank: dims.len(),
+            buf,
+        }
     }
 
     /// Zero this tensor's buffer in place (memset), reusing the existing device
@@ -66,7 +82,11 @@ impl DTensor {
     /// round-trip through host memory.
     pub fn dup(&self, gpu: &Gpu) -> Self {
         let buf = gpu.stream.clone_dtod(&self.buf).expect("device clone");
-        Self { shape: self.shape, rank: self.rank, buf }
+        Self {
+            shape: self.shape,
+            rank: self.rank,
+            buf,
+        }
     }
 
     /// Reinterpret the shape without touching the buffer (metadata-only, zero
@@ -74,7 +94,11 @@ impl DTensor {
     /// just a rank/shape rewrite. Consumes `self` to make the move-not-alias
     /// explicit (the old shape is gone). Panics if the element count changes.
     pub fn reshaped(mut self, dims: &[usize]) -> Self {
-        assert!(dims.len() <= MAX_RANK, "reshape rank {} exceeds MAX_RANK", dims.len());
+        assert!(
+            dims.len() <= MAX_RANK,
+            "reshape rank {} exceeds MAX_RANK",
+            dims.len()
+        );
         let n: usize = dims.iter().product();
         assert_eq!(n, self.buf.len(), "reshape changes element count");
         self.shape = [0usize; MAX_RANK];
@@ -119,7 +143,9 @@ mod tests {
 
     #[test]
     fn host_device_roundtrip() {
-        let Some(gpu) = super::super::test_gpu() else { return };
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
         let t = Tensor::random(&[7, 13], 1.0);
         let d = DTensor::from_host(&gpu, &t);
         let back = d.to_host(&gpu);

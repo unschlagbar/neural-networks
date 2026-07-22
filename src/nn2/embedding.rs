@@ -8,8 +8,8 @@
 //! the model level by sharing one `Embedding` (or by reducing the decoder-side
 //! table grad into the encoder's), exactly as the old system does.
 
-use crate::nn2::optim::{AdamCfg, AdamState};
 use crate::nn2::ops;
+use crate::nn2::optim::{AdamCfg, AdamState};
 use crate::tensor::Tensor;
 
 pub struct Embedding {
@@ -37,7 +37,8 @@ impl Embedding {
 
     /// AdamW step (embedding table is never decayed). Clears the grad.
     pub fn step(&mut self, cfg: &AdamCfg) {
-        self.opt.step(&mut self.table.data, &self.dtable.data, cfg, false);
+        self.opt
+            .step(&mut self.table.data, &self.dtable.data, cfg, false);
         self.zero_grad();
     }
 
@@ -60,7 +61,11 @@ impl Embedding {
     /// Scatter-add: `dtable[ids[b]] += dy[b]`. No input gradient.
     pub fn backward(&mut self, dy: &Tensor) {
         let d = self.dim;
-        assert_eq!(dy.rows(), self.ids.len(), "Embedding::backward — batch mismatch");
+        assert_eq!(
+            dy.rows(),
+            self.ids.len(),
+            "Embedding::backward — batch mismatch"
+        );
         assert_eq!(dy.cols(), d, "Embedding::backward — dim mismatch");
         ops::embedding_scatter_add(&mut self.dtable, &self.ids, dy, d);
     }
@@ -83,7 +88,10 @@ mod tests {
         let out = emb.forward(&ids);
         // Rows must equal the gathered table rows.
         for (r, &id) in ids.iter().enumerate() {
-            assert_eq!(&out.data[r * dim..(r + 1) * dim], &emb.table.data[id * dim..(id + 1) * dim]);
+            assert_eq!(
+                &out.data[r * dim..(r + 1) * dim],
+                &emb.table.data[id * dim..(id + 1) * dim]
+            );
         }
 
         // Upstream grad of all-ones: id 1 gets +2 per element, id 3 gets +1.
@@ -122,7 +130,11 @@ mod tests {
             let lm = loss(&mut emb);
             emb.table.data[i] = orig;
             let num = (lp - lm) / (2.0 * eps);
-            assert!((num - dtable.data[i]).abs() < 1e-3, "dtable[{i}] {num} vs {}", dtable.data[i]);
+            assert!(
+                (num - dtable.data[i]).abs() < 1e-3,
+                "dtable[{i}] {num} vs {}",
+                dtable.data[i]
+            );
         }
     }
 }
