@@ -331,7 +331,26 @@ impl Hierarchical {
         tokens: &[usize],
         words: &[(usize, usize)],
     ) -> f32 {
-        let loss = self.forward_backward_window(gpu, tokens, words);
+        let loss = self.forward_backward_window(gpu, tokens, words, None);
+        gpu.stream.synchronize().expect("stream sync");
+        loss
+    }
+
+    /// Like [`forward_backward`](Self::forward_backward) but for SFT: `word_loss`
+    /// has one flag per DECODED word (word `w` decodes `words[w+1]`, so
+    /// `word_loss.len() == words.len() - 1`). Only words flagged `true`
+    /// contribute to the loss and gradient — every word is still encoded and
+    /// decoded (the backbone must read the prompt), but a masked word's decoder
+    /// slots get CE mask 0, so no gradient flows from the prompt tokens. The
+    /// returned loss is the mean CE over the *unmasked* response tokens.
+    pub fn forward_backward_masked(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[usize],
+        words: &[(usize, usize)],
+        word_loss: &[bool],
+    ) -> f32 {
+        let loss = self.forward_backward_window(gpu, tokens, words, Some(word_loss));
         // The window's temporaries have dropped by now, so their `cuMemFreeAsync`
         // frees are queued on the stream. CUDA's stream-ordered pool only hands
         // that memory back at a synchronization point — without one it just keeps
@@ -346,6 +365,7 @@ impl Hierarchical {
         gpu: &Gpu,
         tokens: &[usize],
         words: &[(usize, usize)],
+        word_loss: Option<&[bool]>,
     ) -> f32 {
         // Phase timing, off unless GPU_PROF is set (each mark syncs the stream).
         // GPU_MEM additionally reports device memory in use after each phase —
@@ -452,8 +472,14 @@ impl Hierarchical {
             .extend((0..dw).map(|w| words[w + 1].1 - words[w + 1].0));
         group_by_len(&sc.dec_lens, no_group, &mut sc.dec_groups);
         // Every group scales by the WINDOW's valid-row count, so the summed loss and
-        // grads match what one big rectangle would have produced.
-        let valid_rows: usize = sc.dec_lens.iter().map(|&m| m + 1).sum();
+        // grads match what one big rectangle would have produced. Under SFT masking
+        // only the response words' rows count, so the normalizer (and the reported
+        // loss) is the number of *unmasked* rows — the mean CE over response tokens.
+        let word_on = |w: usize| word_loss.is_none_or(|m| m[w]);
+        let valid_rows: usize = (0..dw)
+            .filter(|&w| word_on(w))
+            .map(|w| sc.dec_lens[w] + 1)
+            .sum();
         let inv = 1.0 / (valid_rows.max(1) as f32);
 
         let mut loss = 0.0;
@@ -475,6 +501,10 @@ impl Hierarchical {
             for (i, &w) in grp.iter().enumerate() {
                 let m = sc.dec_lens[w];
                 let (s, _) = words[w + 1];
+                // A masked (prompt) word is still fed forward so its state and
+                // the tied-table char grads are produced, but its slots get CE
+                // mask 0 — no loss, no logit gradient from a prompt token.
+                let on = word_on(w) as u32;
                 sc.o_rows.push((i * tmax) as u32);
                 for k in 1..=m {
                     sc.char_rows.push((i * tmax + k) as u32);
@@ -482,10 +512,10 @@ impl Hierarchical {
                 }
                 for k in 0..m {
                     sc.targets[i * tmax + k] = tokens[s + k] as u32;
-                    sc.mask[i * tmax + k] = 1;
+                    sc.mask[i * tmax + k] = on;
                 }
                 sc.targets[i * tmax + m] = w_token as u32;
-                sc.mask[i * tmax + m] = 1;
+                sc.mask[i * tmax + m] = on;
             }
 
             // The group's word indices, narrowed once for the two gathers/scatters

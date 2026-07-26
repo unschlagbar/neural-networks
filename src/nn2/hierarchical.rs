@@ -144,8 +144,8 @@ impl Hierarchical {
         // Encode words 0..dw. Sequence = chars + [W]; readout at the [W] step.
         let enc_lens: Vec<usize> = (0..dw).map(|w| words[w].1 - words[w].0).collect();
         let enc_tmax = enc_lens.iter().map(|&l| l + 1).max().unwrap();
-        let mut enc_ids = vec![0usize; dw * enc_tmax];
-        let mut readout = vec![0usize; dw];
+        let mut enc_ids = vec![0; dw * enc_tmax];
+        let mut readout = vec![0; dw];
         for w in 0..dw {
             let (s, _) = words[w];
             for k in 0..enc_lens[w] {

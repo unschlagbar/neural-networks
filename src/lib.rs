@@ -3,6 +3,7 @@ pub mod config;
 pub mod format;
 #[cfg(feature = "cuda")]
 pub mod gpu;
+pub mod grow_vocab;
 pub mod hierarchical;
 pub mod inspect;
 pub mod loading;
@@ -18,6 +19,7 @@ pub mod sampling;
 pub mod saving;
 pub mod segment;
 pub mod sequential;
+pub mod sft;
 pub mod tensor;
 pub mod tokenizer_utf8;
 pub mod training;
@@ -44,11 +46,15 @@ pub fn run() {
         "h" => training::train_hierarchical(&read_model_path("models/fix_bi")),
         #[cfg(feature = "cuda")]
         "hg" => gpu::train::train_hierarchical_gpu(&read_model_path("models/hier_gpu")),
+        #[cfg(feature = "cuda")]
+        "hqg" => gpu::train::train_sft_gpu(&read_model_path("models/hier_gpu_sft")),
+        "av" => grow_vocab::grow_model_interactive(),
         "hp" => training::probe_hierarchical(&read_model_path("models/fix_bi")),
         "hv" => training::validate_hierarchical(&read_model_path("models/fix_bi")),
         "ht" => training::trace_hierarchical(&read_model_path("models/fix_bi")),
         "s" => sampling::sample_normal(&read_model_path("models/seq")),
         "hs" => sampling::sample_hierarchical(&read_model_path("models/fix_bi")),
+        "hqs" => sampling::sample_chat(&read_model_path("models/hier_gpu_sft")),
         "i" => inspect::inspect_model(),
         "wr" => wake_word::record::record_samples(),
         "wt" => wake_word::training::train_wake(),
@@ -58,7 +64,9 @@ pub fn run() {
                 "Unknown mode {other:?}. Modes: '' train_normal | 'h' train_hierarchical | \
                  'hv' validate_hierarchical | \
                  'hg' train_hierarchical on GPU | \
-                 's' sample_normal | 'hs' sample_hierarchical | 'i' inspect model | \
+                 'hqg' SFT (Q-A) fine-tune on GPU | 'av' add SFT vocab to a model | \
+                 's' sample_normal | 'hs' sample_hierarchical | 'hqs' chat/Q-A sampling | \
+                 'i' inspect model | \
                  'wr' record wake-word samples | 'wt' train wake-word | 'w' run detector",
             );
             std::process::exit(2);

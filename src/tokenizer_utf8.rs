@@ -7,7 +7,19 @@
 // so no valid input can ever collide with them.
 
 /// Special tokens, in id order. Their ids are `256 + index`.
-pub const SPECIAL_TOKENS: &[&str] = &["<W>", "<END>"];
+///
+/// The first two (`<W>`, `<END>`) are the pretraining specials and their ids
+/// are load-bearing — `<W>` (256) is the encoder/decoder end-of-word marker and
+/// `<END>` (257) the end-of-text stop. The rest are post-training (SFT) chat
+/// markers, appended *after* them so an existing byte/`<W>`/`<END>` id never
+/// shifts. A pretrained checkpoint has a smaller vocab than this list implies;
+/// `crate::grow_vocab` widens its tables to make room for the new rows.
+pub const SPECIAL_TOKENS: &[&str] = &["<W>", "<END>", "<CONTEXT>", "<SEP>"];
+
+/// Number of specials present in a model trained *before* SFT (only `<W>` and
+/// `<END>`). A pretrained checkpoint therefore has `256 + PRETRAIN_SPECIALS`
+/// vocab rows; grow-vocab lifts it to the full `vocab_size()`.
+pub const PRETRAIN_SPECIALS: usize = 2;
 
 /// Number of byte tokens — ids `0..256` are exactly the UTF-8 byte values.
 pub const BYTE_TOKENS: usize = 256;
@@ -15,8 +27,13 @@ pub const BYTE_TOKENS: usize = 256;
 /// `[W]` word-boundary marker (HAT): appended as the encoder's end-of-word step
 /// and as the decoder's end-of-word target. Model-internal — never in the data.
 pub const W_TOKEN: u16 = BYTE_TOKENS as u16;
-/// End-of-text marker. Not emitted by `to_tokens`; used by samplers as a stop.
+/// End-of-text marker. Not emitted by `to_tokens`; used by samplers as a stop
+/// and, in SFT, as the end-of-response target.
 pub const END_TOKEN: u16 = BYTE_TOKENS as u16 + 1;
+/// `<CONTEXT>` — SFT marker opening the optional context block of a prompt.
+pub const CONTEXT_TOKEN: u16 = BYTE_TOKENS as u16 + 2;
+/// `<SEP>` — SFT marker separating the prompt from the assistant response.
+pub const SEP_TOKEN: u16 = BYTE_TOKENS as u16 + 3;
 
 #[derive(Clone, Copy, Default)]
 pub struct Utf8Tokenizer;
@@ -99,6 +116,16 @@ impl Utf8Tokenizer {
     /// The `<END>` end-of-text marker id.
     pub const fn end_token(&self) -> u16 {
         END_TOKEN
+    }
+
+    /// The `<CONTEXT>` SFT marker id.
+    pub const fn context_token(&self) -> u16 {
+        CONTEXT_TOKEN
+    }
+
+    /// The `<SEP>` SFT marker id.
+    pub const fn sep_token(&self) -> u16 {
+        SEP_TOKEN
     }
 
     /// Bytes a fixed-size token window may be cut at (used by the flat model's

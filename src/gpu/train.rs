@@ -11,14 +11,18 @@
 
 use std::time::Instant;
 
+use rand::seq::SliceRandom;
+
 use crate::batches::ChunkedWordDataSet;
 use crate::config::{
     BATCH_SIZE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, LOG_EVERY, LOGIT_SOFTCAP, LR, MAX_WINDOW_TOKENS,
-    MIN_WORDS_PER_SEQ, TRAIN_DATA, WORD_BLOCKS, WORD_HIDDEN, WORDS_PER_SEQ,
+    MIN_WORDS_PER_SEQ, SFT_DATA, SFT_EPOCHS, SFT_LR, TRAIN_DATA, WORD_BLOCKS, WORD_HIDDEN,
+    WORDS_PER_SEQ,
 };
 use crate::gpu::Gpu;
 use crate::gpu::hierarchical::{HierCfg, Hierarchical};
 use crate::nn2::optim::AdamCfg;
+use crate::sft;
 use crate::tokenizer_utf8::Utf8Tokenizer;
 use crate::training::TrainingState;
 
@@ -184,6 +188,162 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         Ok(()) => {
             state.flush_log();
             println!("final save -> {}", state.save_path());
+        }
+        Err(e) => eprintln!("final save failed: {e}"),
+    }
+}
+
+/// GPU supervised fine-tuning (Q-A instruction tuning) of a pretrained
+/// hierarchical model.
+///
+/// Loads the SFT set (`config::SFT_DATA`) fully into memory as masked chat
+/// windows (see `crate::sft`) — the corpus is small — and fine-tunes the model
+/// with loss counted only on the response tokens (`forward_backward_masked`).
+///
+/// A model built by this crate already has the full SFT vocabulary (new models
+/// are created at `tokenizer.vocab_size()`), so it just works. Only an *older*
+/// checkpoint — pretrained back when the vocab was smaller — lacks the SFT
+/// marker rows; such a checkpoint is rejected with a hint to run `av`
+/// (`grow_vocab`) once, rather than silently indexing past the tied table.
+pub fn train_sft_gpu(model_path: &str) {
+    let gpu = match Gpu::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("No CUDA GPU available ({e}).");
+            return;
+        }
+    };
+
+    let tokenizer = Utf8Tokenizer::new();
+    let vocab = tokenizer.vocab_size();
+    let w_token = tokenizer.w_token() as usize;
+
+    let mut model = match Hierarchical::load(&gpu, model_path, w_token) {
+        Ok(m) => {
+            println!(
+                "Loaded GPU hierarchical model from '{model_path}' (step {}).",
+                m.step_count
+            );
+            m
+        }
+        Err(e) => {
+            eprintln!(
+                "Could not load '{model_path}' ({e}). SFT fine-tunes an existing \
+                 pretrained model — train one with 'hg' first."
+            );
+            return;
+        }
+    };
+
+    if model.cfg.vocab != vocab {
+        eprintln!(
+            "This is an older checkpoint: its vocab is {} but the tokenizer now has \
+             {vocab} tokens (the SFT markers were added later). Upgrade it once with \
+             the 'av' mode, then fine-tune the grown model. Newly trained models \
+             already have the full vocab and skip this step.",
+            model.cfg.vocab
+        );
+        return;
+    }
+
+    let mut examples = match sft::load_jsonl(&tokenizer, SFT_DATA) {
+        Ok(e) if !e.is_empty() => e,
+        Ok(_) => {
+            eprintln!("SFT set '{SFT_DATA}' produced no trainable examples.");
+            return;
+        }
+        Err(e) => {
+            eprintln!("Could not read SFT set '{SFT_DATA}': {e}");
+            return;
+        }
+    };
+
+    // Size the caches to the longest example (word count + token span).
+    let max_words = examples.iter().map(|e| e.words.len()).max().unwrap();
+    let max_tokens = examples.iter().map(|e| e.tokens.len()).max().unwrap();
+    // The GPU model builds its own per-window rectangles, so no persistent cache
+    // allocation is needed here (unlike the CPU path); max_* only informs logs.
+    println!(
+        "SFT: {} examples, longest {max_words} words / {max_tokens} tokens. \
+         {SFT_EPOCHS} epochs, LR={SFT_LR}, batch={BATCH_SIZE} windows.",
+        examples.len()
+    );
+
+    let mut state = TrainingState::from_step(model.step_count);
+    state.lr = SFT_LR;
+    state.init_log(&format!("{model_path}_sft"), &["resp_ppl"]);
+    state.set_defer_log_flush(true);
+
+    let mut opt = AdamCfg::new(SFT_LR, crate::optimizers::WEIGHT_DECAY);
+
+    let mut rng = rand::rng();
+    for epoch in 1..=SFT_EPOCHS {
+        println!("── SFT epoch {epoch}/{SFT_EPOCHS} ──");
+        examples.shuffle(&mut rng);
+
+        let epoch_start = Instant::now();
+        let mut tokens_since_print = 0usize;
+        let mut time = Instant::now();
+
+        for ex in examples.iter() {
+            let tokens: Vec<usize> = ex.tokens.iter().map(|&t| t as usize).collect();
+            let words: Vec<(usize, usize)> = ex.words.iter().map(|r| (r.start, r.end)).collect();
+            if words.len() < 2 {
+                continue;
+            }
+            // `word_loss` is per DECODED word: word w decodes words[w+1], so its
+            // flag is ex.loss[w+1] (ex.loss[0] belongs to the encode-only prefix).
+            let word_loss: Vec<bool> = ex.loss[1..].to_vec();
+
+            let loss = model.forward_backward_masked(&gpu, &tokens, &words, &word_loss);
+            tokens_since_print += tokens.len();
+            state.log_tokens(tokens.len());
+            state.log_metric("resp_ppl", loss.exp());
+
+            if let Some(lr) = state.step(loss) {
+                opt.lr = lr;
+                opt.t += 1;
+                model.step(&gpu, &opt);
+            }
+            model.step_count = state.step;
+
+            if state.print() {
+                let loss = state.get_loss();
+                println!(
+                    "{} | resp loss {:.4} | ppl {:.4} | lr {:.2e} | {} tok | {:.1?}",
+                    state.step,
+                    loss,
+                    loss.exp(),
+                    opt.lr,
+                    tokens_since_print,
+                    time.elapsed(),
+                );
+                tokens_since_print = 0;
+                time = Instant::now();
+            }
+            if state.save() {
+                match model.save(&gpu, model_path, &[]) {
+                    Ok(()) => {
+                        state.flush_log();
+                        println!("saved -> {model_path}");
+                    }
+                    Err(e) => eprintln!("save failed: {e}"),
+                }
+            }
+        }
+        println!("SFT epoch {epoch} took {:.1?}", epoch_start.elapsed());
+        // Save at every epoch boundary too.
+        if let Err(e) = model.save(&gpu, model_path, &[]) {
+            eprintln!("epoch save failed: {e}");
+        } else {
+            state.flush_log();
+        }
+    }
+
+    match model.save(&gpu, model_path, &[]) {
+        Ok(()) => {
+            state.flush_log();
+            println!("final SFT save -> {model_path}");
         }
         Err(e) => eprintln!("final save failed: {e}"),
     }

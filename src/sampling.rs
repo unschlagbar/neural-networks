@@ -83,6 +83,50 @@ pub fn sample_normal(model_path: &str) {
     }
 }
 
+/// Interactive Q-A sampling for an SFT (instruction-tuned) model. Each line the
+/// user types is an instruction; it is wrapped as `{instruction}<SEP>`, encoded
+/// as context, and the model generates the response until `<END>`. An empty
+/// line lets the user add a context block via a second prompt.
+pub fn sample_chat(model_path: &str) {
+    let tokenizer = Utf8Tokenizer::new();
+
+    let mut model = match Hierarchical::load(model_path, tokenizer) {
+        Ok(m) => {
+            println!("Loaded SFT model from '{model_path}' (step {}).", m.step);
+            m
+        }
+        Err(e) => {
+            eprintln!("Failed to load '{model_path}': {e}");
+            std::process::exit(1);
+        }
+    };
+    model.make_cache(1, MAX_SEQ_LEN);
+
+    loop {
+        println!("\nInstruction (empty line = quit):");
+        let mut instruction = String::new();
+        if stdin().read_line(&mut instruction).unwrap() == 0 || instruction.trim().is_empty() {
+            println!();
+            return;
+        }
+
+        print!("Context (optional, blank for none): ");
+        stdout().flush().unwrap();
+        let mut context = String::new();
+        stdin().read_line(&mut context).unwrap();
+
+        let prompt = crate::sft::format_prompt(&tokenizer, instruction.trim(), context.trim());
+
+        print!(">>> ");
+        stdout().flush().unwrap();
+        let mut printer = Utf8Printer::default();
+        model.sample_chat(&prompt, MAX_LEN, TEMPERATURE, TOP_P, |token| {
+            printer.print(token, &tokenizer)
+        });
+        println!();
+    }
+}
+
 pub fn sample_hierarchical(model_path: &str) {
     let tokenizer = Utf8Tokenizer::new();
 

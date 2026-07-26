@@ -29,8 +29,11 @@ The binary reads one line from stdin to select its mode:
 | *(empty)* | `train_normal` — trains the flat mLSTM model |
 | `h` | `train_hierarchical` — trains the three-part hierarchical model (CPU) |
 | `hg` | `train_hierarchical_gpu` — same model, trained on the GPU (needs `--features cuda`); checkpoints to `models/hier_gpu` as a `GHIR` blob |
+| `av` | `grow_vocab` — **only for old checkpoints**: adds the SFT chat markers to a checkpoint pretrained before they existed (grows the tied embedding + logit head to the current `vocab_size()`). New models are built with the full vocab and never need this |
+| `hqg` | `train_sft_gpu` — GPU Q-A / instruction fine-tuning on `SFT_DATA`, loss masked to the response (needs `--features cuda`). Works directly on any current checkpoint; only an old (smaller-vocab) one must be run through `av` first |
 | `s` | `sample_normal` — interactive sampling from the flat model |
 | `hs` | `sample_hierarchical` — interactive sampling from the hierarchical model |
+| `hqs` | `sample_chat` — interactive Q-A sampling from an SFT model (prompts for an instruction + optional context, generates the response until `<END>`) |
 | `i` | `inspect_model` — prompts for a model name, looks it up in `models/` and prints all layers with their settings |
 
 ## Style 
@@ -93,6 +96,16 @@ bug.
 `Utf8Tokenizer` is byte-level: ids `0..256` are raw UTF-8 bytes, ids `256..` are the specials in `SPECIAL_TOKENS` (`<W>` = end-of-word marker, `<END>`), so `vocab_size() == 256 + SPECIAL_TOKENS.len()` (258). Any UTF-8 text round-trips losslessly and no input byte can collide with a special. There is no charset file. Sampling decodes with `Utf8Printer` (`src/sampling.rs`), which holds bytes back until they form a whole character.
 
 `segment::word_ends` decides what a "word" is — the unit the backbone autoregresses over — with a lexer-shaped split tuned for Rust: a whitespace run is one unit and attaches as a *suffix* to the word before it (`"use "`, `";\n    "`), so a word carries the separator that closes it and the decoder emits that separator right before `[W]`; identifiers/keywords and numbers stay whole (`foo`, `1_000u32`), multi-byte operators are one word (`::`, `->`, `..=`, `//`), lifetimes (`'a`) differ from char literals (`'a'`), and non-ASCII bytes group into their character. Words tile the sequence contiguously and are capped at `MAX_WORD_BYTES` (config), which bounds the decoder unroll. Roughly 3–4 bytes per word on Rust source. `cargo run --example seg_demo -- src/foo.rs` prints the split for a file.
+
+### Post-training / SFT (`src/sft.rs`, `src/grow_vocab.rs`, `src/gpu/train.rs`)
+
+Q-A instruction tuning of a pretrained hierarchical model, GPU only. Three pieces:
+
+- **Chat special tokens.** `SPECIAL_TOKENS` gains `<CONTEXT>` (258) and `<SEP>` (259) *after* the pretraining `<W>`/`<END>`, so no existing byte/`<W>`/`<END>` id ever shifts. `vocab_size()` is therefore 260, while a pretrained checkpoint has 258 (`PRETRAIN_SPECIALS`). The pretraining `<END>` (257) doubles as the SFT end-of-response target/stop.
+- **Growing the vocab (`grow_vocab.rs`, mode `av`) — only for old checkpoints.** New models are built at `tokenizer.vocab_size()`, so they already carry the SFT marker rows and go straight into `hqg`. `av` exists solely to upgrade a checkpoint pretrained *before* the markers were added: its two vocab-sized tables — the encoder's tied char **embedding** (`[vocab, HC]`, rows) and the decoder's logit **head** (`LinearNoBias`, `[HC, vocab]`, cols; its trailing `SoftCap` is resized too) — have no rows/cols for the new ids. `grow_checkpoint` appends them: new embedding rows get a small random init, new head columns start at **zero** (neutral initial logit), every existing weight preserved byte-for-byte, backbone untouched (it never sees token ids). `hqg` detects a stale-vocab checkpoint and points at `av`; a current model never triggers it.
+- **SFT dataset (`sft.rs`).** Reads a dolly-style JSONL (`{instruction, context, response, category}`, dependency-free string parser — no serde) and formats each record as `{instruction}[<CONTEXT>{context}]<SEP>{response}<END>`, one window per example. `segment::word_ends` already makes each special token its own one-token word, so the per-word **loss mask** is a clean flag: words at/after the response carry loss (`true`), the prompt (through `<SEP>`) does not. The whole sequence is still encoded/decoded — the backbone must read the prompt — but gradient flows only from the response.
+- **Training (`train_sft_gpu`, mode `hqg`).** Loads the whole (small) SFT set into memory, shuffles per epoch, and calls `gpu::Hierarchical::forward_backward_masked`, which mirrors `forward_backward` but takes a per-decoded-word mask (`word_loss[w]` gates the CE mask of every decoder slot of word `w+1`) and normalizes the loss by the **unmasked** row count. A current model runs directly; only a stale (smaller-vocab) checkpoint is rejected with a pointer to `av`. LR defaults to `SFT_LR` (1e-5, ×10 below pretraining) over `SFT_EPOCHS`.
+- **Inference (`sample_chat`, mode `hqs`).** Prompts for an instruction + optional context, formats them with `sft::format_prompt` (trailing `<SEP>`), encodes the *whole* prompt into the backbone (nothing teacher-forced, unlike `sample`), then generates the response word by word until `<END>`.
 
 ### Dataset (`src/batches.rs`)
 

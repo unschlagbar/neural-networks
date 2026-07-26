@@ -689,9 +689,9 @@ impl Hierarchical {
             if let Some(lr) = state.step(loss) {
                 // Character stacks train as Adam (no decay); the backbone stays
                 // AdamW (decoupled decay on its interior projections).
-                self.encoder.sgd_step(lr, ENCODER_WEIGHT_DECAY); // marks its own replica pool dirty
-                self.char2_model.sgd_step(lr, DECODER_WEIGHT_DECAY);
-                self.word_model.sgd_step(lr, BACKBONE_WEIGHT_DECAY);
+                self.encoder.step(lr, ENCODER_WEIGHT_DECAY); // marks its own replica pool dirty
+                self.char2_model.step(lr, DECODER_WEIGHT_DECAY);
+                self.word_model.step(lr, BACKBONE_WEIGHT_DECAY);
                 self.dec_pool.mark_dirty();
             }
             self.step = state.step;
@@ -845,6 +845,92 @@ impl Hierarchical {
         out
     }
 
+    /// Chat / instruction sampling for an SFT model. The full `prompt` (already
+    /// formatted with the chat markers, e.g. `{instruction}<SEP>` — its trailing
+    /// `<SEP>` word included) is *entirely encoded* to condition the backbone,
+    /// then the model generates the response one word at a time until it emits
+    /// `<END>` (or `max_len` chars). Unlike [`sample`](Self::sample), nothing is
+    /// teacher-forced: the whole prompt is context, and every emitted token is a
+    /// generated response token.
+    pub fn sample_chat(
+        &mut self,
+        prompt: &[u16],
+        max_len: usize,
+        temperature: f32,
+        top_p: f32,
+        mut callback: impl FnMut(u16) -> bool,
+    ) -> Vec<u16> {
+        if !self.encoder.cache_ready() {
+            self.make_cache(1, MAX_SEQ_LEN);
+        }
+        self.reset();
+        let w_tok = self.w_token as usize;
+        let end_tok = self.tokenizer.end_token();
+
+        // Encode EVERY word of the prompt (markers included) so the backbone has
+        // read the whole instruction before the first response word is decoded.
+        let ends = segment::word_ends(prompt);
+        let mut start = 0usize;
+        for &e in &ends {
+            let word = &prompt[start..e as usize];
+            start = e as usize;
+            if !word.is_empty() {
+                self.encode_word_advance(word);
+            }
+        }
+        // Empty prompt: seed a random byte so a context exists.
+        if ends.is_empty() {
+            self.encode_word_advance(&[rand::random_range(0..BYTE_TOKENS) as u16]);
+        }
+
+        let mut out = Vec::with_capacity(max_len);
+        let mut word_chars: Vec<u16> = Vec::new();
+        let mut empty_words = 0;
+        for layer in &mut self.char2_model.layers {
+            layer.reset_state();
+        }
+
+        loop {
+            Self::forward_sample_step(
+                &mut self.char2_model.layers,
+                &mut self.char2_model.cache[0],
+                &self.char2_input,
+            );
+            let logits = self.char2_model.cache[0].last().unwrap().output();
+            let tok = sample_top_p(logits, temperature, top_p) as u16;
+
+            if tok == end_tok {
+                break; // end of response
+            }
+            if tok as usize == w_tok {
+                if !word_chars.is_empty() {
+                    self.encode_word_advance(&word_chars);
+                    word_chars.clear();
+                    empty_words = 0;
+                } else {
+                    empty_words += 1;
+                    if empty_words > 16 {
+                        break;
+                    }
+                }
+                for layer in &mut self.char2_model.layers {
+                    layer.reset_state();
+                }
+                continue;
+            }
+
+            out.push(tok);
+            if out.len() >= max_len || !callback(tok) {
+                break;
+            }
+            word_chars.push(tok);
+            self.char2_input
+                .copy_from_slice(&self.encoder.char_embedding().weights[tok as usize]);
+        }
+
+        out
+    }
+
     pub fn save(&self, path: &str) -> io::Result<()> {
         // NNM1 container, kind = Hierarchical: one named section per stage.
         Writer::new(
@@ -899,6 +985,15 @@ impl Hierarchical {
         debug_assert_eq!(model.context_size, stacks.context_size);
         model.step = stacks.step;
         Ok(model)
+    }
+}
+
+impl HierStacks {
+    /// Load the raw stacks of a hierarchical checkpoint without the architecture
+    /// validation of [`Hierarchical::new`] — used by tools (e.g. `grow_vocab`)
+    /// that manipulate the stacks directly.
+    pub fn load(path: &str) -> io::Result<Self> {
+        Hierarchical::load_stacks(path)
     }
 }
 

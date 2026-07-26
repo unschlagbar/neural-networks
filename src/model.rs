@@ -42,8 +42,7 @@ pub fn build_hierarchical_model(vocab: usize, tokenizer: Utf8Tokenizer) -> Hiera
     let encoder = SequentialBuilder::new(vocab)
         .embedding(CHAR_HIDDEN)
         .slstm_block(CHAR_HIDDEN)
-        .slstm_block(CHAR_HIDDEN)
-        .slstm_block(CHAR_HIDDEN)
+        .mlstm_block(16, OUT_HIDDEN / 16)
         .slstm_block(CHAR_HIDDEN)
         .build();
 
@@ -70,7 +69,6 @@ pub fn build_hierarchical_model(vocab: usize, tokenizer: Utf8Tokenizer) -> Hiera
     let char2_model = SequentialBuilder::new(OUT_HIDDEN)
         .slstm_block(OUT_HIDDEN)
         .mlstm_block(16, OUT_HIDDEN / 16)
-        .slstm_block(OUT_HIDDEN)
         .slstm_block(OUT_HIDDEN)
         .rms_norm()
         .linear_no_bias(vocab)

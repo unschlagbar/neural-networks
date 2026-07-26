@@ -125,6 +125,19 @@ pub const PARQUET_LANGUAGE_COLUMN: &str = "language";
 pub const TRAIN_DATA: &str = "../../training_data/000_00000.parquet";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
+// Post-training (SFT / instruction tuning)
+
+/// Instruction dataset (JSONL: `{instruction, context, response, category}`,
+/// databricks-dolly-15k layout). Formatted into masked chat windows by
+/// `crate::sft`; the loss counts only the response tokens.
+pub const SFT_DATA: &str = "/home/unschlagbar/training_data/databricks-dolly-15k.jsonl";
+/// Passes over the SFT set. A few epochs is typical for instruction tuning on a
+/// small set; too many overfits the ~15k examples.
+pub const SFT_EPOCHS: usize = 1;
+/// SFT learning rate — an order of magnitude below pretraining `LR`, so
+/// fine-tuning nudges the pretrained weights instead of overwriting them.
+pub const SFT_LR: f32 = 5e-6;
+
 // Wake Word
 
 pub const WAKE_HIDDEN: usize = 128;
