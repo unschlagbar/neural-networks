@@ -11,18 +11,21 @@
 
 use std::time::Instant;
 
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use rand::SeedableRng;
 
 use crate::batches::ChunkedWordDataSet;
 use crate::config::{
     BATCH_SIZE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, LOG_EVERY, LOGIT_SOFTCAP, LR, MAX_WINDOW_TOKENS,
-    MIN_WORDS_PER_SEQ, SFT_DATA, SFT_EPOCHS, SFT_LR, TRAIN_DATA, WORD_BLOCKS, WORD_HIDDEN,
-    WORDS_PER_SEQ,
+    MIN_WORDS_PER_SEQ, SFT_DATA, SFT_EPOCHS, SFT_LR, SFT_MAX_TOKENS, TRAIN_DATA, WORD_BLOCKS,
+    WORD_HIDDEN, WORDS_PER_SEQ,
 };
 use crate::gpu::Gpu;
 use crate::gpu::hierarchical::{HierCfg, Hierarchical};
 use crate::nn2::optim::AdamCfg;
 use crate::sft;
+use crate::sft_progress;
 use crate::tokenizer_utf8::Utf8Tokenizer;
 use crate::training::TrainingState;
 
@@ -246,7 +249,7 @@ pub fn train_sft_gpu(model_path: &str) {
         return;
     }
 
-    let mut examples = match sft::load_jsonl(&tokenizer, SFT_DATA) {
+    let mut examples = match sft::load_jsonl(&tokenizer, SFT_DATA, SFT_MAX_TOKENS) {
         Ok(e) if !e.is_empty() => e,
         Ok(_) => {
             eprintln!("SFT set '{SFT_DATA}' produced no trainable examples.");
@@ -276,16 +279,39 @@ pub fn train_sft_gpu(model_path: &str) {
 
     let mut opt = AdamCfg::new(SFT_LR, crate::optimizers::WEIGHT_DECAY);
 
-    let mut rng = rand::rng();
-    for epoch in 1..=SFT_EPOCHS {
+    // Where a previous, interrupted run stopped (or a fresh start). The shuffle
+    // is seeded from this so resuming replays the exact same permutation and
+    // skipping `done` examples really skips the ones already trained on.
+    let mut progress =
+        sft_progress::resume_or_fresh(model_path, examples.len(), model.step_count, SFT_EPOCHS);
+    let start_epoch = progress.epoch;
+    let start_done = progress.done;
+
+    for epoch in start_epoch..=SFT_EPOCHS {
         println!("── SFT epoch {epoch}/{SFT_EPOCHS} ──");
+        // Per-epoch permutation, derived from (seed, epoch) so it is a function
+        // of the run identity, not of how many times the process restarted.
+        let mut rng = StdRng::seed_from_u64(progress.seed ^ (epoch as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         examples.shuffle(&mut rng);
+
+        // Only the resumed epoch skips; later epochs run whole.
+        let skip = if epoch == start_epoch { start_done } else { 0 };
+        if skip > 0 {
+            println!("  skipping {skip} examples already trained this epoch");
+        }
+        progress.epoch = epoch;
+        progress.done = skip;
 
         let epoch_start = Instant::now();
         let mut tokens_since_print = 0usize;
         let mut time = Instant::now();
 
-        for ex in examples.iter() {
+        for ex in examples.iter().skip(skip) {
+            // Counted for every example the loop consumes — including the ones
+            // skipped below — so `done` always means "examples of this epoch's
+            // permutation already passed", which is exactly what resume skips.
+            progress.done += 1;
+
             let tokens: Vec<usize> = ex.tokens.iter().map(|&t| t as usize).collect();
             let words: Vec<(usize, usize)> = ex.words.iter().map(|r| (r.start, r.end)).collect();
             if words.len() < 2 {
@@ -325,6 +351,12 @@ pub fn train_sft_gpu(model_path: &str) {
                 match model.save(&gpu, model_path, &[]) {
                     Ok(()) => {
                         state.flush_log();
+                        // Written right after the weights, so the recorded
+                        // position never runs ahead of the checkpoint.
+                        progress.step = state.step;
+                        if let Err(e) = sft_progress::save(model_path, &progress) {
+                            eprintln!("progress save failed: {e}");
+                        }
                         println!("saved -> {model_path}");
                     }
                     Err(e) => eprintln!("save failed: {e}"),
@@ -332,17 +364,27 @@ pub fn train_sft_gpu(model_path: &str) {
             }
         }
         println!("SFT epoch {epoch} took {:.1?}", epoch_start.elapsed());
-        // Save at every epoch boundary too.
+        // Save at every epoch boundary too. The recorded position is the START
+        // of the next epoch, so a stop here resumes without redoing this one.
         if let Err(e) = model.save(&gpu, model_path, &[]) {
             eprintln!("epoch save failed: {e}");
         } else {
             state.flush_log();
+            progress.epoch = epoch + 1;
+            progress.done = 0;
+            progress.step = state.step;
+            if let Err(e) = sft_progress::save(model_path, &progress) {
+                eprintln!("progress save failed: {e}");
+            }
         }
     }
 
     match model.save(&gpu, model_path, &[]) {
         Ok(()) => {
             state.flush_log();
+            // The run finished every epoch — drop the sidecar so the next
+            // invocation starts a new run instead of resuming a completed one.
+            sft_progress::clear(model_path);
             println!("final SFT save -> {model_path}");
         }
         Err(e) => eprintln!("final save failed: {e}"),

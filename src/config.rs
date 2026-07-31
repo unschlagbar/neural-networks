@@ -138,6 +138,14 @@ pub const SFT_EPOCHS: usize = 1;
 /// fine-tuning nudges the pretrained weights instead of overwriting them.
 pub const SFT_LR: f32 = 5e-6;
 
+/// Cap on the token length of one SFT example. The per-example cache (encoder +
+/// decoder, one slot per token) is sized to the LONGEST example, so a single
+/// giant record (dolly's tail runs to ~27k tokens) would blow up memory for the
+/// whole run. Examples longer than this are dropped when the set is loaded —
+/// 2048 keeps ~93% of dolly while bounding the cache. Raise it if you have the
+/// RAM/VRAM; lower it if you still OOM.
+pub const SFT_MAX_TOKENS: usize = 2048;
+
 // Wake Word
 
 pub const WAKE_HIDDEN: usize = 128;

@@ -123,13 +123,20 @@ pub fn build_example(
 }
 
 /// Load and format every record of a dolly-style JSONL file into SFT examples.
-/// Records that fail to parse or are too short are skipped with a running count.
-pub fn load_jsonl(tok: &Utf8Tokenizer, path: &str) -> std::io::Result<Vec<SftExample>> {
+/// Records that fail to parse or are too short are skipped; records longer than
+/// `max_tokens` are dropped (their per-example cache would dominate memory — see
+/// `config::SFT_MAX_TOKENS`). Both are counted separately.
+pub fn load_jsonl(
+    tok: &Utf8Tokenizer,
+    path: &str,
+    max_tokens: usize,
+) -> std::io::Result<Vec<SftExample>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
     let mut examples = Vec::new();
     let mut skipped = 0usize;
+    let mut too_long = 0usize;
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -140,15 +147,16 @@ pub fn load_jsonl(tok: &Utf8Tokenizer, path: &str) -> std::io::Result<Vec<SftExa
             continue;
         };
         match build_example(tok, &instruction, &context, &response) {
-            Some(ex) => examples.push(ex),
+            Some(ex) if ex.tokens.len() <= max_tokens => examples.push(ex),
+            Some(_) => too_long += 1,
             None => skipped += 1,
         }
     }
 
     println!(
-        "SFT: loaded {} examples from '{path}' ({} skipped)",
+        "SFT: loaded {} examples from '{path}' ({skipped} skipped, \
+         {too_long} over {max_tokens} tokens dropped)",
         examples.len(),
-        skipped
     );
     Ok(examples)
 }

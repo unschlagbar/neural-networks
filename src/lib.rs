@@ -20,6 +20,7 @@ pub mod saving;
 pub mod segment;
 pub mod sequential;
 pub mod sft;
+pub mod sft_progress;
 pub mod tensor;
 pub mod tokenizer_utf8;
 pub mod training;
@@ -48,6 +49,7 @@ pub fn run() {
         "hg" => gpu::train::train_hierarchical_gpu(&read_model_path("models/hier_gpu")),
         #[cfg(feature = "cuda")]
         "hqg" => gpu::train::train_sft_gpu(&read_model_path("models/hier_gpu_sft")),
+        "hq" => training::train_sft(&read_model_path("models/fix_bi_sft")),
         "av" => grow_vocab::grow_model_interactive(),
         "hp" => training::probe_hierarchical(&read_model_path("models/fix_bi")),
         "hv" => training::validate_hierarchical(&read_model_path("models/fix_bi")),
@@ -64,7 +66,8 @@ pub fn run() {
                 "Unknown mode {other:?}. Modes: '' train_normal | 'h' train_hierarchical | \
                  'hv' validate_hierarchical | \
                  'hg' train_hierarchical on GPU | \
-                 'hqg' SFT (Q-A) fine-tune on GPU | 'av' add SFT vocab to a model | \
+                 'hq' SFT (Q-A) fine-tune on CPU | 'hqg' SFT fine-tune on GPU | \
+                 'av' add SFT vocab to a model | \
                  's' sample_normal | 'hs' sample_hierarchical | 'hqs' chat/Q-A sampling | \
                  'i' inspect model | \
                  'wr' record wake-word samples | 'wt' train wake-word | 'w' run detector",

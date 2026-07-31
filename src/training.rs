@@ -169,6 +169,128 @@ pub fn train_hierarchical(model_path: &str) {
     }
 }
 
+/// CPU supervised fine-tuning (Q-A / instruction tuning) of a hierarchical
+/// model. The CPU twin of `gpu::train::train_sft_gpu`: loads the (small) SFT set
+/// fully into memory as masked chat windows (`crate::sft`) and fine-tunes with
+/// loss counted only on the response tokens (`Hierarchical::train_sft`).
+///
+/// A model built by this crate already carries the SFT vocabulary; only an older
+/// checkpoint (pretrained before the markers existed) must be run through the
+/// `av` mode first — that mismatch is caught with a hint.
+pub fn train_sft(model_path: &str) {
+    use crate::config::{SFT_DATA, SFT_EPOCHS, SFT_LR, SFT_MAX_TOKENS};
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand::seq::SliceRandom;
+
+    let tokenizer = Utf8Tokenizer::new();
+    let vocab = tokenizer.vocab_size();
+
+    let mut model = match Hierarchical::load(model_path, tokenizer) {
+        Ok(m) => {
+            println!("Loaded hierarchical model from '{model_path}' (step {}).", m.step);
+            m
+        }
+        Err(e) => {
+            eprintln!(
+                "Could not load '{model_path}' ({e}). SFT fine-tunes an existing \
+                 pretrained model — train one with 'h' first."
+            );
+            return;
+        }
+    };
+
+    if model.vocab_size != vocab {
+        eprintln!(
+            "This is an older checkpoint: its vocab is {} but the tokenizer now has \
+             {vocab} tokens. Upgrade it once with the 'av' mode, then fine-tune the \
+             grown model. Newly trained models already have the full vocab.",
+            model.vocab_size
+        );
+        return;
+    }
+
+    let mut examples = match crate::sft::load_jsonl(&tokenizer, SFT_DATA, SFT_MAX_TOKENS) {
+        Ok(e) if !e.is_empty() => e,
+        Ok(_) => {
+            eprintln!("SFT set '{SFT_DATA}' produced no trainable examples.");
+            return;
+        }
+        Err(e) => {
+            eprintln!("Could not read SFT set '{SFT_DATA}': {e}");
+            return;
+        }
+    };
+
+    // Size the caches to the longest example (word count / token span). Both
+    // caps are known up front since the whole set is in memory.
+    let max_words = examples.iter().map(|e| e.words.len()).max().unwrap();
+    let max_tokens = examples.iter().map(|e| e.tokens.len()).max().unwrap();
+    model.make_cache(max_words, max_tokens);
+    println!(
+        "SFT (CPU): {} examples, longest {max_words} words / {max_tokens} tokens. \
+         {SFT_EPOCHS} epochs, LR={SFT_LR}, batch={BATCH_SIZE} windows.",
+        examples.len()
+    );
+
+    let mut state = TrainingState::from_step(model.step);
+    state.lr = SFT_LR;
+    state.init_log(&format!("{model_path}_sft"), &["resp_ppl"]);
+
+    // Where a previous, interrupted run stopped (or a fresh start). The shuffle
+    // is seeded from this so resuming replays the same permutation and skipping
+    // `done` examples skips exactly the ones already trained on.
+    let mut progress =
+        crate::sft_progress::resume_or_fresh(model_path, examples.len(), model.step, SFT_EPOCHS);
+    let start_epoch = progress.epoch;
+    let start_done = progress.done;
+
+    let mut total_time = Duration::ZERO;
+    for epoch in start_epoch..=SFT_EPOCHS {
+        println!("── SFT epoch {epoch}/{SFT_EPOCHS} ──");
+        // Per-epoch permutation derived from (seed, epoch), so it depends on the
+        // run identity rather than on how many times the process restarted.
+        let mut rng = StdRng::seed_from_u64(
+            progress.seed ^ (epoch as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
+        examples.shuffle(&mut rng);
+
+        // Only the resumed epoch skips; later epochs run whole.
+        let skip = if epoch == start_epoch { start_done } else { 0 };
+        if skip > 0 {
+            println!("  skipping {skip} examples already trained this epoch");
+        }
+        progress.epoch = epoch;
+        progress.done = skip;
+
+        let start = Instant::now();
+        model.train_sft(examples.iter().skip(skip), &mut state, &mut progress);
+        let epoch_time = start.elapsed();
+        total_time += epoch_time;
+
+        match model.save(model_path) {
+            Ok(()) => {
+                // The recorded position is the START of the next epoch, so a
+                // stop here resumes without redoing the epoch just finished.
+                progress.epoch = epoch + 1;
+                progress.done = 0;
+                progress.step = state.step;
+                if let Err(e) = crate::sft_progress::save(model_path, &progress) {
+                    eprintln!("  ✗ progress save failed: {e}");
+                }
+                println!(
+                    "  ✓ end-of-epoch save to '{model_path}'  (epoch {epoch_time:.0?}, total {total_time:.0?})"
+                );
+            }
+            Err(e) => eprintln!("  ✗ save failed: {e}"),
+        }
+    }
+
+    // Every epoch done — drop the sidecar so the next invocation starts a new
+    // run rather than resuming a completed one.
+    crate::sft_progress::clear(model_path);
+}
+
 /// Debug: load the hierarchical model and print encoder/decoder inputs and
 /// targets (forward) plus decoder targets (backward) for the first few words of
 /// one window. No training. Set via the `ht` mode.

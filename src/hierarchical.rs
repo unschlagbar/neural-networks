@@ -87,6 +87,13 @@ pub struct Hierarchical {
     pub last_word_loss: f32,
     pub step: usize,
 
+    /// SFT loss mask, one flag per DECODED word (word `w` decodes word `w+1`).
+    /// `None` = every word trains (pretraining). `Some(flags)` masks prompt
+    /// words: a `false` word's decoder slots seed a zero delta, so no gradient
+    /// flows from them, and they are excluded from the reported loss. Set per
+    /// window right before `forward_over`/`backwards_sequence`.
+    dec_word_loss: Option<Vec<bool>>,
+
     /// Cross-word context ablation applied during `forward_over` (probing only).
     pub backbone_mode: BackboneMode,
     /// When true, `forward_over`/`backwards_sequence` print encoder & decoder
@@ -162,6 +169,7 @@ impl Hierarchical {
             last_char1_grad_signal: 0.0,
             last_word_loss: 0.0,
             step: 0,
+            dec_word_loss: None,
             backbone_mode: BackboneMode::Normal,
             trace_io: false,
         }
@@ -384,11 +392,28 @@ impl Hierarchical {
     /// backbone is order-sensitive (reverse, so its cross-word BPTT state carries);
     /// the decoder and encoder phases are per-word independent and run
     /// data-parallel across the replica pools.
+    /// SFT loss mask for the next window: one flag per DECODED word (word `w`
+    /// decodes word `w+1`, so the length must equal `words - 1` of the window).
+    /// `None` restores full-window training. Consumed by `backwards_sequence`
+    /// and the loss functions; unset it after the window if reusing the model.
+    pub fn set_word_loss_mask(&mut self, mask: Option<Vec<bool>>) {
+        self.dec_word_loss = mask;
+    }
+
+    /// Whether decoded word `w` contributes to loss/gradient (always true unless
+    /// an SFT mask is set).
+    #[inline]
+    fn word_on(&self, w: usize) -> bool {
+        self.dec_word_loss.as_ref().is_none_or(|m| m[w])
+    }
+
     pub fn backwards_sequence(&mut self) {
         let vocab = self.vocab_size;
         let context = self.context_size;
         let char_out = self.encoder.output_size;
         let words = self.encoder.num_words(); // = number of decode steps (n - 1)
+        // Snapshot the per-word mask flags (indexed by word) for the workers.
+        let word_on: Vec<bool> = (0..words).map(|w| self.word_on(w)).collect();
 
         if self.trace_io {
             for w in 0..words {
@@ -414,6 +439,7 @@ impl Hierarchical {
         let dec_max_dim = self.char2_model.max_layer_dim();
         let dec_ranges = &self.dec_ranges;
         let dec_targets = &self.dec_targets;
+        let word_on = &word_on;
         let chunks = chunk_words(
             &mut self.dec_pool.replicas,
             dec_ranges,
@@ -438,16 +464,21 @@ impl Hierarchical {
                 let w0 = wr.start;
                 for w in wr.into_iter() {
                     let range = dec_ranges[w];
+                    // A masked (prompt) word is still run backward — its BPTT
+                    // state must unwind — but seeded with a ZERO delta, so it
+                    // contributes no gradient anywhere (logits, context, table).
+                    let on = word_on[w];
                     for slot in range.into_iter().rev() {
                         let ci = slot - slot_base;
-                        let out_len = {
-                            let out = cache[ci].last().unwrap().output();
-                            let len = out.len();
-                            delta_buf[..len].copy_from_slice(out);
-                            len
-                        };
-                        softmax_inplace(&mut delta_buf[..out_len]);
-                        delta_buf[dec_targets[slot] as usize] -= 1.0;
+                        let out_len = cache[ci].last().unwrap().output().len();
+                        if on {
+                            delta_buf[..out_len]
+                                .copy_from_slice(cache[ci].last().unwrap().output());
+                            softmax_inplace(&mut delta_buf[..out_len]);
+                            delta_buf[dec_targets[slot] as usize] -= 1.0;
+                        } else {
+                            delta_buf[..out_len].fill(0.0);
+                        }
 
                         backward_through_layers(
                             &mut replica.layers,
@@ -538,11 +569,16 @@ impl Hierarchical {
     }
 
     /// Mean per-step decode cross-entropy across every recorded decoder step.
+    /// Under an SFT mask only the unmasked (response) words are counted, so the
+    /// reported loss is the mean CE over the tokens actually trained on.
     fn decode_loss(&self) -> f32 {
         let last = self.char2_model.layers.len() - 1;
         let mut total = 0.0;
         let mut count = 0;
-        for &range in &self.dec_ranges {
+        for (w, &range) in self.dec_ranges.iter().enumerate() {
+            if !self.word_on(w) {
+                continue;
+            }
             for slot in range {
                 let logits = self.char2_model.cache[slot][last].output();
                 total += nll_from_logits(logits, self.dec_targets[slot] as usize);
@@ -717,6 +753,95 @@ impl Hierarchical {
             if state.save() {
                 match self.save(state.save_path()) {
                     Ok(()) => println!("saved"),
+                    Err(e) => eprintln!("save failed: {e}"),
+                }
+            }
+        }
+    }
+
+    /// Supervised fine-tuning over pre-formatted SFT examples (see `crate::sft`):
+    /// same forward/backward as [`train`](Self::train), but each window carries a
+    /// per-word loss mask so gradient flows only from the response words. The
+    /// whole example is still encoded and decoded — the backbone must read the
+    /// prompt — only the loss and its gradient are restricted to the response.
+    ///
+    /// `progress` tracks how far into this epoch's example order the run has
+    /// got; it is written to the resume sidecar alongside every checkpoint save
+    /// so an interrupted run picks up where it stopped instead of at example 0.
+    pub fn train_sft<'a, I: Iterator<Item = &'a crate::sft::SftExample>>(
+        &mut self,
+        data: I,
+        state: &mut TrainingState,
+        progress: &mut crate::sft_progress::SftProgress,
+    ) {
+        let mut tokens = 0;
+        let mut time = Instant::now();
+
+        for ex in data {
+            // Counted for every consumed example, including the ones skipped
+            // below, so `done` matches what a resume must skip.
+            progress.done += 1;
+
+            let window = &ex.tokens[..];
+            let words = &ex.words;
+            self.reset();
+
+            if words.len() < 2 {
+                continue;
+            }
+            // `dec_word_loss` is per DECODED word: word w decodes words[w+1], so
+            // its flag is ex.loss[w+1] (ex.loss[0] is the encode-only prefix).
+            let mask: Vec<bool> = ex.loss[1..].to_vec();
+            self.set_word_loss_mask(Some(mask));
+
+            self.forward_over(window, words);
+
+            let loss = self.decode_loss();
+            self.last_word_loss = loss;
+            tokens += window.len();
+
+            self.backwards_sequence();
+            state.log_tokens(window.len());
+            state.log_metric("resp_ppl", loss.exp());
+
+            if let Some(lr) = state.step(loss) {
+                self.encoder.step(lr, ENCODER_WEIGHT_DECAY);
+                self.char2_model.step(lr, DECODER_WEIGHT_DECAY);
+                self.word_model.step(lr, BACKBONE_WEIGHT_DECAY);
+                self.dec_pool.mark_dirty();
+            }
+            self.step = state.step;
+            self.set_word_loss_mask(None);
+
+            if state.print() {
+                let loss = state.get_loss();
+                let elapsed = time.elapsed();
+                println!(
+                    "{} | resp loss {:.4} | ppl {:.4} | high ∇ {:.4} | char1 ∇ {:.4} | {} tok | {:.1?}",
+                    state.step,
+                    loss,
+                    loss.exp(),
+                    self.last_high_grad_signal,
+                    self.last_char1_grad_signal,
+                    tokens,
+                    elapsed,
+                );
+                tokens = 0;
+                time = Instant::now();
+            }
+            if state.save() {
+                match self.save(state.save_path()) {
+                    Ok(()) => {
+                        // Written right after the weights so the recorded
+                        // position never runs ahead of the checkpoint.
+                        progress.step = state.step;
+                        if let Err(e) =
+                            crate::sft_progress::save(state.save_path(), progress)
+                        {
+                            eprintln!("progress save failed: {e}");
+                        }
+                        println!("saved");
+                    }
                     Err(e) => eprintln!("save failed: {e}"),
                 }
             }
@@ -1034,7 +1159,10 @@ pub(crate) fn backward_through_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{nn::linear::LinearLayer, nn_layer::SequentialBuilder};
+    use crate::{
+        nn::{linear::LinearLayer, linear_nb::LinearNBLayer},
+        nn_layer::SequentialBuilder,
+    };
     use iron_oxide::collections::Matrix;
 
     const H: usize = 32;
@@ -1256,5 +1384,85 @@ mod tests {
     #[test]
     fn injected_context_grads_match_fd_slstm() {
         check_injected_context(build_slstm, "ctx_slstm", 0.3);
+    }
+
+    // ── SFT loss masking ────────────────────────────────────────────────────
+
+    /// Decoder logit-head gradient after one masked forward/backward. The head
+    /// is the tied embedding's counterpart on the output side; its grad is the
+    /// cleanest single tensor to compare across mask choices.
+    fn head_grad_after(
+        model: &mut Hierarchical,
+        tokens: &[u16],
+        words: &[Range<usize>],
+        mask: Option<Vec<bool>>,
+    ) -> Vec<f32> {
+        for l in model.char2_model.layers.iter_mut() {
+            l.clear_grads();
+        }
+        model.reset();
+        model.set_word_loss_mask(mask);
+        model.forward_over(tokens, words);
+        model.backwards_sequence();
+        model.set_word_loss_mask(None);
+
+        let last = model.char2_model.layers.len() - 1;
+        // The head is the LinearNoBias just before the SoftCap (last layer).
+        model.char2_model.layers[last - 1]
+            .as_any_mut()
+            .downcast_mut::<LinearNBLayer>()
+            .expect("decoder head is a LinearNoBias")
+            .grads
+            .weights
+            .matrix()
+            .as_slice()
+            .to_vec()
+    }
+
+    /// A fully-masked window trains on nothing: zero decode loss, zero head
+    /// gradient. This is the floor the mask must hit for prompt-only words.
+    #[test]
+    fn full_mask_zeros_the_gradient() {
+        let mut s = setup(build_stateless);
+        let dw = s.words.len() - 1;
+        let g = head_grad_after(&mut s.model, &s.tokens, &s.words, Some(vec![false; dw]));
+        let max = g.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+        assert!(max == 0.0, "fully-masked head grad must be exactly zero, got {max}");
+
+        // And the reported loss over an all-masked window is zero.
+        s.model.set_word_loss_mask(Some(vec![false; dw]));
+        s.model.reset();
+        s.model.forward_over(&s.tokens, &s.words);
+        assert_eq!(s.model.decode_loss(), 0.0);
+        s.model.set_word_loss_mask(None);
+    }
+
+    /// Masking is additive and isolating: the head grad with every word on
+    /// equals the sum of the head grads with exactly one word on at a time. This
+    /// proves a masked word contributes nothing and an unmasked word contributes
+    /// exactly its own term — the two things SFT masking must guarantee.
+    #[test]
+    fn per_word_masks_sum_to_the_full_gradient() {
+        let mut s = setup(build_stateless);
+        let dw = s.words.len() - 1;
+
+        let full = head_grad_after(&mut s.model, &s.tokens, &s.words, None);
+
+        let mut summed = vec![0.0f32; full.len()];
+        for w in 0..dw {
+            let mut mask = vec![false; dw];
+            mask[w] = true;
+            let g = head_grad_after(&mut s.model, &s.tokens, &s.words, Some(mask));
+            for (acc, &x) in summed.iter_mut().zip(&g) {
+                *acc += x;
+            }
+        }
+
+        for (i, (&a, &b)) in full.iter().zip(&summed).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-5 * a.abs().max(1.0),
+                "head grad {i}: full {a} != sum of per-word masks {b}"
+            );
+        }
     }
 }
