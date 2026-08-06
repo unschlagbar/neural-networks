@@ -418,45 +418,67 @@ extern "C" __global__ void slstm_step_fused(
 // The deltas are also written to the contiguous [B, 4H] scratch `dgh`, the mirror
 // of the forward's `gh`: this timestep's dh = dgh·Whᵀ is the one thing BPTT cannot
 // defer, and going through the scratch keeps that a dense GEMM at any batch size.
+// Parameters (all device pointers; one thread per (batch, hidden-unit) pair):
+//
+//   d_out        [B, T, H]   in   incoming grad of this layer's output h_t
+//   gates        [B, T, 4H]  both in: biased forget pre-activation (block 2);
+//                                 out: the four gate deltas (z, i, f, o)
+//   d_gates_flat [B, 4H]     out  this step's gate deltas, contiguous, for the
+//                                 dh = d_gates·Whᵀ GEMM (mirror of forward `gh`)
+//   d_h_recur    [B, H]      in   grad arriving from step t+1 through h
+//   o_act        [B, T, H]   in   saved sigmoid(o_pre)
+//   c_t, n_t     [B, T, H]   in   saved cell / normalizer AFTER this step
+//   c_prev,n_prev[B, T, H]   in   saved cell / normalizer BEFORE this step
+//   z_act        [B, T, H]   in   saved tanh(z_pre)
+//   i_gate,f_gate[B, T, H]   in   saved stabilized exp() gate values i', f'
+//   d_c_recur    [B, H]      both cell grad carried backward across steps
+//   d_n_recur    [B, H]      both normalizer grad carried backward across steps
+//   t, T, H, BH              in   current step, sequence length, width, B*H
 extern "C" __global__ void slstm_step_fused_bwd(
-        const float* dy, float* g, float* dgh, const float* dh_bptt,
-        const float* ot, const float* c, const float* n,
-        const float* c_prev, const float* n_prev, const float* zt,
-        const float* i_prime, const float* f_prime,
-        float* dc_bptt, float* dn_bptt, int t, int T, int H, int BH) {
+        const float* d_out, float* gates, float* d_gates_flat, const float* d_h_recur,
+        const float* o_act, const float* c_t, const float* n_t,
+        const float* c_prev, const float* n_prev, const float* z_act,
+        const float* i_gate, const float* f_gate,
+        float* d_c_recur, float* d_n_recur, int t, int T, int H, int BH) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= BH) return;
     int b = k / H, j = k % H;
-    long long go = (long long)(b * T + t) * 4 * H + j;
-    long long s = (long long)(b * T + t) * H + j;
-    int ho = b * 4 * H + j;
+    long long gate_off = (long long)(b * T + t) * 4 * H + j; // row base in [B,T,4H]
+    long long s = (long long)(b * T + t) * H + j;            // row base in [B,T,H]
+    int flat_off = b * 4 * H + j;                            // row base in [B,4H]
 
-    float ft_pre = g[go + 2 * H];
-    float d = dy[s] + dh_bptt[k];
-    float o = ot[s];
-    float cc = c[s];
-    float nn = n[s];
+    float f_pre = gates[gate_off + 2 * H];
+    // Total grad on h_t: from the layer above plus from step t+1.
+    float d_h = d_out[s] + d_h_recur[k];
+    float o = o_act[s];
+    float c = c_t[s];
+    float n = n_t[s];
     // h = o·c/n — no clamp, so dn has no branch: ∂h/∂n = −o·c/n².
-    float dob = d * (cc / nn) * o * (1.0f - o);
-    float dc = d * o / nn + dc_bptt[k];
-    float dn = d * o * (-cc) / (nn * nn) + dn_bptt[k];
-    float fp = f_prime[s];
-    float df_prime = dc * c_prev[s] + dn * n_prev[s];
-    float ztk = zt[s];
-    float di_prime = dc * ztk + dn;
-    float dz_post = dc * i_prime[s];
-    float sig_f = stable_sigmoid(ft_pre);
+    float d_o_pre = d_h * (c / n) * o * (1.0f - o);
+    float d_c = d_h * o / n + d_c_recur[k];
+    float d_n = d_h * o * (-c) / (n * n) + d_n_recur[k];
+    float f = f_gate[s];
+    float i = i_gate[s];
+    float z = z_act[s];
+    // Grads w.r.t. the stabilized gate values i', f', before their exp/sigmoid.
+    float d_f_gate = d_c * c_prev[s] + d_n * n_prev[s];
+    float d_i_gate = d_c * z + d_n;
+    float d_z_act = d_c * i;
 
-    float dz = dz_post * (1.0f - ztk * ztk);
-    float di = di_prime * i_prime[s];
-    float df = df_prime * fp * (1.0f - sig_f);
-    g[go]         = dz;  dgh[ho]         = dz;
-    g[go + H]     = di;  dgh[ho + H]     = di;
-    g[go + 2 * H] = df;  dgh[ho + 2 * H] = df;
-    g[go + 3 * H] = dob; dgh[ho + 3 * H] = dob;
+    // Through the activations: tanh' = 1−z², exp' = the gate itself,
+    // and f' = exp(log σ(f_pre) + …) contributes σ'(f_pre)/σ(f_pre) = 1−σ(f_pre).
+    float d_z_pre = d_z_act * (1.0f - z * z);
+    float d_i_pre = d_i_gate * i;
+    float d_f_pre = d_f_gate * f * (1.0f - stable_sigmoid(f_pre));
 
-    dc_bptt[k] = dc * fp;
-    dn_bptt[k] = dn * fp;
+    gates[gate_off]         = d_z_pre;  d_gates_flat[flat_off]         = d_z_pre;
+    gates[gate_off + H]     = d_i_pre;  d_gates_flat[flat_off + H]     = d_i_pre;
+    gates[gate_off + 2 * H] = d_f_pre;  d_gates_flat[flat_off + 2 * H] = d_f_pre;
+    gates[gate_off + 3 * H] = d_o_pre;  d_gates_flat[flat_off + 3 * H] = d_o_pre;
+
+    // Carry to step t−1: both paths are scaled by the forget gate.
+    d_c_recur[k] = d_c * f;
+    d_n_recur[k] = d_n * f;
 }
 
 // residual block / SwiGLU (nn2/block.rs)

@@ -1,6 +1,6 @@
 // Sequenz-Len
 
-pub const SEQ_LEN: usize = 512 * 1;
+pub const SEQ_LEN: usize = 512 * 4;
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 
 // Word-grouped training (both the flat and the hierarchical model train on
@@ -17,7 +17,7 @@ pub const MAX_WORD_BYTES: usize = 16;
 /// is meant to bind first — this only guards against a pathological run with no
 /// boundary token. Caches are sized to the *actual* longest window
 /// (`WordChunk::max_window_tokens`), never to this cap, so raising it is free.
-pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 6;
+pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 7;
 
 // Training-Schedule
 
@@ -66,7 +66,7 @@ pub const WORD_HIDDEN: usize = 1024;
 pub const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 6;
+pub const WORD_BLOCKS: usize = 16;
 
 /// GPU mLSTM: chunk length for the chunkwise formulation, or `0` for the
 /// single-chunk (whole-sequence) form.

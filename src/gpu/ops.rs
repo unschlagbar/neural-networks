@@ -830,30 +830,44 @@ pub fn slstm_step_fused(
     unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slstm_step_fused");
 }
 
-/// One fused backward step: writes the four gate deltas back into `g` (its
-/// forward contents are dead once read) and carries `dc/dn_bptt` back a step.
+/// One fused backward step of the sLSTM cell.
+///
+/// Reads the biased forget pre-activation out of `gates` and then overwrites all
+/// four of its blocks with the gate *deltas* — one buffer carries the gate
+/// pre-activations forward and their grads backward, since the forward contents
+/// are dead once read. The same deltas also go to the contiguous `d_gates_flat`
+/// scratch so `dh = d_gates·Whᵀ` stays a dense GEMM at any batch size.
+///
+/// * `d_out` — `[B, T, H]` grad of this layer's output `h_t`.
+/// * `gates` — `[B, T, 4H]` gate pre-activations in, gate deltas out.
+/// * `d_gates_flat` — `[B, 4H]` this step's deltas, contiguous, for the dh GEMM.
+/// * `d_h_recur` — `[B, H]` grad arriving from step `t+1` through `h`.
+/// * `slabs` — the forward's saved activations (`o`, `c`, `n`, `z`, `i'`, `f'`).
+/// * `d_c_recur` / `d_n_recur` — `[B, H]` cell and normalizer grads, carried
+///   back a step in place.
+/// * `t` — the timestep being differentiated.
 #[allow(clippy::too_many_arguments)]
 pub fn slstm_step_fused_bwd(
     gpu: &Gpu,
-    dy: &DTensor,
-    g: &mut DTensor,
-    dgh: &mut DTensor,
-    dh_bptt: &DTensor,
+    d_out: &DTensor,
+    gates: &mut DTensor,
+    d_gates_flat: &mut DTensor,
+    d_h_recur: &DTensor,
     slabs: &SlstmSlabs,
-    dc_bptt: &mut DTensor,
-    dn_bptt: &mut DTensor,
+    d_c_recur: &mut DTensor,
+    d_n_recur: &mut DTensor,
     t: usize,
 ) {
-    let (b, h) = (dc_bptt.rows(), dc_bptt.cols());
+    let (b, h) = (d_c_recur.rows(), d_c_recur.cols());
     let bh = b * h;
-    let big_t = dy.shape[1];
+    let big_t = d_out.shape[1];
     let (t_i, bigt_i, h_i, bh_i) = (t as i32, big_t as i32, h as i32, bh as i32);
     let f = gpu.kernels.get("slstm_step_fused_bwd");
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&dy.buf)
-        .arg(&mut g.buf)
-        .arg(&mut dgh.buf)
-        .arg(&dh_bptt.buf)
+    lb.arg(&d_out.buf)
+        .arg(&mut gates.buf)
+        .arg(&mut d_gates_flat.buf)
+        .arg(&d_h_recur.buf)
         .arg(&slabs.ot.buf)
         .arg(&slabs.c.buf)
         .arg(&slabs.n.buf)
@@ -862,8 +876,8 @@ pub fn slstm_step_fused_bwd(
         .arg(&slabs.zt.buf)
         .arg(&slabs.i_prime.buf)
         .arg(&slabs.f_prime.buf)
-        .arg(&mut dc_bptt.buf)
-        .arg(&mut dn_bptt.buf)
+        .arg(&mut d_c_recur.buf)
+        .arg(&mut d_n_recur.buf)
         .arg(&t_i)
         .arg(&bigt_i)
         .arg(&h_i)
