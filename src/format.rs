@@ -26,7 +26,7 @@
 
 use std::{
     fs::File,
-    io::{self, BufReader, Cursor, Read, Write},
+    io::{self, BufReader, BufWriter, Read, Write},
 };
 
 use crate::{
@@ -158,10 +158,9 @@ impl<'a> Writer<'a> {
                 std::fs::create_dir_all(dir)?;
             }
         }
-        let mut buf = Cursor::new(Vec::<u8>::new());
-        self.write_to(&mut buf)?;
         let tmp = format!("{path}.tmp");
-        File::create(&tmp)?.write_all(&buf.into_inner())?;
+        let mut model = BufWriter::new(File::create(&tmp)?);
+        self.write_to(&mut model)?;
         std::fs::rename(&tmp, path)
     }
 }
@@ -255,6 +254,7 @@ mod tests {
     use super::*;
     use crate::nn::linear::LinearLayer;
     use crate::nn_layer::SequentialBuilder;
+    use std::io::Cursor;
 
     /// A flat container round-trips: same kind, one "model" section, weights
     /// preserved (checked via a re-save producing identical bytes).

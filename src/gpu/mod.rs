@@ -75,6 +75,9 @@ pub struct Gpu {
     /// dims they can exceed this — see `MLstm::fused_chunk`, which falls back to
     /// the op-at-a-time path rather than failing the opt-in.
     pub max_shared_optin: usize,
+    /// Number of SMs. A cooperative launch's grid must be co-resident, so this is
+    /// the ceiling on its block count — see `ops::slstm_fused_time_geometry`.
+    pub sm_count: usize,
 }
 
 impl Gpu {
@@ -112,12 +115,16 @@ impl Gpu {
                 cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
             )
             .map_err(|e| format!("querying max shared memory failed: {e:?}"))? as usize;
+        let sm_count = context
+            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .map_err(|e| format!("querying SM count failed: {e:?}"))? as usize;
         Ok(Self {
             context,
             stream,
             blas: Arc::new(blas),
             kernels: Arc::new(kernels),
             max_shared_optin,
+            sm_count,
         })
     }
 }

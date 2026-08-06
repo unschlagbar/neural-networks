@@ -830,6 +830,296 @@ pub fn slstm_step_fused(
     unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slstm_step_fused");
 }
 
+/// Whether the fused kernels stage their `Wh` slice (and the `h` they multiply) in
+/// **bf16** inside shared memory, accumulating in fp32.
+///
+/// This is FlashRNN's arrangement — `R_shared` is `FLASHRNN_DTYPE_R` (bf16) while
+/// `ACC_DTYPE` stays `float`. Unlike the earlier standalone `SLSTM_BF16` path, the
+/// conversion happens where the data already lives (shared memory / registers), so
+/// it costs a couple of ALU ops rather than a separate kernel and a global
+/// round-trip per timestep — which is exactly why that version lost at H=512.
+///
+/// Halving the weights' shared footprint also lets a block own more units, which
+/// is a second-order win on top of the traffic.
+///
+/// **Off by default** (`SLSTM_BF16=1` enables it), because at the backbone's shape
+/// it measured *neutral*: 5.66ms against 5.60ms for fp32 staging.
+///
+/// The reason is structural, and worth recording so it is not re-attempted blindly.
+/// bf16 halves the shared footprint (56 KB -> 29 KB per block), but the grid size
+/// here is pinned by the SM count, not by shared memory: a cooperative launch needs
+/// the whole grid co-resident, so `geometry` picks 84 blocks — one per SM — under
+/// either dtype, giving the same 7 units per block and the same number of FMAs. The
+/// freed shared memory would allow 3 blocks per SM instead of 1, but a cooperative
+/// grid has no additional blocks to place there. So bf16 buys a smaller footprint
+/// that nothing consumes, in exchange for 8-bit mantissas.
+///
+/// It would start paying if the grid ever became shared-memory-bound rather than
+/// SM-bound — a much larger H, or a non-cooperative formulation — which is why the
+/// path is kept rather than deleted. It is also the prerequisite for a tensor-core
+/// (WMMA) reduction, whose fragments must be 16-bit.
+pub fn fused_bf16_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SLSTM_BF16").as_deref() == Ok("1"))
+}
+
+/// Launch geometry for [`slstm_fused_time`]: `(blocks, threads, cols_per_block,
+/// shared_bytes)`, or `None` when the shape does not fit the kernel's contract.
+///
+/// The constraint that drives everything is shared memory: each block stages an
+/// `[H, cols_per_block]` fp32 slice of `Wh`, so `H * cols_per_block * 4` must fit
+/// the device's opt-in limit. We pick the *smallest* block count that satisfies
+/// that (fewest blocks => cheapest `grid.sync()`), then check the whole grid can
+/// actually be co-resident — a cooperative launch deadlocks if it cannot.
+pub fn slstm_fused_time_geometry(
+    gpu: &Gpu,
+    h: usize,
+    b: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let h4 = 4 * h;
+    let threads = 256usize;
+    // Leave a little headroom under the opt-in cap for the driver's own use.
+    let smem_cap = gpu.max_shared_optin.saturating_sub(1024);
+    // `cols_per_block` counts HIDDEN UNITS; each carries four Wh columns, so a block
+    // stages `[H, 4*units]` weights plus a `[B, 4*units]` fp32 gate scratch. Under
+    // bf16 the weights are 2 bytes instead of 4 and a `[B, H]` bf16 mirror of h is
+    // added; the gate scratch stays fp32 either way (it feeds the recurrence).
+    let wbytes = if fused_bf16_enabled() { 2 } else { 4 };
+    let h_mirror = if fused_bf16_enabled() { b * h * 2 } else { 0 };
+    let bytes_per_unit =
+        |units: usize| h * 4 * units * wbytes + b * 4 * units * 4 + h_mirror;
+    let max_units = {
+        let per_unit = h * 4 * wbytes + b * 4 * 4;
+        smem_cap.saturating_sub(h_mirror) / per_unit
+    };
+    if max_units == 0 {
+        return None; // one unit's slice does not fit: H is too large for this path
+    }
+    // Spread over as many SMs as the grid may use, not as few blocks as possible.
+    // The fewest-blocks choice minimises `grid.sync()` cost but leaves most of the
+    // device idle — at H=512 it picks 42 blocks of an 84-SM card, and the gate
+    // reduction (not the sync) is what dominates, so halving the parallelism there
+    // costs far more than the extra sync saves.
+    let min_blocks = h.div_ceil(max_units);
+    let blocks = gpu.sm_count.max(min_blocks).min(h);
+    let cols_per_block = h.div_ceil(blocks);
+    // Recompute: rounding the slice up may need fewer blocks than requested.
+    let blocks = h.div_ceil(cols_per_block);
+    let shared_bytes = bytes_per_unit(cols_per_block);
+    if shared_bytes > smem_cap {
+        return None;
+    }
+    // A cooperative launch requires the WHOLE grid to be co-resident: `grid.sync()`
+    // blocks until every block arrives, so a block that has not been scheduled yet
+    // deadlocks the kernel. With one block per SM at this shared-memory footprint
+    // (98 KB of a ~100 KB budget leaves room for exactly one), the grid must fit in
+    // the SM count. Declining here is what keeps large H on the per-step path
+    // instead of hanging the device.
+    if blocks > gpu.sm_count {
+        return None;
+    }
+    // The pointwise phase is grid-strided over B*H, so any grid covers it; but the
+    // gate phase needs every column owned by some block, which `blocks` guarantees.
+    debug_assert!(blocks * cols_per_block >= h);
+    let _ = h4;
+    let _ = b;
+    Some((blocks, threads, cols_per_block, shared_bytes))
+}
+
+/// Launch geometry for [`slstm_fused_time_bwd`], mirroring
+/// [`slstm_fused_time_geometry`] but sized for the backward's staging: a block
+/// owning `units` output units holds `units` whole **rows** of `Wh` (`4H` each),
+/// where the forward held `4*units` columns of `H`. Same total per unit, different
+/// axis — see the kernel for why the ownership transposes.
+pub fn slstm_fused_time_bwd_geometry(
+    gpu: &Gpu,
+    h: usize,
+    _b: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let h4 = 4 * h;
+    let threads = 256usize;
+    let smem_cap = gpu.max_shared_optin.saturating_sub(1024);
+    let per_unit = h4 * 4; // one fp32 Wh row
+    let max_units = smem_cap / per_unit;
+    if max_units == 0 {
+        return None;
+    }
+    let min_blocks = h.div_ceil(max_units);
+    let blocks = gpu.sm_count.max(min_blocks).min(h);
+    let units_per_block = h.div_ceil(blocks);
+    let blocks = h.div_ceil(units_per_block);
+    let shared_bytes = units_per_block * per_unit;
+    if shared_bytes > smem_cap || blocks > gpu.sm_count {
+        return None;
+    }
+    Some((blocks, threads, units_per_block, shared_bytes))
+}
+
+/// The whole backward T-loop as **one cooperative launch**: see
+/// `slstm_fused_time_bwd` in `kernels.rs`. Writes the gate deltas into `g` exactly
+/// as the per-step path does, so the post-loop dWx/dWh/db GEMMs are unaffected.
+///
+/// Returns `false` (having launched nothing) when unavailable, so the caller falls
+/// back to the per-step loop.
+#[allow(clippy::too_many_arguments)]
+pub fn slstm_fused_time_bwd(
+    gpu: &Gpu,
+    wh: &DTensor,
+    dy: &DTensor,
+    g: &mut DTensor,
+    dgates_all: &mut DTensor,
+    dh_recur: &mut DTensor,
+    dc_recur: &mut DTensor,
+    dn_recur: &mut DTensor,
+    slabs: &SlstmSlabs,
+    t: usize,
+) -> bool {
+    if !gpu.kernels.has_coop {
+        return false;
+    }
+    let (b, h) = (dc_recur.rows(), dc_recur.cols());
+    let Some((blocks, threads, units_per_block, shared_bytes)) =
+        slstm_fused_time_bwd_geometry(gpu, h, b)
+    else {
+        return false;
+    };
+    let (t_i, h_i, b_i, upb_i) = (t as i32, h as i32, b as i32, units_per_block as i32);
+    let f = gpu
+        .kernels
+        .specialized(&gpu.context, "slstm_fused_time_bwd", h, b, false)
+        .unwrap_or_else(|| gpu.kernels.get("slstm_fused_time_bwd"));
+    if let Err(e) = f.set_attribute(
+        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared_bytes as i32,
+    ) {
+        eprintln!("slstm_fused_time_bwd: shared-memory opt-in failed: {e:?}");
+        return false;
+    }
+    let cfg = LaunchConfig {
+        grid_dim: (blocks as u32, 1, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: shared_bytes as u32,
+    };
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&wh.buf)
+        .arg(&dy.buf)
+        .arg(&mut g.buf)
+        .arg(&mut dgates_all.buf)
+        .arg(&mut dh_recur.buf)
+        .arg(&mut dc_recur.buf)
+        .arg(&mut dn_recur.buf)
+        .arg(&slabs.ot.buf)
+        .arg(&slabs.c.buf)
+        .arg(&slabs.n.buf)
+        .arg(&slabs.c_prev.buf)
+        .arg(&slabs.n_prev.buf)
+        .arg(&slabs.zt.buf)
+        .arg(&slabs.i_prime.buf)
+        .arg(&slabs.f_prime.buf)
+        .arg(&t_i)
+        .arg(&h_i)
+        .arg(&b_i)
+        .arg(&upb_i);
+    // SAFETY: geometry guarantees a co-resident grid and a fitting shared slice.
+    match unsafe { lb.launch_cooperative(cfg) } {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("slstm_fused_time_bwd: cooperative launch failed: {e:?}");
+            false
+        }
+    }
+}
+
+/// The whole forward T-loop as **one cooperative launch**: see `slstm_fused_time`
+/// in `kernels.rs`. `g` must already hold the input half `x·Wx` for every
+/// timestep; the kernel adds the recurrent half in place and runs the recurrence.
+///
+/// Returns `false` (having launched nothing) when the kernel is unavailable or the
+/// shape does not fit, so callers can fall back to the per-step path.
+#[allow(clippy::too_many_arguments)]
+pub fn slstm_fused_time(
+    gpu: &Gpu,
+    wh: &DTensor,
+    g: &mut DTensor,
+    bcat: &DTensor,
+    c_state: &mut DTensor,
+    n_state: &mut DTensor,
+    m_state: &mut DTensor,
+    h_state: &mut DTensor,
+    slabs: &mut SlstmSlabs,
+    out: &mut DTensor,
+    t: usize,
+) -> bool {
+    if !gpu.kernels.has_coop {
+        return false;
+    }
+    let (b, h) = (c_state.rows(), c_state.cols());
+    let Some((blocks, threads, cols_per_block, shared_bytes)) =
+        slstm_fused_time_geometry(gpu, h, b)
+    else {
+        return false;
+    };
+    let (t_i, h_i, b_i, cpb_i) = (t as i32, h as i32, b as i32, cols_per_block as i32);
+    // Prefer the (H, B)-specialized build. The generic module is only a valid
+    // fallback when bf16 staging is OFF: it is compiled without -DFUSED_BF16, so it
+    // stages fp32 and would read past a shared allocation that `geometry` sized for
+    // bf16. With bf16 on and no specialized build available, decline instead and let
+    // the caller take the per-step path.
+    let f = match gpu
+        .kernels
+        .specialized(&gpu.context, "slstm_fused_time", h, b, fused_bf16_enabled())
+    {
+        Some(f) => f,
+        None if !fused_bf16_enabled() => gpu.kernels.get("slstm_fused_time"),
+        None => return false,
+    };
+    // Opt into the larger shared-memory carve-out; without this the launch fails
+    // for any slice above the default 48 KB.
+    if let Err(e) = f.set_attribute(
+        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared_bytes as i32,
+    ) {
+        eprintln!("slstm_fused_time: shared-memory opt-in failed: {e:?}");
+        return false;
+    }
+    let cfg = LaunchConfig {
+        grid_dim: (blocks as u32, 1, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: shared_bytes as u32,
+    };
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&wh.buf)
+        .arg(&mut g.buf)
+        .arg(&bcat.buf)
+        .arg(&mut slabs.h_prev.buf)
+        .arg(&mut c_state.buf)
+        .arg(&mut n_state.buf)
+        .arg(&mut m_state.buf)
+        .arg(&mut h_state.buf)
+        .arg(&mut slabs.c_prev.buf)
+        .arg(&mut slabs.n_prev.buf)
+        .arg(&mut slabs.zt.buf)
+        .arg(&mut slabs.ot.buf)
+        .arg(&mut slabs.i_prime.buf)
+        .arg(&mut slabs.f_prime.buf)
+        .arg(&mut slabs.c.buf)
+        .arg(&mut slabs.n.buf)
+        .arg(&mut out.buf)
+        .arg(&t_i)
+        .arg(&h_i)
+        .arg(&b_i)
+        .arg(&cpb_i);
+    // SAFETY: the geometry above guarantees the grid is co-resident (a cooperative
+    // launch deadlocks otherwise) and that every block's shared slice fits.
+    match unsafe { lb.launch_cooperative(cfg) } {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("slstm_fused_time: cooperative launch failed: {e:?}");
+            false
+        }
+    }
+}
+
 /// One fused backward step of the sLSTM cell.
 ///
 /// Reads the biased forget pre-activation out of `gates` and then overwrites all

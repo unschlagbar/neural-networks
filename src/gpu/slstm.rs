@@ -65,6 +65,26 @@ fn graphs_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var("GPU_NO_GRAPH").is_ok())
 }
 
+/// The time-fused T-loop (`slstm_fused_time` / `_bwd`): the whole forward or
+/// backward sequence as ONE cooperative launch instead of two launches per
+/// timestep. **On by default**; `SLSTM_NO_FUSED_TIME=1` forces the per-step path,
+/// which is the A/B baseline and the fallback if a driver ever mis-schedules a
+/// cooperative grid.
+///
+/// Measured at the backbone's shape (B=1, T=2047, H=512): forward 9.35 -> 6.50ms,
+/// backward 10.24 -> 7.64ms, i.e. 1.38x on the layer and 267 -> 217ms on the
+/// backbone's eight sLSTM halves. Parity with the per-step path (output, dx, every
+/// dW and db) is pinned by `slstm_fused_time_matches_per_step`.
+///
+/// It declines on its own when the shape does not fit — notably at H >= 1024,
+/// where the grid would need more blocks than the device has SMs and a cooperative
+/// launch requires the whole grid to be co-resident — so enabling it by default
+/// never removes a working path, it only takes the faster one where it exists.
+fn fused_time_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SLSTM_NO_FUSED_TIME").is_err())
+}
+
 pub struct SLstm {
     input: usize,
     hidden: usize,
@@ -85,6 +105,14 @@ pub struct SLstm {
     wx: DTensor,   // [in, 4H]
     whr: DTensor,  // [H, 4H]  (recurrent half)
     bcat: DTensor, // [4H]
+
+    /// Per-instance override of the time-fused path. `None` follows the global
+    /// default (see [`fused_time_enabled`]); `Some(false)` pins this cell to the
+    /// per-step loop and `Some(true)` to the fused one. The env flag is read through
+    /// a `OnceLock`, so a test that needs BOTH paths in one process sets this — and
+    /// it must set it on both cells, since the default alone no longer distinguishes
+    /// them.
+    pub force_fused_time: Option<bool>,
 
     // Recurrent state carried across timesteps within one call, [B, H].
     h_state: DTensor,
@@ -191,6 +219,7 @@ impl SLstm {
             vb: [zb(), zb(), zb(), zb()],
             wx: DTensor::zeros(gpu, &[0, 0]),
             whr: DTensor::zeros(gpu, &[0, 0]),
+            force_fused_time: None,
             bcat: DTensor::zeros(gpu, &[0]),
             h_state: DTensor::zeros(gpu, &[0, 0]),
             c_state: DTensor::zeros(gpu, &[0, 0]),
@@ -405,6 +434,28 @@ impl SLstm {
         b: usize,
         t: usize,
     ) {
+        // The time-fused kernel replaces the whole loop with one cooperative launch,
+        // so it comes before the graph path (a cooperative launch cannot be stream
+        // captured anyway) and before the eager path. It declines by returning false
+        // when the shape does not fit, leaving both fallbacks intact.
+        if self.force_fused_time.unwrap_or_else(fused_time_enabled)
+            && t >= GRAPH_MIN_T
+            && ops::slstm_fused_time(
+                gpu,
+                &self.whr,
+                g,
+                &self.bcat,
+                &mut self.c_state,
+                &mut self.n_state,
+                &mut self.m_state,
+                &mut self.h_state,
+                slabs,
+                out,
+                t,
+            )
+        {
+            return;
+        }
         if t < GRAPH_MIN_T || graphs_disabled() {
             self.fwd_steps(gpu, g, slabs, out, t);
             return;
@@ -457,6 +508,8 @@ impl SLstm {
         for step in 0..t {
             // Recurrent half of the gates (one dense GEMM into the contiguous
             // scratch), then the elementwise recurrence: two launches per timestep.
+            // The bf16 variant adds a third (the h round-trip) but halves the Wh
+            // traffic, which at B=1 is what the GEMM's time is actually made of.
             ops::matmul_nn_into(gpu, &self.h_state, &self.whr, &mut self.gh, 0.0);
             ops::slstm_step_fused(
                 gpu,
@@ -547,6 +600,26 @@ impl SLstm {
         b: usize,
         t: usize,
     ) {
+        // One cooperative launch for the whole reverse loop; see `fwd_loop` for why
+        // this precedes the graph path. `gh` doubles as the grid-visible [B, 4H]
+        // gate-delta scratch, which is exactly what the per-step path uses it for.
+        if self.force_fused_time.unwrap_or_else(fused_time_enabled)
+            && t >= GRAPH_MIN_T
+            && ops::slstm_fused_time_bwd(
+                gpu,
+                &self.whr,
+                dy,
+                g,
+                &mut self.gh,
+                &mut self.dh_bptt,
+                &mut self.dc_bptt,
+                &mut self.dn_bptt,
+                slabs,
+                t,
+            )
+        {
+            return;
+        }
         if t < GRAPH_MIN_T || graphs_disabled() {
             self.bwd_steps(gpu, dy, g, slabs, t);
             return;
@@ -801,6 +874,76 @@ mod tests {
             assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 2e-3);
 
             poison(256 * 4 * h * b);
+        }
+    }
+
+    /// The time-fused forward (one cooperative launch for the whole T-loop) must
+    /// agree with the per-step path it replaces.
+    ///
+    /// `fused_time_enabled()` reads its env var through a `OnceLock`, so this
+    /// drives `ops::slstm_fused_time` directly rather than toggling the flag: the
+    /// point is that the kernel computes the same thing, not how it is selected.
+    /// T is above `GRAPH_MIN_T` so the comparison is against the graph path that
+    /// actually runs at backbone shapes.
+    #[test]
+    fn slstm_fused_time_matches_per_step() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        if !gpu.kernels.has_coop {
+            return; // cooperative kernels unavailable (no CUDA headers)
+        }
+        let (b, t, h) = (1usize, 64usize, 64usize);
+        if ops::slstm_fused_time_geometry(&gpu, h, b).is_none() {
+            return; // shape does not fit the fused path on this device
+        }
+        let w: Vec<Tensor> = (0..4)
+            .map(|g| Tensor::random(&[2 * h, h], 0.3 + g as f32 * 0.01))
+            .collect();
+        let bi: Vec<Tensor> = (0..4)
+            .map(|g| Tensor::random(&[h], 0.2 + g as f32 * 0.01))
+            .collect();
+        let x = Tensor::random(&[b, t, h], 0.5);
+        let dx = DTensor::from_host(&gpu, &x);
+
+        let mut per_step = SLstm::from_parts(
+            &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3],
+        );
+        per_step.force_fused_time = Some(false);
+        let want = per_step.forward(&gpu, &dx).to_host(&gpu);
+
+        let mut fused = SLstm::from_parts(
+            &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3],
+        );
+        fused.force_fused_time = Some(true);
+        let got = fused.forward(&gpu, &dx).to_host(&gpu);
+
+        assert_eq!(want.data.len(), got.data.len());
+        for (i, (a, c)) in want.data.iter().zip(got.data.iter()).enumerate() {
+            assert!(
+                (a - c).abs() <= 1e-5 * a.abs().max(1.0),
+                "fused vs per-step forward diverged at {i}: {a} vs {c}"
+            );
+        }
+
+        // ...and the backward: dx plus every gate's weight gradient. The fused
+        // backward carries the BPTT channels inside one launch, so an error there
+        // shows up as drift that grows toward t = 0 rather than a single bad slot.
+        let gy = DTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 0.7));
+        let want_dx = per_step.backward(&gpu, &gy).to_host(&gpu);
+        let got_dx = fused.backward(&gpu, &gy).to_host(&gpu);
+        assert_close(&want_dx.data, &got_dx.data, 1e-4);
+        for gi in 0..4 {
+            assert_close(
+                &per_step.dw[gi].to_host(&gpu).data,
+                &fused.dw[gi].to_host(&gpu).data,
+                1e-4,
+            );
+            assert_close(
+                &per_step.db[gi].to_host(&gpu).data,
+                &fused.db[gi].to_host(&gpu).data,
+                1e-4,
+            );
         }
     }
 }
