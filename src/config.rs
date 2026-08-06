@@ -17,18 +17,18 @@ pub const MAX_WORD_BYTES: usize = 16;
 /// is meant to bind first — this only guards against a pathological run with no
 /// boundary token. Caches are sized to the *actual* longest window
 /// (`WordChunk::max_window_tokens`), never to this cap, so raising it is free.
-pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 4;
+pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 6;
 
 // Training-Schedule
 
-pub const LR: f32 = 1e-4;
-pub const MIN_LR: f32 = 1e-5;
+pub const LR: f32 = 3e-4;
+pub const MIN_LR: f32 = 3e-5;
 pub const WARMUP_STEPS: usize = 150;
 pub const DECAY_STEPS: usize = 150_000;
 // Windows whose gradients are accumulated before one optimizer step. Muon
 // (matrices) is scale-invariant via the Frobenius normalization and aux-Adam
 // (vectors) via its second moment, so summed grads need no manual rescaling.
-pub const BATCH_SIZE: usize = 4;
+pub const BATCH_SIZE: usize = 8;
 pub const EPOCHS: usize = 1;
 
 pub const SAVE_EVERY: usize = 100;
@@ -58,7 +58,7 @@ pub const TOP_P: f32 = 0.9;
 
 pub const CHAR_HIDDEN: usize = 256;
 pub const OUT_HIDDEN: usize = 256;
-pub const WORD_HIDDEN: usize = 768;
+pub const WORD_HIDDEN: usize = 1024;
 
 /// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).
 /// Bounds the logits and removes the cross-entropy incentive for unbounded
@@ -66,7 +66,7 @@ pub const WORD_HIDDEN: usize = 768;
 pub const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 16;
+pub const WORD_BLOCKS: usize = 6;
 
 /// GPU mLSTM: chunk length for the chunkwise formulation, or `0` for the
 /// single-chunk (whole-sequence) form.
