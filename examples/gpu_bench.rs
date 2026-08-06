@@ -167,8 +167,8 @@ fn main() {
         let dx_in = DTensor::from_host(&gpu, &x);
         let ddy = DTensor::from_host(&gpu, &dy);
         let gpu_s = gpu_time(&gpu, 3, iters, || {
-            let _y = dev.forward(&gpu, &dx_in);
-            let _dx = dev.backward(&gpu, &ddy);
+            let _y = dev.forward_alloc(&gpu, &dx_in);
+            let _dx = dev.backward_alloc(&gpu, &ddy);
             dev.step(&gpu, &cfg);
         });
 
@@ -217,8 +217,8 @@ fn main() {
         let dx_in = DTensor::from_host(&gpu, &x);
         let ddy = DTensor::from_host(&gpu, &dy);
         let gpu_s = gpu_time(&gpu, GPU_WARMUP, GPU_ITERS, || {
-            let _y = dev.forward(&gpu, &dx_in);
-            let _dx = dev.backward(&gpu, &ddy);
+            let _y = dev.forward_alloc(&gpu, &dx_in);
+            let _dx = dev.backward_alloc(&gpu, &ddy);
             dev.step(&gpu, &cfg);
         });
 
@@ -275,8 +275,8 @@ fn main() {
         let dx_in = DTensor::from_host(&gpu, &x);
         let ddy = DTensor::from_host(&gpu, &dy);
         let gpu_s = gpu_time(&gpu, GPU_WARMUP, GPU_ITERS, || {
-            let _y = dev.forward(&gpu, &dx_in);
-            let _dx = dev.backward(&gpu, &ddy);
+            let _y = dev.forward_alloc(&gpu, &dx_in);
+            let _dx = dev.backward_alloc(&gpu, &ddy);
             dev.step(&gpu, &cfg);
         });
 

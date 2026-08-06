@@ -24,6 +24,8 @@ pub struct RmsNorm {
     /// Normalization group width: `== size` for plain RMSNorm, `== dhv` for the
     /// head-wise variant (`F/group` independent groups per row, one γ slice each).
     group: usize,
+    /// Saved `x̂` / `inv_rms`, reused across calls: both are shape-determined, so
+    /// a steady batch size means the forward reallocates nothing.
     fwd: Option<GpuRmsForward>,
 }
 
@@ -59,20 +61,53 @@ impl RmsNorm {
         Self::from_parts(gpu, &Tensor::new(&[size], vec![1.0; size]))
     }
 
-    /// `y = γ ⊙ (x / rms(x))`, row-wise. `x` is `[B, F]`, result `[B, F]`. Saves
+    /// `y = γ ⊙ (x / rms(x))`, row-wise, into the caller's `out` `[B, F]`. Saves
     /// `x̂`/`inv_rms` for backward.
-    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+    ///
+    /// `out` may alias `x` (the kernel reads each row before writing it), which
+    /// is what lets a caller normalize a buffer in place.
+    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
         assert_eq!(x.cols(), self.size, "RmsNorm::forward — width mismatch");
-        let (out, saved) = ops::rms_norm_forward(gpu, x, &self.gamma, self.group, EPS);
-        self.fwd = Some(saved);
+        let (b, f) = (x.rows(), x.cols());
+        let total_groups = b * (f / self.group);
+        // Refit the saved intermediates, reusing them whenever the shape holds.
+        match &self.fwd {
+            Some(s) if s.x_hat.len() == b * f && s.inv_rms.len() == total_groups => {}
+            _ => {
+                self.fwd = Some(GpuRmsForward {
+                    x_hat: DTensor::uninit(gpu, &[b, f]),
+                    inv_rms: gpu
+                        .stream
+                        .alloc_zeros::<f32>(total_groups)
+                        .expect("alloc inv_rms"),
+                })
+            }
+        }
+        let saved = self.fwd.as_mut().expect("just filled");
+        saved.x_hat.reshape_to(&[b, f]);
+        ops::rms_norm_forward_into(gpu, x, &self.gamma, self.group, EPS, out, saved);
+    }
+
+    /// Forward into a freshly allocated `[B, F]` — the by-value companion to
+    /// [`forward`](Self::forward), for call sites that still compose by value.
+    pub fn forward_alloc(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+        let mut out = DTensor::uninit(gpu, &[x.rows(), x.cols()]);
+        self.forward(gpu, x, &mut out);
         out
     }
 
-    /// Given `dY` `[B, F]`, accumulate `dγ` and return `dX` `[B, F]`.
-    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+    /// Backward into a freshly allocated `dX` `[B, F]`.
+    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+        let mut dx = DTensor::uninit(gpu, &[dy.rows(), dy.cols()]);
+        self.backward(gpu, dy, &mut dx);
+        dx
+    }
+
+    /// Given `dY` `[B, F]`, accumulate `dγ` and write `dX` `[B, F]` into `dx`.
+    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
         assert_eq!(dy.cols(), self.size, "RmsNorm::backward — width mismatch");
         let fwd = self.fwd.as_ref().expect("RmsNorm::backward before forward");
-        ops::rms_norm_backward(gpu, dy, fwd, &self.gamma, &mut self.dgamma, self.group)
+        ops::rms_norm_backward_into(gpu, dy, fwd, &self.gamma, &mut self.dgamma, self.group, dx);
     }
 
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).

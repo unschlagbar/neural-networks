@@ -67,22 +67,22 @@ fn main() {
 
         // Peak: memory live between forward and backward (decay matrices resident).
         let before = mem_used();
-        let y = dev.forward(&gpu, &x);
+        let y = dev.forward_alloc(&gpu, &x);
         gpu.stream.synchronize().unwrap();
         let peak = mem_used();
         drop(y);
-        let _ = dev.backward(&gpu, &g);
+        let _ = dev.backward_alloc(&gpu, &g);
         gpu.stream.synchronize().unwrap();
 
         for _ in 0..warmup {
-            let _ = dev.forward(&gpu, &x);
-            let _ = dev.backward(&gpu, &g);
+            let _ = dev.forward_alloc(&gpu, &x);
+            let _ = dev.backward_alloc(&gpu, &g);
         }
         gpu.stream.synchronize().unwrap();
         let t0 = Instant::now();
         for _ in 0..iters {
-            let _ = dev.forward(&gpu, &x);
-            let _ = dev.backward(&gpu, &g);
+            let _ = dev.forward_alloc(&gpu, &x);
+            let _ = dev.backward_alloc(&gpu, &g);
         }
         gpu.stream.synchronize().unwrap();
         let secs = t0.elapsed().as_secs_f64();

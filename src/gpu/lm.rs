@@ -79,12 +79,15 @@ impl Lm {
 
         let e = ops::embedding_gather(gpu, &self.table, ids, h); // [N, H]
         let mut seq = e.reshaped(&[b, t, h]);
+        // Blocks are H-in == H-out, so one spare buffer ping-pongs the whole stack.
+        let mut next = DTensor::uninit(gpu, &[b, t, h]);
         for blk in self.blocks.iter_mut() {
-            seq = blk.forward(gpu, &seq);
+            blk.forward(gpu, &seq, &mut next);
+            std::mem::swap(&mut seq, &mut next);
         }
         let flat = seq.reshaped(&[n, h]);
-        let normed = self.norm.forward(gpu, &flat);
-        let pre = self.head.forward(gpu, &normed);
+        let normed = self.norm.forward_alloc(gpu, &flat);
+        let pre = self.head.forward_alloc(gpu, &normed);
         let logits = ops::softcap_forward(gpu, &pre, self.cap);
 
         self.ids = ids.to_vec();
@@ -100,12 +103,14 @@ impl Lm {
         let logits = self.logits.as_ref().expect("Lm::backward before forward");
 
         let d_pre = ops::softcap_backward(gpu, dlogits, logits, self.cap);
-        let d_normed = self.head.backward(gpu, &d_pre);
-        let d_flat = self.norm.backward(gpu, &d_normed); // [N, H]
+        let d_normed = self.head.backward_alloc(gpu, &d_pre);
+        let d_flat = self.norm.backward_alloc(gpu, &d_normed); // [N, H]
 
         let mut d_seq = d_flat.reshaped(&[b, t, h]);
+        let mut d_next = DTensor::uninit(gpu, &[b, t, h]);
         for blk in self.blocks.iter_mut().rev() {
-            d_seq = blk.backward(gpu, &d_seq);
+            blk.backward(gpu, &d_seq, &mut d_next);
+            std::mem::swap(&mut d_seq, &mut d_next);
         }
         let d_e = d_seq.reshaped(&[n, h]);
         ops::embedding_scatter_add(gpu, &mut self.dtable, &self.ids, &d_e, h);

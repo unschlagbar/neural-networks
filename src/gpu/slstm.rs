@@ -315,12 +315,17 @@ impl SLstm {
         )
     }
 
-    /// Forward over a whole `[B, T, in]` sequence → `[B, T, H]`. State resets to
-    /// zero at t=0 and stays device-resident across the T-loop.
-    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+    /// Forward over a whole `[B, T, in]` sequence into `y` `[B, T, H]`. State
+    /// resets to zero at t=0 and stays device-resident across the T-loop.
+    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
         assert_eq!(x.rank, 3, "SLstm::forward expects [B, T, in]");
         let (b, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);
         assert_eq!(inp, self.input, "SLstm::forward — input width mismatch");
+        assert_eq!(
+            y.dims(),
+            [b, t, self.hidden],
+            "SLstm::forward — output shape"
+        );
         let h = self.hidden;
         let h4 = 4 * h;
         let n = b * t;
@@ -406,15 +411,17 @@ impl SLstm {
 
         self.fwd_loop(gpu, &mut g, &mut slabs, &mut out, b, t);
 
-        // `out` is the graph's write target and must keep its address, so hand the
-        // caller a copy rather than the buffer itself. One [B, T, H] device-to-device
-        // copy against a loop that was costing tens of milliseconds of launch time.
-        let y = out.dup(gpu);
+        // `out` is the graph's write target and must keep its address, so the loop
+        // writes there and the result is copied into the caller's buffer. One
+        // [B, T, H] device-to-device copy against a loop that was costing tens of
+        // milliseconds of launch time.
+        gpu.stream
+            .memcpy_dtod(&out.buf, &mut y.buf)
+            .expect("copy out");
         self.g = Some(g);
         self.slabs = Some(slabs);
         self.x_saved = Some(x_flat);
         self.out_buf = Some(out);
-        y
     }
 
     /// The forward time loop: replayed from a captured CUDA graph when T is long
@@ -527,13 +534,33 @@ impl SLstm {
         }
     }
 
-    /// Backward over the whole sequence. `dy` is `[B, T, H]`; returns
-    /// `dx` `[B, T, in]`. Accumulates weight/bias grads.
-    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+    /// Forward into a freshly allocated `[B, T, H]` — the by-value companion to
+    /// [`forward`](Self::forward), used by tests and one-shot call sites.
+    pub fn forward_alloc(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+        let mut y = DTensor::uninit(gpu, &[x.shape[0], x.shape[1], self.hidden]);
+        self.forward(gpu, x, &mut y);
+        y
+    }
+
+    /// Backward into a freshly allocated `dx` `[B, T, in]`.
+    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+        let mut dx = DTensor::uninit(gpu, &[dy.shape[0], dy.shape[1], self.input]);
+        self.backward(gpu, dy, &mut dx);
+        dx
+    }
+
+    /// Backward over the whole sequence. `dy` is `[B, T, H]`, `dx` is the
+    /// caller's `[B, T, in]` output. Accumulates weight/bias grads.
+    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
         assert_eq!(dy.rank, 3, "SLstm::backward expects [B, T, H]");
         let (b, t, h) = (dy.shape[0], dy.shape[1], dy.shape[2]);
         assert_eq!(b, self.batch, "SLstm::backward — batch mismatch");
         assert_eq!(h, self.hidden, "SLstm::backward — hidden mismatch");
+        assert_eq!(
+            dx.dims(),
+            [b, t, self.input],
+            "SLstm::backward — dx shape"
+        );
         let inp = self.input;
         let h4 = 4 * h;
         let n = b * t;
@@ -565,7 +592,8 @@ impl SLstm {
         // `g` now holds the gate deltas for the whole sequence: dx, dWx, dWh and the
         // bias grads are three GEMMs and one reduction over it.
         let dg = g.reshaped(&[n, h4]);
-        let dx = ops::matmul_nt(gpu, &dg, &self.wx); // [N, in]
+        dx.reshape_to(&[n, inp]);
+        ops::matmul_nt_into(gpu, &dg, &self.wx, dx, 0.0);
 
         let mut dwx = DTensor::uninit(gpu, &[inp, h4]);
         ops::matmul_tn_into(gpu, &x_flat, &dg, &mut dwx, 0.0);
@@ -587,7 +615,7 @@ impl SLstm {
         self.slabs = Some(slabs);
         self.x_saved = Some(x_flat);
 
-        dx.reshaped(&[b, t, inp])
+        dx.reshape_to(&[b, t, inp]);
     }
 
     /// The backward time loop — graph-replayed on the same terms as [`Self::fwd_loop`].
@@ -763,12 +791,12 @@ mod tests {
 
         // Forward
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward(&gpu, &DTensor::from_host(&gpu, &x));
+        let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 2e-3);
 
         // Backward
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward(&gpu, &DTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 2e-3);
         assert_close(&dev.dw[0].to_host(&gpu).data, &cpu.dwz.data, 2e-3);
         assert_close(&dev.dw[2].to_host(&gpu).data, &cpu.dwf.data, 2e-3);
@@ -814,11 +842,11 @@ mod tests {
             let g = Tensor::random(&[b, t, h], 1.0);
 
             let y_cpu = cpu.forward(&x);
-            let y_dev = dev.forward(&gpu, &DTensor::from_host(&gpu, &x));
+            let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
             assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 2e-3);
 
             let dx_cpu = cpu.backward(&g);
-            let dx_dev = dev.backward(&gpu, &DTensor::from_host(&gpu, &g));
+            let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
             assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 2e-3);
             assert_close(&dev.dw[0].to_host(&gpu).data, &cpu.dwz.data, 2e-3);
             assert_close(&dev.dw[2].to_host(&gpu).data, &cpu.dwf.data, 2e-3);
@@ -867,10 +895,10 @@ mod tests {
             let g = Tensor::random(&[b, t, h], 1.0);
 
             let y_cpu = cpu.forward(&x);
-            let y_dev = dev.forward(&gpu, &DTensor::from_host(&gpu, &x));
+            let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
             assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 2e-3);
             let dx_cpu = cpu.backward(&g);
-            let dx_dev = dev.backward(&gpu, &DTensor::from_host(&gpu, &g));
+            let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
             assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 2e-3);
 
             poison(256 * 4 * h * b);
@@ -910,13 +938,13 @@ mod tests {
             &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3],
         );
         per_step.force_fused_time = Some(false);
-        let want = per_step.forward(&gpu, &dx).to_host(&gpu);
+        let want = per_step.forward_alloc(&gpu, &dx).to_host(&gpu);
 
         let mut fused = SLstm::from_parts(
             &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3],
         );
         fused.force_fused_time = Some(true);
-        let got = fused.forward(&gpu, &dx).to_host(&gpu);
+        let got = fused.forward_alloc(&gpu, &dx).to_host(&gpu);
 
         assert_eq!(want.data.len(), got.data.len());
         for (i, (a, c)) in want.data.iter().zip(got.data.iter()).enumerate() {
@@ -930,8 +958,8 @@ mod tests {
         // backward carries the BPTT channels inside one launch, so an error there
         // shows up as drift that grows toward t = 0 rather than a single bad slot.
         let gy = DTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 0.7));
-        let want_dx = per_step.backward(&gpu, &gy).to_host(&gpu);
-        let got_dx = fused.backward(&gpu, &gy).to_host(&gpu);
+        let want_dx = per_step.backward_alloc(&gpu, &gy).to_host(&gpu);
+        let got_dx = fused.backward_alloc(&gpu, &gy).to_host(&gpu);
         assert_close(&want_dx.data, &got_dx.data, 1e-4);
         for gi in 0..4 {
             assert_close(

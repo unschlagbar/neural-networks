@@ -19,6 +19,7 @@ use cudarc::cublas::sys::{cublasMath_t, cublasSetMathMode};
 use cudarc::driver::{CudaContext, CudaStream};
 
 pub mod block;
+pub mod buf;
 pub mod dtensor;
 pub mod flat;
 pub mod hierarchical;
@@ -31,6 +32,7 @@ pub mod rms_norm;
 pub mod slstm;
 pub mod train;
 
+pub use buf::{Buf, Pool};
 pub use dtensor::DTensor;
 use kernels::Kernels;
 

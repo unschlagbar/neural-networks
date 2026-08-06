@@ -12,7 +12,9 @@
 //! small elementwise kernels (`add`, `swiglu_forward`, `swiglu_backward`) around
 //! a generic GPU `Cell`.
 
-use super::{DTensor, Gpu, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm};
+use super::{
+    Buf, DTensor, Gpu, Pool, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm,
+};
 use crate::{
     nn::{linear::LinearLayer, rms_norm::RMSNorm, slstm_block::SLSTMBlock},
     nn_layer::NnLayer,
@@ -22,8 +24,8 @@ use crate::{
 
 /// A recurrent cell operating on `[B, T, H]` device sequences (H in == H out).
 pub trait Cell {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor;
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor;
+    fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor);
+    fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor);
     fn zero_grad(&mut self, gpu: &Gpu);
     fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg);
     /// Learnable tensors in a fixed order (checkpoint save/load).
@@ -49,11 +51,11 @@ pub trait Cell {
 }
 
 impl Cell for SLstm {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
-        SLstm::forward(self, gpu, x)
+    fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
+        SLstm::forward(self, gpu, x, out)
     }
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
-        SLstm::backward(self, gpu, dy)
+    fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+        SLstm::backward(self, gpu, dy, dx)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {
         SLstm::zero_grad(self, gpu)
@@ -98,8 +100,22 @@ impl Cell for SLstm {
 /// sLSTM / mLSTM blocks) as `Vec<Box<dyn BlockLike>>`. `Block<C>` is generic over
 /// its cell, so the concrete types differ; this is the common interface.
 pub trait BlockLike {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor;
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor;
+    fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor);
+    fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor);
+    /// Forward into a freshly allocated `[B, T, H]`. Blocks are H-in == H-out, so
+    /// the shape follows the input. For benchmarks and one-shot call sites; a
+    /// training loop passes its own buffer to [`forward`](Self::forward).
+    fn forward_alloc(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+        let mut y = DTensor::uninit(gpu, x.dims());
+        self.forward(gpu, x, &mut y);
+        y
+    }
+    /// Backward into a freshly allocated `dx`, shaped like `dy`.
+    fn backward_alloc(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+        let mut dx = DTensor::uninit(gpu, dy.dims());
+        self.backward(gpu, dy, &mut dx);
+        dx
+    }
     fn zero_grad(&mut self, gpu: &Gpu);
     fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg);
     /// Learnable tensors in a fixed order (checkpoint save/load).
@@ -110,11 +126,11 @@ pub trait BlockLike {
 }
 
 impl<C: Cell> BlockLike for Block<C> {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
-        Block::forward(self, gpu, x)
+    fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
+        Block::forward(self, gpu, x, out)
     }
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
-        Block::backward(self, gpu, dy)
+    fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+        Block::backward(self, gpu, dy, dx)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {
         Block::zero_grad(self, gpu)
@@ -142,11 +158,32 @@ pub struct Block<C: Cell> {
     pub lin_value: Linear,
     pub lin_down: Linear,
 
-    // Saved for backward (SwiGLU is the only path not owned by a sub-layer).
-    gate_pre: Option<DTensor>, // [N, U] pre-activation for SiLU'
-    gate_act: Option<DTensor>, // [N, U] SiLU(gate_pre)
-    value: Option<DTensor>,    // [N, U]
-    seq: (usize, usize),       // (B, T) of the last forward
+    /// This block's activations, owned across calls.
+    act: Act,
+    seq: (usize, usize), // (B, T) of the last forward
+}
+
+/// A block's activations.
+///
+/// Only three values have to survive the forward: the SwiGLU operands its
+/// backward differentiates. Those get a permanent [`Buf`] each. Everything else
+/// — the residual chain, the norm outputs, every `d_*` — is a temporary consumed
+/// within the same call, and lives in a [`Pool`] instead.
+///
+/// That split is what keeps the memory honest. Giving all 23 intermediates a
+/// permanent buffer pins every one of them at once: measured at the backbone's
+/// shape (16 blocks, N=2048, H=1024) that is 4–6 GB of retained activations, and
+/// it pushed an 11 GB step to an out-of-memory abort. Pooling the temporaries
+/// keeps only as many buffers as are simultaneously live — a handful — while
+/// still allocating nothing once the shapes are steady.
+#[derive(Default)]
+struct Act {
+    /// Scratch for every temporary, recycled by size within the call.
+    pool: Pool,
+    // The SwiGLU operands, read by backward, so they outlive the forward.
+    gate_pre: Buf, // [N, U] pre-activation for SiLU'
+    gate_act: Buf, // [N, U] SiLU(gate_pre)
+    value: Buf,    // [N, U]
 }
 
 impl<C: Cell> Block<C> {
@@ -170,9 +207,7 @@ impl<C: Cell> Block<C> {
                 &Tensor::xavier(up, hidden),
                 &Tensor::zeros(&[hidden]),
             ),
-            gate_pre: None,
-            gate_act: None,
-            value: None,
+            act: Act::default(),
             seq: (0, 0),
         }
     }
@@ -197,85 +232,145 @@ impl<C: Cell> Block<C> {
             lin_gate: Linear::from_parts(gpu, &cpu.lin_gate.w, &cpu.lin_gate.b),
             lin_value: Linear::from_parts(gpu, &cpu.lin_value.w, &cpu.lin_value.b),
             lin_down: Linear::from_parts(gpu, &cpu.lin_down.w, &cpu.lin_down.b),
-            gate_pre: None,
-            gate_act: None,
-            value: None,
+            act: Act::default(),
             seq: (0, 0),
         }
     }
 
-    /// Forward over `[B, T, H]` → `[B, T, H]`.
-    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+    /// Forward over `[B, T, H]` → `y` `[B, T, H]`.
+    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
         assert_eq!(x.rank, 3, "Block::forward expects [B, T, H]");
         let (b, t, h) = (x.shape[0], x.shape[1], x.shape[2]);
         assert_eq!(h, self.hidden, "Block::forward — hidden mismatch");
-        let n = b * t;
+        assert_eq!(y.dims(), x.dims(), "Block::forward — output shape");
+        let (n, u) = (b * t, self.up);
         self.seq = (b, t);
+        let a = &mut self.act;
 
-        // Owned [N, H] copy of the input: needed for both the norm path and the
-        // residual (read twice), and the caller's `x` is only borrowed.
-        let x_flat = x.dup(gpu).reshaped(&[n, h]);
+        // Owned [N, H] copy of the input: it feeds both the norm path and the
+        // residual, and the caller's `x` is only lent to us.
+        let mut x_flat = a.pool.take(gpu, &[n, h]);
+        gpu.stream
+            .memcpy_dtod(&x.buf, &mut x_flat.buf)
+            .expect("copy x");
 
         // Residual 1: z = x + post_cell_norm(cell(pre_norm1(x))). The post-cell
         // norm is skipped for cells that don't want it (mLSTM).
-        let xn1 = self.pre_norm1.forward(gpu, &x_flat);
-        let cell_out = self.cell.forward(gpu, &xn1.reshaped(&[b, t, h]));
-        let cell_flat = cell_out.reshaped(&[n, h]);
+        let mut xn1 = a.pool.take(gpu, &[n, h]);
+        self.pre_norm1.forward(gpu, &x_flat, &mut xn1);
+        xn1.reshape_to(&[b, t, h]);
+        let mut cell_out = a.pool.take(gpu, &[b, t, h]);
+        self.cell.forward(gpu, &xn1, &mut cell_out);
+        a.pool.put(xn1);
+
+        // Downstream is position-wise [N, H]. With a post-cell norm the normalized
+        // result lands in `cn`; without one the cell output *is* `cn`.
+        cell_out.reshape_to(&[n, h]);
         let cn = match &mut self.post_cell_norm {
-            Some(norm) => norm.forward(gpu, &cell_flat),
-            None => cell_flat,
+            Some(norm) => {
+                let mut cn = a.pool.take(gpu, &[n, h]);
+                norm.forward(gpu, &cell_out, &mut cn);
+                a.pool.put(cell_out);
+                cn
+            }
+            None => cell_out,
         };
-        let z = ops::add(gpu, &x_flat, &cn);
+        let mut z = a.pool.take(gpu, &[n, h]);
+        ops::add_into(gpu, &x_flat, &cn, &mut z);
+        a.pool.put_all([x_flat, cn]);
 
-        // Residual 2: y = z + SwiGLU(pre_norm2(z)).
-        let zn = self.pre_norm2.forward(gpu, &z);
-        let gate_pre = self.lin_gate.forward(gpu, &zn);
-        let value = self.lin_value.forward(gpu, &zn);
-        let (gate_act, mixed) = ops::swiglu_forward(gpu, &gate_pre, &value);
-        let down = self.lin_down.forward(gpu, &mixed);
-        let y = ops::add(gpu, &z, &down);
-
-        self.gate_pre = Some(gate_pre);
-        self.gate_act = Some(gate_act);
-        self.value = Some(value);
-        y.reshaped(&[b, t, h])
+        // Residual 2: y = z + SwiGLU(pre_norm2(z)). The three SwiGLU operands are
+        // the only values backward needs, so they alone go to permanent buffers.
+        let mut zn = a.pool.take(gpu, &[n, h]);
+        self.pre_norm2.forward(gpu, &z, &mut zn);
+        self.lin_gate
+            .forward(gpu, &zn, a.gate_pre.get(gpu, &[n, u]));
+        self.lin_value.forward(gpu, &zn, a.value.get(gpu, &[n, u]));
+        a.pool.put(zn);
+        let mut mixed = a.pool.take(gpu, &[n, u]);
+        ops::swiglu_forward_into(
+            gpu,
+            a.gate_pre.expect("projected"),
+            a.value.expect("projected"),
+            a.gate_act.get(gpu, &[n, u]),
+            &mut mixed,
+        );
+        let mut down = a.pool.take(gpu, &[n, h]);
+        self.lin_down.forward(gpu, &mixed, &mut down);
+        y.reshape_to(&[n, h]);
+        ops::add_into(gpu, &z, &down, y);
+        y.reshape_to(&[b, t, h]);
+        a.pool.put_all([mixed, down, z]);
     }
 
     /// Backward over `[B, T, H]` → `dx` `[B, T, H]`.
-    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
         let (b, t) = self.seq;
-        let h = self.hidden;
+        let (h, u) = (self.hidden, self.up);
         let n = b * t;
-        // Owned [N, H]: used by lin_down.backward and the d_z residual (twice).
-        let dy_flat = dy.dup(gpu).reshaped(&[n, h]);
+        assert_eq!(dx.dims(), [b, t, h], "Block::backward — dx shape");
+        let a = &mut self.act;
+
+        // Owned [N, H]: read by lin_down.backward and again by the d_z residual.
+        let mut dy_flat = a.pool.take(gpu, &[n, h]);
+        gpu.stream
+            .memcpy_dtod(&dy.buf, &mut dy_flat.buf)
+            .expect("copy dy");
 
         // Residual 2.
-        let d_mixed = self.lin_down.backward(gpu, &dy_flat); // [n, u]
-        // Taken, not borrowed: these [N, U] activations are rebuilt by every forward,
-        // so releasing them here frees the device memory across the optimizer step
-        // instead of holding it until the next forward overwrites the fields.
-        let gate_pre = self.gate_pre.take().expect("forward before backward");
-        let gate_act = self.gate_act.take().expect("forward before backward");
-        let value = self.value.take().expect("forward before backward");
-        let (d_gate, d_value) = ops::swiglu_backward(gpu, &d_mixed, &gate_act, &value, &gate_pre);
-        drop((gate_pre, gate_act, value));
-        let d_zn_g = self.lin_gate.backward(gpu, &d_gate);
-        let d_zn_v = self.lin_value.backward(gpu, &d_value);
-        let d_zn = ops::add(gpu, &d_zn_g, &d_zn_v);
-        let d_z_mlp = self.pre_norm2.backward(gpu, &d_zn);
-        // z feeds pre_norm2 (MLP path) and the y = z + down residual.
-        let d_z = ops::add(gpu, &d_z_mlp, &dy_flat);
+        let mut d_mixed = a.pool.take(gpu, &[n, u]);
+        self.lin_down.backward(gpu, &dy_flat, &mut d_mixed);
+        let mut d_gate = a.pool.take(gpu, &[n, u]);
+        let mut d_value = a.pool.take(gpu, &[n, u]);
+        ops::swiglu_backward_into(
+            gpu,
+            &d_mixed,
+            a.gate_act.expect("forward before backward"),
+            a.value.expect("forward before backward"),
+            a.gate_pre.expect("forward before backward"),
+            &mut d_gate,
+            &mut d_value,
+        );
+        a.pool.put(d_mixed);
+        let mut d_zn_g = a.pool.take(gpu, &[n, h]);
+        self.lin_gate.backward(gpu, &d_gate, &mut d_zn_g);
+        let mut d_zn_v = a.pool.take(gpu, &[n, h]);
+        self.lin_value.backward(gpu, &d_value, &mut d_zn_v);
+        let mut d_zn = a.pool.take(gpu, &[n, h]);
+        ops::add_into(gpu, &d_zn_g, &d_zn_v, &mut d_zn);
+        a.pool.put_all([d_gate, d_value, d_zn_g, d_zn_v]);
 
-        // Residual 1.
-        let d_cell_out = match &mut self.post_cell_norm {
-            Some(norm) => norm.backward(gpu, &d_z),
-            None => d_z.dup(gpu),
-        };
-        let d_cell_in = self.cell.backward(gpu, &d_cell_out.reshaped(&[b, t, h]));
-        let d_xn1 = self.pre_norm1.backward(gpu, &d_cell_in.reshaped(&[n, h]));
+        // z feeds pre_norm2 (the MLP path) and the y = z + down residual, so the
+        // norm's dx and the incoming dy sum into d_z. `d_z_mlp` is separate because
+        // `add_into`'s destination must not be one of its operands.
+        let mut d_z_mlp = a.pool.take(gpu, &[n, h]);
+        self.pre_norm2.backward(gpu, &d_zn, &mut d_z_mlp);
+        let mut d_z = a.pool.take(gpu, &[n, h]);
+        ops::add_into(gpu, &d_z_mlp, &dy_flat, &mut d_z);
+        a.pool.put_all([d_zn, d_z_mlp, dy_flat]);
+
+        // Residual 1. Without a post-cell norm, d_cell_out is a copy of d_z — the
+        // cell's backward must not clobber d_z, which the dx residual still needs.
+        let mut d_cell_out = a.pool.take(gpu, &[n, h]);
+        match &mut self.post_cell_norm {
+            Some(norm) => norm.backward(gpu, &d_z, &mut d_cell_out),
+            None => gpu
+                .stream
+                .memcpy_dtod(&d_z.buf, &mut d_cell_out.buf)
+                .expect("seed d_cell_out"),
+        }
+        d_cell_out.reshape_to(&[b, t, h]);
+        let mut d_cell_in = a.pool.take(gpu, &[b, t, h]);
+        self.cell.backward(gpu, &d_cell_out, &mut d_cell_in);
+        a.pool.put(d_cell_out);
+        d_cell_in.reshape_to(&[n, h]);
+        let mut d_xn1 = a.pool.take(gpu, &[n, h]);
+        self.pre_norm1.backward(gpu, &d_cell_in, &mut d_xn1);
         // x feeds pre_norm1 (cell path) and the z = x + cn residual.
-        let dx = ops::add(gpu, &d_xn1, &d_z);
-        dx.reshaped(&[b, t, h])
+        dx.reshape_to(&[n, h]);
+        ops::add_into(gpu, &d_xn1, &d_z, dx);
+        dx.reshape_to(&[b, t, h]);
+        a.pool.put_all([d_cell_in, d_xn1, d_z]);
     }
 
     /// Learnable tensors in a fixed order (checkpoint save/load).
@@ -378,9 +473,7 @@ impl Block<SLstm> {
             lin_gate: lin_from_nn(gpu, &cpu.lin_gate),
             lin_value: lin_from_nn(gpu, &cpu.lin_value),
             lin_down: lin_from_nn(gpu, &cpu.lin_down),
-            gate_pre: None,
-            gate_act: None,
-            value: None,
+            act: Act::default(),
             seq: (0, 0),
         }
     }
@@ -405,9 +498,7 @@ impl Block<MLstm> {
             lin_gate: lin_from_nn(gpu, &cpu.lin_gate),
             lin_value: lin_from_nn(gpu, &cpu.lin_value),
             lin_down: lin_from_nn(gpu, &cpu.lin_down),
-            gate_pre: None,
-            gate_act: None,
-            value: None,
+            act: Act::default(),
             seq: (0, 0),
         }
     }
@@ -444,12 +535,12 @@ mod tests {
 
         // Forward
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward(&gpu, &DTensor::from_host(&gpu, &x));
+        let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, "y");
 
         // Backward
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward(&gpu, &DTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 3e-3, "dx");
 
         // One AdamW step; compare a representative parameter from each path.
@@ -499,11 +590,11 @@ mod tests {
         let g = Tensor::random(&[b, t, h], 1.0);
 
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward(&gpu, &DTensor::from_host(&gpu, &x));
+        let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, "y");
 
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward(&gpu, &DTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 3e-3, "dx");
 
         let mut cfg = AdamCfg::new(1e-3, 0.01);

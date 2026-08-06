@@ -44,7 +44,7 @@
 use std::sync::OnceLock;
 
 use super::block::Cell;
-use super::{DTensor, Gpu, linear::Linear, ops, rms_norm::RmsNorm};
+use super::{DTensor, Gpu, linear::Linear, ops, rms_norm::RmsNorm, Pool};
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
 
@@ -169,6 +169,11 @@ pub struct MLstm {
     headnorm: RmsNorm, // head-wise (group == dhv)
 
     saved: Option<Cache>,
+    /// Scratch buffers for this cell's temporaries, recycled by size. The
+    /// projections and head-major reorgs produce a dozen values that die within
+    /// the same call; pooling them means the cell converges on the peak number
+    /// live at once instead of reallocating each one every window.
+    pool: Pool,
 }
 
 impl MLstm {
@@ -214,6 +219,7 @@ impl MLstm {
             lin_out: Linear::from_parts(gpu, w_out, b_out),
             headnorm: RmsNorm::from_parts_grouped(gpu, gamma, dhv),
             saved: None,
+            pool: Pool::default(),
         }
     }
 
@@ -360,7 +366,16 @@ impl MLstm {
     /// the parallel (attention) form over its own `[BH, L, L]` decay matrix, with
     /// the recurrent state `(C, n, m)` carried across chunk boundaries. One chunk
     /// covering the whole sequence reduces to the single-chunk form.
-    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
+        let out = self.forward_alloc(gpu, x);
+        gpu.stream
+            .memcpy_dtod(&out.buf, &mut y.buf)
+            .expect("MLstm::forward — copy out");
+    }
+
+    /// The chunkwise core, returning its own output buffer. `forward` copies that
+    /// into the caller's; the internals still allocate their per-chunk temporaries.
+    pub fn forward_alloc(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
         assert_eq!(x.rank, 3, "MLstm::forward expects [B, T, in]");
         let (b, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);
         assert_eq!(
@@ -370,33 +385,56 @@ impl MLstm {
         let (d, h, dqk, dhv) = (self.d, self.heads, self.dqk, self.dhv);
         let (n, bh) = (b * t, b * h);
 
-        // Projections on the flat [N, in] view.
-        let xf = x.dup(gpu).reshaped(&[n, inp]);
-        let q = self.lin_q.forward(gpu, &xf);
-        let mut k = self.lin_k.forward(gpu, &xf);
+        // Projections on the flat [N, in] view. Every one of these is consumed by
+        // the head-major reorg below and then dead, so they come from the pool and
+        // go straight back — the cell holds one set of them, not one per call.
+        // Widths differ per projection — q/k are `heads·dqk`, v/o are `heads·dhv`
+        // (== d), i/f are one logit per head — so each buffer is sized from its own
+        // layer rather than assuming `d`.
+        let mut xf = self.pool.take(gpu, &[n, inp]);
+        gpu.stream.memcpy_dtod(&x.buf, &mut xf.buf).expect("copy x");
+        let mut q = self.pool.take(gpu, &[n, self.lin_q.output_size()]);
+        self.lin_q.forward(gpu, &xf, &mut q);
+        let mut k = self.pool.take(gpu, &[n, self.lin_k.output_size()]);
+        self.lin_k.forward(gpu, &xf, &mut k);
         ops::scale_(gpu, &mut k, self.inv_sqrt_dqk);
-        let v = self.lin_v.forward(gpu, &xf);
-        let mut o = self.lin_o.forward(gpu, &xf);
+        let mut v = self.pool.take(gpu, &[n, self.lin_v.output_size()]);
+        self.lin_v.forward(gpu, &xf, &mut v);
+        let mut o = self.pool.take(gpu, &[n, self.lin_o.output_size()]);
+        self.lin_o.forward(gpu, &xf, &mut o);
         ops::sigmoid_(gpu, &mut o);
-        let ig = self.lin_i.forward(gpu, &xf); // [N, H]
-        let fg = self.lin_f.forward(gpu, &xf); // [N, H]
+        let mut ig = self.pool.take(gpu, &[n, self.lin_i.output_size()]); // [N, H]
+        self.lin_i.forward(gpu, &xf, &mut ig);
+        let mut fg = self.pool.take(gpu, &[n, self.lin_f.output_size()]); // [N, H]
+        self.lin_f.forward(gpu, &xf, &mut fg);
+        self.pool.put(xf);
 
-        // Head-major reorg for the per-(b,h) batched matmuls.
+        // Head-major reorg for the per-(b,h) batched matmuls. These outlive the
+        // call (backward reads them), so they are NOT pooled.
         let qh = ops::head_gather(gpu, &q, b, h, t, dqk); // [BH, T, dqk]
         let kh = ops::head_gather(gpu, &k, b, h, t, dqk);
         let vh = ops::head_gather(gpu, &v, b, h, t, dhv); // [BH, T, dhv]
         let igh = ops::head_gather(gpu, &ig, b, h, t, 1).reshaped(&[bh, t]); // [BH, T]
         let fgh = ops::head_gather(gpu, &fg, b, h, t, 1).reshaped(&[bh, t]);
+        // The position-major projections are dead now that they are head-major.
+        self.pool.put_all([q, k, v, ig, fg]);
 
         // The fused kernels do the whole chunkwise core — states and all chunks — in
         // three launches. Everything before and after (projections, head norm, the
         // o-gate, the output projection) is shared with the path below.
         if let Some(l) = self.fused_chunk(gpu, t) {
             let fused = ops::mlstm_fused_fw(gpu, &qh, &kh, &vh, &igh, &fgh, l);
-            let h_tilde = ops::head_scatter(gpu, &fused.ytil, b, h, t, dhv); // [N, d]
-            let yhat = self.headnorm.forward(gpu, &h_tilde);
-            let hconcat = ops::mul(gpu, &o, &yhat);
-            let out = self.lin_out.forward(gpu, &hconcat);
+            // `h_tilde` and `hconcat` die inside this block; `yhat` is cached for
+            // backward, so only the first two are pooled.
+            let mut h_tilde = self.pool.take(gpu, &[n, d]); // [N, d]
+            ops::head_scatter_into(gpu, &fused.ytil, b, h, t, dhv, &mut h_tilde);
+            let mut yhat = DTensor::uninit(gpu, &[n, d]);
+            self.headnorm.forward(gpu, &h_tilde, &mut yhat);
+            self.pool.put(h_tilde);
+            let mut hconcat = self.pool.take(gpu, &[n, d]);
+            ops::mul_into(gpu, &o, &yhat, &mut hconcat);
+            let out = self.lin_out.forward_alloc(gpu, &hconcat);
+            self.pool.put(hconcat);
             self.saved = Some(Cache::Fused(SavedFused {
                 b,
                 t,
@@ -505,9 +543,9 @@ impl MLstm {
 
         // Back to position-major, head-norm, o-gate, output projection.
         let h_tilde = ops::head_scatter(gpu, &ytil, b, h, t, dhv); // [N, d]
-        let yhat = self.headnorm.forward(gpu, &h_tilde);
+        let yhat = self.headnorm.forward_alloc(gpu, &h_tilde);
         let hconcat = ops::mul(gpu, &o, &yhat); // o ⊙ ŷ  [N, d]
-        let out = self.lin_out.forward(gpu, &hconcat); // [N, d]
+        let out = self.lin_out.forward_alloc(gpu, &hconcat); // [N, d]
 
         // `o`/`yhat` are unused after `mul`, so move (not dup) them into the cache.
         self.saved = Some(Cache::Legacy(Saved {
@@ -524,12 +562,28 @@ impl MLstm {
         out.reshaped(&[b, t, d])
     }
 
+    /// Backward into a freshly allocated `dx` `[B, T, in]` — the by-value
+    /// companion to [`backward`](Self::backward).
+    pub fn backward_alloc_dx(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+        let mut dx =
+            DTensor::uninit(gpu, &[dy.shape[0], dy.shape[1], self.input_size]);
+        self.backward(gpu, dy, &mut dx);
+        dx
+    }
+
     /// Backward over `[B, T, d]` → `dx` `[B, T, in]`. Accumulates all grads.
     ///
     /// Chunks are swept in reverse, carrying `dC`/`dn` (the grad wrt the state a
     /// chunk hands to its successor) backwards the way forward carried `C`/`n`
     /// forwards — BPTT over chunks, with the parallel form inside each.
-    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+        let out = self.backward_alloc(gpu, dy);
+        gpu.stream
+            .memcpy_dtod(&out.buf, &mut dx.buf)
+            .expect("MLstm::backward — copy dx");
+    }
+
+    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
         // `take`, not `as_ref`: the cache holds a window's activations, and dropping
         // them at the end of this call (rather than when the next forward overwrites
         // the field) keeps them from staying resident across the optimizer step.
@@ -546,11 +600,24 @@ impl MLstm {
         let (b, t) = (sv.b, sv.t);
         let (n, bh) = (b * t, b * h);
 
-        let dy_flat = dy.dup(gpu).reshaped(&[n, d]);
-        let d_hconcat = self.lin_out.backward(gpu, &dy_flat);
+        // The whole shell is temporaries: each value below dies as soon as the next
+        // op has read it, so all of them come from the pool and go back.
+        let mut dy_flat = self.pool.take(gpu, &[n, d]);
+        gpu.stream
+            .memcpy_dtod(&dy.buf, &mut dy_flat.buf)
+            .expect("copy dy");
+        let mut d_hconcat = self.pool.take(gpu, &[n, d]);
+        self.lin_out.backward(gpu, &dy_flat, &mut d_hconcat);
+        self.pool.put(dy_flat);
         let (do_pre, d_yhat) = ops::ogate_bwd(gpu, &d_hconcat, &sv.o, &sv.yhat);
-        let d_h_tilde = self.headnorm.backward(gpu, &d_yhat);
+        self.pool.put(d_hconcat);
+        let mut d_h_tilde = self.pool.take(gpu, &[n, d]);
+        self.headnorm.backward(gpu, &d_yhat, &mut d_h_tilde);
         let d_ytil = ops::head_gather(gpu, &d_h_tilde, b, h, t, dhv); // [BH, T, dhv]
+        // `d_h_tilde` is the pool's; `d_yhat` came from `ogate_bwd`, so it is only
+        // dropped — see the note at the end of this function.
+        self.pool.put(d_h_tilde);
+        drop(d_yhat);
 
         let (dqh, dkh, dvh, digh, dfgh) = ops::mlstm_fused_bw(
             gpu, &sv.fused, &sv.qh, &sv.kh, &sv.vh, &sv.igh, &sv.fgh, &d_ytil,
@@ -563,13 +630,31 @@ impl MLstm {
         let d_ig = ops::head_scatter(gpu, &digh.reshaped(&[bh, t, 1]), b, h, t, 1);
         let d_fg = ops::head_scatter(gpu, &dfgh.reshaped(&[bh, t, 1]), b, h, t, 1);
 
-        let mut dxf = self.lin_q.backward(gpu, &dq);
-        dxf = ops::add(gpu, &dxf, &self.lin_k.backward(gpu, &dk));
-        dxf = ops::add(gpu, &dxf, &self.lin_v.backward(gpu, &dv));
-        dxf = ops::add(gpu, &dxf, &self.lin_o.backward(gpu, &do_pre));
-        dxf = ops::add(gpu, &dxf, &self.lin_i.backward(gpu, &d_ig));
-        dxf = ops::add(gpu, &dxf, &self.lin_f.backward(gpu, &d_fg));
-        dxf.reshaped(&[b, t, inp])
+        // dx is the sum of six projection backwards. Two buffers ping-pong the
+        // running total — `add_into`'s destination must not be one of its operands
+        // — instead of a fresh [N, in] allocation per `add`.
+        let mut acc = DTensor::uninit(gpu, &[n, inp]);
+        self.lin_q.backward(gpu, &dq, &mut acc);
+        let mut part = self.pool.take(gpu, &[n, inp]);
+        let mut sum = self.pool.take(gpu, &[n, inp]);
+        for (lin, grad) in [
+            (&mut self.lin_k, &dk),
+            (&mut self.lin_v, &dv),
+            (&mut self.lin_o, &do_pre),
+            (&mut self.lin_i, &d_ig),
+            (&mut self.lin_f, &d_fg),
+        ] {
+            lin.backward(gpu, grad, &mut part);
+            ops::add_into(gpu, &acc, &part, &mut sum);
+            std::mem::swap(&mut acc, &mut sum);
+        }
+        // Only `part` and `sum` came from the pool; `dq`..`d_fg` were allocated by
+        // `head_scatter` and `ogate_bwd`, so they are dropped, not donated. Handing
+        // the pool buffers it never lent would grow the free list by five per
+        // window — a leak, not a cache.
+        self.pool.put_all([part, sum]);
+        drop((dq, dk, dv, do_pre, d_ig, d_fg));
+        acc.reshaped(&[b, t, inp])
     }
 
     fn backward_legacy(&mut self, gpu: &Gpu, dy: &DTensor, sv: Saved) -> DTensor {
@@ -581,11 +666,11 @@ impl MLstm {
         let dy_flat = dy.dup(gpu).reshaped(&[n, d]);
 
         // Output projection + o-gate.
-        let d_hconcat = self.lin_out.backward(gpu, &dy_flat); // [N, d]
+        let d_hconcat = self.lin_out.backward_alloc(gpu, &dy_flat); // [N, d]
         let (do_pre, d_yhat) = ops::ogate_bwd(gpu, &d_hconcat, &sv.o, &sv.yhat);
 
         // Head-norm backward → d_h_tilde, then head-gather to head-major d_ytil.
-        let d_h_tilde = self.headnorm.backward(gpu, &d_yhat); // [N, d]
+        let d_h_tilde = self.headnorm.backward_alloc(gpu, &d_yhat); // [N, d]
         let d_ytil = ops::head_gather(gpu, &d_h_tilde, b, h, t, dhv); // [BH, T, dhv]
 
         // Full-sequence grad buffers; each chunk writes its own disjoint T-range.
@@ -748,12 +833,12 @@ impl MLstm {
         let d_fg = ops::head_scatter(gpu, &d_fgh3, b, h, t, 1);
 
         // Projection backward; sum the input grads (all share the saved xf).
-        let mut dxf = self.lin_q.backward(gpu, &dq);
-        dxf = ops::add(gpu, &dxf, &self.lin_k.backward(gpu, &dk));
-        dxf = ops::add(gpu, &dxf, &self.lin_v.backward(gpu, &dv));
-        dxf = ops::add(gpu, &dxf, &self.lin_o.backward(gpu, &do_pre));
-        dxf = ops::add(gpu, &dxf, &self.lin_i.backward(gpu, &d_ig));
-        dxf = ops::add(gpu, &dxf, &self.lin_f.backward(gpu, &d_fg));
+        let mut dxf = self.lin_q.backward_alloc(gpu, &dq);
+        dxf = ops::add(gpu, &dxf, &self.lin_k.backward_alloc(gpu, &dk));
+        dxf = ops::add(gpu, &dxf, &self.lin_v.backward_alloc(gpu, &dv));
+        dxf = ops::add(gpu, &dxf, &self.lin_o.backward_alloc(gpu, &do_pre));
+        dxf = ops::add(gpu, &dxf, &self.lin_i.backward_alloc(gpu, &d_ig));
+        dxf = ops::add(gpu, &dxf, &self.lin_f.backward_alloc(gpu, &d_fg));
         dxf.reshaped(&[b, t, inp])
     }
 
@@ -809,11 +894,11 @@ impl MLstm {
 }
 
 impl Cell for MLstm {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
-        MLstm::forward(self, gpu, x)
+    fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
+        MLstm::forward(self, gpu, x, out)
     }
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
-        MLstm::backward(self, gpu, dy)
+    fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+        MLstm::backward(self, gpu, dy, dx)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {
         MLstm::zero_grad(self, gpu)
@@ -887,12 +972,12 @@ mod tests {
 
         // Forward
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward(&gpu, &DTensor::from_host(&gpu, &x));
+        let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, "y");
 
         // Backward
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward(&gpu, &DTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 3e-3, "dx");
 
         // One AdamW step; compare representative updated parameters.
@@ -949,8 +1034,8 @@ mod tests {
         let run = |chunk: usize| {
             let mut dev = MLstm::from_cpu(&gpu, &proto);
             dev.set_chunk(chunk);
-            let y = dev.forward(&gpu, &dx).to_host(&gpu).data;
-            let dxo = dev.backward(&gpu, &dg).to_host(&gpu).data;
+            let y = dev.forward_alloc(&gpu, &dx).to_host(&gpu).data;
+            let dxo = dev.backward_alloc(&gpu, &dg).to_host(&gpu).data;
             let mut cfg = AdamCfg::new(1e-3, 0.01);
             cfg.t = 1;
             dev.step(&gpu, &cfg);
@@ -1001,8 +1086,8 @@ mod tests {
         let run = |chunk: usize| {
             let mut dev = MLstm::from_cpu(&gpu, &proto);
             dev.set_chunk(chunk);
-            let y = dev.forward(&gpu, &x).to_host(&gpu).data;
-            let dx = dev.backward(&gpu, &g).to_host(&gpu).data;
+            let y = dev.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let dx = dev.backward_alloc(&gpu, &g).to_host(&gpu).data;
             let mut cfg = AdamCfg::new(1e-3, 0.01);
             cfg.t = 1;
             dev.step(&gpu, &cfg);
@@ -1025,17 +1110,31 @@ mod tests {
         assert_close(&wo1, &wo0, 2e-5, "w_out");
     }
 
-    /// Restores the tensor-core path on scope exit, panic or not, so one test's A/B
-    /// cannot leak its setting into whichever test the harness runs next.
-    struct MmaGuard;
+    /// Serializes the tests that select a kernel path through the process-global
+    /// mma flag. Cargo runs a suite's tests on parallel threads in ONE process, so
+    /// the flag is shared: without this lock, `mlstm_fused_matches_legacy` (which
+    /// wants the scalar dots) and `mlstm_fused_mma_matches_scalar` (which wants the
+    /// tensor-core dots) race, and whichever loses runs against the other's kernel
+    /// and misses its tolerance. That was an intermittent failure in roughly half
+    /// of full-suite runs while passing whenever either test ran alone.
+    static MMA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds the flag for the caller's scope and restores it on exit, panic or not,
+    /// so one test's A/B neither races nor leaks into the next.
+    struct MmaGuard(Option<std::sync::MutexGuard<'static, ()>>);
     impl Drop for MmaGuard {
         fn drop(&mut self) {
             super::ops::set_mma_enabled(true);
+            // Release the lock only after the flag is back to its default.
+            self.0.take();
         }
     }
     fn with_mma(on: bool) -> MmaGuard {
+        // A poisoned lock just means some earlier test panicked; the flag is reset
+        // by that test's own guard, so the state is still sound to take over.
+        let g = MMA_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         super::ops::set_mma_enabled(on);
-        MmaGuard
+        MmaGuard(Some(g))
     }
 
     /// The tensor-core (`mma.sync`, TF32) forward against the scalar fp32 one, at
@@ -1078,8 +1177,8 @@ mod tests {
             let _guard = with_mma(mma);
             let mut dev = MLstm::from_cpu(&gpu, &proto);
             dev.set_chunk(32);
-            let y = dev.forward(&gpu, &x).to_host(&gpu).data;
-            let dx = dev.backward(&gpu, &g).to_host(&gpu).data;
+            let y = dev.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let dx = dev.backward_alloc(&gpu, &g).to_host(&gpu).data;
             (y, dx)
         };
 
@@ -1129,11 +1228,11 @@ mod tests {
         let g = Tensor::random(&[b, t, d], 1.0);
 
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward(&gpu, &DTensor::from_host(&gpu, &x));
+        let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, "y");
 
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward(&gpu, &DTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 3e-3, "dx");
 
         let mut cfg = AdamCfg::new(1e-3, 0.01);

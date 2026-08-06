@@ -440,8 +440,11 @@ impl Hierarchical {
             let d_ids = ops::upload_ids_u32(gpu, &lay.ids);
             let embedded = ops::embedding_gather_u32(gpu, &self.table, &d_ids, lay.ids.len(), hc);
             let mut h = embedded.reshaped(&[grp.len(), tmax, hc]);
+            // Blocks are H-in == H-out, so one spare buffer ping-pongs the stack.
+            let mut next = DTensor::uninit(gpu, &[grp.len(), tmax, hc]);
             for blk in self.encoder.blocks.iter_mut() {
-                h = blk.forward(gpu, &h);
+                blk.forward(gpu, &h, &mut next);
+                std::mem::swap(&mut h, &mut next);
             }
             let h_flat = h.reshaped(&[grp.len() * tmax, hc]);
             // e_w = each word's [W]-step row, scattered back to its window slot.
@@ -453,12 +456,14 @@ impl Hierarchical {
         mark("encoder fwd");
 
         // PHASE 2: BACKBONE
-        let bb_in = self.bb_front.forward(gpu, &e_w); // [dw, WH]
+        let bb_in = self.bb_front.forward_alloc(gpu, &e_w); // [dw, WH]
         let mut hb = bb_in.reshaped(&[1, dw, wh]);
+        let mut hb_next = DTensor::uninit(gpu, &[1, dw, wh]);
         for blk in self.bb_blocks.iter_mut() {
-            hb = blk.forward(gpu, &hb);
+            blk.forward(gpu, &hb, &mut hb_next);
+            std::mem::swap(&mut hb, &mut hb_next);
         }
-        let o = self.bb_back.forward(gpu, &hb.reshaped(&[dw, wh])); // [dw, HC]
+        let o = self.bb_back.forward_alloc(gpu, &hb.reshaped(&[dw, wh])); // [dw, HC]
         mark("backbone fwd");
 
         // PHASE 3: DECODER (forward + backward, per length group)
@@ -539,11 +544,13 @@ impl Hierarchical {
             ops::scatter_rows_u32(gpu, &mut dec_in, &char_vecs, &d_char_rows);
 
             let mut hd = dec_in.reshaped(&[n_g, tmax, hc]);
+            let mut hd_next = DTensor::uninit(gpu, &[n_g, tmax, hc]);
             for blk in self.dec_blocks.iter_mut() {
-                hd = blk.forward(gpu, &hd);
+                blk.forward(gpu, &hd, &mut hd_next);
+                std::mem::swap(&mut hd, &mut hd_next);
             }
-            let hdn = self.dec_norm.forward(gpu, &hd.reshaped(&[rows, hc]));
-            let logits = self.dec_head.forward(gpu, &hdn);
+            let hdn = self.dec_norm.forward_alloc(gpu, &hd.reshaped(&[rows, hc]));
+            let logits = self.dec_head.forward_alloc(gpu, &hdn);
             let capped = ops::softcap_forward(gpu, &logits, self.cfg.cap);
 
             let (l, d_capped) =
@@ -551,11 +558,13 @@ impl Hierarchical {
             loss += l;
 
             let d_logits = ops::softcap_backward(gpu, &d_capped, &capped, self.cfg.cap);
-            let d_hdn = self.dec_head.backward(gpu, &d_logits);
-            let d_hd_flat = self.dec_norm.backward(gpu, &d_hdn);
+            let d_hdn = self.dec_head.backward_alloc(gpu, &d_logits);
+            let d_hd_flat = self.dec_norm.backward_alloc(gpu, &d_hdn);
             let mut d_hd = d_hd_flat.reshaped(&[n_g, tmax, hc]);
+            let mut d_hd_next = DTensor::uninit(gpu, &[n_g, tmax, hc]);
             for blk in self.dec_blocks.iter_mut().rev() {
-                d_hd = blk.backward(gpu, &d_hd);
+                blk.backward(gpu, &d_hd, &mut d_hd_next);
+                std::mem::swap(&mut d_hd, &mut d_hd_next);
             }
             let d_dec_in = d_hd.reshaped(&[rows, hc]);
             // Slot 0 rows → d_o; char-slot rows → tied table (gather then scatter-add).
@@ -575,12 +584,14 @@ impl Hierarchical {
         mark("decoder fwd + bwd");
 
         // Backbone backward.
-        let d_bb_out = self.bb_back.backward(gpu, &d_o); // [dw, WH]
+        let d_bb_out = self.bb_back.backward_alloc(gpu, &d_o); // [dw, WH]
         let mut d_hb = d_bb_out.reshaped(&[1, dw, wh]);
+        let mut d_hb_next = DTensor::uninit(gpu, &[1, dw, wh]);
         for blk in self.bb_blocks.iter_mut().rev() {
-            d_hb = blk.backward(gpu, &d_hb);
+            blk.backward(gpu, &d_hb, &mut d_hb_next);
+            std::mem::swap(&mut d_hb, &mut d_hb_next);
         }
-        let d_e_w = self.bb_front.backward(gpu, &d_hb.reshaped(&[dw, wh])); // [dw, HC]
+        let d_e_w = self.bb_front.backward_alloc(gpu, &d_hb.reshaped(&[dw, wh])); // [dw, HC]
         mark("backbone bwd");
 
         // ENCODER BACKWARD (per group, re-forwarded)
@@ -597,10 +608,12 @@ impl Hierarchical {
             let d_ids = ops::upload_ids_u32(gpu, &lay.ids);
             let embedded = ops::embedding_gather_u32(gpu, &self.table, &d_ids, lay.ids.len(), hc);
             let mut h = embedded.reshaped(&[grp.len(), tmax, hc]);
+            let mut next = DTensor::uninit(gpu, &[grp.len(), tmax, hc]);
             for blk in self.encoder.blocks.iter_mut() {
-                h = blk.forward(gpu, &h);
+                blk.forward(gpu, &h, &mut next);
+                std::mem::swap(&mut h, &mut next);
             }
-            drop(h);
+            drop((h, next));
 
             // Scatter this group's d_e_w onto its [W]-step rows, rest zero.
             sc.grp_ids.clear();
@@ -611,8 +624,10 @@ impl Hierarchical {
             let d_readout = ops::upload_ids_u32(gpu, &lay.readout);
             ops::scatter_rows_u32(gpu, &mut d_h, &d_e_w_grp, &d_readout);
             let mut d_h = d_h.reshaped(&[grp.len(), tmax, hc]);
+            let mut d_h_next = DTensor::uninit(gpu, &[grp.len(), tmax, hc]);
             for blk in self.encoder.blocks.iter_mut().rev() {
-                d_h = blk.backward(gpu, &d_h);
+                blk.backward(gpu, &d_h, &mut d_h_next);
+                std::mem::swap(&mut d_h, &mut d_h_next);
             }
             let d_embedded = d_h.reshaped(&[grp.len() * tmax, hc]);
             ops::embedding_scatter_add_u32(

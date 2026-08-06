@@ -107,6 +107,26 @@ impl DTensor {
         self
     }
 
+    /// Reinterpret this tensor's shape **in place**, keeping the same device
+    /// buffer (metadata-only, no copy).
+    ///
+    /// [`reshaped`](Self::reshaped) consumes `self`, which a layer-owned buffer
+    /// borrowed as `&mut DTensor` cannot give up. This is the in-place form, used
+    /// where an owned buffer must be seen as `[B,T,H]` by one op and `[N,H]` by
+    /// the next. Panics if the element count would change.
+    pub fn reshape_to(&mut self, dims: &[usize]) {
+        assert!(
+            dims.len() <= MAX_RANK,
+            "reshape rank {} exceeds MAX_RANK",
+            dims.len()
+        );
+        let n: usize = dims.iter().product();
+        assert_eq!(n, self.buf.len(), "reshape changes element count");
+        self.shape = [0usize; MAX_RANK];
+        self.shape[..dims.len()].copy_from_slice(dims);
+        self.rank = dims.len();
+    }
+
     #[inline]
     pub fn dims(&self) -> &[usize] {
         &self.shape[..self.rank]

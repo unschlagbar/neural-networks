@@ -89,9 +89,9 @@ impl Flat {
     /// Forward to capped logits `[B, vocab]`. Caches everything backward needs.
     pub fn forward(&mut self, gpu: &Gpu, ids: &[usize]) -> DTensor {
         let e = ops::embedding_gather(gpu, &self.table, ids, self.dim);
-        let h = self.lin1.forward(gpu, &e);
+        let h = self.lin1.forward_alloc(gpu, &e);
         let (rms_out, rms) = ops::rms_norm_forward(gpu, &h, &self.gamma, self.hidden, EPS);
-        let pre = self.head.forward(gpu, &rms_out);
+        let pre = self.head.forward_alloc(gpu, &rms_out);
         let logits = ops::softcap_forward(gpu, &pre, self.cap);
         self.ids = ids.to_vec();
         self.rms = Some(rms);
@@ -105,7 +105,7 @@ impl Flat {
         let logits = self.logits.as_ref().expect("forward before backward");
         let rms = self.rms.as_ref().expect("forward before backward");
         let d_pre = ops::softcap_backward(gpu, dlogits, logits, self.cap);
-        let d_rmsout = self.head.backward(gpu, &d_pre);
+        let d_rmsout = self.head.backward_alloc(gpu, &d_pre);
         let d_h = ops::rms_norm_backward(
             gpu,
             &d_rmsout,
@@ -114,7 +114,7 @@ impl Flat {
             &mut self.dgamma,
             self.hidden,
         );
-        let d_e = self.lin1.backward(gpu, &d_h);
+        let d_e = self.lin1.backward_alloc(gpu, &d_h);
         ops::embedding_scatter_add(gpu, &mut self.dtable, &self.ids, &d_e, self.dim);
     }
 

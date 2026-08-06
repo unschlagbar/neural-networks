@@ -59,17 +59,20 @@ impl Linear {
         self.output
     }
 
-    /// `Y = X · W + b`, `x` is `[B, in]`, result `[B, out]`. Saves `x` for backward.
-    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+    /// `Y = X · W + b` into the caller's `y` `[B, out]`; `x` is `[B, in]`. Saves
+    /// `x` for backward.
+    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
         let b = x.rows();
         assert_eq!(
             x.cols(),
             self.input,
             "Linear::forward — input width mismatch"
         );
+        assert_eq!(y.dims(), [b, self.output], "Linear::forward — output shape");
         // Reuse the saved-input buffer when the batch size is unchanged (steady
         // state), else reallocate — avoids a per-call device allocation.
-        if self.x.rank == 2 && self.x.rows() == b {
+        if self.x.len() == b * self.input {
+            self.x.reshape_to(&[b, self.input]);
             gpu.stream
                 .memcpy_dtod(&x.buf, &mut self.x.buf)
                 .expect("save x");
@@ -78,14 +81,32 @@ impl Linear {
         }
         // Seed each output row with the bias (fills y entirely, so uninit is safe),
         // then accumulate X·W on top (beta=1).
-        let mut y = DTensor::uninit(gpu, &[b, self.output]);
-        ops::broadcast_row(gpu, &mut y, &self.b);
-        ops::matmul_nn_into(gpu, x, &self.w, &mut y, 1.0);
+        ops::broadcast_row(gpu, y, &self.b);
+        ops::matmul_nn_into(gpu, x, &self.w, y, 1.0);
+    }
+
+    /// `Y = X · W + b` into a freshly allocated `[B, out]`.
+    ///
+    /// The allocation-free [`forward`](Self::forward) is the one to use on a hot
+    /// path; this exists for call sites that still compose by value (mLSTM's
+    /// projection shell), where the output feeds straight into the next op.
+    pub fn forward_alloc(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+        let mut y = DTensor::uninit(gpu, &[x.rows(), self.output]);
+        self.forward(gpu, x, &mut y);
         y
     }
 
-    /// Given `dY` `[B, out]`, accumulate `dW`/`db` and return `dX = dY · Wᵀ`.
-    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+    /// Backward into a freshly allocated `dX` `[B, in]` — the by-value companion
+    /// to [`backward`](Self::backward).
+    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+        let mut dx = DTensor::uninit(gpu, &[dy.rows(), self.input]);
+        self.backward(gpu, dy, &mut dx);
+        dx
+    }
+
+    /// Given `dY` `[B, out]`, accumulate `dW`/`db` and write `dX = dY · Wᵀ` into
+    /// `dx` `[B, in]`.
+    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
         assert_eq!(
             dy.cols(),
             self.output,
@@ -96,11 +117,16 @@ impl Linear {
             dy.rows(),
             "Linear::backward — batch mismatch"
         );
+        assert_eq!(
+            dx.dims(),
+            [dy.rows(), self.input],
+            "Linear::backward — dx shape"
+        );
         // dW += Xᵀ · dY ; db += Σ_batch dY
         ops::matmul_tn_into(gpu, &self.x, dy, &mut self.dw, 1.0);
         ops::add_col_sum(gpu, &mut self.db, dy);
         // dX = dY · Wᵀ (cuBLAS transposes W(in×out) internally — no host transpose).
-        ops::matmul_nt(gpu, dy, &self.w)
+        ops::matmul_nt_into(gpu, dy, &self.w, dx, 0.0);
     }
 
     /// Freshly-initialised layer, matching `nn2::Linear::new`'s init exactly
@@ -199,12 +225,12 @@ mod tests {
 
         // Forward
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward(&gpu, &DTensor::from_host(&gpu, &x));
+        let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 1e-3);
 
         // Backward
         let dx_cpu = cpu.backward(&dy);
-        let dx_dev = dev.backward(&gpu, &DTensor::from_host(&gpu, &dy));
+        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &dy));
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 1e-3);
         assert_close(&dev.dw.to_host(&gpu).data, &cpu.dw.data, 1e-3);
         assert_close(&dev.db.to_host(&gpu).data, &cpu.db.data, 1e-3);

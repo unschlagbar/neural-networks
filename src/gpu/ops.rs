@@ -379,29 +379,56 @@ pub fn rms_norm_forward(
     eps: f32,
 ) -> (DTensor, GpuRmsForward) {
     let (b, f) = (x.rows(), x.cols());
+    let total_groups = b * (f / group);
+    let mut out = DTensor::uninit(gpu, &[b, f]);
+    let mut saved = GpuRmsForward {
+        x_hat: DTensor::uninit(gpu, &[b, f]),
+        inv_rms: gpu
+            .stream
+            .alloc_zeros::<f32>(total_groups)
+            .expect("alloc inv_rms"),
+    };
+    rms_norm_forward_into(gpu, x, gamma, group, eps, &mut out, &mut saved);
+    (out, saved)
+}
+
+/// Grouped RMSNorm forward into caller-owned buffers — the no-allocation form of
+/// [`rms_norm_forward`]. `out` and `saved.x_hat` must be `[B, F]`, and
+/// `saved.inv_rms` must hold `B * F/group` elements; the kernel writes all three
+/// in full, so their prior contents do not matter.
+pub fn rms_norm_forward_into(
+    gpu: &Gpu,
+    x: &DTensor,
+    gamma: &DTensor,
+    group: usize,
+    eps: f32,
+    out: &mut DTensor,
+    saved: &mut GpuRmsForward,
+) {
+    let (b, f) = (x.rows(), x.cols());
     let groups_per_row = f / group;
     let total_groups = b * groups_per_row;
-    let mut out = DTensor::uninit(gpu, &[b, f]);
-    let mut x_hat = DTensor::uninit(gpu, &[b, f]);
-    let mut inv_rms = gpu
-        .stream
-        .alloc_zeros::<f32>(total_groups)
-        .expect("alloc inv_rms");
+    assert_eq!(out.dims(), [b, f], "rms_norm_forward: out shape");
+    assert_eq!(saved.x_hat.dims(), [b, f], "rms_norm_forward: x_hat shape");
+    assert_eq!(
+        saved.inv_rms.len(),
+        total_groups,
+        "rms_norm_forward: inv_rms length"
+    );
     let (gpr_i, group_i, tg_i) = (groups_per_row as i32, group as i32, total_groups as i32);
     let func = gpu.kernels.get("rms_norm_forward");
     let mut lb = gpu.stream.launch_builder(&func);
     lb.arg(&x.buf)
         .arg(&gamma.buf)
         .arg(&mut out.buf)
-        .arg(&mut x_hat.buf)
-        .arg(&mut inv_rms)
+        .arg(&mut saved.x_hat.buf)
+        .arg(&mut saved.inv_rms)
         .arg(&gpr_i)
         .arg(&group_i)
         .arg(&eps)
         .arg(&tg_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems(total_groups as u32)) }
         .expect("rms_norm_forward");
-    (out, GpuRmsForward { x_hat, inv_rms })
 }
 
 /// Grouped RMSNorm backward. Accumulates γ grad into `dgamma`, returns `dX`.
@@ -413,10 +440,28 @@ pub fn rms_norm_backward(
     dgamma: &mut DTensor,
     group: usize,
 ) -> DTensor {
+    let mut dx = DTensor::uninit(gpu, &[dy.rows(), dy.cols()]);
+    rms_norm_backward_into(gpu, dy, fwd, gamma, dgamma, group, &mut dx);
+    dx
+}
+
+/// Grouped RMSNorm backward into a caller-owned `dx` — the no-allocation form of
+/// [`rms_norm_backward`]. `dgamma` is accumulated into (not overwritten); `dx` is
+/// written in full.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_backward_into(
+    gpu: &Gpu,
+    dy: &DTensor,
+    fwd: &GpuRmsForward,
+    gamma: &DTensor,
+    dgamma: &mut DTensor,
+    group: usize,
+    dx: &mut DTensor,
+) {
     let (b, f) = (dy.rows(), dy.cols());
     let groups_per_row = f / group;
     let total_groups = b * groups_per_row;
-    let mut dx = DTensor::uninit(gpu, &[b, f]);
+    assert_eq!(dx.dims(), [b, f], "rms_norm_backward: dx shape");
     let (gpr_i, group_i, tg_i) = (groups_per_row as i32, group as i32, total_groups as i32);
     let func = gpu.kernels.get("rms_norm_backward");
     let mut lb = gpu.stream.launch_builder(&func);
@@ -431,7 +476,6 @@ pub fn rms_norm_backward(
         .arg(&tg_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems(total_groups as u32)) }
         .expect("rms_norm_backward");
-    dx
 }
 
 /// Fused softmax + cross-entropy. Returns `(mean_loss, dlogits)` with
@@ -1180,24 +1224,49 @@ pub fn slstm_step_fused_bwd(
 /// Elementwise `out = a + b` (fresh allocation). Used for residual adds and the
 /// grad accumulations that are plain sums.
 pub fn add(gpu: &Gpu, a: &DTensor, b: &DTensor) -> DTensor {
+    let mut out = DTensor::uninit(gpu, a.dims());
+    add_into(gpu, a, b, &mut out);
+    out
+}
+
+/// Elementwise `out = a + b` into a caller-owned buffer. The allocating [`add`]
+/// is a thin wrapper over this; layers that own their buffers call this directly
+/// so a residual add costs no allocation.
+///
+/// `out` may alias `a` or `b` (the kernel reads element `i` before writing it).
+pub fn add_into(gpu: &Gpu, a: &DTensor, b: &DTensor, out: &mut DTensor) {
     let n = a.len();
     assert_eq!(n, b.len(), "add: length mismatch");
+    assert_eq!(n, out.len(), "add: output length mismatch");
     let n_i = n as i32;
-    let mut out = DTensor::uninit(gpu, a.dims());
     let f = gpu.kernels.get("add");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut out.buf).arg(&a.buf).arg(&b.buf).arg(&n_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("add");
-    out
 }
 
 /// SwiGLU forward: returns `(gate_act = SiLU(gate_pre), mixed = gate_act ⊙ value)`.
 pub fn swiglu_forward(gpu: &Gpu, gate_pre: &DTensor, value: &DTensor) -> (DTensor, DTensor) {
-    let n = gate_pre.len();
-    assert_eq!(n, value.len(), "swiglu_forward: length mismatch");
-    let n_i = n as i32;
     let mut gate_act = DTensor::uninit(gpu, gate_pre.dims());
     let mut mixed = DTensor::uninit(gpu, gate_pre.dims());
+    swiglu_forward_into(gpu, gate_pre, value, &mut gate_act, &mut mixed);
+    (gate_act, mixed)
+}
+
+/// SwiGLU forward into caller-owned buffers — the no-allocation form of
+/// [`swiglu_forward`]. Both outputs are written in full.
+pub fn swiglu_forward_into(
+    gpu: &Gpu,
+    gate_pre: &DTensor,
+    value: &DTensor,
+    gate_act: &mut DTensor,
+    mixed: &mut DTensor,
+) {
+    let n = gate_pre.len();
+    assert_eq!(n, value.len(), "swiglu_forward: length mismatch");
+    assert_eq!(n, gate_act.len(), "swiglu_forward: gate_act length mismatch");
+    assert_eq!(n, mixed.len(), "swiglu_forward: mixed length mismatch");
+    let n_i = n as i32;
     let f = gpu.kernels.get("swiglu_forward");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&gate_pre.buf)
@@ -1206,7 +1275,6 @@ pub fn swiglu_forward(gpu: &Gpu, gate_pre: &DTensor, value: &DTensor) -> (DTenso
         .arg(&mut mixed.buf)
         .arg(&n_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("swiglu_forward");
-    (gate_act, mixed)
 }
 
 /// SwiGLU backward: from `d_mixed` and the saved `gate_act`/`value`/`gate_pre`,
@@ -1218,10 +1286,30 @@ pub fn swiglu_backward(
     value: &DTensor,
     gate_pre: &DTensor,
 ) -> (DTensor, DTensor) {
-    let n = d_mixed.len();
-    let n_i = n as i32;
     let mut d_gate = DTensor::uninit(gpu, d_mixed.dims());
     let mut d_value = DTensor::uninit(gpu, d_mixed.dims());
+    swiglu_backward_into(
+        gpu, d_mixed, gate_act, value, gate_pre, &mut d_gate, &mut d_value,
+    );
+    (d_gate, d_value)
+}
+
+/// SwiGLU backward into caller-owned buffers — the no-allocation form of
+/// [`swiglu_backward`].
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu_backward_into(
+    gpu: &Gpu,
+    d_mixed: &DTensor,
+    gate_act: &DTensor,
+    value: &DTensor,
+    gate_pre: &DTensor,
+    d_gate: &mut DTensor,
+    d_value: &mut DTensor,
+) {
+    let n = d_mixed.len();
+    assert_eq!(n, d_gate.len(), "swiglu_backward: d_gate length mismatch");
+    assert_eq!(n, d_value.len(), "swiglu_backward: d_value length mismatch");
+    let n_i = n as i32;
     let f = gpu.kernels.get("swiglu_backward");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&d_mixed.buf)
@@ -1232,7 +1320,6 @@ pub fn swiglu_backward(
         .arg(&mut d_value.buf)
         .arg(&n_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("swiglu_backward");
-    (d_gate, d_value)
 }
 
 // mLSTM parallel/chunkwise core (see gpu/mlstm.rs).
@@ -1256,6 +1343,22 @@ pub fn head_gather(gpu: &Gpu, x: &DTensor, b: usize, h: usize, t: usize, w: usiz
 /// Head-major `[B*H, T, W]` → position-major `[N, H*W]` (inverse of `head_gather`).
 pub fn head_scatter(gpu: &Gpu, x: &DTensor, b: usize, h: usize, t: usize, w: usize) -> DTensor {
     let mut out = DTensor::uninit(gpu, &[b * t, h * w]);
+    head_scatter_into(gpu, x, b, h, t, w, &mut out);
+    out
+}
+
+/// Head-major `[B*H, T, W]` → position-major `[N, H*W]` into a caller-owned
+/// buffer — the no-allocation form of [`head_scatter`].
+pub fn head_scatter_into(
+    gpu: &Gpu,
+    x: &DTensor,
+    b: usize,
+    h: usize,
+    t: usize,
+    w: usize,
+    out: &mut DTensor,
+) {
+    assert_eq!(out.len(), b * t * h * w, "head_scatter: output size");
     let (bi, hi, ti, wi) = (b as i32, h as i32, t as i32, w as i32);
     let f = gpu.kernels.get("head_scatter");
     let mut lb = gpu.stream.launch_builder(&f);
@@ -1267,7 +1370,6 @@ pub fn head_scatter(gpu: &Gpu, x: &DTensor, b: usize, h: usize, t: usize, w: usi
         .arg(&wi);
     unsafe { lb.launch(LaunchConfig::for_num_elems((b * h * t * w) as u32)) }
         .expect("head_scatter");
-    out
 }
 
 /// Inclusive cumsum of logσ along T, per row of `f` `[BH, T]` → `fc` `[BH, T]`.
@@ -1747,15 +1849,22 @@ pub fn div_rows(gpu: &Gpu, num: &DTensor, psi: &DTensor, dhv: usize) -> DTensor 
 
 /// Elementwise product `out = a ⊙ b` (fresh allocation).
 pub fn mul(gpu: &Gpu, a: &DTensor, b: &DTensor) -> DTensor {
+    let mut out = DTensor::uninit(gpu, a.dims());
+    mul_into(gpu, a, b, &mut out);
+    out
+}
+
+/// Elementwise `out = a * b` into a caller-owned buffer — the no-allocation form
+/// of [`mul`]. `out` may alias either operand.
+pub fn mul_into(gpu: &Gpu, a: &DTensor, b: &DTensor, out: &mut DTensor) {
     let n = a.len();
     assert_eq!(n, b.len(), "mul: length mismatch");
+    assert_eq!(n, out.len(), "mul: output length mismatch");
     let n_i = n as i32;
-    let mut out = DTensor::uninit(gpu, a.dims());
     let f = gpu.kernels.get("mul");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut out.buf).arg(&a.buf).arg(&b.buf).arg(&n_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("mul");
-    out
 }
 
 // Fused chunkwise mLSTM (TFLA). See the kernel block in `gpu/kernels.rs`.

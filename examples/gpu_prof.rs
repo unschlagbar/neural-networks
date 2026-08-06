@@ -91,17 +91,17 @@ fn main() {
         let g = DTensor::zeros(&gpu, &[b, t, h]);
         // warmup
         for blk in blocks.iter_mut() {
-            let _ = blk.forward(&gpu, &x);
+            let _ = blk.forward_alloc(&gpu, &x);
         }
         for blk in blocks.iter_mut().rev() {
-            let _ = blk.backward(&gpu, &g);
+            let _ = blk.backward_alloc(&gpu, &g);
         }
         gpu.stream.synchronize().unwrap();
 
         let t0 = Instant::now();
         let mut h_ = x.dup(&gpu);
         for blk in blocks.iter_mut() {
-            h_ = blk.forward(&gpu, &h_);
+            h_ = blk.forward_alloc(&gpu, &h_);
         }
         gpu.stream.synchronize().unwrap();
         let fwd = t0.elapsed();
@@ -109,7 +109,7 @@ fn main() {
         let t1 = Instant::now();
         let mut d = g.dup(&gpu);
         for blk in blocks.iter_mut().rev() {
-            d = blk.backward(&gpu, &d);
+            d = blk.backward_alloc(&gpu, &d);
         }
         gpu.stream.synchronize().unwrap();
         let bwd = t1.elapsed();
@@ -236,15 +236,15 @@ fn main() {
         let mut cell = SLstm::new_rand(&gpu, wh, wh);
         let x = DTensor::zeros(&gpu, &[1, words, wh]);
         let g = DTensor::zeros(&gpu, &[1, words, wh]);
-        let _ = cell.forward(&gpu, &x);
-        let _ = cell.backward(&gpu, &g);
+        let _ = cell.forward_alloc(&gpu, &x);
+        let _ = cell.backward_alloc(&gpu, &g);
         gpu.stream.synchronize().unwrap();
         let t0 = Instant::now();
-        let _ = cell.forward(&gpu, &x);
+        let _ = cell.forward_alloc(&gpu, &x);
         gpu.stream.synchronize().unwrap();
         let f = t0.elapsed();
         let t1 = Instant::now();
-        let _ = cell.backward(&gpu, &g);
+        let _ = cell.backward_alloc(&gpu, &g);
         gpu.stream.synchronize().unwrap();
         println!(
             "bare sLSTM cell x1          B=1     T={words}  H={wh}  fwd {:>8.1?}  bwd {:>8.1?}",
