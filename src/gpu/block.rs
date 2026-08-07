@@ -22,6 +22,107 @@ use crate::{
     tensor::Tensor,
 };
 
+/// Per-phase timing, off unless `GPU_PHASE=1`.
+///
+/// A block is a cell (the recurrence) wrapped in norms, residuals and a SwiGLU MLP,
+/// and the whole point of a breakdown is to say which of those the time is in. The
+/// GPU is asynchronous, so a phase can only be timed by synchronizing around it —
+/// which perturbs the schedule and is exactly why this is opt-in rather than always
+/// compiled in. Numbers taken with it on are for *attribution*, not for the headline
+/// step time; take that from a run with it off.
+pub mod phase {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// Nanoseconds accumulated per bucket. Index with [`Bucket`].
+    static NS: [AtomicU64; Bucket::COUNT] = [const { AtomicU64::new(0) }; Bucket::COUNT];
+
+    #[derive(Clone, Copy)]
+    pub enum Bucket {
+        SlstmCellFwd = 0,
+        SlstmCellBwd = 1,
+        MlstmCellFwd = 2,
+        MlstmCellBwd = 3,
+        FfnFwd = 4,
+        FfnBwd = 5,
+        /// Norms, residual adds and the block-level buffer copies — everything in a
+        /// block that is neither the cell nor the MLP.
+        GlueFwd = 6,
+        GlueBwd = 7,
+        /// sLSTM sub-phases, so the 70%-of-a-step cell can be broken down further.
+        /// `Copy` is the device-to-device staging of `x`/`dy`/`out` into the buffers
+        /// the cell owns; `Gemm` is the whole-sequence input projection plus
+        /// backward's dx/dW/db GEMMs; `Loop` is the serial T-loop itself.
+        SlstmCopyFwd = 8,
+        SlstmGemmFwd = 9,
+        SlstmLoopFwd = 10,
+        SlstmCopyBwd = 11,
+        SlstmGemmBwd = 12,
+        SlstmLoopBwd = 13,
+    }
+
+    impl Bucket {
+        pub const COUNT: usize = 14;
+        pub const ALL: [(Bucket, &'static str); Self::COUNT] = [
+            (Bucket::SlstmCellFwd, "sLSTM cell"),
+            (Bucket::SlstmCellBwd, "sLSTM cell"),
+            (Bucket::MlstmCellFwd, "mLSTM cell"),
+            (Bucket::MlstmCellBwd, "mLSTM cell"),
+            (Bucket::FfnFwd, "SwiGLU FFN"),
+            (Bucket::FfnBwd, "SwiGLU FFN"),
+            (Bucket::GlueFwd, "norms/residual/copies"),
+            (Bucket::GlueBwd, "norms/residual/copies"),
+            (Bucket::SlstmCopyFwd, "sLSTM copies"),
+            (Bucket::SlstmGemmFwd, "sLSTM gemm"),
+            (Bucket::SlstmLoopFwd, "sLSTM T-loop"),
+            (Bucket::SlstmCopyBwd, "sLSTM copies"),
+            (Bucket::SlstmGemmBwd, "sLSTM gemm"),
+            (Bucket::SlstmLoopBwd, "sLSTM T-loop"),
+        ];
+    }
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("GPU_PHASE").as_deref() == Ok("1"))
+    }
+
+    /// Whether accumulation is currently live — lets a caller skip warmup iters.
+    static RECORDING: AtomicBool = AtomicBool::new(false);
+
+    pub fn set_recording(on: bool) {
+        RECORDING.store(on, Ordering::Relaxed);
+    }
+
+    pub fn reset() {
+        for a in &NS {
+            a.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn add(b: Bucket, ns: u64) {
+        if RECORDING.load(Ordering::Relaxed) {
+            NS[b as usize].fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    pub fn get(b: Bucket) -> u64 {
+        NS[b as usize].load(Ordering::Relaxed)
+    }
+
+    /// Time `f`, attributing it to `b`. Synchronizes on both sides, so the measured
+    /// span is real device time rather than submission time.
+    pub fn timed<R>(gpu: &super::Gpu, b: Bucket, f: impl FnOnce() -> R) -> R {
+        if !enabled() {
+            return f();
+        }
+        gpu.stream.synchronize().expect("sync");
+        let t0 = std::time::Instant::now();
+        let r = f();
+        gpu.stream.synchronize().expect("sync");
+        add(b, t0.elapsed().as_nanos() as u64);
+        r
+    }
+}
+
 /// A recurrent cell operating on `[B, T, H]` device sequences (H in == H out).
 pub trait Cell {
     fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor);
@@ -33,6 +134,9 @@ pub trait Cell {
     /// Whether the surrounding block applies a `post_cell_norm` before the
     /// residual. sLSTM does; mLSTM doesn't (see `nn2::block::Cell`).
     fn wants_post_cell_norm(&self) -> bool;
+    /// Which phase buckets this cell's forward/backward count toward, so a mixed
+    /// stack can be attributed per cell kind. See [`phase`].
+    fn phase_buckets(&self) -> (phase::Bucket, phase::Bucket);
     /// Build the matching CPU `nn` block (`SLSTMBlock` / `MLSTMBlock`) from this
     /// cell plus the already-exported surrounding norms and projections.
     #[allow(clippy::too_many_arguments)]
@@ -68,6 +172,9 @@ impl Cell for SLstm {
     }
     fn wants_post_cell_norm(&self) -> bool {
         true
+    }
+    fn phase_buckets(&self) -> (phase::Bucket, phase::Bucket) {
+        (phase::Bucket::SlstmCellFwd, phase::Bucket::SlstmCellBwd)
     }
     fn to_nn_block(
         &self,
@@ -245,14 +352,23 @@ impl<C: Cell> Block<C> {
         assert_eq!(y.dims(), x.dims(), "Block::forward — output shape");
         let (n, u) = (b * t, self.up);
         self.seq = (b, t);
+        // Whole-block span; `glue` is this minus the cell and FFN spans, i.e. the
+        // norms, residual adds and buffer copies that are neither.
+        let blk_t0 = phase::enabled().then(|| {
+            gpu.stream.synchronize().expect("sync");
+            (
+                std::time::Instant::now(),
+                phase::get(self.cell.phase_buckets().0),
+                phase::get(phase::Bucket::FfnFwd),
+            )
+        });
         let a = &mut self.act;
+        a.pool.assert_drained("Block::forward");
 
         // Owned [N, H] copy of the input: it feeds both the norm path and the
         // residual, and the caller's `x` is only lent to us.
         let mut x_flat = a.pool.take(gpu, &[n, h]);
-        gpu.stream
-            .memcpy_dtod(&x.buf, &mut x_flat.buf)
-            .expect("copy x");
+        x_flat.copy_from(gpu, x);
 
         // Residual 1: z = x + post_cell_norm(cell(pre_norm1(x))). The post-cell
         // norm is skipped for cells that don't want it (mLSTM).
@@ -260,7 +376,8 @@ impl<C: Cell> Block<C> {
         self.pre_norm1.forward(gpu, &x_flat, &mut xn1);
         xn1.reshape_to(&[b, t, h]);
         let mut cell_out = a.pool.take(gpu, &[b, t, h]);
-        self.cell.forward(gpu, &xn1, &mut cell_out);
+        let (cf, _cb) = self.cell.phase_buckets();
+        phase::timed(gpu, cf, || self.cell.forward(gpu, &xn1, &mut cell_out));
         a.pool.put(xn1);
 
         // Downstream is position-wise [N, H]. With a post-cell norm the normalized
@@ -283,24 +400,33 @@ impl<C: Cell> Block<C> {
         // the only values backward needs, so they alone go to permanent buffers.
         let mut zn = a.pool.take(gpu, &[n, h]);
         self.pre_norm2.forward(gpu, &z, &mut zn);
-        self.lin_gate
-            .forward(gpu, &zn, a.gate_pre.get(gpu, &[n, u]));
-        self.lin_value.forward(gpu, &zn, a.value.get(gpu, &[n, u]));
-        a.pool.put(zn);
         let mut mixed = a.pool.take(gpu, &[n, u]);
-        ops::swiglu_forward_into(
-            gpu,
-            a.gate_pre.expect("projected"),
-            a.value.expect("projected"),
-            a.gate_act.get(gpu, &[n, u]),
-            &mut mixed,
-        );
         let mut down = a.pool.take(gpu, &[n, h]);
-        self.lin_down.forward(gpu, &mixed, &mut down);
+        phase::timed(gpu, phase::Bucket::FfnFwd, || {
+            self.lin_gate
+                .forward(gpu, &zn, a.gate_pre.get(gpu, &[n, u]));
+            self.lin_value.forward(gpu, &zn, a.value.get(gpu, &[n, u]));
+            ops::swiglu_forward_into(
+                gpu,
+                a.gate_pre.expect("projected"),
+                a.value.expect("projected"),
+                a.gate_act.get(gpu, &[n, u]),
+                &mut mixed,
+            );
+            self.lin_down.forward(gpu, &mixed, &mut down);
+        });
+        a.pool.put(zn);
         y.reshape_to(&[n, h]);
         ops::add_into(gpu, &z, &down, y);
         y.reshape_to(&[b, t, h]);
         a.pool.put_all([mixed, down, z]);
+        if let Some((t0, cell0, ffn0)) = blk_t0 {
+            gpu.stream.synchronize().expect("sync");
+            let total = t0.elapsed().as_nanos() as u64;
+            let inner = (phase::get(self.cell.phase_buckets().0) - cell0)
+                + (phase::get(phase::Bucket::FfnFwd) - ffn0);
+            phase::add(phase::Bucket::GlueFwd, total.saturating_sub(inner));
+        }
     }
 
     /// Backward over `[B, T, H]` → `dx` `[B, T, H]`.
@@ -309,16 +435,27 @@ impl<C: Cell> Block<C> {
         let (h, u) = (self.hidden, self.up);
         let n = b * t;
         assert_eq!(dx.dims(), [b, t, h], "Block::backward — dx shape");
+        let blk_t0 = phase::enabled().then(|| {
+            gpu.stream.synchronize().expect("sync");
+            (
+                std::time::Instant::now(),
+                phase::get(self.cell.phase_buckets().1),
+                phase::get(phase::Bucket::FfnBwd),
+            )
+        });
         let a = &mut self.act;
+        a.pool.assert_drained("Block::backward");
 
         // Owned [N, H]: read by lin_down.backward and again by the d_z residual.
         let mut dy_flat = a.pool.take(gpu, &[n, h]);
-        gpu.stream
-            .memcpy_dtod(&dy.buf, &mut dy_flat.buf)
-            .expect("copy dy");
+        dy_flat.copy_from(gpu, dy);
 
         // Residual 2.
         let mut d_mixed = a.pool.take(gpu, &[n, u]);
+        let ffn_t0 = phase::enabled().then(|| {
+            gpu.stream.synchronize().expect("sync");
+            std::time::Instant::now()
+        });
         self.lin_down.backward(gpu, &dy_flat, &mut d_mixed);
         let mut d_gate = a.pool.take(gpu, &[n, u]);
         let mut d_value = a.pool.take(gpu, &[n, u]);
@@ -338,6 +475,10 @@ impl<C: Cell> Block<C> {
         self.lin_value.backward(gpu, &d_value, &mut d_zn_v);
         let mut d_zn = a.pool.take(gpu, &[n, h]);
         ops::add_into(gpu, &d_zn_g, &d_zn_v, &mut d_zn);
+        if let Some(t0) = ffn_t0 {
+            gpu.stream.synchronize().expect("sync");
+            phase::add(phase::Bucket::FfnBwd, t0.elapsed().as_nanos() as u64);
+        }
         a.pool.put_all([d_gate, d_value, d_zn_g, d_zn_v]);
 
         // z feeds pre_norm2 (the MLP path) and the y = z + down residual, so the
@@ -354,14 +495,14 @@ impl<C: Cell> Block<C> {
         let mut d_cell_out = a.pool.take(gpu, &[n, h]);
         match &mut self.post_cell_norm {
             Some(norm) => norm.backward(gpu, &d_z, &mut d_cell_out),
-            None => gpu
-                .stream
-                .memcpy_dtod(&d_z.buf, &mut d_cell_out.buf)
-                .expect("seed d_cell_out"),
+            None => d_cell_out.copy_from(gpu, &d_z),
         }
         d_cell_out.reshape_to(&[b, t, h]);
         let mut d_cell_in = a.pool.take(gpu, &[b, t, h]);
-        self.cell.backward(gpu, &d_cell_out, &mut d_cell_in);
+        let (_cf, cb) = self.cell.phase_buckets();
+        phase::timed(gpu, cb, || {
+            self.cell.backward(gpu, &d_cell_out, &mut d_cell_in)
+        });
         a.pool.put(d_cell_out);
         d_cell_in.reshape_to(&[n, h]);
         let mut d_xn1 = a.pool.take(gpu, &[n, h]);
@@ -371,6 +512,13 @@ impl<C: Cell> Block<C> {
         ops::add_into(gpu, &d_xn1, &d_z, dx);
         dx.reshape_to(&[b, t, h]);
         a.pool.put_all([d_cell_in, d_xn1, d_z]);
+        if let Some((t0, cell0, ffn0)) = blk_t0 {
+            gpu.stream.synchronize().expect("sync");
+            let total = t0.elapsed().as_nanos() as u64;
+            let inner = (phase::get(self.cell.phase_buckets().1) - cell0)
+                + (phase::get(phase::Bucket::FfnBwd) - ffn0);
+            phase::add(phase::Bucket::GlueBwd, total.saturating_sub(inner));
+        }
     }
 
     /// Learnable tensors in a fixed order (checkpoint save/load).
@@ -511,10 +659,69 @@ mod tests {
     use crate::nn2::optim::AdamCfg;
     use crate::tensor::Tensor;
 
-    fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
+    /// Compare with an absolute floor plus a term scaled by the tensor's magnitude.
+    ///
+    /// The scale term is `rel * max|want|`, **not** `rel * |want[i]|`. bf16 slab
+    /// storage perturbs each saved `zt`/`ot` by ~2^-8 of *its own* magnitude, but
+    /// `dx[i]` is a sum over many such terms, so what lands on any one element is an
+    /// absolute error set by the size of the whole tensor. An individual `dx[i]` that
+    /// comes out small does so by cancellation between larger terms — its error does
+    /// not shrink with it, and measured runs show ~0.006-0.027 absolute spread
+    /// roughly evenly whether the element is 0.09 or 4.6.
+    ///
+    /// A per-element relative bound therefore fails on exactly the elements where the
+    /// physics says it should: the near-zero ones. On the fp32 path `rel` is 0 and
+    /// this reduces to the original absolute check.
+    fn assert_close_rel(got: &[f32], want: &[f32], abs: f32, rel: f32, what: &str) {
         assert_eq!(got.len(), want.len(), "{what}: length mismatch");
+        let scale = want.iter().fold(0.0, |m: f32, w| m.max(w.abs()));
+        let bound = abs + rel * scale;
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
-            assert!((g - w).abs() < tol, "{what}[{i}]: gpu {g} vs cpu {w}");
+            assert!(
+                (g - w).abs() < bound,
+                "{what}[{i}]: gpu {g} vs cpu {w} (tolerance {bound:.2e}, scale {scale:.2e})"
+            );
+        }
+    }
+
+    #[allow(dead_code)]
+    fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
+        assert_close_rel(got, want, tol, 0.0, what);
+    }
+
+    /// Relative tolerance term for GPU-vs-CPU comparisons: bf16's half-ulp bound
+    /// when the sLSTM's saved slabs are stored narrow, zero on the fp32 path.
+    ///
+    /// The CPU reference is all-fp32, so with bf16 slabs the gap is one quantization
+    /// of `zt`/`ot` propagated through the block — bounded in relative terms, which
+    /// is why it belongs here rather than in the absolute tolerance. The dangerous
+    /// failure mode (error *growing* with sequence length) is pinned separately by
+    /// `gpu::slstm::tests::bf16_slab_error_does_not_compound_with_t`.
+    /// Relative term for a parameter compared AFTER an Adam step.
+    ///
+    /// Larger than [`rel`] on purpose. Adam's `lr·ĝ/(√v̂+ε)` is scale-invariant in
+    /// the gradient, so a weight whose gradient is near zero has its bf16-sized
+    /// difference divided by an equally small √v̂ — a ~1e-7 wobble lands as ~1e-4 on
+    /// the weight. Reusing the activation tolerance here leaves a bound that passes
+    /// in isolation and fails on roughly one full-suite run in five.
+    fn step_rel(gpu: &Gpu) -> f32 {
+        if ops::gemm_bf16_enabled(gpu) || gpu.kernels.slab_bf16 {
+            5e-2
+        } else {
+            0.0
+        }
+    }
+
+    fn rel(gpu: &Gpu) -> f32 {
+        // Two independent bf16 sources now, not one: the saved slabs AND the
+        // projections' GEMM operands (`ops::GemmBf16`). A block chains several
+        // matmuls, each contributing ~2^-8 relative on its own operands, so the
+        // budget against an all-fp32 CPU reference is a small multiple of the
+        // single-quantization bound rather than exactly it.
+        if ops::gemm_bf16_enabled(gpu) || gpu.kernels.slab_bf16 {
+            1e-2
+        } else {
+            0.0
         }
     }
 
@@ -536,34 +743,43 @@ mod tests {
         // Forward
         let y_cpu = cpu.forward(&x);
         let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
-        assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, "y");
+        assert_close_rel(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, rel(&gpu), "y");
 
         // Backward
         let dx_cpu = cpu.backward(&g);
         let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
-        assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 3e-3, "dx");
+        assert_close_rel(
+            &dx_dev.to_host(&gpu).data,
+            &dx_cpu.data,
+            3e-3,
+            rel(&gpu),
+            "dx",
+        );
 
         // One AdamW step; compare a representative parameter from each path.
         let mut cfg = AdamCfg::new(1e-3, 0.01);
         cfg.t = 1;
         cpu.step(&cfg);
         dev.step(&gpu, &cfg);
-        assert_close(
+        assert_close_rel(
             &dev.lin_down.w.to_host(&gpu).data,
             &cpu.lin_down.w.data,
             3e-3,
+            step_rel(&gpu),
             "lin_down.w",
         );
-        assert_close(
+        assert_close_rel(
             &dev.pre_norm1.gamma.to_host(&gpu).data,
             &cpu.pre_norm1.gamma.data,
             3e-3,
+            step_rel(&gpu),
             "pre_norm1.gamma",
         );
-        assert_close(
-            &dev.cell.w[0].to_host(&gpu).data,
+        assert_close_rel(
+            &dev.cell.gate_w(&gpu, 0),
             &cpu.cell.wz.data,
             3e-3,
+            step_rel(&gpu),
             "cell.wz",
         );
     }
@@ -591,26 +807,34 @@ mod tests {
 
         let y_cpu = cpu.forward(&x);
         let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
-        assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, "y");
+        assert_close_rel(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, rel(&gpu), "y");
 
         let dx_cpu = cpu.backward(&g);
         let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
-        assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 3e-3, "dx");
+        assert_close_rel(
+            &dx_dev.to_host(&gpu).data,
+            &dx_cpu.data,
+            3e-3,
+            rel(&gpu),
+            "dx",
+        );
 
         let mut cfg = AdamCfg::new(1e-3, 0.01);
         cfg.t = 1;
         cpu.step(&cfg);
         dev.step(&gpu, &cfg);
-        assert_close(
+        assert_close_rel(
             &dev.lin_down.w.to_host(&gpu).data,
             &cpu.lin_down.w.data,
             3e-3,
+            step_rel(&gpu),
             "lin_down.w",
         );
-        assert_close(
+        assert_close_rel(
             &dev.pre_norm1.gamma.to_host(&gpu).data,
             &cpu.pre_norm1.gamma.data,
             3e-3,
+            step_rel(&gpu),
             "pre_norm1.gamma",
         );
     }

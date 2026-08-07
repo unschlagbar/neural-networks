@@ -315,7 +315,15 @@ impl Hierarchical {
             bb_back: Linear::new_rand(gpu, cfg.wh, cfg.hc),
             dec_blocks,
             dec_norm: RmsNorm::new(gpu, cfg.hc),
-            dec_head: Linear::new_rand(gpu, cfg.hc, cfg.vocab),
+            dec_head: {
+                // fp32: the head's output is exponentiated by the softmax/CE, and a
+                // bf16 wobble on a logit turns into a multiplicative error on a
+                // probability. One GEMM per decoded word against the backbone's
+                // many, so keeping it wide costs almost nothing.
+                let mut h = Linear::new_rand(gpu, cfg.hc, cfg.vocab);
+                h.set_fp32();
+                h
+            },
             step_count: 0,
             flags: Flags::from_env(),
             scratch: Scratch::default(),
@@ -834,11 +842,17 @@ impl Hierarchical {
             .iter()
             .find_map(|l| l.as_any().downcast_ref::<LinearNBLayer>())
             .ok_or_else(|| err("decoder is missing its LinearNoBias head".into()))?;
-        let dec_head = super::linear::Linear::from_parts(
-            gpu,
-            &tensor_from_matrix(&head.weights),
-            &crate::tensor::Tensor::zeros(&[vocab]),
-        );
+        let dec_head = {
+            // fp32, matching the freshly-built model above — a checkpoint must not
+            // load into a different numeric path than it was created with.
+            let mut h = super::linear::Linear::from_parts(
+                gpu,
+                &tensor_from_matrix(&head.weights),
+                &crate::tensor::Tensor::zeros(&[vocab]),
+            );
+            h.set_fp32();
+            h
+        };
         let cap = dl
             .iter()
             .find_map(|l| l.as_any().downcast_ref::<SoftCapLayer>())

@@ -28,6 +28,18 @@ pub struct Linear {
     vb: DTensor,
     input: usize,
     output: usize,
+    /// bf16 staging for this layer's three GEMMs (see `ops::GemmBf16`). Holds the
+    /// narrowed operand copies across calls so the cast never allocates.
+    ///
+    /// This mirrors the reference's autocast boundary: its projections run under
+    /// `@custom_fwd(cast_inputs="bfloat16")`, i.e. fp32 master weights narrowed per
+    /// call, tensor-core matmul, fp32 accumulator. `w`/`b` above stay fp32 — the
+    /// optimizer steps them there and the checkpoint stores them there.
+    gemm: ops::GemmBf16,
+    /// Whether this layer's GEMMs go through the bf16 path. Pinned at construction
+    /// so forward and backward cannot disagree, and `false` for a layer that must
+    /// stay exact (see `set_fp32`).
+    bf16: bool,
 }
 
 impl Linear {
@@ -47,7 +59,18 @@ impl Linear {
             vb: DTensor::zeros(gpu, &[output]),
             input,
             output,
+            gemm: ops::GemmBf16::new(),
+            bf16: ops::gemm_bf16_enabled(gpu),
         }
+    }
+
+    /// Force this layer's GEMMs back to fp32.
+    ///
+    /// For the few matmuls where the narrowed operands are not worth it: the logit
+    /// head, whose output feeds the softmax/cross-entropy directly, and any layer a
+    /// test needs bit-comparable against the CPU reference.
+    pub fn set_fp32(&mut self) {
+        self.bf16 = false;
     }
 
     #[inline]
@@ -73,16 +96,18 @@ impl Linear {
         // state), else reallocate — avoids a per-call device allocation.
         if self.x.len() == b * self.input {
             self.x.reshape_to(&[b, self.input]);
-            gpu.stream
-                .memcpy_dtod(&x.buf, &mut self.x.buf)
-                .expect("save x");
+            self.x.copy_from(gpu, x);
         } else {
             self.x = x.dup(gpu);
         }
         // Seed each output row with the bias (fills y entirely, so uninit is safe),
         // then accumulate X·W on top (beta=1).
         ops::broadcast_row(gpu, y, &self.b);
-        ops::matmul_nn_into(gpu, x, &self.w, y, 1.0);
+        if self.bf16 {
+            self.gemm.run(gpu, ops::MmForm::Nn, x, &self.w, y, 1.0);
+        } else {
+            ops::matmul_nn_into(gpu, x, &self.w, y, 1.0);
+        }
     }
 
     /// `Y = X · W + b` into a freshly allocated `[B, out]`.
@@ -122,11 +147,21 @@ impl Linear {
             [dy.rows(), self.input],
             "Linear::backward — dx shape"
         );
-        // dW += Xᵀ · dY ; db += Σ_batch dY
-        ops::matmul_tn_into(gpu, &self.x, dy, &mut self.dw, 1.0);
+        // dW += Xᵀ · dY ; db += Σ_batch dY. The bias reduction stays fp32: it is a
+        // sum over the batch, not a matmul, and it is cheap.
+        if self.bf16 {
+            self.gemm
+                .run(gpu, ops::MmForm::Tn, &self.x, dy, &mut self.dw, 1.0);
+        } else {
+            ops::matmul_tn_into(gpu, &self.x, dy, &mut self.dw, 1.0);
+        }
         ops::add_col_sum(gpu, &mut self.db, dy);
         // dX = dY · Wᵀ (cuBLAS transposes W(in×out) internally — no host transpose).
-        ops::matmul_nt_into(gpu, dy, &self.w, dx, 0.0);
+        if self.bf16 {
+            self.gemm.run(gpu, ops::MmForm::Nt, dy, &self.w, dx, 0.0);
+        } else {
+            ops::matmul_nt_into(gpu, dy, &self.w, dx, 0.0);
+        }
     }
 
     /// Freshly-initialised layer, matching `nn2::Linear::new`'s init exactly
@@ -206,6 +241,27 @@ mod tests {
         }
     }
 
+    /// Tolerance against the all-fp32 CPU reference, widened when this layer's
+    /// GEMMs run with bf16 operands. `gemm_bf16_matches_fp32_all_forms` in
+    /// `gpu::ops` is the tighter, more direct check on that path; this test's job is
+    /// the layer's *composition* (bias seeding, grad accumulation, the AdamW step),
+    /// which the wider bound still pins.
+    fn tol(gpu: &Gpu, base: f32) -> f32 {
+        if ops::gemm_bf16_enabled(gpu) { base * 20.0 } else { base }
+    }
+
+    /// Tolerance for a parameter compared AFTER an Adam step.
+    ///
+    /// Deliberately not `tol(gpu, 1e-5)`. Adam's update is `lr·ĝ/(√v̂+ε)`, which is
+    /// scale-invariant in the gradient: a weight whose gradient is near zero has its
+    /// bf16-sized difference divided by an equally small √v̂, so a ~1e-7 gradient
+    /// wobble lands as ~1e-4 on the weight. Scaling the activation tolerance by the
+    /// same factor is not enough — it leaves a bound that passes in isolation and
+    /// fails on maybe one run in five, which is worse than no check at all.
+    fn step_tol(gpu: &Gpu) -> f32 {
+        if ops::gemm_bf16_enabled(gpu) { 2e-3 } else { 1e-5 }
+    }
+
     /// GPU Linear must match the CPU `nn2::Linear` for a full
     /// forward → backward → AdamW-step cycle, starting from identical weights.
     #[test]
@@ -226,13 +282,13 @@ mod tests {
         // Forward
         let y_cpu = cpu.forward(&x);
         let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
-        assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 1e-3);
+        assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, tol(&gpu, 1e-3));
 
         // Backward
         let dx_cpu = cpu.backward(&dy);
         let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &dy));
-        assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 1e-3);
-        assert_close(&dev.dw.to_host(&gpu).data, &cpu.dw.data, 1e-3);
+        assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 1e-3));
+        assert_close(&dev.dw.to_host(&gpu).data, &cpu.dw.data, tol(&gpu, 1e-3));
         assert_close(&dev.db.to_host(&gpu).data, &cpu.db.data, 1e-3);
 
         // One AdamW step, then compare the updated parameters.
@@ -240,7 +296,7 @@ mod tests {
         cfg.t = 1;
         cpu.step(&cfg);
         dev.step(&gpu, &cfg);
-        assert_close(&dev.w.to_host(&gpu).data, &cpu.w.data, 1e-5);
-        assert_close(&dev.b.to_host(&gpu).data, &cpu.b.data, 1e-5);
+        assert_close(&dev.w.to_host(&gpu).data, &cpu.w.data, step_tol(&gpu));
+        assert_close(&dev.b.to_host(&gpu).data, &cpu.b.data, step_tol(&gpu));
     }
 }

@@ -160,20 +160,23 @@ fn main() {
 
     // Isolate the two per-timestep kernels (B=1, H=512, T=2047).
     {
-        use neural_networks::gpu::ops::SlstmSlabs;
+        use neural_networks::gpu::ops::{SlabBuf, SlstmSlabs};
         let (b, t, h) = (1usize, 2047usize, 512usize);
         let h4 = 4 * h;
         let slab = || DTensor::zeros(&gpu, &[b, t, h]);
+        // The plain-activation slabs follow the compiled kernels' width (bf16 unless
+        // GPU_NO_BF16); the stabilizer-carrying ones are always fp32.
+        let act = || SlabBuf::new(&gpu, &[b, t, h]);
         let mut slabs = SlstmSlabs {
             c_prev: slab(),
             n_prev: slab(),
-            zt: slab(),
-            ot: slab(),
             i_prime: slab(),
             f_prime: slab(),
             c: slab(),
             n: slab(),
-            h_prev: slab(),
+            zt: act(),
+            ot: act(),
+            h_prev: act(),
         };
         let mut g = DTensor::zeros(&gpu, &[b, t, h4]);
         let mut gh = DTensor::zeros(&gpu, &[b, h4]);

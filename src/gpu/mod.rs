@@ -18,6 +18,7 @@ use cudarc::cublas::CudaBlas;
 use cudarc::cublas::sys::{cublasMath_t, cublasSetMathMode};
 use cudarc::driver::{CudaContext, CudaStream};
 
+pub mod bf16;
 pub mod block;
 pub mod buf;
 pub mod dtensor;
@@ -32,6 +33,7 @@ pub mod rms_norm;
 pub mod slstm;
 pub mod train;
 
+pub use bf16::{BTensor, Slab};
 pub use buf::{Buf, Pool};
 pub use dtensor::DTensor;
 use kernels::Kernels;
@@ -87,19 +89,21 @@ impl Gpu {
     /// so callers can fall back to the CPU path when no GPU is present.
     ///
     /// The work goes on an explicitly created stream, not `default_stream()`:
-    /// cudarc's default stream is the *legacy* NULL stream, and CUDA refuses to
-    /// capture that one (`cuStreamBeginCapture` errors on it). The sLSTM's
-    /// per-timestep loop is captured as a graph (see `gpu::slstm`), so the whole
-    /// backend has to live on a capturable stream. Everything is submitted to this
-    /// one stream in issue order, so ordering semantics are unchanged.
+    /// cudarc's default stream is the *legacy* NULL stream, which implicitly
+    /// synchronizes against every other stream on the context. Everything is
+    /// submitted to this one stream in issue order, so ordering semantics are
+    /// those of program order.
     pub fn new() -> Result<Self, String> {
         let context = CudaContext::new(0).map_err(|e| format!("CUDA init failed: {e:?}"))?;
         // Leaving the default stream also puts cudarc into "multi stream mode", where
         // every `CudaSlice` records a CUDA event on each use so that buffers shared
         // across streams stay ordered. We submit everything to the one stream below,
         // in issue order, so that bookkeeping buys nothing and costs host time on the
-        // per-launch path we are here to shorten. It is also a capture hazard: a
-        // captured launch may not wait on an event recorded outside the capture.
+        // per-launch path we are here to shorten.
+        //
+        // NOTE: this is what a second stream would have to contend with — the flag
+        // removes the automatic cross-stream ordering, so any future multi-stream
+        // work must place its own events explicitly.
         //
         // SAFETY: the contract is "the caller manages stream synchronization". There
         // is a single stream, so program order *is* the synchronization. Must happen
@@ -194,12 +198,12 @@ impl std::ops::Deref for TestGpu {
 /// self-skip on the dev box with no Nvidia card).
 ///
 /// Holds a process-wide lock for the caller's lifetime, so **only one GPU test runs
-/// at a time**. `cargo test` runs tests on parallel threads, and CUDA stream capture
-/// (`gpu::slstm`) does not tolerate other threads allocating on the same context
-/// while a capture is open — it intermittently produced a corrupt graph and a
-/// `CUBLAS_STATUS_EXECUTION_FAILED` in whichever test got unlucky. Serializing here
-/// keeps `cargo test --features cuda` honest without a `--test-threads=1` incantation
-/// that a future runner would forget.
+/// at a time**. `cargo test` runs tests on parallel threads, which would otherwise
+/// have them contend for the same context: the cooperative launches need the whole
+/// grid co-resident, and the larger shapes want most of the card's memory, so
+/// concurrent tests both slow each other down and can fail to launch. Serializing
+/// here keeps `cargo test --features cuda` honest without a `--test-threads=1`
+/// incantation that a future runner would forget.
 fn test_gpu() -> Option<TestGpu> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // A panicking test poisons the lock; the guarded data is `()`, so there is no
@@ -242,8 +246,8 @@ extern "C" __global__ void vadd(const float* a, const float* b, float* c, int n)
         let a: Vec<f32> = (0..n).map(|i| i as f32).collect();
         let b: Vec<f32> = (0..n).map(|i| (2 * i) as f32).collect();
 
-        let da = gpu.stream.memcpy_stod(&a).unwrap();
-        let db = gpu.stream.memcpy_stod(&b).unwrap();
+        let da = gpu.stream.clone_htod(&a).unwrap();
+        let db = gpu.stream.clone_htod(&b).unwrap();
         let mut dc = gpu.stream.alloc_zeros::<f32>(n).unwrap();
 
         let cfg = LaunchConfig::for_num_elems(n as u32);
@@ -252,7 +256,7 @@ extern "C" __global__ void vadd(const float* a, const float* b, float* c, int n)
         launch.arg(&da).arg(&db).arg(&mut dc).arg(&n_i32);
         unsafe { launch.launch(cfg) }.unwrap();
 
-        let c = gpu.stream.memcpy_dtov(&dc).unwrap();
+        let c = gpu.stream.clone_dtoh(&dc).unwrap();
         for i in 0..n {
             assert_eq!(c[i], a[i] + b[i], "mismatch at {i}");
         }

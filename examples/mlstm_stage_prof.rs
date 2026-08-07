@@ -130,9 +130,21 @@ fn main() {
     // slow, this number says whether the kernels or their surroundings are at fault.
     println!("\n== fused chunkwise core alone (the 5 kernels) ==");
     let lf = ops::FUSED_MAX_L;
-    let qh = DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dqk], 0.5));
-    let kh = DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dqk], 0.5));
-    let vh = DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dhv], 0.5));
+    // q/k/v go in as slabs: the fused kernels read them at whatever width the
+    // backend was compiled for (bf16 unless GPU_NO_BF16), so the profile matches
+    // what the cell actually runs.
+    let qh = ops::SlabBuf::from_f32(
+        &gpu,
+        DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dqk], 0.5)),
+    );
+    let kh = ops::SlabBuf::from_f32(
+        &gpu,
+        DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dqk], 0.5)),
+    );
+    let vh = ops::SlabBuf::from_f32(
+        &gpu,
+        DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dhv], 0.5)),
+    );
     let igh = DTensor::from_host(&gpu, &Tensor::random(&[bh, t], 0.5));
     let fgh = DTensor::from_host(&gpu, &Tensor::random(&[bh, t], 0.5));
     let dyt = DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dhv], 1.0));

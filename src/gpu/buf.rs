@@ -64,7 +64,10 @@ impl Buf {
     pub fn get(&mut self, gpu: &Gpu, dims: &[usize]) -> &mut DTensor {
         let n: usize = dims.iter().product();
         match &mut self.slot {
-            Some(t) if t.len() == n => t.reshape_to(dims),
+            // Reuse whenever the allocation is big enough, presenting it at the
+            // asked-for shape. Requiring an exact match would reallocate on every
+            // shape change, which for a varying window size is every call.
+            Some(t) if t.capacity() >= n => t.shrink_to(dims),
             _ => self.slot = Some(DTensor::uninit(gpu, dims)),
         }
         self.slot.as_mut().expect("just filled")
@@ -76,8 +79,8 @@ impl Buf {
     pub fn get_zeroed(&mut self, gpu: &Gpu, dims: &[usize]) -> &mut DTensor {
         let n: usize = dims.iter().product();
         match &mut self.slot {
-            Some(t) if t.len() == n => {
-                t.reshape_to(dims);
+            Some(t) if t.capacity() >= n => {
+                t.shrink_to(dims);
                 t.zero_(gpu);
             }
             _ => self.slot = Some(DTensor::zeros(gpu, dims)),
@@ -89,9 +92,12 @@ impl Buf {
     /// is the owned-buffer replacement for `src.dup(gpu)` — same result, but
     /// reusing this layer's allocation instead of making a new one.
     pub fn copy_of(&mut self, gpu: &Gpu, src: &DTensor) -> &mut DTensor {
+        let n = src.len();
         let dst = self.get(gpu, src.dims());
+        // Slice both sides to the shape: either may be a pooled buffer with slack
+        // beyond it, and `memcpy_dtod` requires the two lengths to agree.
         gpu.stream
-            .memcpy_dtod(&src.buf, &mut dst.buf)
+            .memcpy_dtod(&src.buf.slice(..n), &mut dst.buf.slice_mut(..n))
             .expect("Buf::copy_of");
         dst
     }
@@ -155,23 +161,38 @@ impl Pool {
         }
     }
 
-    /// A scratch buffer shaped `dims`, recycled from the free list when one of
-    /// that element count is available, else freshly allocated.
+    /// A scratch buffer holding at least `dims`, recycled from the free list when
+    /// a large enough one is available, else freshly allocated.
+    ///
+    /// Reuse is by **capacity, not exact size**: the smallest free buffer that
+    /// fits is taken and presented at the requested shape. Demanding an exact
+    /// match instead makes the pool useless the moment shapes vary — real training
+    /// windows run from `MIN_WORDS_PER_SEQ` up to `WORDS_PER_SEQ`, and the
+    /// encoder/decoder run one rectangle per word length — so every distinct size
+    /// would pin its own buffer forever and the pool would grow without bound.
+    /// That was an out-of-memory abort in real runs while a fixed-size benchmark
+    /// looked perfectly stable.
     ///
     /// Contents are **undefined** — a recycled buffer still holds whatever the
-    /// previous user left. Write it in full before reading, or use
-    /// [`take_zeroed`](Self::take_zeroed).
+    /// previous user left, and may be larger than asked for. Write the requested
+    /// region in full before reading, or use [`take_zeroed`](Self::take_zeroed).
     pub fn take(&mut self, gpu: &Gpu, dims: &[usize]) -> DTensor {
         self.lent += 1;
         let n: usize = dims.iter().product();
-        for (size, bufs) in self.free.iter_mut() {
-            if *size == n {
-                if let Some(mut t) = bufs.pop() {
-                    t.reshape_to(dims);
-                    return t;
-                }
-                break;
+        // Best fit: the smallest buffer that still holds `n`. Picking the smallest
+        // keeps the big ones available for the requests that actually need them.
+        let mut best: Option<usize> = None;
+        for (i, (size, bufs)) in self.free.iter().enumerate() {
+            if *size >= n && !bufs.is_empty() && best.is_none_or(|b| *size < self.free[b].0) {
+                best = Some(i);
             }
+        }
+        if let Some(i) = best {
+            let mut t = self.free[i].1.pop().expect("checked non-empty");
+            // The buffer may be larger than requested; `reshape_to` insists on an
+            // exact element count, so trim the view to the asked-for shape.
+            t.shrink_to(dims);
+            return t;
         }
         DTensor::uninit(gpu, dims)
     }
@@ -198,7 +219,9 @@ impl Pool {
             "Pool::put of a buffer this pool never lent — see the note on `put`"
         );
         self.lent = self.lent.saturating_sub(1);
-        let n = t.len();
+        // File under the ALLOCATION size, not the shape it was last used at — a
+        // buffer handed out shrunk still owns its full capacity.
+        let n = t.capacity();
         for (size, bufs) in self.free.iter_mut() {
             if *size == n {
                 bufs.push(t);
@@ -214,6 +237,23 @@ impl Pool {
     /// reuse), and a `put` without a matching `take` trips the assert above.
     pub fn outstanding(&self) -> usize {
         self.lent
+    }
+
+    /// Assert that nothing is still on loan — call at a point where every scratch
+    /// value should be dead, i.e. the top of a forward or backward.
+    ///
+    /// A buffer taken and then *moved* somewhere permanent (a cache the next pass
+    /// reads) never comes back, so the pool reallocates a replacement every pass
+    /// while the free list stays the same size: a slow leak that neither
+    /// [`pooled_elems`](Self::pooled_elems) nor a memory graph makes obvious. This
+    /// turns that into a panic at the point of the mistake. Debug builds only.
+    pub fn assert_drained(&self, what: &str) {
+        debug_assert_eq!(
+            self.lent, 0,
+            "{what}: {} pooled buffer(s) never returned — a `take` whose value was \
+             moved somewhere permanent instead of `put` back",
+            self.lent
+        );
     }
 
     /// Return several buffers at once.
@@ -314,6 +354,58 @@ mod tests {
 
         // Two were live at once, so the pool retains exactly two.
         assert_eq!(pool.pooled_elems(), 2 * 128);
+    }
+
+    /// The bug this pool shipped with: requiring an EXACT size match meant every
+    /// distinct shape pinned its own buffer forever. Real training windows vary
+    /// (trailing windows shrink to `MIN_WORDS_PER_SEQ`, and the encoder runs one
+    /// rectangle per word length), so the free list grew without bound and the run
+    /// died of out-of-memory — while a fixed-shape benchmark looked stable.
+    ///
+    /// Reuse is now by capacity, so a descending sequence of sizes must recycle
+    /// ONE buffer rather than accumulate one per size.
+    #[test]
+    fn pool_reuses_one_buffer_across_shrinking_shapes() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let mut pool = Pool::new();
+        for len in [1024, 768, 512, 300, 64, 8] {
+            let t = pool.take(&gpu, &[len]);
+            assert_eq!(t.len(), len, "presented at the requested shape");
+            pool.put(t);
+        }
+        assert_eq!(
+            pool.pooled_elems(),
+            1024,
+            "the largest allocation must serve every smaller request"
+        );
+    }
+
+    /// Growing past the retained capacity allocates once, and that bigger buffer
+    /// then serves everything below it.
+    #[test]
+    fn pool_grows_once_then_reuses() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let mut pool = Pool::new();
+        for len in [64, 512, 4096] {
+            let t = pool.take(&gpu, &[len]);
+            pool.put(t);
+        }
+        // 64 and 512 are still on the list (each was returned before the next grew
+        // past it), but nothing beyond the high-water mark is ever allocated again.
+        let before = pool.pooled_elems();
+        for len in [4096, 2048, 1000, 4096] {
+            let t = pool.take(&gpu, &[len]);
+            pool.put(t);
+        }
+        assert_eq!(
+            pool.pooled_elems(),
+            before,
+            "no request at or below the high-water mark may allocate"
+        );
     }
 
     /// Reuse is by element count, so a `[4, 32]` temporary can serve a later

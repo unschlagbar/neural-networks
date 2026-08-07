@@ -1,10 +1,11 @@
 //! Device-resident batched sLSTM cell, the GPU counterpart of
 //! [`nn2::slstm::SLstm`](crate::nn2::slstm::SLstm).
 //!
-//! Same equations, same weight layout (4 gates `[rows, H]`, `rows = in + H`,
-//! concat-trick), and the same AdamW convention (gate matrices decay, biases do
+//! Same equations and the same AdamW convention (gate matrices decay, biases do
 //! not), so a GPU cell built from a CPU cell's weights matches it for
 //! forward → backward → step — which the parity test checks against `nn2::SLstm`.
+//! The weights are stored fused rather than as the CPU's 4 gates `[rows, H]`; see
+//! the note on the layout below.
 //!
 //! Time is a serial loop; the batch is the parallel axis. **The whole recurrent
 //! state `(h,c,n,m)` stays resident in `DTensor`s across the entire T-loop** — no
@@ -27,13 +28,18 @@
 //! channels — `dh = dg[:, t, :]·Whᵀ` — and `dx`, `dWx`, `dWh` and the bias grads
 //! all fall out of three whole-sequence GEMMs plus one reduction *after* the loop.
 //!
-//! The gate weights of record stay the four `[rows, H]` matrices `nn2::SLstm` and
-//! the checkpoints use; `slstm_pack` derives the fused `Wx`/`Wh`/`bias` operands
-//! from them each forward, and `slstm_unpack_dw` folds the fused gradients back.
+//! The fused operands **are** the parameters of record: `wx [in, 4H]`,
+//! `whr [H, 4H]` and `bcat [4H]` are what the optimizer steps and what the grads
+//! accumulate into, so no per-forward repacking happens at all. The four `[rows, H]`
+//! gate matrices `nn2::SLstm` and the checkpoints use are a *serialization* layout,
+//! converted on the host only in `from_parts` / `to_nn_cell` — once per checkpoint,
+//! never per step. Gate order stays z=0, i=1, f=2, o=3: the column blocks of the
+//! fused `[·, 4H]`, with the input rows above the recurrent rows in `[rows, H]`.
 
 use cudarc::driver::CudaGraph;
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 
+use super::block::phase;
 use super::ops::{self, SlstmSlabs};
 use super::{DTensor, Gpu};
 use crate::nn2::optim::AdamCfg;
@@ -89,22 +95,23 @@ pub struct SLstm {
     input: usize,
     hidden: usize,
 
-    // Gate weights/biases and their grads/moments, indexed z=0, i=1, f=2, o=3.
-    // These are the parameters of record: the optimizer steps them and the
-    // checkpoint stores them. The fused operands below are derived from them.
-    pub w: [DTensor; 4],    // [rows, H]
-    pub bias: [DTensor; 4], // [H]
-    dw: [DTensor; 4],
-    db: [DTensor; 4],
-    mw: [DTensor; 4],
-    vw: [DTensor; 4],
-    mb: [DTensor; 4],
-    vb: [DTensor; 4],
-
-    // Fused operands, repacked from `w`/`bias` at the top of every forward.
-    wx: DTensor,   // [in, 4H]
-    whr: DTensor,  // [H, 4H]  (recurrent half)
-    bcat: DTensor, // [4H]
+    // The parameters of record, in the fused layout the GEMMs consume directly:
+    // gates z=0, i=1, f=2, o=3 occupy the four column blocks of the `4H` axis.
+    // The optimizer steps these, the grads accumulate into them, and nothing is
+    // repacked per forward — the `[rows, H]` gate matrices exist only at the
+    // checkpoint boundary (`from_parts` / `to_nn_cell`).
+    pub wx: DTensor,   // [in, 4H]   input half
+    pub whr: DTensor,  // [H, 4H]    recurrent half
+    pub bcat: DTensor, // [4H]
+    dwx: DTensor,
+    dwhr: DTensor,
+    dbcat: DTensor,
+    mwx: DTensor,
+    vwx: DTensor,
+    mwhr: DTensor,
+    vwhr: DTensor,
+    mbcat: DTensor,
+    vbcat: DTensor,
 
     /// Per-instance override of the time-fused path. `None` follows the global
     /// default (see [`fused_time_enabled`]); `Some(false)` pins this cell to the
@@ -123,10 +130,9 @@ pub struct SLstm {
     /// (`h_{t-1}·Wh` forward, the gate deltas backward). It exists so both of those
     /// GEMMs stay dense at any batch size — see `slstm_step_fused` in `kernels.rs`.
     gh: DTensor,
-    /// `[1, N]` of ones and a `[1, 4H]` landing pad: the bias gradient is the column
-    /// sum of the gate deltas, which cuBLAS reduces as a `ones · dgates` GEMM.
+    /// `[1, N]` of ones: the bias gradient is the column sum of the gate deltas,
+    /// which cuBLAS reduces as a `ones · dgates` GEMM straight into `dbcat`.
     ones: DTensor,
-    dbcat: DTensor,
     // BPTT channels, [B, H].
     dh_bptt: DTensor,
     dc_bptt: DTensor,
@@ -148,6 +154,9 @@ pub struct SLstm {
     /// Backward's incoming `dy`, copied into a stable buffer: the caller hands us a
     /// fresh `DTensor` every time, whose pointer a graph cannot depend on.
     dy_buf: Option<DTensor>,
+    /// Scratch for widening a bf16 `h_prev` slab back to fp32 for the `dWh` GEMM
+    /// (cuBLAS has no bf16 operand here). Unused on the fp32 slab path.
+    h_prev_f32: Option<DTensor>,
     /// The `(b, t)` the buffers above are currently allocated for. A captured graph
     /// is only valid for the allocation it was captured against, so the graphs are
     /// dropped whenever this changes — see [`Self::forward`].
@@ -202,32 +211,58 @@ impl SLstm {
         bf: &Tensor,
         bo: &Tensor,
     ) -> Self {
-        let rows = input + hidden;
-        let up = |t: &Tensor| DTensor::from_host(gpu, t);
-        let zw = || DTensor::zeros(gpu, &[rows, hidden]);
-        let zb = || DTensor::zeros(gpu, &[hidden]);
+        let (h, h4) = (hidden, 4 * hidden);
+        let rows = input + h;
+        let w = [wz, wi, wf, wo];
+        let b = [bz, bi, bf, bo];
+        for (g, t) in w.iter().enumerate() {
+            assert_eq!(t.dims(), [rows, h], "SLstm::from_parts — gate {g} weight");
+            assert_eq!(b[g].dims(), [h], "SLstm::from_parts — gate {g} bias");
+        }
+
+        // Host-side pack into the fused layout: gate `g` becomes column block
+        // `g·H..(g+1)·H`, with `[rows, H]`'s top `input` rows going to `wx` and its
+        // remaining `H` rows to `whr`. This is the only place the two layouts meet.
+        let mut wx = vec![0.0; input * h4];
+        let mut whr = vec![0.0; h * h4];
+        let mut bcat = vec![0.0; h4];
+        for (g, gw) in w.iter().enumerate() {
+            let src = gw.data.as_slice();
+            for r in 0..rows {
+                let (dst, dr) = if r < input {
+                    (&mut wx, r)
+                } else {
+                    (&mut whr, r - input)
+                };
+                let (from, to) = (r * h, dr * h4 + g * h);
+                dst[to..to + h].copy_from_slice(&src[from..from + h]);
+            }
+            bcat[g * h..(g + 1) * h].copy_from_slice(&b[g].data);
+        }
+
+        let up = |d: Vec<f32>, dims: &[usize]| DTensor::from_host(gpu, &Tensor::new(dims, d));
         Self {
             input,
             hidden,
-            w: [up(wz), up(wi), up(wf), up(wo)],
-            bias: [up(bz), up(bi), up(bf), up(bo)],
-            dw: [zw(), zw(), zw(), zw()],
-            db: [zb(), zb(), zb(), zb()],
-            mw: [zw(), zw(), zw(), zw()],
-            vw: [zw(), zw(), zw(), zw()],
-            mb: [zb(), zb(), zb(), zb()],
-            vb: [zb(), zb(), zb(), zb()],
-            wx: DTensor::zeros(gpu, &[0, 0]),
-            whr: DTensor::zeros(gpu, &[0, 0]),
+            wx: up(wx, &[input, h4]),
+            whr: up(whr, &[h, h4]),
+            bcat: up(bcat, &[h4]),
+            dwx: DTensor::zeros(gpu, &[input, h4]),
+            dwhr: DTensor::zeros(gpu, &[h, h4]),
+            dbcat: DTensor::zeros(gpu, &[h4]),
+            mwx: DTensor::zeros(gpu, &[input, h4]),
+            vwx: DTensor::zeros(gpu, &[input, h4]),
+            mwhr: DTensor::zeros(gpu, &[h, h4]),
+            vwhr: DTensor::zeros(gpu, &[h, h4]),
+            mbcat: DTensor::zeros(gpu, &[h4]),
+            vbcat: DTensor::zeros(gpu, &[h4]),
             force_fused_time: None,
-            bcat: DTensor::zeros(gpu, &[0]),
             h_state: DTensor::zeros(gpu, &[0, 0]),
             c_state: DTensor::zeros(gpu, &[0, 0]),
             n_state: DTensor::zeros(gpu, &[0, 0]),
             m_state: DTensor::zeros(gpu, &[0, 0]),
             gh: DTensor::zeros(gpu, &[0, 0]),
             ones: DTensor::zeros(gpu, &[0, 0]),
-            dbcat: DTensor::zeros(gpu, &[0, 0]),
             dh_bptt: DTensor::zeros(gpu, &[0, 0]),
             dc_bptt: DTensor::zeros(gpu, &[0, 0]),
             dn_bptt: DTensor::zeros(gpu, &[0, 0]),
@@ -236,6 +271,7 @@ impl SLstm {
             x_saved: None,
             out_buf: None,
             dy_buf: None,
+            h_prev_f32: None,
             buf_shape: None,
             fwd_graph: None,
             bwd_graph: None,
@@ -279,22 +315,83 @@ impl SLstm {
     /// `h_init`/`c_init` the CPU format carries are always zero here). Used to
     /// write a `HIER` checkpoint from a GPU model.
     pub fn to_nn_cell(&self, gpu: &Gpu) -> crate::nn::slstm::SLSTMLayer {
-        use super::{dt_matrix, dt_vec};
-        let h = self.hidden;
+        let (h, inp) = (self.hidden, self.input);
+        let [wz, wi, wf, wo] = self.gate_matrices(gpu);
+        let b = self.bcat.to_host(gpu).data;
+        let bias = |g: usize| b[g * h..(g + 1) * h].to_vec().into_boxed_slice();
         crate::nn::slstm::SLSTMLayer::from_loaded(
-            self.input,
+            inp,
             h,
-            dt_matrix(gpu, &self.w[0]),
-            dt_matrix(gpu, &self.w[1]),
-            dt_matrix(gpu, &self.w[2]),
-            dt_matrix(gpu, &self.w[3]),
-            dt_vec(gpu, &self.bias[0]),
-            dt_vec(gpu, &self.bias[1]),
-            dt_vec(gpu, &self.bias[2]),
-            dt_vec(gpu, &self.bias[3]),
+            wz,
+            wi,
+            wf,
+            wo,
+            bias(0),
+            bias(1),
+            bias(2),
+            bias(3),
             vec![0.0; h].into(),
             vec![0.0; h].into(),
         )
+    }
+
+    /// Gate `g`'s weights as the `[rows, H]` matrix the CPU cell holds, downloaded
+    /// and unpacked. For parity tests, which compare per gate.
+    #[cfg(test)]
+    pub(crate) fn gate_w(&self, gpu: &Gpu, g: usize) -> Vec<f32> {
+        let m = &self.gate_matrices(gpu)[g];
+        m.as_slice().to_vec()
+    }
+
+    /// Gate `g`'s bias `[H]`, sliced out of the fused `bcat`. Test companion to
+    /// [`gate_w`](Self::gate_w).
+    #[cfg(test)]
+    fn gate_b(&self, gpu: &Gpu, g: usize) -> Vec<f32> {
+        let h = self.hidden;
+        self.bcat.to_host(gpu).data[g * h..(g + 1) * h].to_vec()
+    }
+
+    /// Gate `g`'s weight gradient, unpacked from the fused `dwx`/`dwhr` into the
+    /// `[rows, H]` layout the CPU cell's `dw*` use. Test-only.
+    #[cfg(test)]
+    fn gate_dw(&self, gpu: &Gpu, g: usize) -> Vec<f32> {
+        let (h, h4, inp) = (self.hidden, 4 * self.hidden, self.input);
+        let rows = inp + h;
+        let dwx = self.dwx.to_host(gpu).data;
+        let dwhr = self.dwhr.to_host(gpu).data;
+        let mut out = vec![0.0; rows * h];
+        for r in 0..rows {
+            let (src, sr) = if r < inp { (&dwx, r) } else { (&dwhr, r - inp) };
+            let from = sr * h4 + g * h;
+            out[r * h..(r + 1) * h].copy_from_slice(&src[from..from + h]);
+        }
+        out
+    }
+
+    /// Gate `g`'s bias gradient `[H]`. Test companion to [`gate_dw`](Self::gate_dw).
+    #[cfg(test)]
+    fn gate_db(&self, gpu: &Gpu, g: usize) -> Vec<f32> {
+        let h = self.hidden;
+        self.dbcat.to_host(gpu).data[g * h..(g + 1) * h].to_vec()
+    }
+
+    /// Unpack the fused `wx`/`whr` back into the four `[rows, H]` gate matrices the
+    /// CPU cells and checkpoints use — the inverse of the pack in
+    /// [`from_parts`](Self::from_parts). Host-side and once per checkpoint.
+    fn gate_matrices(&self, gpu: &Gpu) -> [iron_oxide::collections::Matrix; 4] {
+        let (h, h4, inp) = (self.hidden, 4 * self.hidden, self.input);
+        let rows = inp + h;
+        let wx = self.wx.to_host(gpu).data;
+        let whr = self.whr.to_host(gpu).data;
+        std::array::from_fn(|g| {
+            let mut m = vec![0.0; rows * h];
+            for r in 0..rows {
+                let (src, sr) = if r < inp { (&wx, r) } else { (&whr, r - inp) };
+                let from = sr * h4 + g * h;
+                m[r * h..(r + 1) * h].copy_from_slice(&src[from..from + h]);
+            }
+            iron_oxide::collections::Matrix::from_vec(m, rows, h)
+        })
     }
 
     /// Rebuild a GPU cell from a CPU `nn::SLSTMLayer` (inverse of `to_nn_cell`).
@@ -352,20 +449,8 @@ impl SLstm {
             self.buf_shape = Some((b, t));
         }
 
-        // Rebuild the fused operands from the gate weights the optimizer owns.
-        fit_uninit(gpu, &mut self.wx, &[inp, h4]);
-        fit_uninit(gpu, &mut self.whr, &[h, h4]);
-        fit_uninit(gpu, &mut self.bcat, &[h4]);
-        ops::slstm_pack(
-            gpu,
-            &self.w,
-            &self.bias,
-            &mut self.wx,
-            &mut self.whr,
-            &mut self.bcat,
-            inp,
-            h,
-        );
+        // `wx`/`whr`/`bcat` are the parameters themselves — already in the layout the
+        // GEMMs below want, so there is nothing to pack here.
 
         // Recurrent state starts at zero.
         for s in [
@@ -380,44 +465,70 @@ impl SLstm {
         // The input half of every gate pre-activation, for all timesteps at once —
         // it has no recurrent dependency, so it is one GEMM outside the loop.
         let mut x_flat = take_uninit(gpu, self.x_saved.take(), &[n, inp]);
-        gpu.stream
-            .memcpy_dtod(&x.buf, &mut x_flat.buf)
-            .expect("copy x");
+        // The copy is for LIFETIME, not layout: `backward` needs `x` again for
+        // `dWx = xᵀ·dg`, and by then the caller has returned its buffer to the pool
+        // and someone else owns that memory. `x_flat` is the cell's own copy, held
+        // across the forward→backward boundary as `x_saved`.
+        //
+        // Slice both sides because `x` may be a pooled buffer larger than [B, T, in]
+        // (`Buf`/`Pool` reuse by capacity) while `x_flat` is exactly [N, in]:
+        // `memcpy_dtod` asserts dst >= src, so copying the raw `buf`s would trip on
+        // any oversized input — and would move capacity rather than content.
+        let n_x = x_flat.len();
+        phase::timed(gpu, phase::Bucket::SlstmCopyFwd, || {
+            gpu.stream
+                .memcpy_dtod(&x.buf.slice(..n_x), &mut x_flat.buf.slice_mut(..n_x))
+                .expect("copy x");
+        });
         // One buffer, two views: the GEMM wants [N, 4H], the time loop wants
         // [B, T, 4H]. `reshaped` is metadata-only, so the allocation is untouched.
         let mut g = take_uninit(gpu, self.g.take(), &[b, t, h4]).reshaped(&[n, h4]);
-        ops::matmul_nn_into(gpu, &x_flat, &self.wx, &mut g, 0.0);
+        phase::timed(gpu, phase::Bucket::SlstmGemmFwd, || {
+            ops::matmul_nn_into(gpu, &x_flat, &self.wx, &mut g, 0.0);
+        });
         let mut g = g.reshaped(&[b, t, h4]);
 
         let mut slabs = match self.slabs.take() {
             Some(s) if s.c.dims() == [b, t, h].as_slice() => s,
             _ => {
-                let slab = || DTensor::uninit(gpu, &[b, t, h]);
+                // fp32 for the stabilizer-carrying slabs, kernel-matched width for
+                // the plain activations — see `SlstmSlabs` and `gpu::bf16`.
+                let f32_slab = || DTensor::uninit(gpu, &[b, t, h]);
+                let act_slab = || ops::SlabBuf::new(gpu, &[b, t, h]);
                 SlstmSlabs {
-                    c_prev: slab(),
-                    n_prev: slab(),
-                    zt: slab(),
-                    ot: slab(),
-                    i_prime: slab(),
-                    f_prime: slab(),
-                    c: slab(),
-                    n: slab(),
-                    h_prev: slab(),
+                    c_prev: f32_slab(),
+                    n_prev: f32_slab(),
+                    i_prime: f32_slab(),
+                    f_prime: f32_slab(),
+                    c: f32_slab(),
+                    n: f32_slab(),
+                    zt: act_slab(),
+                    ot: act_slab(),
+                    h_prev: act_slab(),
                 }
             }
         };
         let mut out = take_uninit(gpu, self.out_buf.take(), &[b, t, h]);
         fit_uninit(gpu, &mut self.gh, &[b, h4]);
 
-        self.fwd_loop(gpu, &mut g, &mut slabs, &mut out, b, t);
+        phase::timed(gpu, phase::Bucket::SlstmLoopFwd, || {
+            self.fwd_loop(gpu, &mut g, &mut slabs, &mut out, b, t);
+        });
 
         // `out` is the graph's write target and must keep its address, so the loop
         // writes there and the result is copied into the caller's buffer. One
         // [B, T, H] device-to-device copy against a loop that was costing tens of
         // milliseconds of launch time.
-        gpu.stream
-            .memcpy_dtod(&out.buf, &mut y.buf)
-            .expect("copy out");
+        // Slice BOTH sides to the shape: `y` is the caller's buffer and may be a
+        // pooled allocation larger than [B, T, H] (`Buf::get` reuses by capacity),
+        // while `out` is exactly that shape — `memcpy_dtod` asserts dst >= src, and
+        // copying raw `buf`s moves capacity rather than content.
+        let n_out = out.len();
+        phase::timed(gpu, phase::Bucket::SlstmCopyFwd, || {
+            gpu.stream
+                .memcpy_dtod(&out.buf.slice(..n_out), &mut y.buf.slice_mut(..n_out))
+                .expect("copy out");
+        });
         self.g = Some(g);
         self.slabs = Some(slabs);
         self.x_saved = Some(x_flat);
@@ -537,7 +648,7 @@ impl SLstm {
     /// Forward into a freshly allocated `[B, T, H]` — the by-value companion to
     /// [`forward`](Self::forward), used by tests and one-shot call sites.
     pub fn forward_alloc(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
-        let mut y = DTensor::uninit(gpu, &[x.shape[0], x.shape[1], self.hidden]);
+        let mut y: DTensor = DTensor::uninit(gpu, &[x.shape[0], x.shape[1], self.hidden]);
         self.forward(gpu, x, &mut y);
         y
     }
@@ -556,11 +667,7 @@ impl SLstm {
         let (b, t, h) = (dy.shape[0], dy.shape[1], dy.shape[2]);
         assert_eq!(b, self.batch, "SLstm::backward — batch mismatch");
         assert_eq!(h, self.hidden, "SLstm::backward — hidden mismatch");
-        assert_eq!(
-            dx.dims(),
-            [b, t, self.input],
-            "SLstm::backward — dx shape"
-        );
+        assert_eq!(dx.dims(), [b, t, self.input], "SLstm::backward — dx shape");
         let inp = self.input;
         let h4 = 4 * h;
         let n = b * t;
@@ -580,37 +687,69 @@ impl SLstm {
         // `DTensor` each time — a pointer a captured graph cannot follow. Copy it
         // into a buffer whose address we own.
         let mut dy_buf = take_uninit(gpu, self.dy_buf.take(), &[b, t, h]);
-        gpu.stream
-            .memcpy_dtod(&dy.buf, &mut dy_buf.buf)
-            .expect("copy dy");
+        let n_dy = dy_buf.len();
+        phase::timed(gpu, phase::Bucket::SlstmCopyBwd, || {
+            gpu.stream
+                .memcpy_dtod(&dy.buf.slice(..n_dy), &mut dy_buf.buf.slice_mut(..n_dy))
+                .expect("copy dy");
+        });
 
         // The only thing the loop must carry is BPTT: the gate deltas go straight
         // back into `g`, and everything derived from them waits until the loop ends.
-        self.bwd_loop(gpu, &dy_buf, &mut g, &slabs, b, t);
+        phase::timed(gpu, phase::Bucket::SlstmLoopBwd, || {
+            self.bwd_loop(gpu, &dy_buf, &mut g, &slabs, b, t);
+        });
         self.dy_buf = Some(dy_buf);
 
         // `g` now holds the gate deltas for the whole sequence: dx, dWx, dWh and the
         // bias grads are three GEMMs and one reduction over it.
         let dg = g.reshaped(&[n, h4]);
         dx.reshape_to(&[n, inp]);
-        ops::matmul_nt_into(gpu, &dg, &self.wx, dx, 0.0);
+        let wx = &self.wx;
+        phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || {
+            ops::matmul_nt_into(gpu, &dg, wx, dx, 0.0);
+        });
 
-        let mut dwx = DTensor::uninit(gpu, &[inp, h4]);
-        ops::matmul_tn_into(gpu, &x_flat, &dg, &mut dwx, 0.0);
-        let h_prev = slabs.h_prev.reshaped(&[n, h]);
-        let mut dwh = DTensor::uninit(gpu, &[h, h4]);
-        ops::matmul_tn_into(gpu, &h_prev, &dg, &mut dwh, 0.0);
+        // The gate grads land in the parameter layout directly, so these GEMMs write
+        // into `dwx`/`dwhr` with beta = 1: cuBLAS does the accumulation across
+        // windows that the unpack kernel used to do by hand.
+        let dwx = &mut self.dwx;
+        phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || {
+            ops::matmul_tn_into(gpu, &x_flat, &dg, dwx, 1.0);
+        });
+        // dWh = h_prevᵀ · dg goes through cuBLAS, which needs an fp32 operand, so a
+        // bf16 `h_prev` slab is widened into reusable scratch first. The scratch is
+        // transient (one GEMM) while the slab it replaced was pinned across the whole
+        // forward AND backward, so this still gives memory back.
+        slabs.h_prev.shrink_to(&[n, h]);
+        let dwhr = &mut self.dwhr;
+        let h_prev_f32 = &mut self.h_prev_f32;
+        phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || match &slabs.h_prev {
+            ops::SlabBuf::F32(t) => ops::matmul_tn_into(gpu, t, &dg, dwhr, 1.0),
+            ops::SlabBuf::Bf16(b16) => {
+                let mut scratch = take_uninit(gpu, h_prev_f32.take(), &[n, h]);
+                b16.load(gpu, &mut scratch);
+                ops::matmul_tn_into(gpu, &scratch, &dg, dwhr, 1.0);
+                *h_prev_f32 = Some(scratch);
+            }
+        });
+        slabs.h_prev.shrink_to(&[b, t, h]);
 
-        ops::slstm_unpack_dw(gpu, &dwx, &dwh, &mut self.dw, inp, h);
-
+        // The bias gradient is the column sum of the gate deltas — a `ones · dg` GEMM,
+        // accumulating straight into the fused `dbcat` (viewed as the [1, 4H] row it
+        // is). Nothing to scatter afterwards.
         fit_uninit(gpu, &mut self.ones, &[1, n]);
         ops::fill(gpu, &mut self.ones, 1.0);
-        fit_uninit(gpu, &mut self.dbcat, &[1, h4]);
-        ops::slstm_db_from_dg(gpu, &dg, &self.ones, &mut self.dbcat, &mut self.db, h);
+        let mut dbcat =
+            std::mem::replace(&mut self.dbcat, DTensor::zeros(gpu, &[0])).reshaped(&[1, h4]);
+        let ones = &self.ones;
+        phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || {
+            ops::matmul_nn_into(gpu, ones, &dg, &mut dbcat, 1.0);
+        });
+        self.dbcat = dbcat.reshaped(&[h4]);
 
         // Give the buffers back (same allocations, original shapes) so the next
         // forward reuses them — and so the captured graphs stay valid.
-        slabs.h_prev = h_prev.reshaped(&[b, t, h]);
         self.g = Some(dg.reshaped(&[b, t, h4]));
         self.slabs = Some(slabs);
         self.x_saved = Some(x_flat);
@@ -706,39 +845,49 @@ impl SLstm {
 
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
     pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
-        self.w.iter_mut().chain(self.bias.iter_mut()).collect()
+        vec![&mut self.wx, &mut self.whr, &mut self.bcat]
     }
 
     pub fn zero_grad(&mut self, gpu: &Gpu) {
-        for g in self.dw.iter_mut().chain(self.db.iter_mut()) {
+        for g in [&mut self.dwx, &mut self.dwhr, &mut self.dbcat] {
             g.zero_(gpu);
         }
     }
 
     /// AdamW step: gate matrices decay, biases don't. Clears the grads.
+    ///
+    /// AdamW is elementwise, so stepping the fused `[in, 4H]` / `[H, 4H]` operands is
+    /// numerically identical to stepping the four `[rows, H]` gate matrices they hold
+    /// — the decay/no-decay split that actually matters is weights vs. bias, and that
+    /// survives the fusion because `bcat` is still its own tensor.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        for i in 0..4 {
-            ops::adamw(
-                gpu,
-                &mut self.w[i],
-                &self.dw[i],
-                &mut self.mw[i],
-                &mut self.vw[i],
-                cfg,
-                true,
-            );
-        }
-        for i in 0..4 {
-            ops::adamw(
-                gpu,
-                &mut self.bias[i],
-                &self.db[i],
-                &mut self.mb[i],
-                &mut self.vb[i],
-                cfg,
-                false,
-            );
-        }
+        ops::adamw(
+            gpu,
+            &mut self.wx,
+            &self.dwx,
+            &mut self.mwx,
+            &mut self.vwx,
+            cfg,
+            true,
+        );
+        ops::adamw(
+            gpu,
+            &mut self.whr,
+            &self.dwhr,
+            &mut self.mwhr,
+            &mut self.vwhr,
+            cfg,
+            true,
+        );
+        ops::adamw(
+            gpu,
+            &mut self.bcat,
+            &self.dbcat,
+            &mut self.mbcat,
+            &mut self.vbcat,
+            cfg,
+            false,
+        );
         self.zero_grad(gpu);
     }
 }
@@ -748,6 +897,42 @@ mod tests {
     use super::*;
     use crate::nn2::optim::AdamCfg;
     use crate::nn2::slstm::SLstm as CpuSLstm;
+
+    /// GPU-vs-CPU tolerance, scaled for the slab storage dtype in use.
+    ///
+    /// The CPU reference is all-fp32, so with bf16 slabs the gap is one quantization
+    /// of `zt`/`ot` (~2^-8 relative) propagated through the recurrence. Loosening is
+    /// expected here; what would be a regression is the error GROWING with T, which
+    /// `bf16_slab_error_does_not_compound_with_t` pins separately.
+    fn tol(gpu: &Gpu, base: f32) -> f32 {
+        // x16, not x8. bf16's half-ulp is ~2e-3 relative at these magnitudes and a
+        // T-loop accumulates several of them, so x8 sat right ON the observed spread
+        // (a 2.0e-3 diff against a 2.0e-3 bound) and failed about one run in five.
+        // A bound a correct implementation trips intermittently is worse than none;
+        // the property that would actually signal a bug — error GROWING with T — is
+        // pinned separately by `bf16_slab_error_does_not_compound_with_t`.
+        if gpu.kernels.slab_bf16 {
+            base * 16.0
+        } else {
+            base
+        }
+    }
+
+    /// Tolerance for a parameter compared AFTER an Adam step. Wider than [`tol`]:
+    /// `lr·ĝ/(√v̂+ε)` is scale-invariant in the gradient, so a near-zero-gradient
+    /// weight turns a ~1e-7 difference into ~1e-4.
+    fn step_tol(gpu: &Gpu, base: f32) -> f32 {
+        // A MULTIPLE, not `base.max(2e-3)` — with base == 2e-3 that was a no-op and
+        // left the post-Adam check at its fp32 bound, which failed ~2 runs in 10.
+        // Adam's `lr·ĝ/(√v̂+ε)` is scale-invariant in the gradient, so a weight whose
+        // gradient is near zero divides a bf16-sized difference by an equally small
+        // √v̂ and lands far wider than the activations it came from.
+        if gpu.kernels.slab_bf16 {
+            base * 16.0
+        } else {
+            base
+        }
+    }
 
     fn assert_close(got: &[f32], want: &[f32], tol: f32) {
         assert_eq!(got.len(), want.len(), "length mismatch");
@@ -792,15 +977,15 @@ mod tests {
         // Forward
         let y_cpu = cpu.forward(&x);
         let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
-        assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 2e-3);
+        assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, tol(&gpu, 2e-3));
 
         // Backward
         let dx_cpu = cpu.backward(&g);
         let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
-        assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 2e-3);
-        assert_close(&dev.dw[0].to_host(&gpu).data, &cpu.dwz.data, 2e-3);
-        assert_close(&dev.dw[2].to_host(&gpu).data, &cpu.dwf.data, 2e-3);
-        assert_close(&dev.db[2].to_host(&gpu).data, &cpu.dbf.data, 2e-3);
+        assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 2e-3));
+        assert_close(&dev.gate_dw(&gpu, 0), &cpu.dwz.data, tol(&gpu, 2e-3));
+        assert_close(&dev.gate_dw(&gpu, 2), &cpu.dwf.data, tol(&gpu, 2e-3));
+        assert_close(&dev.gate_db(&gpu, 2), &cpu.dbf.data, tol(&gpu, 2e-3));
 
         // One AdamW step, then compare the updated gate weights.
         let mut cfg = AdamCfg::new(1e-3, 0.01);
@@ -811,9 +996,9 @@ mod tests {
         // near-zero grad element can sign-flip between the cuBLAS and CPU gemm
         // reduction orders, swinging its update by ~2·lr. A plumbing bug misses by
         // O(weight), far more than this.
-        assert_close(&dev.w[0].to_host(&gpu).data, &cpu.wz.data, 2e-3);
-        assert_close(&dev.w[2].to_host(&gpu).data, &cpu.wf.data, 2e-3);
-        assert_close(&dev.bias[2].to_host(&gpu).data, &cpu.bf.data, 2e-3);
+        assert_close(&dev.gate_w(&gpu, 0), &cpu.wz.data, step_tol(&gpu, 2e-3));
+        assert_close(&dev.gate_w(&gpu, 2), &cpu.wf.data, step_tol(&gpu, 2e-3));
+        assert_close(&dev.gate_b(&gpu, 2), &cpu.bf.data, step_tol(&gpu, 2e-3));
     }
 
     /// The same parity check, but at `T > GRAPH_MIN_T` so the time loops run as
@@ -843,20 +1028,20 @@ mod tests {
 
             let y_cpu = cpu.forward(&x);
             let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
-            assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 2e-3);
+            assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, tol(&gpu, 2e-3));
 
             let dx_cpu = cpu.backward(&g);
             let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
-            assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 2e-3);
-            assert_close(&dev.dw[0].to_host(&gpu).data, &cpu.dwz.data, 2e-3);
-            assert_close(&dev.dw[2].to_host(&gpu).data, &cpu.dwf.data, 2e-3);
+            assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 2e-3));
+            assert_close(&dev.gate_dw(&gpu, 0), &cpu.dwz.data, tol(&gpu, 2e-3));
+            assert_close(&dev.gate_dw(&gpu, 2), &cpu.dwf.data, tol(&gpu, 2e-3));
 
             // Step between passes, so the replay runs against *changed* weights —
             // the graph must read the packed operands live, not a stale copy.
             cfg.t = pass + 1;
             cpu.step(&cfg);
             dev.step(&gpu, &cfg);
-            assert_close(&dev.w[0].to_host(&gpu).data, &cpu.wz.data, 2e-3);
+            assert_close(&dev.gate_w(&gpu, 0), &cpu.wz.data, step_tol(&gpu, 2e-3));
         }
     }
 
@@ -896,10 +1081,10 @@ mod tests {
 
             let y_cpu = cpu.forward(&x);
             let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
-            assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 2e-3);
+            assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, tol(&gpu, 2e-3));
             let dx_cpu = cpu.backward(&g);
             let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
-            assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 2e-3);
+            assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 2e-3));
 
             poison(256 * 4 * h * b);
         }
@@ -962,16 +1147,8 @@ mod tests {
         let got_dx = fused.backward_alloc(&gpu, &gy).to_host(&gpu);
         assert_close(&want_dx.data, &got_dx.data, 1e-4);
         for gi in 0..4 {
-            assert_close(
-                &per_step.dw[gi].to_host(&gpu).data,
-                &fused.dw[gi].to_host(&gpu).data,
-                1e-4,
-            );
-            assert_close(
-                &per_step.db[gi].to_host(&gpu).data,
-                &fused.db[gi].to_host(&gpu).data,
-                1e-4,
-            );
+            assert_close(&per_step.gate_dw(&gpu, gi), &fused.gate_dw(&gpu, gi), 1e-4);
+            assert_close(&per_step.gate_db(&gpu, gi), &fused.gate_db(&gpu, gi), 1e-4);
         }
     }
 }

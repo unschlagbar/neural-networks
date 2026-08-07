@@ -8,7 +8,12 @@ use std::{
 
 const FILE: &str = "data/political_speeches.txt";
 
+/// One-off corpus extraction, not a test: it asserts nothing, reads a path that
+/// only exists on the machine that ran it once, and WRITES into `data/`. Kept
+/// runnable on demand (`cargo test political -- --ignored`) rather than deleted,
+/// since it documents how the corpus was built.
 #[test]
+#[ignore = "data-prep script, not a test — needs political_speeches.xml"]
 fn political() {
     let corpus = fs::read_to_string("political_speeches.xml").unwrap();
 
@@ -39,7 +44,11 @@ fn political() {
     }
 }
 
+/// Same: a one-off copy of a local rustc checkout into `data/rust-lib`, hardcoded
+/// to one machine's `~/Downloads`. Asserts nothing and copies files as a side
+/// effect, so it must not run in the normal suite.
 #[test]
+#[ignore = "data-prep script, not a test — needs ~/Downloads/rust"]
 fn collect_rs_files_for_training() {
     let src_dir = std::path::Path::new("/home/unschlagbar/Downloads/rust");
     let dst_dir = std::path::Path::new("/home/unschlagbar/Dev/neural-networks/data/rust-lib");

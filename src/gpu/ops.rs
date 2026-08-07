@@ -101,6 +101,168 @@ pub fn matmul_tn_into(gpu: &Gpu, a: &DTensor, b: &DTensor, c: &mut DTensor, beta
     unsafe { gpu.blas.gemm(cfg, &b.buf, &a.buf, &mut c.buf) }.expect("cublas gemm tn");
 }
 
+// ---------------------------------------------------------------------------
+// bf16 GEMM (`cublasGemmEx`, bf16 operands, fp32 accumulate)
+// ---------------------------------------------------------------------------
+
+/// Which transpose form a [`matmul_bf16_into`] call wants; the same three shapes
+/// the fp32 wrappers above expose.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MmForm {
+    /// `C = A · B` — forward.
+    Nn,
+    /// `C = A · Bᵀ` — input gradient (`dX = dY · Wᵀ`).
+    Nt,
+    /// `C = Aᵀ · B` — weight gradient (`dW += Xᵀ · dY`).
+    Tn,
+}
+
+/// Whether GEMMs run with bf16 operands. Follows the same switch as slab storage
+/// (`GPU_NO_BF16=1` disables) and additionally needs the cast kernels.
+pub fn gemm_bf16_enabled(gpu: &Gpu) -> bool {
+    super::bf16::active(gpu)
+}
+
+/// `C = op(A) · op(B) + beta·C` with **bf16 operands and an fp32 accumulator**,
+/// via `cublasGemmEx`.
+///
+/// This is what the reference does at its autograd boundary: `@custom_fwd(
+/// cast_inputs=autocast_kernel_dtype)` with `autocast_kernel_dtype="bfloat16"`
+/// casts the projection inputs to bf16, and the matmuls then run on the tensor
+/// cores with `CUBLAS_COMPUTE_32F` — operands narrow, accumulation wide. cudarc
+/// ships exactly this shape for `half::f16` (`Gemm<f16>` calls `result::gemm_ex`
+/// with `CUDA_R_16F` + `CUBLAS_COMPUTE_32F`); this is the `CUDA_R_16BF` twin, which
+/// the crate does not provide.
+///
+/// bf16 rather than fp16 for the usual reason: it keeps fp32's 8 exponent bits, so
+/// no activation or gradient here can overflow or flush that would not have in
+/// fp32, and no loss scaling is needed. Only the multiplicand mantissas narrow to 8
+/// bits — a strictly larger cut than the TF32 path in `gpu::set_tf32` (10 bits),
+/// applied at the same place.
+///
+/// `a`/`b` are the bf16 operands, already narrowed by the caller (see
+/// [`GemmBf16`]); `c` stays fp32, because it is both the accumulator's output type
+/// and what every downstream op expects.
+///
+/// # Safety of the operand swap
+///
+/// Identical to the fp32 wrappers: cuBLAS is column-major, so we ask for `Cᵀ` by
+/// passing `b` first and swapping `m`/`n`. The `ld*` values below therefore mirror
+/// `matmul_{nn,nt,tn}_into` exactly — keep them in step if those ever change.
+pub fn matmul_bf16_into(
+    gpu: &Gpu,
+    form: MmForm,
+    a: &super::BTensor,
+    b: &super::BTensor,
+    c: &mut DTensor,
+    beta: f32,
+) {
+    use cudarc::cublas::sys;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    let (m, ka, n, kb) = match form {
+        MmForm::Nn => (a.dims()[0], a.dims()[1], b.dims()[1], b.dims()[0]),
+        MmForm::Nt => (a.dims()[0], a.dims()[1], b.dims()[0], b.dims()[1]),
+        MmForm::Tn => (a.dims()[1], a.dims()[0], b.dims()[1], b.dims()[0]),
+    };
+    assert_eq!(ka, kb, "matmul_bf16: inner dims {ka} != {kb}");
+    assert_eq!((c.rows(), c.cols()), (m, n), "matmul_bf16: C shape mismatch");
+
+    // Mirrors the fp32 wrappers' (transa, transb, lda, ldb) per form.
+    let (transa, transb, lda, ldb) = match form {
+        MmForm::Nn => (CUBLAS_OP_N, CUBLAS_OP_N, n, ka),
+        MmForm::Nt => (CUBLAS_OP_T, CUBLAS_OP_N, ka, ka),
+        MmForm::Tn => (CUBLAS_OP_N, CUBLAS_OP_T, n, m),
+    };
+    let (alpha, beta) = (1.0f32, beta);
+    let (pa, _ra) = a.buf.device_ptr(&gpu.stream);
+    let (pb, _rb) = b.buf.device_ptr(&gpu.stream);
+    let (pc, _rc) = c.buf.device_ptr_mut(&gpu.stream);
+
+    // SAFETY: the handle is live, the three pointers are device allocations of at
+    // least the sizes the shape asserts above imply, and the leading dimensions are
+    // the same ones the parity-tested fp32 wrappers use for this form.
+    unsafe {
+        cudarc::cublas::result::gemm_ex(
+            *gpu.blas.handle(),
+            transa,
+            transb,
+            n as i32, // swapped m/n: we are computing Cᵀ
+            m as i32,
+            ka as i32,
+            (&alpha) as *const f32 as *const _,
+            pb as *const _, // operand swap: B first
+            sys::cudaDataType_t::CUDA_R_16BF,
+            lda as i32,
+            pa as *const _,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            ldb as i32,
+            (&beta) as *const f32 as *const _,
+            pc as *mut _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            n as i32,
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        )
+    }
+    .expect("cublas gemm_ex bf16");
+}
+
+/// Reusable bf16 staging for a layer's GEMM operands.
+///
+/// [`matmul_bf16_into`] needs both operands already in bf16, but the tensors a
+/// layer holds are fp32 (the optimizer steps them there, and the checkpoint stores
+/// them there). This owns the narrowed copies and refills them per call, so the
+/// conversion does not allocate on the hot path.
+///
+/// Keeping the fp32 master and narrowing per use is deliberate — it is what every
+/// mixed-precision framework does, and what makes this safe: the weights that
+/// accumulate small updates never lose precision, only the transient operands the
+/// tensor cores read.
+#[derive(Default)]
+pub struct GemmBf16 {
+    lhs: Option<super::BTensor>,
+    rhs: Option<super::BTensor>,
+}
+
+impl GemmBf16 {
+    pub const fn new() -> Self {
+        Self { lhs: None, rhs: None }
+    }
+
+    /// Narrow `a` and `b` into the owned staging buffers and run the GEMM.
+    pub fn run(
+        &mut self,
+        gpu: &Gpu,
+        form: MmForm,
+        a: &DTensor,
+        b: &DTensor,
+        c: &mut DTensor,
+        beta: f32,
+    ) {
+        fn stage<'s>(
+            gpu: &Gpu,
+            slot: &'s mut Option<super::BTensor>,
+            src: &DTensor,
+        ) -> &'s super::BTensor {
+            let n = src.len();
+            match slot {
+                Some(t) if t.capacity() >= n => t.shrink_to(src.dims()),
+                _ => *slot = Some(super::BTensor::uninit(gpu, src.dims())),
+            }
+            let t = slot.as_mut().expect("just filled");
+            t.store(gpu, src);
+            t
+        }
+        // Two separate slots so the borrows do not overlap.
+        stage(gpu, &mut self.lhs, a);
+        stage(gpu, &mut self.rhs, b);
+        let lhs = self.lhs.as_ref().expect("staged");
+        let rhs = self.rhs.as_ref().expect("staged");
+        matmul_bf16_into(gpu, form, lhs, rhs, c, beta);
+    }
+}
+
 /// `C = A · B` (fresh allocation). Convenience wrapper over [`matmul_nn_into`].
 pub fn matmul(gpu: &Gpu, a: &DTensor, b: &DTensor) -> DTensor {
     let mut c = DTensor::uninit(gpu, &[a.rows(), b.cols()]);
@@ -396,6 +558,34 @@ pub fn rms_norm_forward(
 /// [`rms_norm_forward`]. `out` and `saved.x_hat` must be `[B, F]`, and
 /// `saved.inv_rms` must hold `B * F/group` elements; the kernel writes all three
 /// in full, so their prior contents do not matter.
+/// Threads per block for the RMSNorm kernels. Must match `RMSN_THREADS` in the
+/// kernel source.
+const RMSN_THREADS: u32 = 256;
+
+/// Launch geometry for the RMSNorm kernels: one BLOCK per (row, group), which
+/// reduces over the group cooperatively.
+///
+/// The kernels used to be thread-per-group, which was pathological at this model's
+/// shape: a block's norms are ungrouped, so `group == hidden` and one thread walked
+/// 1024 elements serially — 1024 threads for the whole launch on an 84-SM card.
+/// Phase timing put the norms plus residual adds at 44.7% of a training step, more
+/// than every recurrent cell combined; block-per-group took that component from
+/// 213 ms to 4 ms and the step from 475 ms to 263 ms (1.8x).
+///
+/// One kernel, no crossover: block-per-group was measured faster at every group
+/// size present here, including the mLSTM's head-wise `group == dhv` (64), where the
+/// old kernel's launch was already wide. A sweep of the crossover found 257.8 ms
+/// with the block kernel used everywhere against 262.8 ms with it used only above
+/// 128, so the narrow case gains too and the second kernel earned no keep.
+fn rms_norm_cfg(total_groups: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (total_groups as u32, 1, 1),
+        block_dim: (RMSN_THREADS, 1, 1),
+        // One float per warp for the cross-warp fold.
+        shared_mem_bytes: (RMSN_THREADS / 32) * std::mem::size_of::<f32>() as u32,
+    }
+}
+
 pub fn rms_norm_forward_into(
     gpu: &Gpu,
     x: &DTensor,
@@ -416,6 +606,7 @@ pub fn rms_norm_forward_into(
         "rms_norm_forward: inv_rms length"
     );
     let (gpr_i, group_i, tg_i) = (groups_per_row as i32, group as i32, total_groups as i32);
+    let cfg = rms_norm_cfg(total_groups);
     let func = gpu.kernels.get("rms_norm_forward");
     let mut lb = gpu.stream.launch_builder(&func);
     lb.arg(&x.buf)
@@ -427,8 +618,7 @@ pub fn rms_norm_forward_into(
         .arg(&group_i)
         .arg(&eps)
         .arg(&tg_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(total_groups as u32)) }
-        .expect("rms_norm_forward");
+    unsafe { lb.launch(cfg) }.expect("rms_norm_forward");
 }
 
 /// Grouped RMSNorm backward. Accumulates γ grad into `dgamma`, returns `dX`.
@@ -463,6 +653,7 @@ pub fn rms_norm_backward_into(
     let total_groups = b * groups_per_row;
     assert_eq!(dx.dims(), [b, f], "rms_norm_backward: dx shape");
     let (gpr_i, group_i, tg_i) = (groups_per_row as i32, group as i32, total_groups as i32);
+    let cfg = rms_norm_cfg(total_groups);
     let func = gpu.kernels.get("rms_norm_backward");
     let mut lb = gpu.stream.launch_builder(&func);
     lb.arg(&dy.buf)
@@ -474,8 +665,7 @@ pub fn rms_norm_backward_into(
         .arg(&gpr_i)
         .arg(&group_i)
         .arg(&tg_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(total_groups as u32)) }
-        .expect("rms_norm_backward");
+    unsafe { lb.launch(cfg) }.expect("rms_norm_backward");
 }
 
 /// Fused softmax + cross-entropy. Returns `(mean_loss, dlogits)` with
@@ -816,15 +1006,130 @@ pub fn slstm_db_from_dg(
 /// Saved forward tensors of a fused-gate sLSTM, each a `[B, T, H]` slab (indexed
 /// `(b·T + t)·H + j`) rather than one small tensor per timestep.
 pub struct SlstmSlabs {
+    // Stabilizer-carrying: fp32, always. `c`/`n` and their `_prev` counterparts
+    // hold the exp(-m)-scaled cell and normalizer, and `i_prime`/`f_prime` ARE
+    // exp(·-m). Narrowing any of them injects a multiplicative error into the
+    // quantity that keeps the recurrence bounded — see `gpu::bf16`.
     pub c_prev: DTensor,
     pub n_prev: DTensor,
-    pub zt: DTensor,
-    pub ot: DTensor,
     pub i_prime: DTensor,
     pub f_prime: DTensor,
     pub c: DTensor,
     pub n: DTensor,
-    pub h_prev: DTensor,
+    // Plain activations: bf16 when the kernels were built for it. These are bounded
+    // by construction (`zt` is a tanh, `ot` a sigmoid, `h_prev` their product over a
+    // normalized ratio), written once and read once, and enter no reduction in their
+    // stored form — so storage precision is free of the recurrence's error growth.
+    //
+    // Held as `SlabBuf` rather than `DTensor`: the width must match what the kernels
+    // were compiled against (`Kernels::slab_bf16`), which is checked on construction.
+    pub zt: SlabBuf,
+    pub ot: SlabBuf,
+    pub h_prev: SlabBuf,
+}
+
+/// A saved slab whose element width follows the compiled kernels: bf16 when they
+/// were built with `-DSLAB_BF16`, fp32 otherwise.
+///
+/// This exists rather than a bare `DTensor` because the kernels index these buffers
+/// at a **compile-time** width. Handing a kernel built for `__nv_bfloat16` an fp32
+/// buffer is not a type error anywhere — it is a silent stride mismatch that reads
+/// half the tensor and writes past the end of it. Routing every allocation through
+/// [`SlabBuf::new`], which reads `Kernels::slab_bf16`, makes the two agree by
+/// construction.
+pub enum SlabBuf {
+    F32(DTensor),
+    Bf16(super::BTensor),
+}
+
+impl SlabBuf {
+    /// An uninitialized slab at the width the kernels expect.
+    pub fn new(gpu: &Gpu, dims: &[usize]) -> Self {
+        if gpu.kernels.slab_bf16 {
+            SlabBuf::Bf16(super::BTensor::uninit(gpu, dims))
+        } else {
+            SlabBuf::F32(DTensor::uninit(gpu, dims))
+        }
+    }
+
+    /// Take ownership of an fp32 tensor as a slab, narrowing it when the kernels
+    /// were built for bf16.
+    ///
+    /// This is the conversion point for a value that is *produced* in fp32 (a
+    /// projection, a head-major reorg) but only *consumed* by the fused kernels.
+    /// On the bf16 path the fp32 original is dropped here, so the cache holds only
+    /// the narrow copy — which is the whole point: the wide buffer is transient,
+    /// the slab is what lives across forward and backward.
+    pub fn from_f32(gpu: &Gpu, t: DTensor) -> Self {
+        if !gpu.kernels.slab_bf16 {
+            return SlabBuf::F32(t);
+        }
+        let mut b = super::BTensor::uninit(gpu, t.dims());
+        b.store(gpu, &t);
+        SlabBuf::Bf16(b)
+    }
+
+    /// An fp32 view of this slab, for a consumer that cannot read bf16 — chiefly
+    /// cuBLAS, which has no bf16 operand on these GEMMs.
+    ///
+    /// `scratch` receives the widened copy on the bf16 path and is left untouched on
+    /// the fp32 path, where the slab is already what the caller wants. (A `Cow` would
+    /// be the natural shape, but `DTensor` is deliberately not `Clone`.)
+    pub fn as_f32<'a>(&'a self, gpu: &Gpu, scratch: &'a mut DTensor) -> &'a DTensor {
+        match self {
+            SlabBuf::F32(t) => t,
+            SlabBuf::Bf16(b) => {
+                b.load(gpu, scratch);
+                scratch
+            }
+        }
+    }
+
+    pub fn dims(&self) -> &[usize] {
+        match self {
+            SlabBuf::F32(t) => t.dims(),
+            SlabBuf::Bf16(t) => t.dims(),
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        match self {
+            SlabBuf::F32(t) => t.capacity(),
+            SlabBuf::Bf16(t) => t.capacity(),
+        }
+    }
+
+    pub fn shrink_to(&mut self, dims: &[usize]) {
+        match self {
+            SlabBuf::F32(t) => t.shrink_to(dims),
+            SlabBuf::Bf16(t) => t.shrink_to(dims),
+        }
+    }
+}
+
+/// Push a slab as a kernel argument at whichever width it holds.
+///
+/// A `LaunchArgs` builder takes `&CudaSlice<T>` for a concrete `T`, so the two
+/// variants cannot be unified behind one `.arg()` call; this matches once and
+/// pushes the right pointer. The kernel's parameter is `slab_t*`, which was
+/// compiled to the same width by construction (see [`SlabBuf`]).
+macro_rules! push_slab {
+    ($lb:expr, $slab:expr) => {
+        match &mut $slab {
+            SlabBuf::F32(t) => $lb.arg(&mut t.buf),
+            SlabBuf::Bf16(t) => $lb.arg(&mut t.buf),
+        }
+    };
+}
+
+/// [`push_slab`] for a slab the kernel only reads.
+macro_rules! push_slab_ref {
+    ($lb:expr, $slab:expr) => {
+        match &$slab {
+            SlabBuf::F32(t) => $lb.arg(&t.buf),
+            SlabBuf::Bf16(t) => $lb.arg(&t.buf),
+        }
+    };
 }
 
 /// One fused forward step: add the biases, advance `(c,n,m,h)_state`, fill the
@@ -850,19 +1155,17 @@ pub fn slstm_step_fused(
     let (t_i, bigt_i, h_i, bh_i) = (t as i32, big_t as i32, h as i32, bh as i32);
     let f = gpu.kernels.get("slstm_step_fused");
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&mut g.buf)
-        .arg(&gh.buf)
-        .arg(&bcat.buf)
-        .arg(&mut slabs.h_prev.buf)
-        .arg(&mut c_state.buf)
+    lb.arg(&mut g.buf).arg(&gh.buf).arg(&bcat.buf);
+    push_slab!(lb, slabs.h_prev);
+    lb.arg(&mut c_state.buf)
         .arg(&mut n_state.buf)
         .arg(&mut m_state.buf)
         .arg(&mut h_state.buf)
         .arg(&mut slabs.c_prev.buf)
-        .arg(&mut slabs.n_prev.buf)
-        .arg(&mut slabs.zt.buf)
-        .arg(&mut slabs.ot.buf)
-        .arg(&mut slabs.i_prime.buf)
+        .arg(&mut slabs.n_prev.buf);
+    push_slab!(lb, slabs.zt);
+    push_slab!(lb, slabs.ot);
+    lb.arg(&mut slabs.i_prime.buf)
         .arg(&mut slabs.f_prime.buf)
         .arg(&mut slabs.c.buf)
         .arg(&mut slabs.n.buf)
@@ -930,8 +1233,7 @@ pub fn slstm_fused_time_geometry(
     // added; the gate scratch stays fp32 either way (it feeds the recurrence).
     let wbytes = if fused_bf16_enabled() { 2 } else { 4 };
     let h_mirror = if fused_bf16_enabled() { b * h * 2 } else { 0 };
-    let bytes_per_unit =
-        |units: usize| h * 4 * units * wbytes + b * 4 * units * 4 + h_mirror;
+    let bytes_per_unit = |units: usize| h * 4 * units * wbytes + b * 4 * units * 4 + h_mirror;
     let max_units = {
         let per_unit = h * 4 * wbytes + b * 4 * 4;
         smem_cap.saturating_sub(h_mirror) / per_unit
@@ -1051,14 +1353,14 @@ pub fn slstm_fused_time_bwd(
         .arg(&mut dgates_all.buf)
         .arg(&mut dh_recur.buf)
         .arg(&mut dc_recur.buf)
-        .arg(&mut dn_recur.buf)
-        .arg(&slabs.ot.buf)
-        .arg(&slabs.c.buf)
+        .arg(&mut dn_recur.buf);
+    push_slab_ref!(lb, slabs.ot);
+    lb.arg(&slabs.c.buf)
         .arg(&slabs.n.buf)
         .arg(&slabs.c_prev.buf)
-        .arg(&slabs.n_prev.buf)
-        .arg(&slabs.zt.buf)
-        .arg(&slabs.i_prime.buf)
+        .arg(&slabs.n_prev.buf);
+    push_slab_ref!(lb, slabs.zt);
+    lb.arg(&slabs.i_prime.buf)
         .arg(&slabs.f_prime.buf)
         .arg(&t_i)
         .arg(&h_i)
@@ -1109,14 +1411,15 @@ pub fn slstm_fused_time(
     // stages fp32 and would read past a shared allocation that `geometry` sized for
     // bf16. With bf16 on and no specialized build available, decline instead and let
     // the caller take the per-step path.
-    let f = match gpu
-        .kernels
-        .specialized(&gpu.context, "slstm_fused_time", h, b, fused_bf16_enabled())
-    {
-        Some(f) => f,
-        None if !fused_bf16_enabled() => gpu.kernels.get("slstm_fused_time"),
-        None => return false,
-    };
+    let f =
+        match gpu
+            .kernels
+            .specialized(&gpu.context, "slstm_fused_time", h, b, fused_bf16_enabled())
+        {
+            Some(f) => f,
+            None if !fused_bf16_enabled() => gpu.kernels.get("slstm_fused_time"),
+            None => return false,
+        };
     // Opt into the larger shared-memory carve-out; without this the launch fails
     // for any slice above the default 48 KB.
     if let Err(e) = f.set_attribute(
@@ -1132,19 +1435,17 @@ pub fn slstm_fused_time(
         shared_mem_bytes: shared_bytes as u32,
     };
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&wh.buf)
-        .arg(&mut g.buf)
-        .arg(&bcat.buf)
-        .arg(&mut slabs.h_prev.buf)
-        .arg(&mut c_state.buf)
+    lb.arg(&wh.buf).arg(&mut g.buf).arg(&bcat.buf);
+    push_slab!(lb, slabs.h_prev);
+    lb.arg(&mut c_state.buf)
         .arg(&mut n_state.buf)
         .arg(&mut m_state.buf)
         .arg(&mut h_state.buf)
         .arg(&mut slabs.c_prev.buf)
-        .arg(&mut slabs.n_prev.buf)
-        .arg(&mut slabs.zt.buf)
-        .arg(&mut slabs.ot.buf)
-        .arg(&mut slabs.i_prime.buf)
+        .arg(&mut slabs.n_prev.buf);
+    push_slab!(lb, slabs.zt);
+    push_slab!(lb, slabs.ot);
+    lb.arg(&mut slabs.i_prime.buf)
         .arg(&mut slabs.f_prime.buf)
         .arg(&mut slabs.c.buf)
         .arg(&mut slabs.n.buf)
@@ -1201,14 +1502,14 @@ pub fn slstm_step_fused_bwd(
     lb.arg(&d_out.buf)
         .arg(&mut gates.buf)
         .arg(&mut d_gates_flat.buf)
-        .arg(&d_h_recur.buf)
-        .arg(&slabs.ot.buf)
-        .arg(&slabs.c.buf)
+        .arg(&d_h_recur.buf);
+    push_slab_ref!(lb, slabs.ot);
+    lb.arg(&slabs.c.buf)
         .arg(&slabs.n.buf)
         .arg(&slabs.c_prev.buf)
-        .arg(&slabs.n_prev.buf)
-        .arg(&slabs.zt.buf)
-        .arg(&slabs.i_prime.buf)
+        .arg(&slabs.n_prev.buf);
+    push_slab_ref!(lb, slabs.zt);
+    lb.arg(&slabs.i_prime.buf)
         .arg(&slabs.f_prime.buf)
         .arg(&mut d_c_recur.buf)
         .arg(&mut d_n_recur.buf)
@@ -1227,6 +1528,22 @@ pub fn add(gpu: &Gpu, a: &DTensor, b: &DTensor) -> DTensor {
     let mut out = DTensor::uninit(gpu, a.dims());
     add_into(gpu, a, b, &mut out);
     out
+}
+
+/// In-place `acc += b`.
+///
+/// The running sums in mLSTM's backward (`dkc`, `dqc`, `dxf`, …) were written as
+/// `x = add(&x, &term)`, which allocates a buffer per term and drops the previous
+/// one. This accumulates into `acc` instead, so a sum of k terms costs no
+/// allocations at all.
+pub fn add_assign(gpu: &Gpu, acc: &mut DTensor, b: &DTensor) {
+    let n = acc.len();
+    assert_eq!(n, b.len(), "add_assign: length mismatch");
+    let n_i = n as i32;
+    let f = gpu.kernels.get("add_assign");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut acc.buf).arg(&b.buf).arg(&n_i);
+    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("add_assign");
 }
 
 /// Elementwise `out = a + b` into a caller-owned buffer. The allocating [`add`]
@@ -1264,7 +1581,11 @@ pub fn swiglu_forward_into(
 ) {
     let n = gate_pre.len();
     assert_eq!(n, value.len(), "swiglu_forward: length mismatch");
-    assert_eq!(n, gate_act.len(), "swiglu_forward: gate_act length mismatch");
+    assert_eq!(
+        n,
+        gate_act.len(),
+        "swiglu_forward: gate_act length mismatch"
+    );
     assert_eq!(n, mixed.len(), "swiglu_forward: mixed length mismatch");
     let n_i = n as i32;
     let f = gpu.kernels.get("swiglu_forward");
@@ -1289,7 +1610,13 @@ pub fn swiglu_backward(
     let mut d_gate = DTensor::uninit(gpu, d_mixed.dims());
     let mut d_value = DTensor::uninit(gpu, d_mixed.dims());
     swiglu_backward_into(
-        gpu, d_mixed, gate_act, value, gate_pre, &mut d_gate, &mut d_value,
+        gpu,
+        d_mixed,
+        gate_act,
+        value,
+        gate_pre,
+        &mut d_gate,
+        &mut d_value,
     );
     (d_gate, d_value)
 }
@@ -1370,6 +1697,73 @@ pub fn head_scatter_into(
         .arg(&wi);
     unsafe { lb.launch(LaunchConfig::for_num_elems((b * h * t * w) as u32)) }
         .expect("head_scatter");
+}
+
+/// [`head_gather`] writing straight into a [`SlabBuf`], narrowing as it goes.
+///
+/// The conversion has to happen *here* rather than on the result of a normal
+/// `head_gather`. Materializing the fp32 tensor first and then narrowing it pays
+/// for the wide allocation regardless — and cudarc frees through an async pool that
+/// retains blocks, so the fp32 buffer stays resident afterwards and the pair costs
+/// **more** than fp32 alone. That was measured: the naive ordering made a training
+/// step 32 MB larger rather than smaller. Writing narrow from the start is what
+/// removes the wide buffer from the working set.
+pub fn head_gather_slab(
+    gpu: &Gpu,
+    x: &DTensor,
+    b: usize,
+    h: usize,
+    t: usize,
+    w: usize,
+) -> SlabBuf {
+    let mut out = SlabBuf::new(gpu, &[b * h, t, w]);
+    let (bi, hi, ti, wi) = (b as i32, h as i32, t as i32, w as i32);
+    let name = match out {
+        SlabBuf::F32(_) => "head_gather",
+        SlabBuf::Bf16(_) => "head_gather_slab",
+    };
+    let f = gpu.kernels.get(name);
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&x.buf);
+    push_slab!(lb, out);
+    lb.arg(&bi).arg(&hi).arg(&ti).arg(&wi);
+    unsafe { lb.launch(LaunchConfig::for_num_elems((b * h * t * w) as u32)) }
+        .expect("head_gather_slab");
+    out
+}
+
+/// [`head_scatter_into`] reading a [`SlabBuf`] source, converting on the fly.
+///
+/// The mLSTM's `ytil` is stored bf16; widening it into a temporary before the
+/// scatter would allocate the very fp32 buffer the narrow storage exists to avoid,
+/// so the kernel reads it narrow instead. Output is fp32 either way.
+pub fn head_scatter_slab_into(
+    gpu: &Gpu,
+    x: &SlabBuf,
+    b: usize,
+    h: usize,
+    t: usize,
+    w: usize,
+    out: &mut DTensor,
+) {
+    assert_eq!(out.len(), b * t * h * w, "head_scatter_slab: output size");
+    let (bi, hi, ti, wi) = (b as i32, h as i32, t as i32, w as i32);
+    // The fp32 variant is the same kernel without the convert; dispatch on the
+    // slab's own width so this works on both paths.
+    let name = match x {
+        SlabBuf::F32(_) => "head_scatter",
+        SlabBuf::Bf16(_) => "head_scatter_slab",
+    };
+    let f = gpu.kernels.get(name);
+    let mut lb = gpu.stream.launch_builder(&f);
+    push_slab_ref!(lb, *x);
+    lb.arg(&mut out.buf)
+        .arg(&bi)
+        .arg(&hi)
+        .arg(&ti)
+        .arg(&wi);
+    unsafe { lb.launch(LaunchConfig::for_num_elems((b * h * t * w) as u32)) }
+        .expect("head_scatter_slab");
 }
 
 /// Inclusive cumsum of logσ along T, per row of `f` `[BH, T]` → `fc` `[BH, T]`.
@@ -1909,7 +2303,7 @@ pub const FUSED_MAX_L: usize = 32;
 pub struct MlstmFused {
     pub l: usize,
     pub nc: usize,
-    pub ytil: DTensor, // [BH, T, dhv]
+    pub ytil: SlabBuf, // [BH, T, dhv]  bf16 storage (reference: matHout at DTYPE)
     cst: DTensor,      // [BH, NC+1, dhv, dqk]  state entering each chunk
     nst: DTensor,      // [BH, NC+1, dqk]
     mst: DTensor,      // [BH, NC+1]
@@ -2124,15 +2518,15 @@ pub fn mlstm_fused_kernels(
 #[allow(clippy::too_many_arguments)]
 pub fn mlstm_fused_fw(
     gpu: &Gpu,
-    qh: &DTensor,  // [BH, T, dqk]
-    kh: &DTensor,  // [BH, T, dqk]  (already scaled by 1/√dqk)
-    vh: &DTensor,  // [BH, T, dhv]
-    igh: &DTensor, // [BH, T]
-    fgh: &DTensor, // [BH, T]
+    qh: &SlabBuf,  // [BH, T, dqk]   bf16 storage (reference: matQ at DTYPE)
+    kh: &SlabBuf,  // [BH, T, dqk]   bf16, already scaled by 1/√dqk
+    vh: &SlabBuf,  // [BH, T, dhv]   bf16 (matV)
+    igh: &DTensor, // [BH, T]        fp32: gate logit (reference pins vecI)
+    fgh: &DTensor, // [BH, T]        fp32: gate logit (vecB is fp32 too)
     l: usize,
 ) -> MlstmFused {
-    let (bh, t, dqk) = (qh.shape[0], qh.shape[1], qh.shape[2]);
-    let dhv = vh.shape[2];
+    let (bh, t, dqk) = (qh.dims()[0], qh.dims()[1], qh.dims()[2]);
+    let dhv = vh.dims()[2];
     let l = l.min(t);
     assert!(
         mlstm_fused_supported(l, dqk, dhv),
@@ -2147,7 +2541,9 @@ pub fn mlstm_fused_fw(
     let mut cst = DTensor::uninit(gpu, &[bh, nc + 1, dhv, dqk]);
     let mut nst = DTensor::uninit(gpu, &[bh, nc + 1, dqk]);
     let mut mst = DTensor::uninit(gpu, &[bh, nc + 1]);
-    let mut ytil = DTensor::uninit(gpu, &[bh, t, dhv]);
+    // ytil is the kernel's output h (reference stores matHout at DTYPE); the
+    // stabilizer/normalizer triple stays fp32, as does the chunk state.
+    let mut ytil = SlabBuf::new(gpu, &[bh, t, dhv]);
     let mut msv = DTensor::uninit(gpu, &[bh, t]);
     let mut psiv = DTensor::uninit(gpu, &[bh, t]);
     let mut qnv = DTensor::uninit(gpu, &[bh, t]);
@@ -2168,9 +2564,9 @@ pub fn mlstm_fused_fw(
 
     let (f, smem) = fused_kernel(gpu, "mlstm_fw_C", fused_smem("fw_C", l, dqk, dhv));
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&kh.buf)
-        .arg(&vh.buf)
-        .arg(&igh.buf)
+    push_slab_ref!(lb, *kh);
+    push_slab_ref!(lb, *vh);
+    lb.arg(&igh.buf)
         .arg(&fcb.buf)
         .arg(&mut cst.buf)
         .arg(&mut nst.buf)
@@ -2187,16 +2583,16 @@ pub fn mlstm_fused_fw(
     let (name, kind) = fw_parallel_kernel(gpu);
     let (f, smem) = fused_kernel(gpu, name, fused_smem(kind, l, dqk, dhv));
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&qh.buf)
-        .arg(&kh.buf)
-        .arg(&vh.buf)
-        .arg(&igh.buf)
+    push_slab_ref!(lb, *qh);
+    push_slab_ref!(lb, *kh);
+    push_slab_ref!(lb, *vh);
+    lb.arg(&igh.buf)
         .arg(&fcb.buf)
         .arg(&cst.buf)
         .arg(&nst.buf)
-        .arg(&mst.buf)
-        .arg(&mut ytil.buf)
-        .arg(&mut msv.buf)
+        .arg(&mst.buf);
+    push_slab!(lb, ytil);
+    lb.arg(&mut msv.buf)
         .arg(&mut psiv.buf)
         .arg(&mut qnv.buf)
         .arg(&t_i)
@@ -2233,15 +2629,18 @@ pub fn mlstm_fused_fw(
 pub fn mlstm_fused_bw(
     gpu: &Gpu,
     sv: &MlstmFused,
-    qh: &DTensor,
-    kh: &DTensor,
-    vh: &DTensor,
+    qh: &SlabBuf,
+    kh: &SlabBuf,
+    vh: &SlabBuf,
     igh: &DTensor,
     fgh: &DTensor,
+    // The incoming gradient is fp32: it is a transient, not a saved tensor, so
+    // narrowing it would buy no memory. (The reference does cast matDeltaH to
+    // DTYPE, but only to feed its tensor cores.)
     d_ytil: &DTensor, // [BH, T, dhv]
 ) -> (DTensor, DTensor, DTensor, DTensor, DTensor) {
-    let (bh, t, dqk) = (qh.shape[0], qh.shape[1], qh.shape[2]);
-    let dhv = vh.shape[2];
+    let (bh, t, dqk) = (qh.dims()[0], qh.dims()[1], qh.dims()[2]);
+    let dhv = vh.dims()[2];
     let (l, nc) = (sv.l, sv.nc);
     let (t_i, l_i, nc_i, dqk_i, dhv_i) = (t as i32, l as i32, nc as i32, dqk as i32, dhv as i32);
 
@@ -2254,10 +2653,10 @@ pub fn mlstm_fused_bw(
 
     let (f, smem) = fused_kernel(gpu, "mlstm_bw_dC", fused_smem("bw_dC", l, dqk, dhv));
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&qh.buf)
-        .arg(&d_ytil.buf)
-        .arg(&sv.ytil.buf)
-        .arg(&sv.psiv.buf)
+    push_slab_ref!(lb, *qh);
+    lb.arg(&d_ytil.buf);
+    push_slab_ref!(lb, sv.ytil);
+    lb.arg(&sv.psiv.buf)
         .arg(&sv.qnv.buf)
         .arg(&sv.msv.buf)
         .arg(&sv.fcb.buf)
@@ -2282,19 +2681,19 @@ pub fn mlstm_fused_bw(
     let (name, kind) = bw_parallel_kernel(gpu);
     let (f, smem) = fused_kernel(gpu, name, fused_smem(kind, l, dqk, dhv));
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&qh.buf)
-        .arg(&kh.buf)
-        .arg(&vh.buf)
-        .arg(&igh.buf)
+    push_slab_ref!(lb, *qh);
+    push_slab_ref!(lb, *kh);
+    push_slab_ref!(lb, *vh);
+    lb.arg(&igh.buf)
         .arg(&fgh.buf)
         .arg(&sv.fcb.buf)
         .arg(&sv.cst.buf)
         .arg(&sv.nst.buf)
         .arg(&sv.mst.buf)
         .arg(&dcst.buf)
-        .arg(&dnst.buf)
-        .arg(&sv.ytil.buf)
-        .arg(&d_ytil.buf)
+        .arg(&dnst.buf);
+    push_slab_ref!(lb, sv.ytil);
+    lb.arg(&d_ytil.buf)
         .arg(&sv.psiv.buf)
         .arg(&sv.qnv.buf)
         .arg(&sv.msv.buf)
@@ -2329,6 +2728,138 @@ mod tests {
         assert_eq!(got.len(), want.len(), "length mismatch");
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
             assert!((g - w).abs() < 1e-3, "index {i}: gpu {g} vs cpu {w}");
+        }
+    }
+
+    /// The bf16 GEMM must agree with the fp32 one to bf16's precision, in all three
+    /// transpose forms — the operand swap and leading dimensions are hand-derived
+    /// per form, so a wrong `ld` would silently transpose or stride the result.
+    ///
+    /// The bound is a relative one against the result's own scale: each product
+    /// carries ~2^-8 relative error, and summing K of them lets that grow like √K
+    /// in the worst realistic case, so the tolerance is scaled by √K rather than
+    /// being a fixed constant.
+    #[test]
+    fn gemm_bf16_matches_fp32_all_forms() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        if !gemm_bf16_enabled(&gpu) {
+            eprintln!("skipping: bf16 unavailable");
+            return;
+        }
+        let (m, k, n) = (37usize, 53usize, 29usize);
+        for form in [MmForm::Nn, MmForm::Nt, MmForm::Tn] {
+            let (ad, bd) = match form {
+                MmForm::Nn => ([m, k], [k, n]),
+                MmForm::Nt => ([m, k], [n, k]),
+                MmForm::Tn => ([k, m], [k, n]),
+            };
+            let a = Tensor::random(&ad, 1.0);
+            let b = Tensor::random(&bd, 1.0);
+            let (da, db) = (
+                DTensor::from_host(&gpu, &a),
+                DTensor::from_host(&gpu, &b),
+            );
+
+            let mut want = DTensor::uninit(&gpu, &[m, n]);
+            match form {
+                MmForm::Nn => matmul_nn_into(&gpu, &da, &db, &mut want, 0.0),
+                MmForm::Nt => matmul_nt_into(&gpu, &da, &db, &mut want, 0.0),
+                MmForm::Tn => matmul_tn_into(&gpu, &da, &db, &mut want, 0.0),
+            }
+            let mut got = DTensor::uninit(&gpu, &[m, n]);
+            GemmBf16::new().run(&gpu, form, &da, &db, &mut got, 0.0);
+
+            let (w, g) = (want.to_host(&gpu).data, got.to_host(&gpu).data);
+            let scale = w.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+            let bound = 4e-3 * scale * (k as f32).sqrt();
+            for (i, (a, b)) in g.iter().zip(&w).enumerate() {
+                assert!(
+                    (a - b).abs() < bound,
+                    "form {} elem {i}: bf16 {a} vs fp32 {b} (bound {bound:.2e})",
+                    match form {
+                        MmForm::Nn => "NN",
+                        MmForm::Nt => "NT",
+                        MmForm::Tn => "TN",
+                    }
+                );
+            }
+        }
+    }
+
+    /// The staging buffers must be REUSED across calls, not reallocated.
+    ///
+    /// This runs on every projection of every block, every step, so a staging buffer
+    /// that reallocated per call would put the allocator back on the hot path — and
+    /// because cudarc frees through a retaining async pool, the freed copies would
+    /// also inflate the resident set. Pinned by device address: a steady shape must
+    /// keep the same allocation, and a smaller one must reuse it rather than
+    /// allocate a second.
+    #[test]
+    fn gemm_bf16_staging_reuses_its_buffers() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        if !gemm_bf16_enabled(&gpu) {
+            return;
+        }
+        use cudarc::driver::DevicePtr;
+        let mut g = GemmBf16::new();
+        let addr = |g: &GemmBf16| {
+            let l = g.lhs.as_ref().expect("staged").buf.device_ptr(&gpu.stream).0;
+            let r = g.rhs.as_ref().expect("staged").buf.device_ptr(&gpu.stream).0;
+            (l, r)
+        };
+
+        let a = DTensor::from_host(&gpu, &Tensor::random(&[64, 32], 1.0));
+        let b = DTensor::from_host(&gpu, &Tensor::random(&[32, 16], 1.0));
+        let mut c = DTensor::uninit(&gpu, &[64, 16]);
+        g.run(&gpu, MmForm::Nn, &a, &b, &mut c, 0.0);
+        let first = addr(&g);
+        for _ in 0..5 {
+            g.run(&gpu, MmForm::Nn, &a, &b, &mut c, 0.0);
+            assert_eq!(first, addr(&g), "steady shape must reuse the staging buffers");
+        }
+
+        // A smaller call fits the existing allocation, so it must not reallocate —
+        // this is what keeps a varying window size from thrashing.
+        let a2 = DTensor::from_host(&gpu, &Tensor::random(&[32, 32], 1.0));
+        let mut c2 = DTensor::uninit(&gpu, &[32, 16]);
+        g.run(&gpu, MmForm::Nn, &a2, &b, &mut c2, 0.0);
+        assert_eq!(first, addr(&g), "a smaller shape must fit the existing buffers");
+    }
+
+    /// `beta = 1` must accumulate into C rather than overwrite it — the weight
+    /// gradient form relies on this.
+    #[test]
+    fn gemm_bf16_accumulates_with_beta_one() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        if !gemm_bf16_enabled(&gpu) {
+            return;
+        }
+        let (m, k, n) = (8usize, 16usize, 4usize);
+        let a = Tensor::random(&[m, k], 1.0);
+        let b = Tensor::random(&[k, n], 1.0);
+        let (da, db) = (DTensor::from_host(&gpu, &a), DTensor::from_host(&gpu, &b));
+
+        let mut once = DTensor::zeros(&gpu, &[m, n]);
+        GemmBf16::new().run(&gpu, MmForm::Nn, &da, &db, &mut once, 0.0);
+        let single = once.to_host(&gpu).data;
+
+        let mut twice = DTensor::zeros(&gpu, &[m, n]);
+        let mut g = GemmBf16::new();
+        g.run(&gpu, MmForm::Nn, &da, &db, &mut twice, 0.0);
+        g.run(&gpu, MmForm::Nn, &da, &db, &mut twice, 1.0);
+        let doubled = twice.to_host(&gpu).data;
+
+        for (i, (d, s)) in doubled.iter().zip(&single).enumerate() {
+            assert!(
+                (d - 2.0 * s).abs() < 1e-4 * s.abs().max(1.0),
+                "beta=1 did not accumulate at {i}: {d} vs 2*{s}"
+            );
         }
     }
 
@@ -2550,6 +3081,73 @@ mod tests {
         let mut dt_gpu = DTensor::zeros(&gpu, &[vocab, dim]);
         embedding_scatter_add(&gpu, &mut dt_gpu, &ids, &gathered_gpu, dim);
         assert_close(&dt_gpu.to_host(&gpu).data, &dt_cpu.data);
+    }
+
+    /// The block-per-group RMSNorm kernels must match the CPU reference at a WIDE
+    /// group — the regime they exist for, and the one `rms_norm_matches_cpu` does
+    /// NOT cover (it uses group=4, which routes to the thread-per-group kernel).
+    ///
+    /// Both directions, and `dgamma` too: the backward accumulates it with atomics
+    /// from every thread of every block, so a reduction bug shows up there first.
+    /// Non-multiple-of-blockDim widths are included because the strided loops must
+    /// handle a ragged tail.
+    #[test]
+    fn rms_norm_block_kernel_matches_cpu() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        use crate::nn2::ops as cpu;
+        let eps = 1e-5;
+        // (rows, features, group): ungrouped wide (the block norms), a multi-group
+        // wide case, and a width that is not a multiple of the 256 block threads.
+        for &(b, f, group) in &[(7usize, 1024usize, 1024usize), (3, 512, 256), (5, 300, 300)] {
+            assert!(group >= 128, "this test must exercise the block kernel");
+            let x = Tensor::random(&[b, f], 1.0);
+            let gamma = Tensor::random(&[f], 1.0);
+            let dy = Tensor::random(&[b, f], 1.0);
+
+            let fwd_cpu = cpu::rms_norm_forward(&x, &gamma, group, eps);
+            let mut dg_cpu = Tensor::zeros(&[f]);
+            let dx_cpu = cpu::rms_norm_backward(
+                &dy,
+                &fwd_cpu.x_hat,
+                &fwd_cpu.inv_rms,
+                &gamma,
+                &mut dg_cpu,
+                group,
+            );
+
+            let gamma_d = DTensor::from_host(&gpu, &gamma);
+            let (out_gpu, fwd_gpu) =
+                rms_norm_forward(&gpu, &DTensor::from_host(&gpu, &x), &gamma_d, group, eps);
+            let mut dg_gpu = DTensor::zeros(&gpu, &[f]);
+            let dx_gpu = rms_norm_backward(
+                &gpu,
+                &DTensor::from_host(&gpu, &dy),
+                &fwd_gpu,
+                &gamma_d,
+                &mut dg_gpu,
+                group,
+            );
+
+            let what = format!("b={b} f={f} group={group}");
+            for (name, got, want) in [
+                ("out", out_gpu.to_host(&gpu).data, fwd_cpu.out.data.clone()),
+                ("dx", dx_gpu.to_host(&gpu).data, dx_cpu.data.clone()),
+                ("dgamma", dg_gpu.to_host(&gpu).data, dg_cpu.data.clone()),
+            ] {
+                assert_eq!(got.len(), want.len(), "{what}: {name} length");
+                let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    // A tree reduction sums in a different order than the CPU's
+                    // sequential one, so this is fp32 reassociation, not an error.
+                    assert!(
+                        (g - w).abs() < 1e-4 * scale.max(1.0),
+                        "{what}: {name}[{i}] gpu {g} vs cpu {w}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

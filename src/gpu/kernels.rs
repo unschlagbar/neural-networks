@@ -18,6 +18,42 @@ use cudarc::driver::{CudaContext, CudaFunction};
 use cudarc::nvrtc::{CompileOptions, compile_ptx, compile_ptx_with_opts};
 
 const SRC: &str = r#"
+// STORAGE dtype of the sLSTM's saved-for-backward slabs. With SLAB_BF16 the slabs
+// that do NOT carry the stabilizer (`zt`, `ot`, `h_prev`) live in global memory as
+// bf16: half the bytes, and since each is written once by the forward and read once
+// by the backward, narrowing them costs one convert on either side and saves a full
+// [B, T, H] round-trip's worth of bandwidth.
+//
+// Arithmetic is unaffected. `slab_ld` widens to fp32 on load and `slab_st` narrows
+// on store, so every recurrence below computes in fp32 exactly as it did before;
+// only the bits that sit in HBM between the two passes are narrower.
+//
+// `c`, `n`, `c_prev`, `n_prev`, `i_prime` and `f_prime` are deliberately NOT in
+// this set. They all carry the exp(-m) stabilizer factor (i' and f' *are*
+// exp(·-m)), and an absolute error eps in an exponent becomes a multiplicative
+// exp(eps) error in the value it guards. The reference kernels (NX-AI
+// mlstm_kernels) pin exactly this group to fp32 — `vecM`/`vecN` are stored
+// `.to(tl.float32)` even where Q/K/V are bf16. See the table in `gpu::bf16`.
+//
+// This must sit at file scope, ahead of every kernel: both the cooperative
+// (`slstm_fused_time`) and the eager (`slstm_step_fused`) paths write the SAME
+// slab buffers, so they have to agree on the dtype, and they are compiled into
+// different modules.
+#ifdef SLAB_BF16
+#include <cuda_bf16.h>
+typedef __nv_bfloat16 slab_t;
+__device__ __forceinline__ float slab_ld(const slab_t* p, long long i) {
+    return __bfloat162float(p[i]);
+}
+__device__ __forceinline__ void slab_st(slab_t* p, long long i, float v) {
+    p[i] = __float2bfloat16(v);
+}
+#else
+typedef float slab_t;
+__device__ __forceinline__ float slab_ld(const slab_t* p, long long i) { return p[i]; }
+__device__ __forceinline__ void slab_st(slab_t* p, long long i, float v) { p[i] = v; }
+#endif
+
 extern "C" __global__ void softcap_forward(const float* x, float* y, float cap, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = cap * tanhf(x[i] / cap);
@@ -64,53 +100,108 @@ extern "C" __global__ void embedding_scatter_add(float* dtable, const unsigned* 
     }
 }
 
-// Grouped RMSNorm forward. One thread per (row, group); f = groups_per_row*group.
+
+// Grouped RMSNorm backward. dgamma is shared across rows -> atomicAdd.
+// Block-per-group RMSNorm. One CUDA BLOCK owns one (row, group) and reduces over
+// the group cooperatively, instead of one thread walking it serially.
+//
+// The thread-per-group kernels below are correct but pathologically parallel-poor at
+// the shape this model actually runs: a block's norms are ungrouped, so
+// `group == hidden == 1024` and `total_groups == rows`. At T=1024 that launched
+// 1024 threads for the whole kernel — on an 84-SM card — with each thread doing a
+// 1024-element serial pass, twice. Measured, the three norms plus the residual adds
+// ("block glue") came to 44.7% of a training step, MORE than every recurrent cell
+// combined. This is that fix.
+//
+// One block per group turns the group loop into a strided read plus a tree
+// reduction: 256 threads each handle group/256 elements, a warp shuffle folds each
+// warp, and one shared slot per warp finishes it. The launch goes from
+// `total_groups` threads to `total_groups` BLOCKS.
+//
+// Grid: total_groups blocks. Block: RMSN_THREADS threads. Shared: one float per warp.
+#define RMSN_THREADS 256
+
+__device__ __forceinline__ float rmsn_block_sum(float v, float* sh) {
+    // Fold within each warp first (no shared traffic), then across warps.
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) sh[warp] = v;
+    __syncthreads();
+    int nwarps = blockDim.x >> 5;
+    // The first warp reduces the per-warp partials; broadcast through sh[0].
+    if (warp == 0) {
+        float t = (lane < nwarps) ? sh[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) t += __shfl_down_sync(0xffffffff, t, off);
+        if (lane == 0) sh[0] = t;
+    }
+    __syncthreads();
+    return sh[0];
+}
+
 extern "C" __global__ void rms_norm_forward(const float* x, const float* gamma, float* out,
-                                            float* x_hat, float* inv_rms,
-                                            int groups_per_row, int group, float eps,
-                                            int total_groups) {
-    int gi = blockIdx.x * blockDim.x + threadIdx.x;
+                                                float* x_hat, float* inv_rms,
+                                                int groups_per_row, int group, float eps,
+                                                int total_groups) {
+    int gi = blockIdx.x;
     if (gi >= total_groups) return;
+    extern __shared__ float sh[];
     int row = gi / groups_per_row;
-    int grp = gi % groups_per_row;
-    int f = groups_per_row * group;
-    int off = row * f + grp * group;
+    int grp = gi - row * groups_per_row;
+    long long off = (long long)row * groups_per_row * group + (long long)grp * group;
     int g_off = grp * group;
+
     float ss = 0.0f;
-    for (int i = 0; i < group; ++i) { float v = x[off + i]; ss += v * v; }
+    for (int i = threadIdx.x; i < group; i += blockDim.x) {
+        float v = x[off + i];
+        ss += v * v;
+    }
+    ss = rmsn_block_sum(ss, sh);
     float inv = rsqrtf(ss / (float)group + eps);
-    inv_rms[gi] = inv;
-    for (int i = 0; i < group; ++i) {
+    if (threadIdx.x == 0) inv_rms[gi] = inv;
+
+    for (int i = threadIdx.x; i < group; i += blockDim.x) {
         float xh = x[off + i] * inv;
         x_hat[off + i] = xh;
         out[off + i] = gamma[g_off + i] * xh;
     }
 }
 
-// Grouped RMSNorm backward. dgamma is shared across rows -> atomicAdd.
+// Backward twin. Besides the reduction, this fixes the other half of the problem:
+// the thread-per-group version did an `atomicAdd` to `dgamma` for EVERY element,
+// so at ungrouped width every row's thread contended on the same 1024 slots. Here
+// each thread accumulates its strided slice into a register and issues one atomic
+// per element it owns — same total atomics, but spread across blocks rather than
+// serialized behind one thread per row, and the `s` reduction is a tree.
 extern "C" __global__ void rms_norm_backward(const float* dy, const float* x_hat,
-                                             const float* inv_rms, const float* gamma,
-                                             float* dgamma, float* dx,
-                                             int groups_per_row, int group, int total_groups) {
-    int gi = blockIdx.x * blockDim.x + threadIdx.x;
+                                                 const float* inv_rms, const float* gamma,
+                                                 float* dgamma, float* dx,
+                                                 int groups_per_row, int group,
+                                                 int total_groups) {
+    int gi = blockIdx.x;
     if (gi >= total_groups) return;
+    extern __shared__ float sh[];
     int row = gi / groups_per_row;
-    int grp = gi % groups_per_row;
-    int f = groups_per_row * group;
-    int off = row * f + grp * group;
+    int grp = gi - row * groups_per_row;
+    long long off = (long long)row * groups_per_row * group + (long long)grp * group;
     int g_off = grp * group;
     float inv = inv_rms[gi];
+
     float s = 0.0f;
-    for (int i = 0; i < group; ++i) {
+    for (int i = threadIdx.x; i < group; i += blockDim.x) {
         float dyxh = dy[off + i] * x_hat[off + i];
         atomicAdd(&dgamma[g_off + i], dyxh);
         s += gamma[g_off + i] * dyxh;
     }
+    s = rmsn_block_sum(s, sh);
     float s_over_g = s / (float)group;
-    for (int i = 0; i < group; ++i) {
+
+    for (int i = threadIdx.x; i < group; i += blockDim.x) {
         dx[off + i] = inv * (gamma[g_off + i] * dy[off + i] - x_hat[off + i] * s_over_g);
     }
 }
+
 
 // Fused softmax + cross-entropy. One thread per row. Writes dlogits = (p - onehot)/B
 // in place and the per-row loss -ln p_target into row_loss (host sums * inv_b).
@@ -207,7 +298,7 @@ extern "C" __global__ void split_dxh(const float* dxh, float* dx, float* dh_bptt
 extern "C" __global__ void slstm_cell_step(
         const float* zt_pre, const float* it_pre, const float* ft_pre, const float* ot_pre,
         float* c_state, float* n_state, float* m_state, float* h_state,
-        float* c_prev, float* n_prev, float* zt, float* ot,
+        float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
         float* i_prime, float* f_prime, float* c_out, float* n_out,
         float* out, int t, int T, int H, int BH) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -230,7 +321,8 @@ extern "C" __global__ void slstm_cell_step(
     float n = fp * np + ip;
     c_prev[k] = cp;
     n_prev[k] = np;
-    zt[k] = z; ot[k] = o; i_prime[k] = ip; f_prime[k] = fp;
+    slab_st(zt, k, z); slab_st(ot, k, o);
+    i_prime[k] = ip; f_prime[k] = fp;
     c_out[k] = c; n_out[k] = n;
     c_state[k] = c; n_state[k] = n; m_state[k] = m;
     // h = o·c/n, NOT o·c/max(|n|,1). c and n both carry exp(−m), so it cancels in
@@ -248,8 +340,8 @@ extern "C" __global__ void slstm_cell_step(
 // step). dh_bptt (incoming) is read here; it is rewritten by split_dxh afterward.
 extern "C" __global__ void slstm_cell_step_bwd(
         const float* dy, int t, int T, const float* dh_bptt,
-        const float* ot, const float* c, const float* n,
-        const float* c_prev, const float* n_prev, const float* zt,
+        const slab_t* ot, const float* c, const float* n,
+        const float* c_prev, const float* n_prev, const slab_t* zt,
         const float* i_prime, const float* f_prime, const float* ft_pre,
         float* dc_bptt, float* dn_bptt,
         float* dz, float* di, float* df, float* dob, int H, int BH) {
@@ -257,7 +349,7 @@ extern "C" __global__ void slstm_cell_step_bwd(
     if (k >= BH) return;
     int b = k / H, j = k % H;
     float d = dy[(b * T + t) * H + j] + dh_bptt[k];
-    float o = ot[k];
+    float o = slab_ld(ot, k);
     float cc = c[k];
     float nn = n[k];
     // h = o·c/n — no clamp, so dn has no branch: ∂h/∂n = −o·c/n².
@@ -266,7 +358,7 @@ extern "C" __global__ void slstm_cell_step_bwd(
     float dn = d * o * (-cc) / (nn * nn) + dn_bptt[k];
     float fp = f_prime[k];
     float df_prime = dc * c_prev[k] + dn * n_prev[k];
-    float ztk = zt[k];
+    float ztk = slab_ld(zt, k);
     float di_prime = dc * ztk + dn;
     float dz_post = dc * i_prime[k];
     dz[k] = dz_post * (1.0f - ztk * ztk);
@@ -348,6 +440,27 @@ extern "C" __global__ void fill_const(float* out, float v, int n) {
     if (i < n) out[i] = v;
 }
 
+#ifdef BF16_CAST
+#include <cuda_bf16.h>
+
+// fp32 -> bf16 and back, for activations that are SAVED for backward but whose
+// stored precision does not need fp32's 24-bit mantissa (see `gpu::bf16`).
+//
+// Round-to-nearest-even, not truncation: `__float2bfloat16` is the RNE intrinsic.
+// Truncating instead would bias every stored value toward zero, and the sLSTM's
+// saved slabs feed a product chain that is summed over T — a systematic bias there
+// accumulates over the sequence, where symmetric rounding noise cancels.
+extern "C" __global__ void cast_f32_to_bf16(const float* src, __nv_bfloat16* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2bfloat16(src[i]);
+}
+
+extern "C" __global__ void cast_bf16_to_f32(const __nv_bfloat16* src, float* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __bfloat162float(src[i]);
+}
+#endif
+
 #ifdef COOP_KERNELS
 #include <cooperative_groups.h>
 #ifdef FUSED_BF16
@@ -400,8 +513,8 @@ namespace cg = cooperative_groups;
 
 extern "C" __global__ void slstm_fused_time(
         const float* __restrict__ wh, float* g, const float* __restrict__ bcat,
-        float* h_prev, float* c_state, float* n_state, float* m_state, float* h_state,
-        float* c_prev, float* n_prev, float* zt, float* ot,
+        slab_t* h_prev, float* c_state, float* n_state, float* m_state, float* h_state,
+        float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
         float* i_prime, float* f_prime, float* c_out, float* n_out,
         float* out, int T, int H_rt, int B_rt, int cols_per_block) {
     extern __shared__ float smem[];
@@ -532,7 +645,7 @@ extern "C" __global__ void slstm_fused_time(
             float o_pre = g[go + 3 * FUSED_H] + ga[3 * nj]     + bcat[3 * FUSED_H + j];
             g[go + 2 * FUSED_H] = f_pre; // biased forget pre-activation, saved for backward
 
-            h_prev[s] = h_state[k];
+            slab_st(h_prev, s, h_state[k]);
 
             float z = tanhf(z_pre);
             float o = stable_sigmoid(o_pre);
@@ -548,7 +661,8 @@ extern "C" __global__ void slstm_fused_time(
 
             c_prev[s] = cp;
             n_prev[s] = np;
-            zt[s] = z; ot[s] = o; i_prime[s] = ip; f_prime[s] = fp;
+            slab_st(zt, s, z); slab_st(ot, s, o);
+            i_prime[s] = ip; f_prime[s] = fp;
             c_out[s] = c; n_out[s] = n;
             c_state[k] = c; n_state[k] = n; m_state[k] = m;
 
@@ -596,9 +710,9 @@ extern "C" __global__ void slstm_fused_time(
 extern "C" __global__ void slstm_fused_time_bwd(
         const float* __restrict__ wh, const float* __restrict__ dy, float* g,
         float* dgates_all, float* dh_recur, float* dc_recur, float* dn_recur,
-        const float* __restrict__ ot, const float* __restrict__ c_t,
+        const slab_t* __restrict__ ot, const float* __restrict__ c_t,
         const float* __restrict__ n_t, const float* __restrict__ c_prev,
-        const float* __restrict__ n_prev, const float* __restrict__ zt,
+        const float* __restrict__ n_prev, const slab_t* __restrict__ zt,
         const float* __restrict__ i_gate, const float* __restrict__ f_gate,
         int T, int H_rt, int B_rt, int units_per_block) {
     extern __shared__ float smem[];
@@ -639,7 +753,7 @@ extern "C" __global__ void slstm_fused_time_bwd(
 
             float f_pre = g[go + 2 * FUSED_H];
             float d_h = dy[s] + dh_recur[k];
-            float o = ot[s];
+            float o = slab_ld(ot, s);
             float c = c_t[s];
             float n = n_t[s];
             float d_o_pre = d_h * (c / n) * o * (1.0f - o);
@@ -647,7 +761,7 @@ extern "C" __global__ void slstm_fused_time_bwd(
             float d_n = d_h * o * (-c) / (n * n) + dn_recur[k];
             float f = f_gate[s];
             float ig = i_gate[s];
-            float z = zt[s];
+            float z = slab_ld(zt, s);
             float d_f_gate = d_c * c_prev[s] + d_n * n_prev[s];
             float d_i_gate = d_c * z + d_n;
             float d_z_act = d_c * ig;
@@ -709,10 +823,84 @@ extern "C" __global__ void slstm_fused_time_bwd(
 // `g`'s forget block is overwritten in place with the *biased* forget
 // pre-activation: backward needs it, and the slot is dead once this step is done.
 // `h_prev` records h_{t-1} for the deferred dWh GEMM.
+// Recurrent gate half for ONE timestep: gh[b, c] = sum_r h[b, r] * Wh[r, c].
+//
+// This replaces a cuBLAS call inside the sLSTM's per-step loop, and the reason is
+// host overhead rather than device throughput. Measured at the backbone's shape
+// (B=1, H=1024, so M=1 x K=1024 x N=4096): the matvec itself is ~5.6 us of GPU work,
+// but the cuBLAS call costs **41 us per invocation** back-to-back, while a bare
+// kernel launch is 1.7 us. Across T=1024 timesteps that overhead IS the T-loop.
+//
+// The kernel is bandwidth-bound: arithmetic intensity is 2*H*4H / (H*4H*4) = 0.5
+// FLOP/byte, so every byte of Wh read is the cost. Two things follow, and getting
+// either wrong loses more than the cuBLAS overhead saved (both were measured):
+//
+//   * `h` goes in SHARED MEMORY, staged once per block. It is the operand reused by
+//     every column, so leaving it in global costs an extra H-length read per column.
+//   * the Wh read must COALESCE. Lanes hold consecutive columns `c` and walk rows
+//     together, so `wh[r*H4 + c]` at fixed r is one contiguous 128-byte transaction
+//     per warp. A warp-per-column arrangement (each lane striding `r`) reads the same
+//     bytes with a stride of H4 and measured 79.9 ms against cuBLAS's 44.5 ms.
+//
+// Wh itself cannot be staged: it is [H, 4H] = 16 MB at this width. Only `h` fits,
+// which is why this is a shared-memory *broadcast* rather than a tiled GEMM.
+extern "C" __global__ void slstm_gate_matvec(
+        const float* __restrict__ h_state, const float* __restrict__ wh,
+        float* __restrict__ gh, int H, int B, int cols_per_thread) {
+    extern __shared__ float sh[];   // [H] — this block's copy of h for batch `b`
+    int H4 = 4 * H;
+    // One block serves a contiguous run of columns from ONE batch element, so a
+    // single staged `h` row serves the whole block. Each thread takes
+    // `cols_per_thread` columns, strided by blockDim so the warp stays coalesced.
+    int cols_per_block = blockDim.x * cols_per_thread;
+    long long first = (long long)blockIdx.x * cols_per_block;
+    long long total = (long long)B * H4;
+    if (first >= total) return;
+    int b = (int)(first / H4);
+    for (int r = threadIdx.x; r < H; r += blockDim.x) sh[r] = h_state[(long long)b * H + r];
+    __syncthreads();
+
+    // Accumulate `cols_per_thread` columns at once: `h[r]` is read from shared ONCE
+    // per row and reused across them, so the inner loop is pure coalesced Wh traffic.
+    for (int u = 0; u < cols_per_thread; ++u) {
+        long long i = first + (long long)u * blockDim.x + threadIdx.x;
+        if (i >= total) return;
+        int c = (int)(i - (long long)b * H4);
+        if (c < 0 || c >= H4) continue;  // block straddles a batch boundary
+        float acc = 0.0f;
+        for (int r = 0; r < H; ++r) acc = fmaf(sh[r], wh[(long long)r * H4 + c], acc);
+        gh[i] = acc;
+    }
+}
+
+// Backward twin: dh[b, r] = sum_c dg[b, c] * Wh[r, c]  (i.e. dg · Whᵀ).
+//
+// Same reasoning as `slstm_gate_matvec` — M=1, so cuBLAS's per-call cost dwarfs the
+// work. One warp per output ROW here, reducing over the 4H gate columns; that walk
+// is contiguous in `wh`, so these reads coalesce better than the forward's do.
+extern "C" __global__ void slstm_gate_matvec_t(
+        const float* __restrict__ dg, const float* __restrict__ wh,
+        float* __restrict__ dh, int H, int B) {
+    int H4 = 4 * H;
+    int warps = (blockDim.x * gridDim.x) >> 5;
+    int wid = ((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    int lane = threadIdx.x & 31;
+    for (int i = wid; i < B * H; i += warps) {
+        int b = i / H, r = i - b * H;
+        const float* dgrow = dg + (long long)b * H4;
+        const float* wrow = wh + (long long)r * H4;
+        float acc = 0.0f;
+        for (int c = lane; c < H4; c += 32) acc = fmaf(dgrow[c], wrow[c], acc);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+        if (lane == 0) dh[i] = acc;
+    }
+}
+
 extern "C" __global__ void slstm_step_fused(
-        float* g, const float* gh, const float* bcat, float* h_prev,
+        float* g, const float* gh, const float* bcat, slab_t* h_prev,
         float* c_state, float* n_state, float* m_state, float* h_state,
-        float* c_prev, float* n_prev, float* zt, float* ot,
+        float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
         float* i_prime, float* f_prime, float* c_out, float* n_out,
         float* out, int t, int T, int H, int BH) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -728,7 +916,7 @@ extern "C" __global__ void slstm_step_fused(
     float o_pre = g[go + 3 * H] + gh[ho + 3 * H]   + bcat[3 * H + j];
     g[go + 2 * H] = f_pre; // biased forget pre-activation, saved for backward
 
-    h_prev[s] = h_state[k];
+    slab_st(h_prev, s, h_state[k]);
 
     float z = tanhf(z_pre);
     float o = stable_sigmoid(o_pre);
@@ -752,7 +940,8 @@ extern "C" __global__ void slstm_step_fused(
 
     c_prev[s] = cp;
     n_prev[s] = np;
-    zt[s] = z; ot[s] = o; i_prime[s] = ip; f_prime[s] = fp;
+    slab_st(zt, s, z); slab_st(ot, s, o);
+    i_prime[s] = ip; f_prime[s] = fp;
     c_out[s] = c; n_out[s] = n;
     c_state[k] = c; n_state[k] = n; m_state[k] = m;
 
@@ -788,8 +977,8 @@ extern "C" __global__ void slstm_step_fused(
 //   t, T, H, BH              in   current step, sequence length, width, B*H
 extern "C" __global__ void slstm_step_fused_bwd(
         const float* d_out, float* gates, float* d_gates_flat, const float* d_h_recur,
-        const float* o_act, const float* c_t, const float* n_t,
-        const float* c_prev, const float* n_prev, const float* z_act,
+        const slab_t* o_act, const float* c_t, const float* n_t,
+        const float* c_prev, const float* n_prev, const slab_t* z_act,
         const float* i_gate, const float* f_gate,
         float* d_c_recur, float* d_n_recur, int t, int T, int H, int BH) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -802,7 +991,7 @@ extern "C" __global__ void slstm_step_fused_bwd(
     float f_pre = gates[gate_off + 2 * H];
     // Total grad on h_t: from the layer above plus from step t+1.
     float d_h = d_out[s] + d_h_recur[k];
-    float o = o_act[s];
+    float o = slab_ld(o_act, s);
     float c = c_t[s];
     float n = n_t[s];
     // h = o·c/n — no clamp, so dn has no branch: ∂h/∂n = −o·c/n².
@@ -811,7 +1000,7 @@ extern "C" __global__ void slstm_step_fused_bwd(
     float d_n = d_h * o * (-c) / (n * n) + d_n_recur[k];
     float f = f_gate[s];
     float i = i_gate[s];
-    float z = z_act[s];
+    float z = slab_ld(z_act, s);
     // Grads w.r.t. the stabilized gate values i', f', before their exp/sigmoid.
     float d_f_gate = d_c * c_prev[s] + d_n * n_prev[s];
     float d_i_gate = d_c * z + d_n;
@@ -839,6 +1028,14 @@ extern "C" __global__ void slstm_step_fused_bwd(
 extern "C" __global__ void add(float* out, const float* a, const float* b, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] + b[i];
+}
+
+// In-place accumulate: acc += b. The two-operand `add` needs a distinct output,
+// so a running sum through it costs a fresh buffer per term (and, where the old
+// buffer was rebound, dropped the previous one). This writes back into `acc`.
+extern "C" __global__ void add_assign(float* acc, const float* b, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) acc[i] += b[i];
 }
 
 // SwiGLU forward: gate_act = SiLU(gate_pre); mixed = gate_act ⊙ value.
@@ -880,6 +1077,24 @@ extern "C" __global__ void head_gather(const float* x, float* out, int B, int H,
     out[idx] = x[(b * T + t) * (H * W) + h * W + c];
 }
 
+// `head_gather` writing a bf16 destination, for the mLSTM's saved q/k/v.
+//
+// This must narrow AT THE GATHER, not afterwards. Producing the fp32 tensor first
+// and converting it costs the full-width allocation anyway — and because cudarc
+// frees through an async memory pool that retains blocks, that fp32 buffer stays
+// resident, so the pair costs MORE than fp32 alone. Measured: doing it the naive
+// way made a step 32 MB larger, not smaller. Writing narrow from the start is what
+// actually removes the wide buffer.
+extern "C" __global__ void head_gather_slab(const float* x, slab_t* out, int B, int H, int T, int W) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H * T * W) return;
+    int c = idx % W;
+    int t = (idx / W) % T;
+    int h = (idx / (W * T)) % H;
+    int b = idx / (W * T * H);
+    slab_st(out, idx, x[(b * T + t) * (H * W) + h * W + c]);
+}
+
 // Inverse of head_gather: head-major [B*H, T, W] → position-major [N, H*W].
 // Plain write (each destination element hit once).
 extern "C" __global__ void head_scatter(const float* in, float* x, int B, int H, int T, int W) {
@@ -890,6 +1105,21 @@ extern "C" __global__ void head_scatter(const float* in, float* x, int B, int H,
     int h = (idx / (W * T)) % H;
     int b = idx / (W * T * H);
     x[(b * T + t) * (H * W) + h * W + c] = in[idx];
+}
+
+// `head_scatter` reading a bf16 source. The mLSTM's `ytil` is stored narrow, and
+// this is the one consumer that reads it outside the fused kernels; widening it
+// into a temporary first would allocate exactly the fp32 buffer the narrow storage
+// exists to avoid, so the conversion happens here, on the fly. The destination is
+// fp32 either way — it feeds the head norm.
+extern "C" __global__ void head_scatter_slab(const slab_t* in, float* x, int B, int H, int T, int W) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H * T * W) return;
+    int c = idx % W;
+    int t = (idx / W) % T;
+    int h = (idx / (W * T)) % H;
+    int b = idx / (W * T * H);
+    x[(b * T + t) * (H * W) + h * W + c] = slab_ld(in, idx);
 }
 
 // Inclusive cumulative sum of logσ(f) along T, per row g of [BH, T]. One thread
@@ -1291,7 +1521,7 @@ extern "C" __global__ void mlstm_fw_gates(const float* fg, float* fcb,
 // in sequence. Slicing `v` is free: C's update is an outer product, so row v of C
 // only ever needs column v of V, and only the `n` update (which does not depend on
 // v at all) has to be assigned to a single tile — tile 0.
-extern "C" __global__ void mlstm_fw_C(const float* kk, const float* vv, const float* ig,
+extern "C" __global__ void mlstm_fw_C(const slab_t* kk, const slab_t* vv, const float* ig,
                                       const float* fcb,
                                       float* cst, float* nst, float* mst,
                                       int T, int L, int NC, int dqk, int dhv, int TV) {
@@ -1343,11 +1573,11 @@ extern "C" __global__ void mlstm_fw_C(const float* kk, const float* vv, const fl
         }
         for (int e = tid; e < len * dqk; e += nthreads) {
             int j = e / dqk, q = e - j * dqk;
-            sK[j * LQ + q] = kk[((long)bh * T + c0) * dqk + e];
+            sK[j * LQ + q] = slab_ld(kk, ((long)bh * T + c0) * dqk + e);
         }
         for (int e = tid; e < len * tv; e += nthreads) {
             int j = e / tv, v = e - j * tv;
-            sV[j * LV + v] = vv[((long)bh * T + c0 + j) * dhv + v0 + v];
+            sV[j * LV + v] = slab_ld(vv, ((long)bh * T + c0 + j) * dhv + v0 + v);
         }
         __syncthreads();
 
@@ -1409,9 +1639,9 @@ extern "C" __global__ void mlstm_fw_C(const float* kk, const float* vv, const fl
 // Chunk 0 needs no special case: its incoming state is zero, so the inter terms
 // vanish on their own.
 extern "C" __global__ void mlstm_fw_parallel(
-    const float* qq, const float* kk, const float* vv, const float* ig, const float* fcb,
+    const slab_t* qq, const slab_t* kk, const slab_t* vv, const float* ig, const float* fcb,
     const float* cst, const float* nst, const float* mst,
-    float* ytil, float* msv, float* psiv, float* qnv,
+    slab_t* ytil, float* msv, float* psiv, float* qnv,
     int T, int L, int NC, int dqk, int dhv) {
     int k = blockIdx.x, bh = blockIdx.y;
     int tid = threadIdx.x, nthreads = blockDim.x;
@@ -1434,12 +1664,12 @@ extern "C" __global__ void mlstm_fw_parallel(
 
     for (int e = tid; e < len * dqk; e += nthreads) {
         int t = e / dqk, q = e - t * dqk;
-        sQ[t * LQ + q] = qq[((long)bh * T + c0) * dqk + e];
-        sK[t * LQ + q] = kk[((long)bh * T + c0) * dqk + e];
+        sQ[t * LQ + q] = slab_ld(qq, ((long)bh * T + c0) * dqk + e);
+        sK[t * LQ + q] = slab_ld(kk, ((long)bh * T + c0) * dqk + e);
     }
     for (int e = tid; e < len * dhv; e += nthreads) {
         int t = e / dhv, v = e - t * dhv;
-        sV[t * LV + v] = vv[((long)bh * T + c0) * dhv + e];
+        sV[t * LV + v] = slab_ld(vv, ((long)bh * T + c0) * dhv + e);
     }
     for (int e = tid; e < dhv * dqk; e += nthreads) {
         int v = e / dqk, q = e - v * dqk;
@@ -1498,8 +1728,8 @@ extern "C" __global__ void mlstm_fw_parallel(
         float inter = 0.0f;
         for (int q = 0; q < dqk; ++q) inter += sQ[t * LQ + q] * sC[v * LQ + q];
         acc += sB[t] * inter;
-        ytil[((long)bh * T + c0 + t) * dhv + v] =
-            acc / fmaxf(fabsf(sQn[t]), expf(-sM[t]));
+        slab_st(ytil, ((long)bh * T + c0 + t) * dhv + v,
+                acc / fmaxf(fabsf(sQn[t]), expf(-sM[t])));
     }
 }
 // Tensor-core dot (MMA_TF32, sm_80+)
@@ -1594,9 +1824,9 @@ __device__ __forceinline__ int mma_col(int i) { return (((threadIdx.x & 31) & 3)
 // out-of-range outputs are simply not written. `LP`/`KP`/`VP` are those padded
 // dims and must match `fused_smem("fw_parallel_mma", ..)` on the host exactly.
 extern "C" __global__ void mlstm_fw_parallel_mma(
-    const float* qq, const float* kk, const float* vv, const float* ig, const float* fcb,
+    const slab_t* qq, const slab_t* kk, const slab_t* vv, const float* ig, const float* fcb,
     const float* cst, const float* nst, const float* mst,
-    float* ytil, float* msv, float* psiv, float* qnv,
+    slab_t* ytil, float* msv, float* psiv, float* qnv,
     int T, int L, int NC, int dqk, int dhv) {
     int k = blockIdx.x, bh = blockIdx.y;
     int tid = threadIdx.x, nthreads = blockDim.x;
@@ -1625,13 +1855,13 @@ extern "C" __global__ void mlstm_fw_parallel_mma(
     for (int e = tid; e < LP * KP; e += nthreads) {
         int t = e / KP, q = e - t * KP;
         int ok = (t < len) && (q < dqk);
-        sQ[t * LQ + q] = ok ? qq[((long)bh * T + c0 + t) * dqk + q] : 0.0f;
-        sK[t * LQ + q] = ok ? kk[((long)bh * T + c0 + t) * dqk + q] : 0.0f;
+        sQ[t * LQ + q] = ok ? slab_ld(qq, ((long)bh * T + c0 + t) * dqk + q) : 0.0f;
+        sK[t * LQ + q] = ok ? slab_ld(kk, ((long)bh * T + c0 + t) * dqk + q) : 0.0f;
     }
     for (int e = tid; e < LP * VP; e += nthreads) {
         int t = e / VP, v = e - t * VP;
         sV[t * LV + v] = ((t < len) && (v < dhv))
-            ? vv[((long)bh * T + c0 + t) * dhv + v] : 0.0f;
+            ? slab_ld(vv, ((long)bh * T + c0 + t) * dhv + v) : 0.0f;
     }
     for (int e = tid; e < VP * KP; e += nthreads) {
         int v = e / KP, q = e - v * KP;
@@ -1719,8 +1949,8 @@ extern "C" __global__ void mlstm_fw_parallel_mma(
             int t = m0 + mma_row(i), v = n0 + mma_col(i);
             if (t < len && v < dhv) {
                 float acc = dintra[i] + sB[t] * dinter[i];
-                ytil[((long)bh * T + c0 + t) * dhv + v] =
-                    acc / fmaxf(fabsf(sQn[t]), expf(-sM[t]));
+                slab_st(ytil, ((long)bh * T + c0 + t) * dhv + v,
+                        acc / fmaxf(fabsf(sQn[t]), expf(-sM[t])));
             }
         }
     }
@@ -1734,7 +1964,7 @@ extern "C" __global__ void mlstm_fw_parallel_mma(
 //   dcst[k] = g_k · dcst[k+1] + Σ_t b_k[t]·d_num_k[t]⊗Q_k[t]
 // dcst[NC] is zero — the state the last chunk produces is never read.
 extern "C" __global__ void mlstm_bw_dC(
-    const float* qq, const float* dytil, const float* ytil,
+    const slab_t* qq, const float* dytil, const slab_t* ytil,
     const float* psiv, const float* qnv, const float* msv,
     const float* fcb, const float* mst,
     float* dcst, float* dnst,
@@ -1783,7 +2013,7 @@ extern "C" __global__ void mlstm_bw_dC(
 
         for (int e = tid; e < len * dqk; e += nthreads) {
             int t = e / dqk, q = e - t * dqk;
-            sQ[t * LQ + q] = qq[((long)bh * T + c0) * dqk + e];
+            sQ[t * LQ + q] = slab_ld(qq, ((long)bh * T + c0) * dqk + e);
         }
 
         // d_num = d_ytil/ψ and d_qn — the backward of ỹ = num/ψ, ψ = max(|qn|,1).
@@ -1795,7 +2025,7 @@ extern "C" __global__ void mlstm_bw_dC(
             long gt = (long)bh * T + c0 + t;
             float inv = 1.0f / psiv[gt];
             float red = 0.0f;
-            for (int v = 0; v < dhv; ++v) red += dytil[gt * dhv + v] * ytil[gt * dhv + v];
+            for (int v = 0; v < dhv; ++v) red += dytil[gt * dhv + v] * slab_ld(ytil, gt * dhv + v);
             for (int v = 0; v < tv; ++v)
                 sDN[t * LV + v] = dytil[gt * dhv + v0 + v] * inv;
             float dpsi = -red * inv;
@@ -1845,11 +2075,11 @@ extern "C" __global__ void mlstm_bw_dC(
 // so dfc/dig need no cross-block reduction, and the reverse cumsum that turns dfc
 // into the forget-logit grad is a within-chunk scan.
 extern "C" __global__ void mlstm_bw_parallel(
-    const float* qq, const float* kk, const float* vv,
+    const slab_t* qq, const slab_t* kk, const slab_t* vv,
     const float* ig, const float* fg, const float* fcb,
     const float* cst, const float* nst, const float* mst,
     const float* dcst, const float* dnst,
-    const float* ytil, const float* dytil, const float* psiv,
+    const slab_t* ytil, const float* dytil, const float* psiv,
     const float* qnv, const float* msv,
     float* dq, float* dk, float* dv, float* dig, float* dfg,
     int T, int L, int NC, int dqk, int dhv) {
@@ -1885,12 +2115,12 @@ extern "C" __global__ void mlstm_bw_parallel(
 
     for (int e = tid; e < len * dqk; e += nthreads) {
         int t = e / dqk, q = e - t * dqk;
-        sQ[t * LQ + q] = qq[((long)bh * T + c0) * dqk + e];
-        sK[t * LQ + q] = kk[((long)bh * T + c0) * dqk + e];
+        sQ[t * LQ + q] = slab_ld(qq, ((long)bh * T + c0) * dqk + e);
+        sK[t * LQ + q] = slab_ld(kk, ((long)bh * T + c0) * dqk + e);
     }
     for (int e = tid; e < len * dhv; e += nthreads) {
         int t = e / dhv, v = e - t * dhv;
-        sV[t * LV + v] = vv[((long)bh * T + c0) * dhv + e];
+        sV[t * LV + v] = slab_ld(vv, ((long)bh * T + c0) * dhv + e);
     }
     for (int e = tid; e < dhv * dqk; e += nthreads) {
         int v = e / dqk, q = e - v * dqk;
@@ -1930,7 +2160,7 @@ extern "C" __global__ void mlstm_bw_parallel(
         for (int v = 0; v < dhv; ++v) {
             float dy = dytil[gt * dhv + v];
             sDN[t * LV + v] = dy * inv;
-            red += dy * ytil[gt * dhv + v];
+            red += dy * slab_ld(ytil, gt * dhv + v);
         }
         float dpsi = -red * inv;
         float qn = sQn[t];
@@ -2106,11 +2336,11 @@ extern "C" __global__ void mlstm_bw_parallel(
 // Everything else — the dg reduction, the a/b/g -> (dfc, dig) fold, the reverse
 // cumsum tail — is elementwise or a scan, has no dot in it, and is unchanged.
 extern "C" __global__ void mlstm_bw_parallel_mma(
-    const float* qq, const float* kk, const float* vv,
+    const slab_t* qq, const slab_t* kk, const slab_t* vv,
     const float* ig, const float* fg, const float* fcb,
     const float* cst, const float* nst, const float* mst,
     const float* dcst, const float* dnst,
-    const float* ytil, const float* dytil, const float* psiv,
+    const slab_t* ytil, const float* dytil, const float* psiv,
     const float* qnv, const float* msv,
     float* dq, float* dk, float* dv, float* dig, float* dfg,
     int T, int L, int NC, int dqk, int dhv) {
@@ -2152,13 +2382,13 @@ extern "C" __global__ void mlstm_bw_parallel_mma(
     for (int e = tid; e < LP * KP; e += nthreads) {
         int t = e / KP, q = e - t * KP;
         int ok = (t < len) && (q < dqk);
-        sQ[t * LQ + q] = ok ? qq[((long)bh * T + c0 + t) * dqk + q] : 0.0f;
-        sK[t * LQ + q] = ok ? kk[((long)bh * T + c0 + t) * dqk + q] : 0.0f;
+        sQ[t * LQ + q] = ok ? slab_ld(qq, ((long)bh * T + c0 + t) * dqk + q) : 0.0f;
+        sK[t * LQ + q] = ok ? slab_ld(kk, ((long)bh * T + c0 + t) * dqk + q) : 0.0f;
     }
     for (int e = tid; e < LP * VP; e += nthreads) {
         int t = e / VP, v = e - t * VP;
         sV[t * LV + v] = ((t < len) && (v < dhv))
-            ? vv[((long)bh * T + c0 + t) * dhv + v] : 0.0f;
+            ? slab_ld(vv, ((long)bh * T + c0 + t) * dhv + v) : 0.0f;
         sDN[t * LV + v] = 0.0f; // filled below for t < len
     }
     for (int e = tid; e < VP * KP; e += nthreads) {
@@ -2200,7 +2430,7 @@ extern "C" __global__ void mlstm_bw_parallel_mma(
         for (int v = 0; v < dhv; ++v) {
             float dy = dytil[gt * dhv + v];
             sDN[t * LV + v] = dy * inv;
-            red += dy * ytil[gt * dhv + v];
+            red += dy * slab_ld(ytil, gt * dhv + v);
         }
         float dpsi = -red * inv;
         float qn = sQn[t];
@@ -2407,6 +2637,9 @@ const NAMES: &[&str] = &[
     "slstm_unpack_dw",
     "slstm_unpack_db",
     "fill_const",
+    "add_assign",
+    "slstm_gate_matvec",
+    "slstm_gate_matvec_t",
     "slstm_step_fused",
     "slstm_step_fused_bwd",
     "add",
@@ -2415,7 +2648,9 @@ const NAMES: &[&str] = &[
     "scale_inplace",
     "sigmoid_inplace",
     "head_gather",
+    "head_gather_slab",
     "head_scatter",
+    "head_scatter_slab",
     "cumsum_logsig",
     "mlstm_rowmax_m",
     "mlstm_ds",
@@ -2452,6 +2687,11 @@ const MMA_NAMES: &[&str] = &["mlstm_fw_parallel_mma", "mlstm_bw_parallel_mma"];
 /// Cooperative-launch kernels; need `<cooperative_groups.h>`, so they share the
 /// bf16 module's include-path requirement.
 const COOP_NAMES: &[&str] = &["slstm_fused_time", "slstm_fused_time_bwd"];
+
+/// fp32 <-> bf16 casts. Need `<cuda_bf16.h>` only — a strictly smaller include
+/// requirement than [`COOP_NAMES`], hence their own module: a machine that cannot
+/// build the cooperative kernels can still store activations in bf16.
+const BF16_NAMES: &[&str] = &["cast_f32_to_bf16", "cast_bf16_to_f32"];
 
 /// Directory holding `cuda_bf16.h`, or `None` if it cannot be found.
 ///
@@ -2516,6 +2756,17 @@ pub struct Kernels {
     pub has_mma: bool,
     /// Whether [`COOP_NAMES`] were compiled (same include-path requirement as bf16).
     pub has_coop: bool,
+    /// Whether [`BF16_NAMES`] were compiled, i.e. whether `<cuda_bf16.h>` was found.
+    /// When false, bf16 activation storage is unavailable and callers stay fp32.
+    pub has_bf16: bool,
+    /// Whether the kernels were built with `-DSLAB_BF16`, i.e. whether the sLSTM's
+    /// saved `zt`/`ot`/`h_prev` slabs are bf16 in global memory.
+    ///
+    /// **This is the authority the Rust side must allocate against**: the kernels
+    /// index those buffers at a compile-time width, so a `BTensor` where the kernel
+    /// expects `float` (or the reverse) is a silent out-of-bounds walk, not a type
+    /// error. Every slab allocation reads this flag rather than the env var.
+    pub slab_bf16: bool,
     /// Include flags the optional modules were compiled with, kept so the
     /// shape-specialized variants can reuse them. `None` if the headers were absent.
     coop_includes: Option<Vec<String>>,
@@ -2559,7 +2810,41 @@ impl Kernels {
             .map_err(|e| format!("compute capability query failed: {e:?}"))?;
         let has_mma = major >= 8;
 
-        let base = compile_ptx(SRC).map_err(|e| format!("NVRTC compile failed: {e:?}"))?;
+        // Slab storage dtype has to be decided BEFORE the base module is compiled:
+        // `slab_t` appears in the signature of `slstm_cell_step` and friends, which
+        // live in this module, and every module that touches the same slab buffers
+        // must agree on their width. bf16 needs `<cuda_bf16.h>`, so it is only
+        // attempted when the header was found and the user has not opted out; the
+        // compile is still allowed to fail, in which case we fall back to fp32 below.
+        let inc = cuda_include_dir();
+        let want_bf16 = super::bf16::enabled() && inc.is_some();
+        let base_opts = |bf16: bool| -> CompileOptions {
+            let mut options = Vec::new();
+            if bf16 {
+                let inc = inc.as_deref().expect("checked is_some");
+                options.push("-DSLAB_BF16=1".to_string());
+                options.push(format!("-I{inc}"));
+                options.extend(extra_include_dirs(inc).iter().map(|d| format!("-I{d}")));
+            }
+            CompileOptions { options, ..Default::default() }
+        };
+
+        // Try bf16 first, fall back to fp32 if NVRTC cannot build it. `slab_bf16`
+        // records what actually got compiled — the Rust side allocates to match.
+        let mut slab_bf16 = want_bf16;
+        let base = match want_bf16
+            .then(|| compile_ptx_with_opts(SRC, base_opts(true)))
+            .and_then(|r| r.ok())
+        {
+            Some(ptx) => ptx,
+            None => {
+                if want_bf16 {
+                    eprintln!("bf16 slab storage unavailable (NVRTC); falling back to fp32");
+                }
+                slab_bf16 = false;
+                compile_ptx(SRC).map_err(|e| format!("NVRTC compile failed: {e:?}"))?
+            }
+        };
         let base = ctx
             .load_module(base)
             .map_err(|e| format!("load_module failed: {e:?}"))?;
@@ -2573,11 +2858,21 @@ impl Kernels {
         }
 
         if has_mma {
+            let mut options = vec![
+                format!("--gpu-architecture=compute_{major}{minor}"),
+                "-DMMA_TF32=1".to_string(),
+            ];
+            // Same slab dtype as the base module: these kernels do not touch the
+            // sLSTM slabs, but `slab_t` is at file scope and the two must agree so
+            // that a future kernel moved between modules cannot silently disagree.
+            if slab_bf16 {
+                let inc = inc.as_deref().expect("slab_bf16 implies an include dir");
+                options.push("-DSLAB_BF16=1".to_string());
+                options.push(format!("-I{inc}"));
+                options.extend(extra_include_dirs(inc).iter().map(|d| format!("-I{d}")));
+            }
             let opts = CompileOptions {
-                options: vec![
-                    format!("--gpu-architecture=compute_{major}{minor}"),
-                    "-DMMA_TF32=1".to_string(),
-                ],
+                options,
                 ..Default::default()
             };
             let ptx = compile_ptx_with_opts(SRC, opts)
@@ -2598,6 +2893,7 @@ impl Kernels {
         // in libcu++ through <cooperative_groups.h> and so have a strictly larger
         // include requirement. Either may be absent; neither is fatal.
         let mut has_coop = false;
+        let mut has_bf16 = false;
         let mut coop_includes: Option<Vec<String>> = None;
         if let Some(inc) = cuda_include_dir() {
             let extra = extra_include_dirs(&inc);
@@ -2612,6 +2908,11 @@ impl Kernels {
                     format!("-D{define}=1"),
                     format!("-I{inc}"),
                 ];
+                // The cooperative sLSTM kernels write the same slabs as the base
+                // module's eager ones, so they MUST be built at the same width.
+                if slab_bf16 {
+                    options.push("-DSLAB_BF16=1".to_string());
+                }
                 options.extend(extra.iter().map(|d| format!("-I{d}")));
                 let opts = CompileOptions {
                     options,
@@ -2641,12 +2942,15 @@ impl Kernels {
                     }
                 }
             };
+            has_bf16 = compile_module("BF16_CAST", BF16_NAMES);
             has_coop = compile_module("COOP_KERNELS", COOP_NAMES);
         }
 
         Ok(Self {
             funcs,
             has_mma,
+            has_bf16,
+            slab_bf16,
             has_coop,
             coop_includes,
             arch: (major, minor),
@@ -2687,6 +2991,11 @@ impl Kernels {
         ];
         if bf16 {
             options.push("-DFUSED_BF16=1".to_string());
+        }
+        // Must match the slab width the rest of the backend was built at, or this
+        // specialized kernel would read the saved slabs at the wrong stride.
+        if self.slab_bf16 {
+            options.push("-DSLAB_BF16=1".to_string());
         }
         options.extend(includes.iter().cloned());
         let built = compile_ptx_with_opts(SRC, CompileOptions {

@@ -1,6 +1,6 @@
 // Sequenz-Len
 
-pub const SEQ_LEN: usize = 512 * 4;
+pub const SEQ_LEN: usize = 512 * 1;
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 
 // Word-grouped training (both the flat and the hierarchical model train on
@@ -17,18 +17,18 @@ pub const MAX_WORD_BYTES: usize = 16;
 /// is meant to bind first — this only guards against a pathological run with no
 /// boundary token. Caches are sized to the *actual* longest window
 /// (`WordChunk::max_window_tokens`), never to this cap, so raising it is free.
-pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 7;
+pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 5;
 
 // Training-Schedule
 
-pub const LR: f32 = 3e-4;
-pub const MIN_LR: f32 = 3e-5;
+pub const LR: f32 = 2e-4;
+pub const MIN_LR: f32 = 2e-5;
 pub const WARMUP_STEPS: usize = 150;
 pub const DECAY_STEPS: usize = 150_000;
 // Windows whose gradients are accumulated before one optimizer step. Muon
 // (matrices) is scale-invariant via the Frobenius normalization and aux-Adam
 // (vectors) via its second moment, so summed grads need no manual rescaling.
-pub const BATCH_SIZE: usize = 8;
+pub const BATCH_SIZE: usize = 4;
 pub const EPOCHS: usize = 1;
 
 pub const SAVE_EVERY: usize = 100;

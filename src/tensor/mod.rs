@@ -86,6 +86,38 @@ impl Tensor {
         }
     }
 
+    /// Uniform `[-scale, scale)` from a fixed `seed` — the reproducible twin of
+    /// [`Self::random`].
+    ///
+    /// Parity tests (GPU vs CPU, fused vs op-at-a-time) compare two paths whose
+    /// float reassociation differs, so they run against a tolerance. With unseeded
+    /// data every run draws a different sample of that error distribution and the
+    /// test passes or fails by luck; with a seed a run that passes keeps passing,
+    /// and a failure means the math changed rather than the dice.
+    pub fn random_seeded(dims: &[usize], scale: f32, seed: u64) -> Self {
+        let n: usize = dims.iter().product();
+        // SplitMix64: cheap, dependency-free, and good enough to decorrelate the
+        // per-element draws that these tests feed to a GEMM.
+        let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let data = (0..n)
+            .map(|_| {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                // Top 24 bits -> [0, 1), then to [-scale, scale).
+                let u = (z >> 40) as f32 / (1u32 << 24) as f32;
+                (u * 2.0 - 1.0) * scale
+            })
+            .collect();
+        Self {
+            shape: shape_array(dims),
+            rank: dims.len(),
+            data,
+        }
+    }
+
     /// Xavier/Glorot-uniform init for a `[fan_in, fan_out]` weight matrix.
     /// Matches the old `LinearLayer::new` scale so both systems start comparably.
     pub fn xavier(fan_in: usize, fan_out: usize) -> Self {

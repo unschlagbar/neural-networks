@@ -38,7 +38,7 @@ hound = "3"
 # Pin cuda-13000 bindings: cudarc 0.17.8's auto-detect doesn't recognise the
 # installed 13.3 toolkit, but the 13.0 API surface is what we use and, with
 # `dynamic-loading`, the real 13.3 .so's are dlopen'd at runtime regardless.
-cudarc = { version = "0.17", default-features = false, features = [
+cudarc = { version = "0.19.8", default-features = false, features = [
     "cuda-13000",
     "driver",
     "nvrtc",

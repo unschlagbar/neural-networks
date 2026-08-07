@@ -63,7 +63,16 @@ impl Lm {
             v_tbl: DTensor::zeros(gpu, &[vocab, hidden]),
             blocks,
             norm: RmsNorm::from_parts(gpu, gamma),
-            head: Linear::from_parts(gpu, head_w, head_b),
+            head: {
+                // The logit head stays fp32. Its output goes straight into the
+                // softmax/cross-entropy, where a bf16-sized perturbation of a logit
+                // is exponentiated — and the vocab-sized reduction that follows is
+                // exactly the place the reference keeps wide. It is also one GEMM
+                // per step against the backbone's many, so there is little to win.
+                let mut h = Linear::from_parts(gpu, head_w, head_b);
+                h.set_fp32();
+                h
+            },
             cap,
             hidden,
             ids: Vec::new(),
@@ -241,26 +250,37 @@ mod tests {
         // GPU: same init, one train step
         let gpu_loss = dev.train_step(&gpu, &ids, &targets, b, t, &cfg);
 
+        // The interior projections run bf16 operands / fp32 accumulate when enabled
+        // (the head itself is pinned fp32 — see `Lm::from_parts`), so both the loss
+        // and the stepped parameters land within bf16's precision of the CPU's.
+        //
+        // The parameter bound is the looser of the two because Adam's update is
+        // scale-invariant in the gradient: `lr·ĝ/(√v̂+ε)` divides a near-zero
+        // gradient by an equally small √v̂, turning a ~1e-7 difference into ~1e-4 on
+        // the weight. Same amplification the arch flag hits in `kernels.rs`.
+        let bf = ops::gemm_bf16_enabled(&gpu);
+        let ltol = if bf { 5e-3 } else { 1e-3 };
+        let ptol = if bf { 2e-2 } else { 3e-3 };
         assert!(
-            (cpu_loss - gpu_loss).abs() < 1e-3,
-            "loss: cpu {cpu_loss} vs gpu {gpu_loss}"
+            (cpu_loss - gpu_loss).abs() < ltol,
+            "loss: cpu {cpu_loss} vs gpu {gpu_loss} (tolerance {ltol:.0e})"
         );
         assert_close(
             &dev.table.to_host(&gpu).data,
             &c_emb.table.data,
-            3e-3,
+            ptol,
             "table",
         );
         assert_close(
             &dev.norm.gamma.to_host(&gpu).data,
             &c_norm.gamma.data,
-            3e-3,
+            ptol,
             "gamma",
         );
         assert_close(
             &dev.head.w.to_host(&gpu).data,
             &c_head.w.data,
-            3e-3,
+            ptol,
             "head.w",
         );
     }
