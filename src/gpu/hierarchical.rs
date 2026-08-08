@@ -29,6 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::range::Range;
 
 use super::block::{Block, BlockLike};
 use super::{DTensor, Gpu, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm};
@@ -189,7 +190,7 @@ struct EncGroup {
 /// buffers are cleared and refilled rather than reallocated per window.
 fn enc_group_rows(
     tokens: &[usize],
-    words: &[(usize, usize)],
+    words: &[Range<usize>],
     grp: &[usize],
     enc_lens: &[usize],
     w_token: usize,
@@ -201,7 +202,7 @@ fn enc_group_rows(
     out.ids.resize(grp.len() * tmax, 0);
     out.readout.clear();
     for (i, &w) in grp.iter().enumerate() {
-        let (s, _) = words[w];
+        let s = words[w].start;
         let len = enc_lens[w];
         for k in 0..len {
             out.ids[i * tmax + k] = tokens[s + k] as u32;
@@ -251,6 +252,16 @@ struct Flags {
     mem: bool,
     /// `GPU_NO_GROUP=1` — one rectangle per window instead of length groups.
     no_group: bool,
+    /// Park the backbone's saved activations in host memory between forward and
+    /// backward, trading (overlapped) PCIe for device memory. **On by default**;
+    /// `GPU_NO_OFFLOAD=1` forces the all-resident path.
+    ///
+    /// Default-on because it is bit-exact against the resident path (it moves bytes
+    /// and reorders no arithmetic — see `Block::offload_matches_resident_exactly`),
+    /// costs ~2% of a step, and frees ~420 MB at the backbone's config. A knob whose
+    /// off-state is strictly worse is just a way to forget to turn it on.
+    /// See `Hierarchical::enable_backbone_offload`.
+    offload: bool,
 }
 
 impl Flags {
@@ -259,6 +270,7 @@ impl Flags {
             prof: std::env::var("GPU_PROF").is_ok(),
             mem: std::env::var("GPU_MEM").is_ok(),
             no_group: std::env::var("GPU_NO_GROUP").is_ok(),
+            offload: std::env::var("GPU_NO_OFFLOAD").is_err(),
         }
     }
 }
@@ -303,7 +315,7 @@ impl Hierarchical {
                 }
             })
             .collect();
-        Self {
+        let mut model = Self {
             cfg: *cfg,
             table: DTensor::from_host(gpu, &Tensor::random(&[cfg.vocab, cfg.hc], 0.02)),
             dtable: DTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
@@ -327,18 +339,43 @@ impl Hierarchical {
             step_count: 0,
             flags: Flags::from_env(),
             scratch: Scratch::default(),
+        };
+        model.enable_backbone_offload(gpu);
+        model
+    }
+
+    /// Park the backbone blocks' saved activations on the host (unless
+    /// `GPU_NO_OFFLOAD=1`).
+    ///
+    /// **Backbone only.** It is the one stack that runs its whole forward before any
+    /// of its backward, which is what gives each block's device→host copy a full block
+    /// of compute to hide behind and what makes releasing the source buffers one block
+    /// later safe. The encoder re-forwards per group instead of saving, and the
+    /// decoder runs forward-then-backward within each length group — only two blocks
+    /// apart, so parking there frees buffers that are still being read (observed as
+    /// `CUDA_ERROR_ILLEGAL_ADDRESS`). See `Block::enable_offload`.
+    fn enable_backbone_offload(&mut self, gpu: &Gpu) {
+        if !self.flags.offload {
+            return;
+        }
+        // One shared slot across the backbone: block i+1's eviction releases block i's
+        // buffers, bounding in-flight device memory at a single block's worth.
+        let in_flight = crate::gpu::offload::InFlight::shared();
+        for blk in self.bb_blocks.iter_mut() {
+            blk.enable_offload(gpu, in_flight.clone());
+        }
+        if self.flags.mem {
+            println!(
+                "  offload: parking activations for {} backbone blocks",
+                self.bb_blocks.len()
+            );
         }
     }
 
     /// Forward + backward over one window; accumulates all grads and returns the
     /// mean decode cross-entropy. `tokens` are char ids; `words` are `(start,
     /// end)` char ranges. Word 0 is encode-only; words 1..n are decoded.
-    pub fn forward_backward(
-        &mut self,
-        gpu: &Gpu,
-        tokens: &[usize],
-        words: &[(usize, usize)],
-    ) -> f32 {
+    pub fn forward_backward(&mut self, gpu: &Gpu, tokens: &[usize], words: &[Range<usize>]) -> f32 {
         let loss = self.forward_backward_window(gpu, tokens, words, None);
         gpu.stream.synchronize().expect("stream sync");
         loss
@@ -355,7 +392,7 @@ impl Hierarchical {
         &mut self,
         gpu: &Gpu,
         tokens: &[usize],
-        words: &[(usize, usize)],
+        words: &[Range<usize>],
         word_loss: &[bool],
     ) -> f32 {
         let loss = self.forward_backward_window(gpu, tokens, words, Some(word_loss));
@@ -372,7 +409,7 @@ impl Hierarchical {
         &mut self,
         gpu: &Gpu,
         tokens: &[usize],
-        words: &[(usize, usize)],
+        words: &[Range<usize>],
         word_loss: Option<&[bool]>,
     ) -> f32 {
         // Phase timing, off unless GPU_PROF is set (each mark syncs the stream).
@@ -419,7 +456,8 @@ impl Hierarchical {
         // padding collapses to within-group slack, and each group is still a clean
         // rectangle, which the mLSTM's per-word [T, T] attention requires.
         sc.enc_lens.clear();
-        sc.enc_lens.extend((0..dw).map(|w| words[w].1 - words[w].0));
+        sc.enc_lens
+            .extend((0..dw).map(|w| words[w].end - words[w].start));
         group_by_len(&sc.enc_lens, no_group, &mut sc.enc_groups);
 
         // Build every group's id rectangle once. The encoder BACKWARD re-forwards
@@ -460,6 +498,19 @@ impl Hierarchical {
             let e_w_grp =
                 ops::embedding_gather_u32(gpu, &h_flat, &d_readout, lay.readout.len(), hc); // [n_g, HC]
             ops::scatter_rows(gpu, &mut e_w, &e_w_grp, grp);
+            // This group's forward cache is dead: the encoder backward re-forwards each
+            // group to rebuild it (activation checkpointing, see below), so nothing
+            // will ever read what was just saved. Dropping it releases the buffers a
+            // step earlier than letting the next group overwrite them would.
+            //
+            // Worth little on its own — the caches are ~200 MB at HC=256 against the
+            // backbone's GBs at WORD_HIDDEN=1024, and the allocator caches the freed
+            // blocks so the high-water mark barely moves. Kept because it makes the
+            // checkpointing explicit: these activations are garbage by construction,
+            // and holding them was never intended.
+            for blk in self.encoder.blocks.iter_mut() {
+                blk.drop_saved_act();
+            }
         }
         mark("encoder fwd");
 
@@ -482,7 +533,7 @@ impl Hierarchical {
         // of decoder rows (and of the [rows, vocab] logits) is ever resident.
         sc.dec_lens.clear();
         sc.dec_lens
-            .extend((0..dw).map(|w| words[w + 1].1 - words[w + 1].0));
+            .extend((0..dw).map(|w| words[w + 1].end - words[w + 1].start));
         group_by_len(&sc.dec_lens, no_group, &mut sc.dec_groups);
         // Every group scales by the WINDOW's valid-row count, so the summed loss and
         // grads match what one big rectangle would have produced. Under SFT masking
@@ -513,7 +564,7 @@ impl Hierarchical {
             sc.mask.resize(rows, 0);
             for (i, &w) in grp.iter().enumerate() {
                 let m = sc.dec_lens[w];
-                let (s, _) = words[w + 1];
+                let s = words[w + 1].start;
                 // A masked (prompt) word is still fed forward so its state and
                 // the tied-table char grads are produced, but its slots get CE
                 // mask 0 — no loss, no logit gradient from a prompt token.
@@ -592,11 +643,29 @@ impl Hierarchical {
         mark("decoder fwd + bwd");
 
         // Backbone backward.
+        //
+        // The last block's activations are wanted first, and nothing inside the loop
+        // precedes them — so their upload is issued here, ahead of `bb_back`'s
+        // backward, and overlaps it.
+        if let Some(last) = self.bb_blocks.last_mut() {
+            last.prefetch_act(gpu);
+        }
         let d_bb_out = self.bb_back.backward_alloc(gpu, &d_o); // [dw, WH]
         let mut d_hb = d_bb_out.reshaped(&[1, dw, wh]);
         let mut d_hb_next = DTensor::uninit(gpu, &[1, dw, wh]);
-        for blk in self.bb_blocks.iter_mut().rev() {
-            blk.backward(gpu, &d_hb, &mut d_hb_next);
+        // Backward unwinds the backbone in reverse. With offload on, each block's
+        // saved activations have to come back from the host first — so block i-1's
+        // upload is started *before* block i's backward runs, giving it a whole
+        // block of compute to hide behind. Issuing the copy and waiting for it in the
+        // same breath exposes the whole transfer (measured: +37 ms).
+        for i in (0..self.bb_blocks.len()).rev() {
+            if i > 0 {
+                let (head, tail) = self.bb_blocks.split_at_mut(i);
+                head[i - 1].prefetch_act(gpu);
+                tail[0].backward(gpu, &d_hb, &mut d_hb_next);
+            } else {
+                self.bb_blocks[0].backward(gpu, &d_hb, &mut d_hb_next);
+            }
             std::mem::swap(&mut d_hb, &mut d_hb_next);
         }
         let d_e_w = self.bb_front.backward_alloc(gpu, &d_hb.reshaped(&[dw, wh])); // [dw, HC]
@@ -650,7 +719,36 @@ impl Hierarchical {
         mark("encoder bwd");
 
         self.scratch = sc;
+        // Release pooled scratch far larger than this window needed.
+        //
+        // Window sizes vary across a corpus and both `Buf` and `Pool` reuse by
+        // capacity, so without this every buffer ratchets to the largest window ever
+        // seen — device memory climbed monotonically window over window on the real
+        // `hg` path at WORDS_PER_SEQ=2048 (10.4 GB, 13.4, 15.9, 16.6) until it
+        // aborted, while the per-window footprint was never the problem.
+        //
+        // The bound is generous (see `buf::RETAIN_SLACK`), so an ordinary run of
+        // similar windows frees nothing and the allocator stays off the hot path.
+        self.trim_pools(words.len());
         loss
+    }
+
+    /// Drop pooled scratch beyond what a `words`-word window needs, in every stage.
+    ///
+    /// Each stage is sized by what its rectangles actually are: the backbone runs one
+    /// row per word, while the encoder and decoder run one row per *character* and are
+    /// bounded by `MAX_WORD_BYTES`.
+    fn trim_pools(&mut self, words: usize) {
+        for blk in self.bb_blocks.iter_mut() {
+            blk.trim_to(words);
+        }
+        let chars = words * (crate::config::MAX_WORD_BYTES + 1);
+        for blk in self.encoder.blocks.iter_mut() {
+            blk.trim_to(chars);
+        }
+        for blk in self.dec_blocks.iter_mut() {
+            blk.trim_to(chars);
+        }
     }
 
     /// AdamW across every stage. Tied table and the logit head are undecayed;
@@ -884,6 +982,9 @@ impl Hierarchical {
         model.dec_blocks = dec_blocks;
         model.dec_norm = dec_norm;
         model.dec_head = dec_head;
+        // The loaded blocks replaced the ones `new` set up, so re-apply the offload
+        // opt-in to the stack that actually ends up in the model.
+        model.enable_backbone_offload(gpu);
         Ok(model)
     }
 }
@@ -926,7 +1027,12 @@ mod tests {
         let mut model = Hierarchical::new(&gpu, &cfg);
 
         let tokens = vec![1usize, 2, 3, 4, 5, 6, 7, 1, 2, 3];
-        let words = vec![(0, 3), (3, 5), (5, 8), (8, 10)];
+        let words = vec![
+            Range { start: 0, end: 3 },
+            Range { start: 3, end: 5 },
+            Range { start: 5, end: 8 },
+            Range { start: 8, end: 10 },
+        ];
 
         let mut opt = AdamCfg::new(5e-3, 0.0);
         let first = model.forward_backward(&gpu, &tokens, &words);
@@ -983,7 +1089,13 @@ mod tests {
         };
         // Word lengths 1, 3, 2, 6, 4 — four distinct power-of-two buckets.
         let tokens: Vec<usize> = (0..16).map(|i| 1 + i % 9).collect();
-        let words = vec![(0, 1), (1, 4), (4, 6), (6, 12), (12, 16)];
+        let words = vec![
+            Range { start: 0, end: 1 },
+            Range { start: 1, end: 4 },
+            Range { start: 4, end: 6 },
+            Range { start: 6, end: 12 },
+            Range { start: 12, end: 16 },
+        ];
 
         let run = |grouped: bool| -> (f32, Vec<f32>) {
             // SAFETY-adjacent: tests in this binary run in threads. The flag is

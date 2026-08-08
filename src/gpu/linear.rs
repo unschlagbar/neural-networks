@@ -100,6 +100,43 @@ impl Linear {
         } else {
             self.x = x.dup(gpu);
         }
+        self.forward_raw(gpu, x, y);
+    }
+
+    /// `Y = X · W + b` for a caller-owned input, saving **nothing**.
+    ///
+    /// [`forward`](Self::forward) deep-copies `x` into `self.x` so backward can form
+    /// `dW = Xᵀ·dY`. When several layers share one input — mLSTM hands the same `xf`
+    /// to all six projections — that is five identical `[N, in]` copies (21 MB per
+    /// cell at H=1024, 252 MB across the backbone). Here the caller keeps `x` alive
+    /// to its own backward instead and passes it to
+    /// [`backward_with_x`](Self::backward_with_x).
+    ///
+    /// The saved-input buffer is released, not merely bypassed: a layer that has ever
+    /// taken this path must not keep a stale `[N, in]` allocation resident. That frees
+    /// at most once per layer — after the first shared forward `self.x` is already
+    /// empty — so it is not an allocation on the steady-state path.
+    pub fn forward_shared(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
+        assert_eq!(
+            x.cols(),
+            self.input,
+            "Linear::forward_shared — input width mismatch"
+        );
+        assert_eq!(
+            y.dims(),
+            [x.rows(), self.output],
+            "Linear::forward_shared — output shape"
+        );
+        if !self.x.is_empty() {
+            self.x = DTensor::uninit(gpu, &[0, self.input]);
+        }
+        self.forward_raw(gpu, x, y);
+    }
+
+    /// The GEMM half of forward, without the input-saving policy. Shared by
+    /// [`forward`](Self::forward) and [`forward_shared`](Self::forward_shared) so the
+    /// two cannot drift apart.
+    fn forward_raw(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
         // Seed each output row with the bias (fills y entirely, so uninit is safe),
         // then accumulate X·W on top (beta=1).
         ops::broadcast_row(gpu, y, &self.b);
@@ -129,34 +166,87 @@ impl Linear {
         dx
     }
 
+    /// [`backward_with_x`](Self::backward_with_x) into a freshly allocated `dX`.
+    pub fn backward_alloc_with_x(&mut self, gpu: &Gpu, x: &DTensor, dy: &DTensor) -> DTensor {
+        let mut dx = DTensor::uninit(gpu, &[dy.rows(), self.input]);
+        self.backward_with_x(gpu, x, dy, &mut dx);
+        dx
+    }
+
     /// Given `dY` `[B, out]`, accumulate `dW`/`db` and write `dX = dY · Wᵀ` into
     /// `dx` `[B, in]`.
     pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+        assert_eq!(
+            self.x.rows(),
+            dy.rows(),
+            "Linear::backward — batch mismatch"
+        );
+        // `self.x` and `self.dw` are disjoint fields, but the borrow checker cannot
+        // see that through a `&mut self` method call — so the shared body takes the
+        // three tensors it touches, not `self`.
+        Self::grad_w(gpu, &mut self.gemm, self.bf16, &self.x, dy, &mut self.dw);
+        ops::add_col_sum(gpu, &mut self.db, dy);
+        self.grad_x(gpu, dy, dx);
+    }
+
+    /// Backward for a caller-owned input: the companion to
+    /// [`forward_shared`](Self::forward_shared).
+    ///
+    /// `x` must be the `[B, in]` this layer saw in forward — or, for a chunked
+    /// caller, a contiguous **row block** of it paired with the matching row block of
+    /// `dy`. Both weight terms contract over the row axis
+    /// (`dW = Xᵀ·dY`, `db = Σ_rows dY`) and both accumulate at `beta = 1`, so
+    /// summing over row blocks gives the identical result — splitting `N` is a
+    /// reassociation, not a change of math. `dX = dY·Wᵀ` writes at `beta = 0`, which
+    /// stays correct because each block owns disjoint rows of `dx`.
+    pub fn backward_with_x(&mut self, gpu: &Gpu, x: &DTensor, dy: &DTensor, dx: &mut DTensor) {
         assert_eq!(
             dy.cols(),
             self.output,
             "Linear::backward — grad width mismatch"
         );
         assert_eq!(
-            self.x.rows(),
+            x.cols(),
+            self.input,
+            "Linear::backward — saved input width mismatch"
+        );
+        assert_eq!(
+            x.rows(),
             dy.rows(),
-            "Linear::backward — batch mismatch"
+            "Linear::backward — saved input / grad row mismatch"
         );
         assert_eq!(
             dx.dims(),
             [dy.rows(), self.input],
             "Linear::backward — dx shape"
         );
-        // dW += Xᵀ · dY ; db += Σ_batch dY. The bias reduction stays fp32: it is a
-        // sum over the batch, not a matmul, and it is cheap.
-        if self.bf16 {
-            self.gemm
-                .run(gpu, ops::MmForm::Tn, &self.x, dy, &mut self.dw, 1.0);
-        } else {
-            ops::matmul_tn_into(gpu, &self.x, dy, &mut self.dw, 1.0);
-        }
+        Self::grad_w(gpu, &mut self.gemm, self.bf16, x, dy, &mut self.dw);
         ops::add_col_sum(gpu, &mut self.db, dy);
-        // dX = dY · Wᵀ (cuBLAS transposes W(in×out) internally — no host transpose).
+        self.grad_x(gpu, dy, dx);
+    }
+
+    /// `dW += Xᵀ · dY` (accumulating, `beta = 1`).
+    ///
+    /// Free-standing in the three tensors it touches rather than a `&mut self`
+    /// method, so a caller holding `self.x` borrowed can still reach `self.dw`.
+    fn grad_w(
+        gpu: &Gpu,
+        gemm: &mut ops::GemmBf16,
+        bf16: bool,
+        x: &DTensor,
+        dy: &DTensor,
+        dw: &mut DTensor,
+    ) {
+        if bf16 {
+            gemm.run(gpu, ops::MmForm::Tn, x, dy, dw, 1.0);
+        } else {
+            ops::matmul_tn_into(gpu, x, dy, dw, 1.0);
+        }
+    }
+
+    /// `dX = dY · Wᵀ` (overwriting, `beta = 0`). cuBLAS transposes `W(in×out)`
+    /// internally — no host transpose.
+    fn grad_x(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
         if self.bf16 {
             self.gemm.run(gpu, ops::MmForm::Nt, dy, &self.w, dx, 0.0);
         } else {
@@ -298,5 +388,98 @@ mod tests {
         dev.step(&gpu, &cfg);
         assert_close(&dev.w.to_host(&gpu).data, &cpu.w.data, step_tol(&gpu));
         assert_close(&dev.b.to_host(&gpu).data, &cpu.b.data, step_tol(&gpu));
+    }
+
+    /// The shared-input path must be numerically identical to the saving one, and
+    /// must actually stop holding an `[N, in]` copy.
+    ///
+    /// This is what lets mLSTM keep one `xf` for all six projections instead of six
+    /// copies of it (252 MB across the backbone).
+    #[test]
+    fn forward_shared_matches_forward_and_saves_nothing() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let (batch, input, output) = (12, 7, 5);
+        let w = Tensor::xavier(input, output);
+        let b = Tensor::random(&[output], 0.1);
+        let x = DTensor::from_host(&gpu, &Tensor::random(&[batch, input], 1.0));
+        let dy = DTensor::from_host(&gpu, &Tensor::random(&[batch, output], 1.0));
+
+        let mut saving = Linear::from_parts(&gpu, &w, &b);
+        let mut shared = Linear::from_parts(&gpu, &w, &b);
+
+        // Both paths issue the identical GEMM over the identical data — the only
+        // difference is whether `x` was copied first — so this is exact equality,
+        // not a tolerance.
+        let eq = |got: &[f32], want: &[f32], what: &str| {
+            assert_eq!(got, want, "{what}: shared path diverged from the saving one");
+        };
+
+        let y_saving = saving.forward_alloc(&gpu, &x);
+        let mut y_shared = DTensor::uninit(&gpu, &[batch, output]);
+        shared.forward_shared(&gpu, &x, &mut y_shared);
+        eq(&y_shared.to_host(&gpu).data, &y_saving.to_host(&gpu).data, "y");
+
+        // The whole point: no retained input.
+        assert!(shared.x.is_empty(), "forward_shared kept an [N, in] copy");
+        assert!(!saving.x.is_empty(), "forward should keep its input");
+
+        let dx_saving = saving.backward_alloc(&gpu, &dy);
+        let mut dx_shared = DTensor::uninit(&gpu, &[batch, input]);
+        shared.backward_with_x(&gpu, &x, &dy, &mut dx_shared);
+
+        eq(&dx_shared.to_host(&gpu).data, &dx_saving.to_host(&gpu).data, "dx");
+        eq(&shared.dw.to_host(&gpu).data, &saving.dw.to_host(&gpu).data, "dw");
+        eq(&shared.db.to_host(&gpu).data, &saving.db.to_host(&gpu).data, "db");
+    }
+
+    /// `backward_with_x` over contiguous **row blocks** must sum to the whole-batch
+    /// backward: `dW = Xᵀ·dY` and `db = Σ_rows dY` both contract over the row axis and
+    /// accumulate at `beta = 1`, so splitting `N` is a reassociation. `dX = dY·Wᵀ`
+    /// writes at `beta = 0` but each block owns disjoint rows, so it stays correct.
+    ///
+    /// This is the property the chunked-offload path rests on. The batch is
+    /// deliberately **not** a multiple of the block size, to exercise a ragged last
+    /// block.
+    #[test]
+    fn backward_in_row_blocks_matches_whole_batch() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let (batch, input, output, blk) = (14, 7, 5, 4); // 14 = 3·4 + 2 (ragged)
+        let w = Tensor::xavier(input, output);
+        let b = Tensor::random(&[output], 0.1);
+        let x_h = Tensor::random(&[batch, input], 1.0);
+        let dy_h = Tensor::random(&[batch, output], 1.0);
+        let x = DTensor::from_host(&gpu, &x_h);
+        let dy = DTensor::from_host(&gpu, &dy_h);
+
+        let mut whole = Linear::from_parts(&gpu, &w, &b);
+        let mut blocked = Linear::from_parts(&gpu, &w, &b);
+
+        let dx_whole = whole.backward_alloc_with_x(&gpu, &x, &dy);
+
+        // Row blocks are contiguous in a row-major [batch, ·] tensor, so a block is a
+        // plain host sub-slice — no gather needed.
+        let mut dx_blocked = Vec::with_capacity(batch * input);
+        for r0 in (0..batch).step_by(blk) {
+            let rows = blk.min(batch - r0);
+            let xb = Tensor::new(&[rows, input], x_h.data[r0 * input..(r0 + rows) * input].to_vec());
+            let dyb = Tensor::new(
+                &[rows, output],
+                dy_h.data[r0 * output..(r0 + rows) * output].to_vec(),
+            );
+            let part = blocked.backward_alloc_with_x(
+                &gpu,
+                &DTensor::from_host(&gpu, &xb),
+                &DTensor::from_host(&gpu, &dyb),
+            );
+            dx_blocked.extend_from_slice(&part.to_host(&gpu).data);
+        }
+
+        assert_close(&dx_blocked, &dx_whole.to_host(&gpu).data, 1e-5);
+        assert_close(&blocked.dw.to_host(&gpu).data, &whole.dw.to_host(&gpu).data, 1e-4);
+        assert_close(&blocked.db.to_host(&gpu).data, &whole.db.to_host(&gpu).data, 1e-4);
     }
 }

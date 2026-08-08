@@ -7,6 +7,15 @@
 //! The weights are stored fused rather than as the CPU's 4 gates `[rows, H]`; see
 //! the note on the layout below.
 //!
+//! The cell also owns its **post-cell RMSNorm**, applied to the output on the way
+//! out of `forward` and undone first in `backward`. `nn2` and the checkpoint format
+//! still keep that norm on the surrounding block, so its γ crosses the boundary as
+//! an argument (`from_parts`) and a getter (`post_norm_gamma`) — but on the GPU
+//! path the block holds no norm at all, because how a cell normalizes its own
+//! output is the cell's business: this one uses a plain row-wise norm, the mLSTM a
+//! head-wise one. The parity tests therefore compare against `nn2::SLstm` composed
+//! with an `nn2::RmsNorm`, not against the bare cell.
+//!
 //! Time is a serial loop; the batch is the parallel axis. **The whole recurrent
 //! state `(h,c,n,m)` stays resident in `DTensor`s across the entire T-loop** — no
 //! per-step host transfer.
@@ -41,6 +50,7 @@ use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 
 use super::block::phase;
 use super::ops::{self, SlstmSlabs};
+use super::rms_norm::RmsNorm;
 use super::{DTensor, Gpu};
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
@@ -94,6 +104,14 @@ fn fused_time_enabled() -> bool {
 pub struct SLstm {
     input: usize,
     hidden: usize,
+
+    /// Post-cell RMSNorm, applied to the cell's output before it leaves `forward`.
+    ///
+    /// It belongs here rather than in the surrounding block: normalizing its own
+    /// output is the cell's business, and the two cells do it differently — this one
+    /// with a plain row-wise norm, the mLSTM with its head-wise `headnorm`. Neither
+    /// shape is something the block should have to know about.
+    post_norm: RmsNorm,
 
     // The parameters of record, in the fused layout the GEMMs consume directly:
     // gates z=0, i=1, f=2, o=3 occupy the four column blocks of the `4H` axis.
@@ -197,6 +215,9 @@ fn fit_uninit(gpu: &Gpu, t: &mut DTensor, dims: &[usize]) {
 impl SLstm {
     /// Build from a CPU cell's host weights (gate order z, i, f, o). The `w{*}`
     /// are `[rows, H]` and the `b{*}` are `[H]`; they are uploaded to the device.
+    ///
+    /// `post_gamma` is the post-cell norm's scale `[H]`; `None` starts it at γ=1,
+    /// which is what a freshly-built cell wants. A checkpoint passes the saved one.
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         gpu: &Gpu,
@@ -210,6 +231,7 @@ impl SLstm {
         bi: &Tensor,
         bf: &Tensor,
         bo: &Tensor,
+        post_gamma: Option<&Tensor>,
     ) -> Self {
         let (h, h4) = (hidden, 4 * hidden);
         let rows = input + h;
@@ -244,6 +266,13 @@ impl SLstm {
         Self {
             input,
             hidden,
+            post_norm: match post_gamma {
+                Some(g) => {
+                    assert_eq!(g.dims(), [h], "SLstm::from_parts — post_norm gamma");
+                    RmsNorm::from_parts(gpu, g)
+                }
+                None => RmsNorm::new(gpu, h),
+            },
             wx: up(wx, &[input, h4]),
             whr: up(whr, &[h, h4]),
             bcat: up(bcat, &[h4]),
@@ -280,13 +309,16 @@ impl SLstm {
     }
 
     /// Freshly-initialised cell, matching `nn2::SLstm::new`'s init exactly
-    /// (including the +4.5 forget-gate bias).
+    /// (including the +4.5 forget-gate bias). Post-norm starts at γ=1.
     pub fn new_rand(gpu: &Gpu, input: usize, hidden: usize) -> Self {
-        Self::from_cpu(gpu, &crate::nn2::SLstm::new(input, hidden))
+        Self::from_cpu(gpu, &crate::nn2::SLstm::new(input, hidden), None)
     }
 
     /// Upload a CPU cell (weights are copied; grads/moments start at zero).
-    pub fn from_cpu(gpu: &Gpu, cpu: &crate::nn2::SLstm) -> Self {
+    ///
+    /// The post-cell norm's γ comes from the surrounding CPU *block* — `nn2` still
+    /// keeps it there — so the caller passes it in; `None` starts it at 1.
+    pub fn from_cpu(gpu: &Gpu, cpu: &crate::nn2::SLstm, post_gamma: Option<&Tensor>) -> Self {
         Self::from_parts(
             gpu,
             cpu.input_size,
@@ -299,6 +331,7 @@ impl SLstm {
             &cpu.bi,
             &cpu.bf,
             &cpu.bo,
+            post_gamma,
         )
     }
 
@@ -395,7 +428,12 @@ impl SLstm {
     }
 
     /// Rebuild a GPU cell from a CPU `nn::SLSTMLayer` (inverse of `to_nn_cell`).
-    pub fn from_nn_cell(gpu: &Gpu, c: &crate::nn::slstm::SLSTMLayer) -> Self {
+    /// `post_gamma` is the enclosing `SLSTMBlock`'s `post_cell_norm.gamma`.
+    pub fn from_nn_cell(
+        gpu: &Gpu,
+        c: &crate::nn::slstm::SLSTMLayer,
+        post_gamma: Option<&Tensor>,
+    ) -> Self {
         use super::{tensor_from_matrix as m, tensor_from_slice as v};
         Self::from_parts(
             gpu,
@@ -409,7 +447,14 @@ impl SLstm {
             &v(&c.bi),
             &v(&c.bf),
             &v(&c.bo),
+            post_gamma,
         )
+    }
+
+    /// The post-cell norm's scale, for exporting the enclosing block to a CPU
+    /// `SLSTMBlock` (which still keeps the norm at block level).
+    pub fn post_norm_gamma(&self) -> &DTensor {
+        &self.post_norm.gamma
     }
 
     /// Forward over a whole `[B, T, in]` sequence into `y` `[B, T, H]`. State
@@ -516,18 +561,14 @@ impl SLstm {
         });
 
         // `out` is the graph's write target and must keep its address, so the loop
-        // writes there and the result is copied into the caller's buffer. One
-        // [B, T, H] device-to-device copy against a loop that was costing tens of
-        // milliseconds of launch time.
-        // Slice BOTH sides to the shape: `y` is the caller's buffer and may be a
-        // pooled allocation larger than [B, T, H] (`Buf::get` reuses by capacity),
-        // while `out` is exactly that shape — `memcpy_dtod` asserts dst >= src, and
-        // copying raw `buf`s moves capacity rather than content.
-        let n_out = out.len();
+        // writes there and the result reaches the caller's buffer through the
+        // post-cell norm — which is also what moves it, so there is no separate copy.
+        //
+        // The norm is position-wise and folds the leading axes itself, so both sides
+        // stay [B, T, H]. `y` was asserted that shape on entry, so the write covers
+        // exactly the caller's buffer.
         phase::timed(gpu, phase::Bucket::SlstmCopyFwd, || {
-            gpu.stream
-                .memcpy_dtod(&out.buf.slice(..n_out), &mut y.buf.slice_mut(..n_out))
-                .expect("copy out");
+            self.post_norm.forward(gpu, &out, y);
         });
         self.g = Some(g);
         self.slabs = Some(slabs);
@@ -683,15 +724,16 @@ impl SLstm {
         }
         fit_uninit(gpu, &mut self.gh, &[b, h4]);
 
-        // The loop reads `dy` every step, and the caller hands us a different
-        // `DTensor` each time — a pointer a captured graph cannot follow. Copy it
-        // into a buffer whose address we own.
+        // The post-cell norm is the last thing forward applied, so it is the first
+        // thing to undo: its `dx` is what the recurrence actually receives.
+        //
+        // It lands directly in `dy_buf` — the loop reads that every step, and the
+        // caller hands us a different `dy` each time, a pointer a captured graph
+        // cannot follow. Undoing the norm into our own buffer therefore costs nothing
+        // extra: it replaces the copy that was there for the same reason.
         let mut dy_buf = take_uninit(gpu, self.dy_buf.take(), &[b, t, h]);
-        let n_dy = dy_buf.len();
         phase::timed(gpu, phase::Bucket::SlstmCopyBwd, || {
-            gpu.stream
-                .memcpy_dtod(&dy.buf.slice(..n_dy), &mut dy_buf.buf.slice_mut(..n_dy))
-                .expect("copy dy");
+            self.post_norm.backward(gpu, dy, &mut dy_buf);
         });
 
         // The only thing the loop must carry is BPTT: the gate deltas go straight
@@ -844,14 +886,30 @@ impl SLstm {
     }
 
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
+    /// The post-cell norm's γ comes last, where the enclosing block used to emit it.
     pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
-        vec![&mut self.wx, &mut self.whr, &mut self.bcat]
+        let mut v = vec![&mut self.wx, &mut self.whr, &mut self.bcat];
+        v.extend(self.post_norm.params_mut());
+        v
+    }
+
+    /// Release the forward cache — the `[B, T, ·]` slabs and the saved input — without
+    /// reading it.
+    ///
+    /// For a stack that re-forwards rather than unwinding; see
+    /// `Block::drop_saved_act`. These are the cell's largest buffers, and in the
+    /// encoder every group but the last leaves them holding activations no backward
+    /// will ever read.
+    pub fn drop_saved_act(&mut self) {
+        self.slabs = None;
+        self.x_saved = None;
     }
 
     pub fn zero_grad(&mut self, gpu: &Gpu) {
         for g in [&mut self.dwx, &mut self.dwhr, &mut self.dbcat] {
             g.zero_(gpu);
         }
+        self.post_norm.zero_grad(gpu);
     }
 
     /// AdamW step: gate matrices decay, biases don't. Clears the grads.
@@ -888,6 +946,8 @@ impl SLstm {
             cfg,
             false,
         );
+        // Before `zero_grad` below, which would otherwise clear dγ unstepped.
+        self.post_norm.step(gpu, cfg);
         self.zero_grad(gpu);
     }
 }
@@ -905,14 +965,27 @@ mod tests {
     /// expected here; what would be a regression is the error GROWING with T, which
     /// `bf16_slab_error_does_not_compound_with_t` pins separately.
     fn tol(gpu: &Gpu, base: f32) -> f32 {
-        // x16, not x8. bf16's half-ulp is ~2e-3 relative at these magnitudes and a
+        // x128, not x8. bf16's half-ulp is ~2e-3 relative at these magnitudes and a
         // T-loop accumulates several of them, so x8 sat right ON the observed spread
         // (a 2.0e-3 diff against a 2.0e-3 bound) and failed about one run in five.
         // A bound a correct implementation trips intermittently is worse than none;
         // the property that would actually signal a bug — error GROWING with T — is
         // pinned separately by `bf16_slab_error_does_not_compound_with_t`.
+        //
+        // x16 was enough while the post-cell norm sat in the block. Now that the cell
+        // owns it, `backward` runs that noise through the norm's `γ·dY − x̂·S/F`
+        // reduction before it reaches `dx`, which amplifies it — and, because the
+        // reduction is over the whole row, makes the worst element swing a lot from
+        // run to run. Ten measured runs of `slstm_graph_path_matches_cpu` at T=64
+        // spread 2.2e-2 to 5.9e-2 on `dx`, so x32 (6.4e-2) was back to clearing by a
+        // hair and failing intermittently. x128 (2.6e-1) sits ~4x above the observed
+        // maximum, which is the margin this bound needs to be worth having.
+        //
+        // That this is bf16 and not a logic error is directly checkable:
+        // `GPU_NO_BF16=1` makes both graph tests pass at the base tolerance, two
+        // orders tighter.
         if gpu.kernels.slab_bf16 {
-            base * 16.0
+            base * 128.0
         } else {
             base
         }
@@ -954,7 +1027,49 @@ mod tests {
             &cpu.bi,
             &cpu.bf,
             &cpu.bo,
+            None,
         )
+    }
+
+    /// The CPU reference for a GPU cell: `nn2::SLstm` is the bare recurrence, while
+    /// the GPU cell now also owns the post-cell norm, so the comparison composes the
+    /// two by hand. γ starts at 1 on both sides (`from_cpu` above passes `None`).
+    ///
+    /// Only the *cell's* gradients are compared in these tests, and the norm sits
+    /// downstream of every one of them — so routing dy through it is exactly what
+    /// makes the two sides see the same delta at the recurrence.
+    struct CpuRef {
+        cell: CpuSLstm,
+        norm: crate::nn2::rms_norm::RmsNorm,
+    }
+
+    impl CpuRef {
+        fn new(inp: usize, h: usize) -> Self {
+            Self {
+                cell: CpuSLstm::new(inp, h),
+                norm: crate::nn2::rms_norm::RmsNorm::new(h),
+            }
+        }
+        /// `nn2::RmsNorm` is strictly rank 2 (its GPU twin folds leading axes
+        /// itself), so the `[B, T, H]` sequences are flattened around it here.
+        fn flat(t: &Tensor) -> Tensor {
+            let f = t.shape[t.rank - 1];
+            t.reshape(&[t.len() / f, f])
+        }
+        fn forward(&mut self, x: &Tensor) -> Tensor {
+            let y = self.cell.forward(x);
+            let dims = y.dims().to_vec();
+            self.norm.forward(&Self::flat(&y)).reshape(&dims)
+        }
+        fn backward(&mut self, dy: &Tensor) -> Tensor {
+            let dims = dy.dims().to_vec();
+            let d = self.norm.backward(&Self::flat(dy)).reshape(&dims);
+            self.cell.backward(&d)
+        }
+        fn step(&mut self, cfg: &AdamCfg) {
+            self.cell.step(cfg);
+            self.norm.step(cfg);
+        }
     }
 
     /// GPU sLSTM must match `nn2::SLstm` (cell alone) for a full
@@ -968,8 +1083,8 @@ mod tests {
         };
         let (b, t, inp, h) = (2, 5, 4, 6);
 
-        let mut cpu = CpuSLstm::new(inp, h);
-        let mut dev = from_cpu(&gpu, &cpu);
+        let mut cpu = CpuRef::new(inp, h);
+        let mut dev = from_cpu(&gpu, &cpu.cell);
 
         let x = Tensor::random(&[b, t, inp], 0.5);
         let g = Tensor::random(&[b, t, h], 1.0);
@@ -983,9 +1098,9 @@ mod tests {
         let dx_cpu = cpu.backward(&g);
         let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 2e-3));
-        assert_close(&dev.gate_dw(&gpu, 0), &cpu.dwz.data, tol(&gpu, 2e-3));
-        assert_close(&dev.gate_dw(&gpu, 2), &cpu.dwf.data, tol(&gpu, 2e-3));
-        assert_close(&dev.gate_db(&gpu, 2), &cpu.dbf.data, tol(&gpu, 2e-3));
+        assert_close(&dev.gate_dw(&gpu, 0), &cpu.cell.dwz.data, tol(&gpu, 2e-3));
+        assert_close(&dev.gate_dw(&gpu, 2), &cpu.cell.dwf.data, tol(&gpu, 2e-3));
+        assert_close(&dev.gate_db(&gpu, 2), &cpu.cell.dbf.data, tol(&gpu, 2e-3));
 
         // One AdamW step, then compare the updated gate weights.
         let mut cfg = AdamCfg::new(1e-3, 0.01);
@@ -996,9 +1111,21 @@ mod tests {
         // near-zero grad element can sign-flip between the cuBLAS and CPU gemm
         // reduction orders, swinging its update by ~2·lr. A plumbing bug misses by
         // O(weight), far more than this.
-        assert_close(&dev.gate_w(&gpu, 0), &cpu.wz.data, step_tol(&gpu, 2e-3));
-        assert_close(&dev.gate_w(&gpu, 2), &cpu.wf.data, step_tol(&gpu, 2e-3));
-        assert_close(&dev.gate_b(&gpu, 2), &cpu.bf.data, step_tol(&gpu, 2e-3));
+        assert_close(
+            &dev.gate_w(&gpu, 0),
+            &cpu.cell.wz.data,
+            step_tol(&gpu, 2e-3),
+        );
+        assert_close(
+            &dev.gate_w(&gpu, 2),
+            &cpu.cell.wf.data,
+            step_tol(&gpu, 2e-3),
+        );
+        assert_close(
+            &dev.gate_b(&gpu, 2),
+            &cpu.cell.bf.data,
+            step_tol(&gpu, 2e-3),
+        );
     }
 
     /// The same parity check, but at `T > GRAPH_MIN_T` so the time loops run as
@@ -1018,8 +1145,8 @@ mod tests {
         assert!(64 > GRAPH_MIN_T, "this test must exercise the graph path");
         let (b, t, inp, h) = (2, 64, 8, 12);
 
-        let mut cpu = CpuSLstm::new(inp, h);
-        let mut dev = from_cpu(&gpu, &cpu);
+        let mut cpu = CpuRef::new(inp, h);
+        let mut dev = from_cpu(&gpu, &cpu.cell);
         let mut cfg = AdamCfg::new(1e-3, 0.01);
 
         for pass in 0..2 {
@@ -1033,15 +1160,19 @@ mod tests {
             let dx_cpu = cpu.backward(&g);
             let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
             assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 2e-3));
-            assert_close(&dev.gate_dw(&gpu, 0), &cpu.dwz.data, tol(&gpu, 2e-3));
-            assert_close(&dev.gate_dw(&gpu, 2), &cpu.dwf.data, tol(&gpu, 2e-3));
+            assert_close(&dev.gate_dw(&gpu, 0), &cpu.cell.dwz.data, tol(&gpu, 2e-3));
+            assert_close(&dev.gate_dw(&gpu, 2), &cpu.cell.dwf.data, tol(&gpu, 2e-3));
 
             // Step between passes, so the replay runs against *changed* weights —
             // the graph must read the packed operands live, not a stale copy.
             cfg.t = pass + 1;
             cpu.step(&cfg);
             dev.step(&gpu, &cfg);
-            assert_close(&dev.gate_w(&gpu, 0), &cpu.wz.data, step_tol(&gpu, 2e-3));
+            assert_close(
+                &dev.gate_w(&gpu, 0),
+                &cpu.cell.wz.data,
+                step_tol(&gpu, 2e-3),
+            );
         }
     }
 
@@ -1062,8 +1193,8 @@ mod tests {
             return;
         };
         let (b, inp, h) = (1, 64, 64);
-        let mut cpu = CpuSLstm::new(inp, h);
-        let mut dev = from_cpu(&gpu, &cpu);
+        let mut cpu = CpuRef::new(inp, h);
+        let mut dev = from_cpu(&gpu, &cpu.cell);
 
         // Freed device memory only *shows* it was reused if somebody reuses it. In
         // the real model the encoder/decoder's per-group temporaries do that between
@@ -1120,13 +1251,13 @@ mod tests {
         let dx = DTensor::from_host(&gpu, &x);
 
         let mut per_step = SLstm::from_parts(
-            &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3],
+            &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3], None,
         );
         per_step.force_fused_time = Some(false);
         let want = per_step.forward_alloc(&gpu, &dx).to_host(&gpu);
 
         let mut fused = SLstm::from_parts(
-            &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3],
+            &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3], None,
         );
         fused.force_fused_time = Some(true);
         let got = fused.forward_alloc(&gpu, &dx).to_host(&gpu);

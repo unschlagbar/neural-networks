@@ -106,6 +106,9 @@ struct Inter {
 struct Saved {
     b: usize,
     t: usize,
+    /// The flat `[N, in]` input, shared by all six projections (see `forward_alloc`).
+    /// Held here rather than six times inside the `Linear`s.
+    xf: DTensor,
     qh: DTensor, // [BH, T, dqk]
     kh: DTensor, // [BH, T, dqk]  (already ×1/√dqk)
     vh: DTensor, // [BH, T, dhv]
@@ -124,18 +127,54 @@ struct Saved {
 struct SavedFused {
     b: usize,
     t: usize,
+    /// The six large per-`N` tensors, `None` exactly while they are parked on the host.
+    ///
+    /// `Option` rather than a `parked: bool` flag: backward reads these through
+    /// `expect`, so a missing `restore_saved` is a named panic at the use site instead
+    /// of a silent read of a stale buffer. They are `Some` for the whole of a
+    /// non-offloaded run.
+    ///
+    /// The flat `[N, in]` input `xf` is shared by all six projections (see
+    /// `forward_alloc`) — held here rather than six times inside the `Linear`s.
+    xf: Option<DTensor>,
     // bf16 storage, mirroring the reference's DTYPE tensors (matQ/matK/matV).
-    qh: ops::SlabBuf,
-    kh: ops::SlabBuf,
-    vh: ops::SlabBuf,
+    qh: Option<ops::SlabBuf>,
+    kh: Option<ops::SlabBuf>,
+    vh: Option<ops::SlabBuf>,
     // fp32: gate logits. The reference loads vecI/vecB `.to(tl.float32)` — they are
     // exponents feeding the stabilizer, where an absolute error becomes a
     // multiplicative one. See `gpu::bf16`.
+    // Left resident when parking: 64 KB each against the 4 MB tensors above, so
+    // moving them would cost bookkeeping and PCIe for nothing.
     igh: DTensor,
     fgh: DTensor,
     fused: ops::MlstmFused,
-    o: DTensor,
-    yhat: DTensor,
+    o: Option<DTensor>,
+    yhat: Option<DTensor>,
+}
+
+impl SavedFused {
+    /// The six parkable tensors, in the one order `evict`/`restore` both use.
+    ///
+    /// Panics if they are parked — every reader runs after `restore_saved`.
+    fn xf(&self) -> &DTensor {
+        self.xf.as_ref().expect("mLSTM: xf is parked on the host")
+    }
+    fn o(&self) -> &DTensor {
+        self.o.as_ref().expect("mLSTM: o is parked on the host")
+    }
+    fn yhat(&self) -> &DTensor {
+        self.yhat.as_ref().expect("mLSTM: yhat is parked on the host")
+    }
+    fn qh(&self) -> &ops::SlabBuf {
+        self.qh.as_ref().expect("mLSTM: qh is parked on the host")
+    }
+    fn kh(&self) -> &ops::SlabBuf {
+        self.kh.as_ref().expect("mLSTM: kh is parked on the host")
+    }
+    fn vh(&self) -> &ops::SlabBuf {
+        self.vh.as_ref().expect("mLSTM: vh is parked on the host")
+    }
 }
 
 /// Which forward ran, and hence which backward must.
@@ -178,6 +217,13 @@ pub struct MLstm {
     /// the same call; pooling them means the cell converges on the peak number
     /// live at once instead of reallocating each one every window.
     pool: Pool,
+    /// Host parking for the fused cache's large per-N tensors, when the surrounding
+    /// stack opted in (`Block::enable_offload` → `MLstm::enable_offload`).
+    ///
+    /// Same mechanism as the FFN's: written once in forward, read once in backward,
+    /// and in the backbone's block-major sweep those are a whole pass apart. Only the
+    /// big ones ride — see `evict_saved` for which and why.
+    park: Option<super::offload::HostPark>,
 }
 
 impl MLstm {
@@ -224,6 +270,7 @@ impl MLstm {
             headnorm: RmsNorm::from_parts_grouped(gpu, gamma, dhv),
             saved: None,
             pool: Pool::default(),
+            park: None,
         }
     }
 
@@ -378,6 +425,13 @@ impl MLstm {
     /// The chunkwise core, returning its own output buffer. `forward` copies that
     /// into the caller's; the internals still allocate their per-chunk temporaries.
     pub fn forward_alloc(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+        // Release the previous eviction before allocating anything here: freeing
+        // returns memory to the CUDA allocator, which must not hand it back while a
+        // copy is still reading it. Ordered on the compute stream, so it costs no host
+        // time. See `Block::forward` for the failure this prevents.
+        if let Some(park) = &self.park {
+            park.release_previous(gpu);
+        }
         assert_eq!(x.rank, 3, "MLstm::forward expects [B, T, in]");
         let (b, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);
         assert_eq!(
@@ -393,25 +447,34 @@ impl MLstm {
         // Widths differ per projection — q/k are `heads·dqk`, v/o are `heads·dhv`
         // (== d), i/f are one logit per head — so each buffer is sized from its own
         // layer rather than assuming `d`.
-        let mut xf = self.pool.take(gpu, &[n, inp]);
+        //
+        // All six projections read the SAME `xf`, so it is saved once here and handed
+        // to `forward_shared`, which copies nothing. `Linear::forward` would instead
+        // deep-copy it into each layer's own `self.x` — five identical [N, in] copies,
+        // 21 MB per cell at H=1024 and 252 MB across the backbone, for one tensor.
+        // Backward pairs this with `backward_with_x(&sv.xf, …)`.
+        //
+        // `xf` therefore outlives the call and is NOT pooled: it must survive to
+        // backward, and the pool has to get back everything it lends
+        // (`assert_drained` at the top of `backward_alloc`).
+        let mut xf = DTensor::uninit(gpu, &[n, inp]);
         xf.copy_from(gpu, x);
         let mut q = self.pool.take(gpu, &[n, self.lin_q.output_size()]);
-        self.lin_q.forward(gpu, &xf, &mut q);
+        self.lin_q.forward_shared(gpu, &xf, &mut q);
         let mut k = self.pool.take(gpu, &[n, self.lin_k.output_size()]);
-        self.lin_k.forward(gpu, &xf, &mut k);
+        self.lin_k.forward_shared(gpu, &xf, &mut k);
         ops::scale_(gpu, &mut k, self.inv_sqrt_dqk);
         let mut v = self.pool.take(gpu, &[n, self.lin_v.output_size()]);
-        self.lin_v.forward(gpu, &xf, &mut v);
+        self.lin_v.forward_shared(gpu, &xf, &mut v);
         // `o` is kept in the cache for backward, so it is NOT pooled: the pool must
         // get back everything it lends, and this one never comes back.
         let mut o = DTensor::uninit(gpu, &[n, self.lin_o.output_size()]);
-        self.lin_o.forward(gpu, &xf, &mut o);
+        self.lin_o.forward_shared(gpu, &xf, &mut o);
         ops::sigmoid_(gpu, &mut o);
         let mut ig = self.pool.take(gpu, &[n, self.lin_i.output_size()]); // [N, H]
-        self.lin_i.forward(gpu, &xf, &mut ig);
+        self.lin_i.forward_shared(gpu, &xf, &mut ig);
         let mut fg = self.pool.take(gpu, &[n, self.lin_f.output_size()]); // [N, H]
-        self.lin_f.forward(gpu, &xf, &mut fg);
-        self.pool.put(xf);
+        self.lin_f.forward_shared(gpu, &xf, &mut fg);
 
         // The gate logits go head-major as fp32 on either path: the reference pins
         // vecI/vecB to fp32, and they are [BH, T] — a factor of `dqk` smaller than
@@ -451,15 +514,17 @@ impl MLstm {
             self.saved = Some(Cache::Fused(SavedFused {
                 b,
                 t,
-                qh,
-                kh,
-                vh,
+                xf: Some(xf),
+                qh: Some(qh),
+                kh: Some(kh),
+                vh: Some(vh),
                 igh,
                 fgh,
                 fused,
-                o,
-                yhat,
+                o: Some(o),
+                yhat: Some(yhat),
             }));
+            self.evict_saved(gpu);
             return out.reshaped(&[b, t, d]);
         }
 
@@ -577,6 +642,7 @@ impl MLstm {
         self.saved = Some(Cache::Legacy(Saved {
             b,
             t,
+            xf,
             qh,
             kh,
             vh,
@@ -586,6 +652,71 @@ impl MLstm {
             yhat,
         }));
         out.reshaped(&[b, t, d])
+    }
+
+    /// Park this cell's saved activations on the host, if offload is enabled.
+    ///
+    /// Called at the end of a fused forward. Only the six large per-`N` tensors ride:
+    /// `xf`/`o`/`yhat` (4 MB each at the backbone's shape) and the `qh`/`kh`/`vh`
+    /// slabs (2 MB each on the bf16 path) — 18 MB of the cell's 21.5 MB. The rest
+    /// (`igh`/`fgh` at 64 KB, and everything inside `fused`) is left resident: each is
+    /// two orders of magnitude smaller, so moving it would add PCIe traffic and
+    /// bookkeeping for nothing.
+    ///
+    /// The slabs park at **their own width** — a bf16 slab comes back bf16, since the
+    /// precision split belongs at each value's production point, not here.
+    fn evict_saved(&mut self, gpu: &Gpu) {
+        use super::offload::Parked;
+        let Some(park) = &mut self.park else { return };
+        let Some(Cache::Fused(sv)) = &mut self.saved else {
+            return;
+        };
+        // Fixed order, mirrored exactly by `restore_saved`.
+        park.evict(
+            gpu,
+            vec![
+                Parked::from(sv.xf.take().expect("evict before restore: xf")),
+                Parked::from(sv.o.take().expect("evict before restore: o")),
+                Parked::from(sv.yhat.take().expect("evict before restore: yhat")),
+                Parked::from(sv.qh.take().expect("evict before restore: qh")),
+                Parked::from(sv.kh.take().expect("evict before restore: kh")),
+                Parked::from(sv.vh.take().expect("evict before restore: vh")),
+            ],
+        );
+    }
+
+    /// Start the parked activations on their way back, without waiting. Called one
+    /// block ahead of this cell's backward so the upload overlaps compute.
+    pub fn prefetch_saved(&mut self, gpu: &Gpu) {
+        if let Some(park) = &mut self.park {
+            park.prefetch(gpu);
+        }
+    }
+
+    /// Put the parked activations back into the cache, in `evict_saved`'s order.
+    fn restore_saved(&mut self, gpu: &Gpu) {
+        let Some(park) = &mut self.park else { return };
+        let Some(Cache::Fused(sv)) = &mut self.saved else {
+            return;
+        };
+        let mut it = park.restore(gpu).into_iter();
+        let mut next = |what: &str| it.next().expect(what);
+        sv.xf = Some(next("parked xf").f32());
+        sv.o = Some(next("parked o").f32());
+        sv.yhat = Some(next("parked yhat").f32());
+        sv.qh = Some(next("parked qh").into());
+        sv.kh = Some(next("parked kh").into());
+        sv.vh = Some(next("parked vh").into());
+    }
+
+    /// Park this cell's saved activations on the host between forward and backward.
+    ///
+    /// Opted into by the surrounding [`Block`](super::block::Block), and subject to the
+    /// same constraint: only for a stack whose whole forward precedes its backward.
+    /// See `Block::enable_offload`.
+    pub fn enable_offload(&mut self, gpu: &Gpu, in_flight: super::offload::SharedInFlight) {
+        self.park =
+            Some(super::offload::HostPark::new(gpu, in_flight).expect("offload: host park"));
     }
 
     /// Backward into a freshly allocated `dx` `[B, T, in]` — the by-value
@@ -609,6 +740,9 @@ impl MLstm {
 
     pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
         self.pool.assert_drained("MLstm::backward");
+        // Bring the parked activations back into the cache first, so everything below
+        // reads them as if they had never left. No-op unless offload is enabled.
+        self.restore_saved(gpu);
         // `take`, not `as_ref`: the cache holds a window's activations, and dropping
         // them at the end of this call (rather than when the next forward overwrites
         // the field) keeps them from staying resident across the optimizer step.
@@ -632,7 +766,7 @@ impl MLstm {
         let mut d_hconcat = self.pool.take(gpu, &[n, d]);
         self.lin_out.backward(gpu, &dy_flat, &mut d_hconcat);
         self.pool.put(dy_flat);
-        let (do_pre, d_yhat) = ops::ogate_bwd(gpu, &d_hconcat, &sv.o, &sv.yhat);
+        let (do_pre, d_yhat) = ops::ogate_bwd(gpu, &d_hconcat, sv.o(), sv.yhat());
         self.pool.put(d_hconcat);
         let mut d_h_tilde = self.pool.take(gpu, &[n, d]);
         self.headnorm.backward(gpu, &d_yhat, &mut d_h_tilde);
@@ -643,7 +777,7 @@ impl MLstm {
         drop(d_yhat);
 
         let (dqh, dkh, dvh, digh, dfgh) = ops::mlstm_fused_bw(
-            gpu, &sv.fused, &sv.qh, &sv.kh, &sv.vh, &sv.igh, &sv.fgh, &d_ytil,
+            gpu, &sv.fused, sv.qh(), sv.kh(), sv.vh(), &sv.igh, &sv.fgh, &d_ytil,
         );
 
         let dq = ops::head_scatter(gpu, &dqh, b, h, t, dqk); // [N, dqk·H]
@@ -655,8 +789,11 @@ impl MLstm {
 
         // dx is the sum of the six projection backwards, accumulated into one
         // buffer with one pooled scratch — not a fresh [N, in] per term.
+        //
+        // All six read the one shared `sv.xf` (see `forward_alloc`), so they take
+        // `backward_with_x` rather than each consulting a private saved copy.
         let mut acc = DTensor::uninit(gpu, &[n, inp]);
-        self.lin_q.backward(gpu, &dq, &mut acc);
+        self.lin_q.backward_with_x(gpu, sv.xf(), &dq, &mut acc);
         let mut part = self.pool.take(gpu, &[n, inp]);
         for (lin, grad) in [
             (&mut self.lin_k, &dk),
@@ -665,7 +802,7 @@ impl MLstm {
             (&mut self.lin_i, &d_ig),
             (&mut self.lin_f, &d_fg),
         ] {
-            lin.backward(gpu, grad, &mut part);
+            lin.backward_with_x(gpu, sv.xf(), grad, &mut part);
             ops::add_assign(gpu, &mut acc, &part);
         }
         // Only `part` came from the pool; `dq`..`d_fg` were allocated by
@@ -863,11 +1000,12 @@ impl MLstm {
         let d_ig = ops::head_scatter(gpu, &digh, b, h, t, 1); // [N, H]
         let d_fg = ops::head_scatter(gpu, &d_fgh3, b, h, t, 1);
 
-        // Projection backward; sum the input grads (all share the saved xf).
+        // Projection backward; sum the input grads (all share the saved xf, held
+        // once in the cache rather than copied into each of the six `Linear`s).
         // dx is the sum of the six projection backwards, accumulated into one
         // buffer with one pooled scratch — not a fresh [N, in] per term.
         let mut dxf = DTensor::uninit(gpu, &[n, inp]);
-        self.lin_q.backward(gpu, &dq, &mut dxf);
+        self.lin_q.backward_with_x(gpu, &sv.xf, &dq, &mut dxf);
         let mut part = self.pool.take(gpu, &[n, inp]);
         for (lin, grad) in [
             (&mut self.lin_k, &dk),
@@ -876,7 +1014,7 @@ impl MLstm {
             (&mut self.lin_i, &d_ig),
             (&mut self.lin_f, &d_fg),
         ] {
-            lin.backward(gpu, grad, &mut part);
+            lin.backward_with_x(gpu, &sv.xf, grad, &mut part);
             ops::add_assign(gpu, &mut dxf, &part);
         }
         self.pool.put(part);
@@ -954,8 +1092,22 @@ impl Cell for MLstm {
         use super::block::phase::Bucket;
         (Bucket::MlstmCellFwd, Bucket::MlstmCellBwd)
     }
-    fn wants_post_cell_norm(&self) -> bool {
-        false
+    fn enable_offload(&mut self, gpu: &Gpu, in_flight: super::offload::SharedInFlight) {
+        MLstm::enable_offload(self, gpu, in_flight)
+    }
+    fn prefetch_act(&mut self, gpu: &Gpu) {
+        MLstm::prefetch_saved(self, gpu)
+    }
+    fn trim_to(&mut self, rows: usize) {
+        // The widest thing this cell pools is `[rows, d]` (the projections and the
+        // head-major reorgs); size the bound from that.
+        self.pool.trim(rows * self.d);
+    }
+    fn drop_saved_act(&mut self) {
+        // The whole fused cache — qh/kh/vh slabs, o, yhat, xf and the `MlstmFused`
+        // internals. Safe to drop wholesale because the only caller re-forwards to
+        // rebuild it (see `Block::drop_saved_act`).
+        self.saved = None;
     }
     fn to_nn_block(
         &self,
@@ -963,7 +1115,6 @@ impl Cell for MLstm {
         hidden: usize,
         up: usize,
         pre_norm1: crate::nn::rms_norm::RMSNorm,
-        _post_cell_norm: Option<crate::nn::rms_norm::RMSNorm>,
         pre_norm2: crate::nn::rms_norm::RMSNorm,
         lin_gate: crate::nn::linear::LinearLayer,
         lin_value: crate::nn::linear::LinearLayer,

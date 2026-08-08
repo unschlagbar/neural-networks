@@ -11,9 +11,9 @@
 
 use std::time::Instant;
 
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
 
 use crate::batches::ChunkedWordDataSet;
 use crate::config::{
@@ -137,13 +137,12 @@ pub fn train_hierarchical_gpu(model_path: &str) {
             for batch in chunk.iter().skip(skip) {
                 // The dataset speaks u16 / Range; the model takes usize / (start, end).
                 let tokens: Vec<usize> = batch.tokens.iter().map(|&t| t as usize).collect();
-                let words: Vec<(usize, usize)> =
-                    batch.words.iter().map(|r| (r.start, r.end)).collect();
+                let words = &batch.words;
                 if words.len() < 2 {
                     continue; // no decoded word in this window
                 }
 
-                let loss = model.forward_backward(&gpu, &tokens, &words);
+                let loss = model.forward_backward(&gpu, &tokens, words);
                 tokens_since_print += tokens.len();
                 state.log_tokens(tokens.len());
 
@@ -291,7 +290,9 @@ pub fn train_sft_gpu(model_path: &str) {
         println!("── SFT epoch {epoch}/{SFT_EPOCHS} ──");
         // Per-epoch permutation, derived from (seed, epoch) so it is a function
         // of the run identity, not of how many times the process restarted.
-        let mut rng = StdRng::seed_from_u64(progress.seed ^ (epoch as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut rng = StdRng::seed_from_u64(
+            progress.seed ^ (epoch as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
         examples.shuffle(&mut rng);
 
         // Only the resumed epoch skips; later epochs run whole.
@@ -313,7 +314,7 @@ pub fn train_sft_gpu(model_path: &str) {
             progress.done += 1;
 
             let tokens: Vec<usize> = ex.tokens.iter().map(|&t| t as usize).collect();
-            let words: Vec<(usize, usize)> = ex.words.iter().map(|r| (r.start, r.end)).collect();
+            let words = &ex.words;
             if words.len() < 2 {
                 continue;
             }
@@ -321,7 +322,7 @@ pub fn train_sft_gpu(model_path: &str) {
             // flag is ex.loss[w+1] (ex.loss[0] belongs to the encode-only prefix).
             let word_loss: Vec<bool> = ex.loss[1..].to_vec();
 
-            let loss = model.forward_backward_masked(&gpu, &tokens, &words, &word_loss);
+            let loss = model.forward_backward_masked(&gpu, &tokens, words, &word_loss);
             tokens_since_print += tokens.len();
             state.log_tokens(tokens.len());
             state.log_metric("resp_ppl", loss.exp());

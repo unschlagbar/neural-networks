@@ -276,7 +276,8 @@ mod tests {
 
     #[test]
     fn parses_escapes_and_unicode() {
-        let line = r#"{"instruction": "a’b", "context": "", "response": "line1\nline2", "category": "x"}"#;
+        let line =
+            r#"{"instruction": "a’b", "context": "", "response": "line1\nline2", "category": "x"}"#;
         let (instr, ctx, resp) = parse_record(line).unwrap();
         assert_eq!(instr, "a\u{2019}b");
         assert_eq!(ctx, "");

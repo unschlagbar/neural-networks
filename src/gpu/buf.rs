@@ -33,6 +33,28 @@
 
 use super::{DTensor, Gpu};
 
+/// How much larger than the request a retained allocation may be before it is
+/// dropped and replaced with a right-sized one.
+///
+/// Reuse-if-it-fits alone makes every slot ratchet to the largest window ever seen:
+/// real windows vary (`MIN_WORDS_PER_SEQ`..`WORDS_PER_SEQ`, and one encoder/decoder
+/// rectangle per word-length bucket), so a single unusually large window permanently
+/// inflates every buffer behind it. Measured on the real `hg` path at
+/// `WORDS_PER_SEQ = 2048`: device memory sat flat for many windows, then one larger
+/// window walked it from 14.2 GB to 16.5 GB and aborted.
+///
+/// 4x is deliberately loose. The point is to cap the ratchet, not to chase an exact
+/// fit — reallocating whenever a window is merely a bit smaller would put the
+/// allocator back on the hot path, which is what `Buf` exists to avoid. At 4x a slot
+/// still absorbs the ordinary window-to-window spread without a single free.
+const RETAIN_SLACK: usize = 4;
+
+/// Whether an existing `capacity` should be kept for a request of `want` elements.
+#[inline]
+fn fits(capacity: usize, want: usize) -> bool {
+    capacity >= want && capacity <= want.saturating_mul(RETAIN_SLACK)
+}
+
 /// A device buffer owned by a layer across calls, resized only when the shape
 /// it is asked for changes.
 ///
@@ -67,7 +89,11 @@ impl Buf {
             // Reuse whenever the allocation is big enough, presenting it at the
             // asked-for shape. Requiring an exact match would reallocate on every
             // shape change, which for a varying window size is every call.
-            Some(t) if t.capacity() >= n => t.shrink_to(dims),
+            //
+            // But only while it is not *wildly* too big — see `RETAIN_SLACK`. A slot
+            // that keeps every allocation it has ever been big enough for ratchets to
+            // the largest window in the corpus and stays there.
+            Some(t) if fits(t.capacity(), n) => t.shrink_to(dims),
             _ => self.slot = Some(DTensor::uninit(gpu, dims)),
         }
         self.slot.as_mut().expect("just filled")
@@ -79,7 +105,7 @@ impl Buf {
     pub fn get_zeroed(&mut self, gpu: &Gpu, dims: &[usize]) -> &mut DTensor {
         let n: usize = dims.iter().product();
         match &mut self.slot {
-            Some(t) if t.capacity() >= n => {
+            Some(t) if fits(t.capacity(), n) => {
                 t.shrink_to(dims);
                 t.zero_(gpu);
             }
@@ -111,6 +137,21 @@ impl Buf {
     /// The saved tensor, panicking with `what` if the forward never ran.
     pub fn expect(&self, what: &str) -> &DTensor {
         self.slot.as_ref().expect(what)
+    }
+
+    /// Move the tensor out of this slot, leaving it empty.
+    ///
+    /// For a caller that needs to *own* the buffer for a while — typically because it
+    /// must be borrowed alongside other fields of the same struct, which a borrow of
+    /// the whole slot would prevent. Pair with [`put`](Self::put) to give it back and
+    /// keep the allocation for the next call.
+    pub fn take(&mut self) -> Option<DTensor> {
+        self.slot.take()
+    }
+
+    /// Put a tensor (back) into this slot, replacing any current one.
+    pub fn put(&mut self, t: DTensor) {
+        self.slot = Some(t);
     }
 
     /// Release the allocation. Only for a layer being torn down or deliberately
@@ -181,9 +222,13 @@ impl Pool {
         let n: usize = dims.iter().product();
         // Best fit: the smallest buffer that still holds `n`. Picking the smallest
         // keeps the big ones available for the requests that actually need them.
+        // Only buffers within `RETAIN_SLACK` of the request are candidates. A pooled
+        // buffer sized for the corpus's largest window would otherwise be handed to
+        // every small window that follows, keeping it alive forever — the same ratchet
+        // `Buf` has, one level down.
         let mut best: Option<usize> = None;
         for (i, (size, bufs)) in self.free.iter().enumerate() {
-            if *size >= n && !bufs.is_empty() && best.is_none_or(|b| *size < self.free[b].0) {
+            if fits(*size, n) && !bufs.is_empty() && best.is_none_or(|b| *size < self.free[b].0) {
                 best = Some(i);
             }
         }
@@ -213,6 +258,10 @@ impl Pool {
     /// each pass — the pool stops being a fixed working set and becomes a leak.
     /// [`outstanding`](Self::outstanding) is the invariant that catches this: it
     /// must return to zero, not climb, between passes.
+    ///
+    /// Oversized buffers are filed as usual; [`trim`](Self::trim) is what evicts them,
+    /// because only the caller knows when a pass boundary has been reached and the
+    /// free list can safely be pruned.
     pub fn put(&mut self, t: DTensor) {
         debug_assert!(
             self.lent > 0,
@@ -229,6 +278,21 @@ impl Pool {
             }
         }
         self.free.push((n, vec![t]));
+    }
+
+    /// Drop free buffers more than `RETAIN_SLACK`x larger than `want` elements.
+    ///
+    /// Call at a pass boundary with the size the *next* pass will ask for. `take`
+    /// already refuses to hand out anything that oversized, so those buffers are dead
+    /// weight from the moment a big window ends — this is what actually releases them.
+    ///
+    /// Without it, one unusually large window leaves the pool permanently inflated:
+    /// measured on the real `hg` path at `WORDS_PER_SEQ = 2048`, device memory sat
+    /// flat for many windows and then a single larger one walked it from 14.2 GB to
+    /// 16.5 GB and aborted.
+    pub fn trim(&mut self, want: usize) {
+        let cap = want.saturating_mul(RETAIN_SLACK);
+        self.free.retain(|(size, bufs)| *size <= cap && !bufs.is_empty());
     }
 
     /// How many buffers are currently out on loan. Zero between passes if every
@@ -370,7 +434,8 @@ mod tests {
             return;
         };
         let mut pool = Pool::new();
-        for len in [1024, 768, 512, 300, 64, 8] {
+        // All within RETAIN_SLACK (4x) of 1024, so one buffer serves them all.
+        for len in [1024, 768, 512, 300] {
             let t = pool.take(&gpu, &[len]);
             assert_eq!(t.len(), len, "presented at the requested shape");
             pool.put(t);
@@ -378,7 +443,33 @@ mod tests {
         assert_eq!(
             pool.pooled_elems(),
             1024,
-            "the largest allocation must serve every smaller request"
+            "one allocation must serve every request within the slack bound"
+        );
+    }
+
+    /// A request far below the retained capacity gets its own buffer rather than the
+    /// oversized one — the bound that stops a pool from ratcheting to the largest
+    /// window it ever saw. See [`RETAIN_SLACK`].
+    #[test]
+    fn pool_does_not_hand_out_wildly_oversized_buffers() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let mut pool = Pool::new();
+        let big = pool.take(&gpu, &[4096]);
+        pool.put(big);
+
+        // 8 is 512x smaller: reusing the 4096 buffer would pin it forever.
+        let small = pool.take(&gpu, &[8]);
+        assert_eq!(small.capacity(), 8, "a tiny request took the oversized buffer");
+        pool.put(small);
+
+        // `trim` at a pass boundary then releases the buffer nothing can use.
+        pool.trim(8);
+        assert_eq!(
+            pool.pooled_elems(),
+            8,
+            "trim must drop free buffers beyond the slack bound"
         );
     }
 
@@ -394,17 +485,16 @@ mod tests {
             let t = pool.take(&gpu, &[len]);
             pool.put(t);
         }
-        // 64 and 512 are still on the list (each was returned before the next grew
-        // past it), but nothing beyond the high-water mark is ever allocated again.
+        // Every size is on the list; nothing within the slack bound reallocates.
         let before = pool.pooled_elems();
-        for len in [4096, 2048, 1000, 4096] {
+        for len in [4096, 2048, 1500, 4096] {
             let t = pool.take(&gpu, &[len]);
             pool.put(t);
         }
         assert_eq!(
             pool.pooled_elems(),
             before,
-            "no request at or below the high-water mark may allocate"
+            "a request within RETAIN_SLACK of a pooled buffer may not allocate"
         );
     }
 

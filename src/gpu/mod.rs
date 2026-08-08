@@ -28,6 +28,7 @@ pub mod kernels;
 pub mod linear;
 pub mod lm;
 pub mod mlstm;
+pub mod offload;
 pub mod ops;
 pub mod rms_norm;
 pub mod slstm;
@@ -36,6 +37,7 @@ pub mod train;
 pub use bf16::{BTensor, Slab};
 pub use buf::{Buf, Pool};
 pub use dtensor::DTensor;
+pub use offload::OffloadRing;
 use kernels::Kernels;
 
 use iron_oxide::collections::Matrix;

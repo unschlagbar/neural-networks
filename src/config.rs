@@ -5,7 +5,7 @@ pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 
 // Word-grouped training (both the flat and the hierarchical model train on
 // these K-word windows, so WORDS_PER_SEQ is the one binding knob).
-pub const WORDS_PER_SEQ: usize = 1024 * 1; // K — words per window / backbone unroll length
+pub const WORDS_PER_SEQ: usize = 1024 * 2; // K — words per window / backbone unroll length
 pub const MIN_WORDS_PER_SEQ: usize = 8; // keep a trailing window only if >= this
 
 /// Cap on the bytes of a single word (see `crate::segment`). Words longer than
@@ -17,7 +17,7 @@ pub const MAX_WORD_BYTES: usize = 16;
 /// is meant to bind first — this only guards against a pathological run with no
 /// boundary token. Caches are sized to the *actual* longest window
 /// (`WordChunk::max_window_tokens`), never to this cap, so raising it is free.
-pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 5;
+pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 4;
 
 // Training-Schedule
 

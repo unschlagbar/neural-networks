@@ -67,8 +67,10 @@ impl RmsNorm {
     /// `out` may alias `x` (the kernel reads each row before writing it), which
     /// is what lets a caller normalize a buffer in place.
     pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
-        assert_eq!(x.cols(), self.size, "RmsNorm::forward — width mismatch");
-        let (b, f) = (x.rows(), x.cols());
+        // Position-wise: any rank is accepted and folded to `[N, F]` over the last
+        // axis, so a caller holding `[B, T, H]` need not reshape.
+        let (b, f) = x.as_2d();
+        assert_eq!(f, self.size, "RmsNorm::forward — width mismatch");
         let total_groups = b * (f / self.group);
         // Refit the saved intermediates, reusing them whenever the shape holds.
         match &self.fwd {
@@ -105,7 +107,8 @@ impl RmsNorm {
 
     /// Given `dY` `[B, F]`, accumulate `dγ` and write `dX` `[B, F]` into `dx`.
     pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
-        assert_eq!(dy.cols(), self.size, "RmsNorm::backward — width mismatch");
+        let (_, f) = dy.as_2d();
+        assert_eq!(f, self.size, "RmsNorm::backward — width mismatch");
         let fwd = self.fwd.as_ref().expect("RmsNorm::backward before forward");
         ops::rms_norm_backward_into(gpu, dy, fwd, &self.gamma, &mut self.dgamma, self.group, dx);
     }

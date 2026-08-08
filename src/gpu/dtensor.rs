@@ -231,6 +231,19 @@ impl DTensor {
         assert_eq!(self.rank, 2, "cols(): tensor is rank {}", self.rank);
         self.shape[1]
     }
+
+    /// This tensor as `[N, F]` — the last axis kept, every leading axis folded into
+    /// `N`. For position-wise ops (RMSNorm), which act on the last axis and do not
+    /// care whether the caller is holding `[B, T, H]` or the flat `[N, H]`.
+    ///
+    /// Metadata only, and borrowing: unlike [`reshaped`](Self::reshaped) it does not
+    /// consume the tensor, so a `&DTensor` argument can be viewed this way.
+    #[inline]
+    pub fn as_2d(&self) -> (usize, usize) {
+        assert!(self.rank >= 1, "as_2d(): rank 0");
+        let f = self.shape[self.rank - 1];
+        (self.len() / f, f)
+    }
 }
 
 #[cfg(test)]

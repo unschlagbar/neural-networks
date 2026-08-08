@@ -595,11 +595,13 @@ pub fn rms_norm_forward_into(
     out: &mut DTensor,
     saved: &mut GpuRmsForward,
 ) {
-    let (b, f) = (x.rows(), x.cols());
+    // Position-wise over the last axis, so a `[B, T, H]` caller is served as-is —
+    // see `DTensor::as_2d`.
+    let (b, f) = x.as_2d();
     let groups_per_row = f / group;
     let total_groups = b * groups_per_row;
-    assert_eq!(out.dims(), [b, f], "rms_norm_forward: out shape");
-    assert_eq!(saved.x_hat.dims(), [b, f], "rms_norm_forward: x_hat shape");
+    assert_eq!(out.as_2d(), (b, f), "rms_norm_forward: out shape");
+    assert_eq!(saved.x_hat.as_2d(), (b, f), "rms_norm_forward: x_hat shape");
     assert_eq!(
         saved.inv_rms.len(),
         total_groups,
@@ -648,10 +650,10 @@ pub fn rms_norm_backward_into(
     group: usize,
     dx: &mut DTensor,
 ) {
-    let (b, f) = (dy.rows(), dy.cols());
+    let (b, f) = dy.as_2d();
     let groups_per_row = f / group;
     let total_groups = b * groups_per_row;
-    assert_eq!(dx.dims(), [b, f], "rms_norm_backward: dx shape");
+    assert_eq!(dx.as_2d(), (b, f), "rms_norm_backward: dx shape");
     let (gpr_i, group_i, tg_i) = (groups_per_row as i32, group as i32, total_groups as i32);
     let cfg = rms_norm_cfg(total_groups);
     let func = gpu.kernels.get("rms_norm_backward");

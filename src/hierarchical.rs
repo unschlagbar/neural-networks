@@ -835,9 +835,7 @@ impl Hierarchical {
                         // Written right after the weights so the recorded
                         // position never runs ahead of the checkpoint.
                         progress.step = state.step;
-                        if let Err(e) =
-                            crate::sft_progress::save(state.save_path(), progress)
-                        {
+                        if let Err(e) = crate::sft_progress::save(state.save_path(), progress) {
                             eprintln!("progress save failed: {e}");
                         }
                         println!("saved");
@@ -1427,7 +1425,10 @@ mod tests {
         let dw = s.words.len() - 1;
         let g = head_grad_after(&mut s.model, &s.tokens, &s.words, Some(vec![false; dw]));
         let max = g.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
-        assert!(max == 0.0, "fully-masked head grad must be exactly zero, got {max}");
+        assert!(
+            max == 0.0,
+            "fully-masked head grad must be exactly zero, got {max}"
+        );
 
         // And the reported loss over an all-masked window is zero.
         s.model.set_word_loss_mask(Some(vec![false; dw]));

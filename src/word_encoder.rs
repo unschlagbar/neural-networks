@@ -99,7 +99,7 @@ impl WordEncoder {
     }
 
     pub fn enc_range(&self, w: usize) -> Range<usize> {
-        self.enc_ranges[w]
+        self.enc_ranges[w].clone()
     }
 
     /// Word embedding `e_w` of the `w`-th encoded word (valid after `encode_words`).

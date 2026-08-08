@@ -213,6 +213,7 @@ fn main() {
 
         let mut dev = neural_networks::gpu::slstm::SLstm::from_parts(
             &gpu, h, h, &cpu.wz, &cpu.wi, &cpu.wf, &cpu.wo, &cpu.bz, &cpu.bi, &cpu.bf, &cpu.bo,
+            None,
         );
         let dx_in = DTensor::from_host(&gpu, &x);
         let ddy = DTensor::from_host(&gpu, &dy);
