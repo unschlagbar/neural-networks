@@ -155,6 +155,26 @@ pub trait Cell {
     /// Drop pooled scratch far larger than a `rows`-row window needs.
     /// See [`Block::trim_to`].
     fn trim_to(&mut self, _rows: usize) {}
+    /// Continue the previous call's recurrence instead of starting from zero.
+    ///
+    /// For a chunked sweep, where one sequence is split across several calls and the
+    /// state has to cross the chunk borders. Default: ignore it — a cell with no
+    /// cross-call state has nothing to carry.
+    fn set_carry(&mut self, _carry: bool) {}
+    /// Zero the carried forward state (before the first chunk of a sweep).
+    fn reset_state(&mut self, _gpu: &Gpu) {}
+    /// Zero the carried BPTT state (before the last chunk's backward — backward
+    /// unwinds chunks right to left).
+    fn reset_bptt(&mut self, _gpu: &Gpu) {}
+    /// Device bytes this cell holds, split `(params, activations)`. Diagnostic.
+    fn retained_bytes(&self) -> (usize, usize);
+    /// Retained activation bytes split `(saved_cache, other)` — "other" being the
+    /// cell's own stable buffers plus whatever its internal projections and norms
+    /// hold, i.e. the part `drop_saved_act` does **not** reach. Diagnostic.
+    fn act_split(&self) -> (usize, usize);
+    /// Release every activation this cell holds, including the ones its
+    /// `drop_saved_act` leaves behind (a cell's projections and norms keep their own).
+    fn drop_all_act(&mut self, gpu: &Gpu);
     /// Build the matching CPU `nn` block (`SLSTMBlock` / `MLSTMBlock`) from this
     /// cell plus the already-exported surrounding norms and projections.
     #[allow(clippy::too_many_arguments)]
@@ -192,6 +212,24 @@ impl Cell for SLstm {
     }
     fn drop_saved_act(&mut self) {
         SLstm::drop_saved_act(self)
+    }
+    fn retained_bytes(&self) -> (usize, usize) {
+        SLstm::retained_bytes(self)
+    }
+    fn drop_all_act(&mut self, _gpu: &Gpu) {
+        SLstm::drop_all_act(self)
+    }
+    fn act_split(&self) -> (usize, usize) {
+        SLstm::act_split(self)
+    }
+    fn set_carry(&mut self, carry: bool) {
+        SLstm::set_carry(self, carry)
+    }
+    fn reset_state(&mut self, gpu: &Gpu) {
+        SLstm::reset_state(self, gpu)
+    }
+    fn reset_bptt(&mut self, gpu: &Gpu) {
+        SLstm::reset_bptt(self, gpu)
     }
     fn to_nn_block(
         &self,
@@ -259,6 +297,24 @@ pub trait BlockLike {
     /// Drop pooled scratch far larger than a `rows`-row window needs, at a window
     /// boundary. See [`Block::trim_to`].
     fn trim_to(&mut self, rows: usize);
+    /// Device bytes held, split `(params, activations)`. See
+    /// [`Block::retained_bytes`].
+    fn retained_bytes(&self) -> (usize, usize);
+    /// Release every activation, including what `drop_saved_act` keeps. See
+    /// [`Block::drop_all_act`].
+    fn drop_all_act(&mut self, gpu: &Gpu);
+    /// Retained activation bytes by owner. See [`Block::act_breakdown`].
+    fn act_breakdown(&self) -> [usize; 5];
+    /// Pool free-list shape `(distinct sizes, buffers)`. See [`Block::pool_shape`].
+    fn pool_shape(&self) -> (usize, usize);
+    /// Carry the cell's recurrence across calls, for a chunked sweep.
+    fn set_carry(&mut self, carry: bool);
+    /// Zero the carried forward state (before a sweep's first chunk).
+    fn reset_state(&mut self, gpu: &Gpu);
+    /// Zero the carried BPTT state (before a sweep's last chunk backward).
+    fn reset_bptt(&mut self, gpu: &Gpu);
+    /// The cell's `(saved_cache, other)` activation split. See [`Cell::act_split`].
+    fn cell_act_split(&self) -> (usize, usize);
     /// Export the block into the matching CPU `nn` block (`SLSTMBlock` /
     /// `MLSTMBlock`) for a `HIER` checkpoint.
     fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn NnLayer>;
@@ -292,6 +348,39 @@ impl<C: Cell> BlockLike for Block<C> {
     fn trim_to(&mut self, rows: usize) {
         Block::trim_to(self, rows)
     }
+    fn retained_bytes(&self) -> (usize, usize) {
+        Block::retained_bytes(self)
+    }
+    fn drop_all_act(&mut self, gpu: &Gpu) {
+        Block::drop_all_act(self, gpu)
+    }
+    fn act_breakdown(&self) -> [usize; 5] {
+        Block::act_breakdown(self)
+    }
+    fn pool_shape(&self) -> (usize, usize) {
+        Block::pool_shape(self)
+    }
+    fn set_carry(&mut self, carry: bool) {
+        self.carry = carry;
+        // The two pre-norms save an `x̂` per forward, exactly like the FFN and the cell.
+        self.pre_norm1.set_carry(carry);
+        self.pre_norm2.set_carry(carry);
+        self.cell.set_carry(carry)
+    }
+    fn reset_state(&mut self, gpu: &Gpu) {
+        // A sweep that forwarded chunks and never unwound them would otherwise leave
+        // its FFN caches to accumulate across steps.
+        self.act.chunk_saved.clear();
+        self.seq.clear();
+        self.fwd_chunks = 0;
+        self.cell.reset_state(gpu)
+    }
+    fn reset_bptt(&mut self, gpu: &Gpu) {
+        self.cell.reset_bptt(gpu)
+    }
+    fn cell_act_split(&self) -> (usize, usize) {
+        self.cell.act_split()
+    }
     fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn NnLayer> {
         Block::to_nn_layer(self, gpu)
     }
@@ -309,7 +398,17 @@ pub struct Block<C: Cell> {
 
     /// This block's activations, owned across calls.
     act: Act,
-    seq: (usize, usize), // (B, T) of the last forward
+    /// `(B, T)` of each forward still owed a backward, oldest first. A chunked sweep's
+    /// last chunk is shorter than the rest, so backward cannot assume one shape — it
+    /// pops the shape belonging to the chunk it is unwinding.
+    seq: Vec<(usize, usize)>,
+    /// Whether this block is part of a chunked sweep, i.e. whether its forward caches
+    /// must survive the next chunk's forward. Set alongside the cell's own carry.
+    carry: bool,
+    /// Chunks forwarded in the current sweep and not yet unwound. Drives the stash:
+    /// the first chunk has nothing to preserve, every later one does. Counted rather
+    /// than inferred from the `Buf` slots, which `FfnSaved::put_back` refills.
+    fwd_chunks: usize,
 }
 
 /// A block's activations.
@@ -348,6 +447,14 @@ struct Act {
     /// The parked tensors between `restore` and their consumption in backward. Only
     /// non-empty inside `backward`.
     restored: Vec<offload::Parked>,
+    /// Earlier chunks' FFN activations, oldest first, when the sweep is chunked.
+    ///
+    /// The five `Buf` slots above hold one chunk's worth, so without this chunk c+1's
+    /// forward overwrites what chunk c's backward reads. Each chunk's set moves here
+    /// as the next one's forward starts, and backward pops them right to left. Empty
+    /// on the unchunked path, and on the offload path (where the park holds a
+    /// generation per chunk instead).
+    chunk_saved: Vec<FfnSaved>,
 }
 
 impl Act {
@@ -450,7 +557,86 @@ impl<C: Cell> Block<C> {
             b.clear();
         }
         a.restored.clear();
+        // These caches are being abandoned, not consumed, so the bookkeeping that
+        // tracks what is owed a backward goes with them — otherwise a stack that
+        // re-forwards per group (the encoder) accumulates shapes it will never pop.
+        a.chunk_saved.clear();
+        self.seq.clear();
+        self.fwd_chunks = 0;
         self.cell.drop_saved_act();
+    }
+
+    /// Device bytes this block holds, split `(params, activations)`. Diagnostic — see
+    /// [`Hierarchical::retained_report`](super::hierarchical::Hierarchical::retained_report).
+    pub fn retained_bytes(&self) -> (usize, usize) {
+        let (mut params, mut act) = self.cell.retained_bytes();
+        for n in [&self.pre_norm1, &self.pre_norm2] {
+            let (p, a) = n.retained_bytes();
+            params += p;
+            act += a;
+        }
+        for l in [&self.lin_gate, &self.lin_value, &self.lin_down] {
+            let (p, a) = l.retained_bytes();
+            params += p;
+            act += a;
+        }
+        let a = &self.act;
+        act += a.pool.retained_bytes()
+            + a.gate_pre.retained_bytes()
+            + a.gate_act.retained_bytes()
+            + a.value.retained_bytes()
+            + a.zn.retained_bytes()
+            + a.mixed.retained_bytes();
+        (params, act)
+    }
+
+    /// Retained activation bytes broken out by owner, for the memory audit:
+    /// `(ffn_bufs, pool, norms, projections, cell)`.
+    ///
+    /// The split matters because only the first two are reachable from
+    /// [`drop_saved_act`](Self::drop_saved_act) + [`trim_to`](Self::trim_to); the last
+    /// three are held inside the sub-layers and survive both.
+    pub fn act_breakdown(&self) -> [usize; 5] {
+        let a = &self.act;
+        let ffn = a.gate_pre.retained_bytes()
+            + a.gate_act.retained_bytes()
+            + a.value.retained_bytes()
+            + a.zn.retained_bytes()
+            + a.mixed.retained_bytes();
+        let norms: usize = [&self.pre_norm1, &self.pre_norm2]
+            .iter()
+            .map(|n| n.retained_bytes().1)
+            .sum();
+        let proj: usize = [&self.lin_gate, &self.lin_value, &self.lin_down]
+            .iter()
+            .map(|l| l.retained_bytes().1)
+            .sum();
+        [ffn, a.pool.retained_bytes(), norms, proj, self.cell.retained_bytes().1]
+    }
+
+    /// This block's pool free-list shape `(distinct sizes, buffers)`. Diagnostic.
+    pub fn pool_shape(&self) -> (usize, usize) {
+        self.act.pool.free_list_shape()
+    }
+
+    /// Release every activation this block holds, everywhere — the FFN buffers and
+    /// pool, the cell's caches, and the saved inputs and bf16 staging inside the
+    /// norms and projections.
+    ///
+    /// [`drop_saved_act`](Self::drop_saved_act) deliberately keeps the last group; this
+    /// does not. For a window boundary, not the hot path.
+    pub fn drop_all_act(&mut self, gpu: &Gpu) {
+        self.drop_saved_act();
+        // The pool is NOT emptied here — see `MLstm::drop_all_act`. It is this block's
+        // scratch working set, re-taken in full on the next call, and dropping it at a
+        // group boundary puts the allocator back on the hot path. `trim_to` at the
+        // window boundary is what sizes it.
+        self.pre_norm1.drop_saved_act();
+        self.pre_norm2.drop_saved_act();
+        for l in [&mut self.lin_gate, &mut self.lin_value, &mut self.lin_down] {
+            l.drop_saved_act(gpu);
+        }
+        self.cell.drop_all_act(gpu);
     }
 
     /// Turn offload back off. For the parity test, which runs both paths in one
@@ -533,7 +719,9 @@ impl<C: Cell> Block<C> {
                 &Tensor::zeros(&[hidden]),
             ),
             act: Act::new(gpu),
-            seq: (0, 0),
+            seq: Vec::new(),
+            carry: false,
+            fwd_chunks: 0,
         }
     }
 
@@ -554,7 +742,9 @@ impl<C: Cell> Block<C> {
             lin_value: Linear::from_parts(gpu, &cpu.lin_value.w, &cpu.lin_value.b),
             lin_down: Linear::from_parts(gpu, &cpu.lin_down.w, &cpu.lin_down.b),
             act: Act::new(gpu),
-            seq: (0, 0),
+            seq: Vec::new(),
+            carry: false,
+            fwd_chunks: 0,
         }
     }
 
@@ -565,7 +755,7 @@ impl<C: Cell> Block<C> {
         assert_eq!(h, self.hidden, "Block::forward — hidden mismatch");
         assert_eq!(y.dims(), x.dims(), "Block::forward — output shape");
         let (n, u) = (b * t, self.up);
-        self.seq = (b, t);
+        self.seq.push((b, t));
         // Whole-block span; `glue` is this minus the cell and FFN spans, i.e. the
         // norms, residual adds and buffer copies that are neither.
         let blk_t0 = phase::enabled().then(|| {
@@ -594,6 +784,17 @@ impl<C: Cell> Block<C> {
         }
         let a = &mut self.act;
         a.pool.assert_drained("Block::forward");
+        // Chunked sweep without offload: the previous chunk's FFN activations are still
+        // owed a backward, so move them aside before the `Buf` slots below overwrite
+        // them. With offload on, the park already holds a generation per chunk and the
+        // slots are empty here.
+        if self.carry && a.park.is_none() && self.fwd_chunks > 0 {
+            let prev = FfnSaved::take(a);
+            a.chunk_saved.push(prev);
+        }
+        if self.carry {
+            self.fwd_chunks += 1;
+        }
 
         // Owned [N, H] copy of the input: it feeds both the norm path and the
         // residual, and the caller's `x` is only lent to us.
@@ -736,7 +937,7 @@ impl<C: Cell> Block<C> {
 
     /// Backward over `[B, T, H]` → `dx` `[B, T, H]`.
     pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
-        let (b, t) = self.seq;
+        let (b, t) = self.seq.pop().expect("Block::backward before forward");
         let (h, u) = (self.hidden, self.up);
         let n = b * t;
         assert_eq!(dx.dims(), [b, t, h], "Block::backward — dx shape");
@@ -758,6 +959,7 @@ impl<C: Cell> Block<C> {
         // buffers are returned to their slots at the end (`FfnSaved::put_back`), which
         // for the offload path means simply dropping them.
         let saved = FfnSaved::take(&mut self.act);
+        self.fwd_chunks = self.fwd_chunks.saturating_sub(1);
         let a = &mut self.act;
         a.pool.assert_drained("Block::backward");
 
@@ -832,6 +1034,14 @@ impl<C: Cell> Block<C> {
         // the allocations. On the offload path this drops them instead, which is what
         // releases the restored device memory again.
         saved.put_back(a);
+        // Chunked sweep: the slots now hold the chunk just unwound, which nothing will
+        // read again. Replace them with the chunk to its left — the next to unwind —
+        // so `FfnSaved::take` finds that chunk's own activations. The allocations the
+        // line above returned are dropped here, releasing them a chunk earlier than
+        // the next forward would.
+        if let Some(prev) = a.chunk_saved.pop() {
+            prev.put_back(a);
+        }
         if let Some((t0, cell0, ffn0)) = blk_t0 {
             gpu.stream.synchronize().expect("sync");
             let total = t0.elapsed().as_nanos() as u64;
@@ -932,7 +1142,9 @@ impl Block<SLstm> {
             lin_value: lin_from_nn(gpu, &cpu.lin_value),
             lin_down: lin_from_nn(gpu, &cpu.lin_down),
             act: Act::new(gpu),
-            seq: (0, 0),
+            seq: Vec::new(),
+            carry: false,
+            fwd_chunks: 0,
         }
     }
 }
@@ -956,7 +1168,9 @@ impl Block<MLstm> {
             lin_value: lin_from_nn(gpu, &cpu.lin_value),
             lin_down: lin_from_nn(gpu, &cpu.lin_down),
             act: Act::new(gpu),
-            seq: (0, 0),
+            seq: Vec::new(),
+            carry: false,
+            fwd_chunks: 0,
         }
     }
 }

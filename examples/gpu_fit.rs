@@ -67,14 +67,14 @@ fn main() {
     println!("ctx {base0:.0} MB -> after model init {:.0} MB", used_mb());
     let mut opt = AdamCfg::new(LR, neural_networks::optimizers::WEIGHT_DECAY);
     let tokens: Vec<usize> = worst.tokens.iter().map(|&t| t as usize).collect();
-    let words: Vec<(usize, usize)> = worst.words.iter().map(|r| (r.start, r.end)).collect();
+    let words = &worst.words;
 
     let mut peak: f64 = 0.0;
     let after_weights = used_mb();
     let mut secs = 0.0;
     for i in 0..4 {
         let t0 = Instant::now();
-        let l = model.forward_backward(&gpu, &tokens, &words);
+        let l = model.forward_backward(&gpu, &tokens, words);
         opt.t += 1;
         model.step(&gpu, &opt);
         if i > 0 {

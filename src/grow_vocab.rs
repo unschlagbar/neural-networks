@@ -101,6 +101,7 @@ pub fn grow_checkpoint(in_path: &str, out_path: &str, new_vocab: usize) -> io::R
         mut char2_model,
         context_size,
         step,
+        seen,
         ..
     } = stacks;
 
@@ -145,6 +146,7 @@ pub fn grow_checkpoint(in_path: &str, out_path: &str, new_vocab: usize) -> io::R
             vocab_size: new_vocab as u32,
             context_size: context_size as u32,
             step: step as u64,
+            seen,
         },
     )
     .section("encoder", &encoder_chars.layers)

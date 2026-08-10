@@ -64,6 +64,31 @@ impl Linear {
         }
     }
 
+    /// Device bytes held, split `(params, activations)`. Diagnostic — see
+    /// [`Hierarchical::retained_report`](super::hierarchical::Hierarchical::retained_report).
+    ///
+    /// `params` is weights + grads + AdamW moments, which are fixed by the config.
+    /// `activations` is the saved forward input `x` plus the bf16 GEMM staging, both
+    /// of which scale with the batch and are what a longer window grows.
+    pub fn retained_bytes(&self) -> (usize, usize) {
+        let params = [&self.w, &self.b, &self.dw, &self.db, &self.mw, &self.vw, &self.mb, &self.vb]
+            .iter()
+            .map(|t| t.capacity() * 4)
+            .sum();
+        (params, self.x.capacity() * 4 + self.gemm.retained_bytes())
+    }
+
+    /// Release the saved forward input and the bf16 GEMM staging.
+    ///
+    /// Neither is read outside a forward→backward pair, but both are kept across
+    /// calls (stable addresses for graph replay, and to keep the cast off the hot
+    /// path) and both reuse by **capacity** — so in a stack with varying window
+    /// sizes they settle at the largest window ever seen.
+    pub fn drop_saved_act(&mut self, gpu: &Gpu) {
+        self.x = DTensor::zeros(gpu, &[0, self.input]);
+        self.gemm.clear();
+    }
+
     /// Force this layer's GEMMs back to fp32.
     ///
     /// For the few matmuls where the narrowed operands are not worth it: the logit
@@ -141,7 +166,7 @@ impl Linear {
         // then accumulate X·W on top (beta=1).
         ops::broadcast_row(gpu, y, &self.b);
         if self.bf16 {
-            self.gemm.run(gpu, ops::MmForm::Nn, x, &self.w, y, 1.0);
+            self.gemm.run_wb(gpu, ops::MmForm::Nn, x, &self.w, y, 1.0);
         } else {
             ops::matmul_nn_into(gpu, x, &self.w, y, 1.0);
         }
@@ -248,7 +273,7 @@ impl Linear {
     /// internally — no host transpose.
     fn grad_x(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
         if self.bf16 {
-            self.gemm.run(gpu, ops::MmForm::Nt, dy, &self.w, dx, 0.0);
+            self.gemm.run_wb(gpu, ops::MmForm::Nt, dy, &self.w, dx, 0.0);
         } else {
             ops::matmul_nt_into(gpu, dy, &self.w, dx, 0.0);
         }
@@ -262,7 +287,11 @@ impl Linear {
     }
 
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
+    ///
+    /// Hands out `&mut w`, so the cached bf16 weight is dropped here rather than at the
+    /// (untrackable) point the caller writes through it.
     pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
+        self.gemm.invalidate_w();
         vec![&mut self.w, &mut self.b]
     }
 
@@ -280,6 +309,7 @@ impl Linear {
     /// AdamW step with explicit weight-decay control on `w` (pass `false` for an
     /// undecayed logit head).
     pub fn step_wd(&mut self, gpu: &Gpu, cfg: &AdamCfg, decay_w: bool) {
+        self.gemm.invalidate_w();
         ops::adamw(
             gpu,
             &mut self.w,
@@ -305,6 +335,7 @@ impl Linear {
     /// a bias-free head: `b` stays at its (zero) init so the layer is equivalent
     /// to `nn::LinearNBLayer` and exports to the no-bias `HIER` head faithfully.
     pub fn step_w_only(&mut self, gpu: &Gpu, cfg: &AdamCfg, decay_w: bool) {
+        self.gemm.invalidate_w();
         ops::adamw(
             gpu,
             &mut self.w,
@@ -350,6 +381,65 @@ mod tests {
     /// fails on maybe one run in five, which is worse than no check at all.
     fn step_tol(gpu: &Gpu) -> f32 {
         if ops::gemm_bf16_enabled(gpu) { 2e-3 } else { 1e-5 }
+    }
+
+    /// The bf16 weight cache must be dropped by every optimizer step.
+    ///
+    /// `GemmBf16` narrows `w` once and reuses it across the layer's forward and its
+    /// `dX = dY·Wᵀ`; a step that forgot to invalidate would leave every later forward
+    /// reading the *initial* weight. That does not diverge or panic — the layer simply
+    /// stops learning — so a single-step test cannot see it. Two steps can: the second
+    /// forward must reflect the first step's update.
+    #[test]
+    fn weight_cache_follows_optimizer_steps() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let (b, i, o) = (4usize, 6usize, 5usize);
+        let cpu = CpuLinear::new(i, o);
+        let mut gl = Linear::from_parts(&gpu, &cpu.w, &cpu.b);
+        let hx = Tensor::random(&[b, i], 0.5);
+        let x = DTensor::from_host(&gpu, &hx);
+        let hdy = Tensor::random(&[b, o], 1.0);
+        let dy = DTensor::from_host(&gpu, &hdy);
+        let cfg = AdamCfg::new(1e-2, 0.0);
+
+        // The observable is the forward recomputed from the *current* fp32 weight, not
+        // a drifting comparison against a CPU twin: what a stale cache breaks is
+        // exactly the link between `w` and what the GEMM reads. `y = x·W + b`, so
+        // subtracting the bias leaves a term that must track `W`.
+        for t in 1..=3 {
+            let before = gl.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let w_before = gl.w.to_host(&gpu).data;
+
+            let _ = gl.backward_alloc(&gpu, &dy);
+            let mut c = cfg;
+            c.t = t;
+            // `step_w_only`, so the bias stays put: a step that also moved `b` would
+            // shift the output whether or not the cached weight was refreshed, and the
+            // test would pass with the invalidation removed.
+            gl.step_w_only(&gpu, &c, false);
+
+            let w_after = gl.w.to_host(&gpu).data;
+            let moved = w_before
+                .iter()
+                .zip(&w_after)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(moved > 1e-5, "step {t}: the optimizer did not move w");
+
+            let after = gl.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let changed = before
+                .iter()
+                .zip(&after)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                changed > 1e-5,
+                "step {t}: w moved by {moved} but the forward output did not change — \
+                 the bf16 weight cache was not invalidated"
+            );
+        }
     }
 
     /// GPU Linear must match the CPU `nn2::Linear` for a full

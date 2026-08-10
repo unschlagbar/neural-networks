@@ -53,6 +53,8 @@ pub fn inspect_model() {
                 "vocab_size = {}, context_size = {}, step = {}",
                 stacks.vocab_size, stacks.context_size, stacks.step,
             );
+            println!("\ntrained on:");
+            print!("{}", stacks.seen.report());
             println!("\nencoder (char model):");
             print_sequential(&stacks.encoder_chars);
             println!("\nword_model:");

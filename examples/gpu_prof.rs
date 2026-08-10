@@ -63,14 +63,14 @@ fn main() {
         };
         let mut model = Hierarchical::new(&gpu, &cfg);
         let mut tokens = Vec::new();
-        let mut words = Vec::new();
+        let mut words: Vec<std::range::Range<usize>> = Vec::new();
         for w in 0..words_n {
             let start = tokens.len();
             let len = 3 + (w % 5);
             for k in 0..len {
                 tokens.push(1 + (w + k) % 90);
             }
-            words.push((start, tokens.len()));
+            words.push((start..tokens.len()).into());
         }
         let _ = model.forward_backward(&gpu, &tokens, &words);
         let t0 = Instant::now();

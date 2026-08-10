@@ -43,6 +43,22 @@ pub struct SftExample {
     pub loss: Vec<bool>,
 }
 
+impl SftExample {
+    /// `(chars, words)` of the response — the part the loss is computed on.
+    /// Word 0 is the encode-only prefix and never decodes, so it is excluded
+    /// whatever its flag says.
+    pub fn response_extent(&self) -> (usize, usize) {
+        self.words
+            .iter()
+            .zip(&self.loss)
+            .skip(1)
+            .filter(|&(_, &keep)| keep)
+            .fold((0, 0), |(chars, words), (r, _)| {
+                (chars + (r.end - r.start), words + 1)
+            })
+    }
+}
+
 /// Assemble the token sequence for one record and mark the first response token.
 /// Returns `(tokens, response_start)` where `response_start` is the token index
 /// of the first response token (right after `<SEP>`).
@@ -314,6 +330,31 @@ mod tests {
         assert!(ex.loss.iter().any(|&b| b));
         // The very last word (the <END> word) carries loss.
         assert!(*ex.loss.last().unwrap());
+    }
+
+    /// `response_extent` counts exactly the loss-carrying words and their
+    /// tokens — the prompt side and the never-decoded word 0 stay out.
+    #[test]
+    fn response_extent_counts_only_loss_words() {
+        let tok = Utf8Tokenizer::new();
+        let ex = build_example(&tok, "what is 2+2?", "", "four").unwrap();
+        let (chars, words) = ex.response_extent();
+
+        let expect_words = ex.loss.iter().skip(1).filter(|&&b| b).count();
+        let expect_chars: usize = ex
+            .words
+            .iter()
+            .zip(&ex.loss)
+            .skip(1)
+            .filter(|&(_, &on)| on)
+            .map(|(w, _)| w.end - w.start)
+            .sum();
+        assert_eq!((chars, words), (expect_chars, expect_words));
+        assert!(words > 0 && chars > 0, "response must be counted");
+        assert!(
+            chars < ex.tokens.len(),
+            "the prompt must not be counted as response"
+        );
     }
 
     /// A record with context inserts the `<CONTEXT>` marker and still masks only

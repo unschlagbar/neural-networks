@@ -119,6 +119,9 @@ struct Saved {
     chunks: Vec<Chunk>,
     o: DTensor,    // [N, d]  (post-sigmoid)
     yhat: DTensor, // [N, d]
+    /// `lin_out`'s input, kept here rather than as the projection's private copy so a
+    /// chunked sweep's later chunk cannot overwrite it. Fed back via `backward_with_x`.
+    hconcat: DTensor, // [N, d]
 }
 
 /// Forward intermediates of the **fused** path. Far smaller than `Saved`: the
@@ -151,6 +154,9 @@ struct SavedFused {
     fused: ops::MlstmFused,
     o: Option<DTensor>,
     yhat: Option<DTensor>,
+    /// `lin_out`'s input, kept here rather than as the projection's private copy so a
+    /// chunked sweep's later chunk cannot overwrite it. Fed back via `backward_with_x`.
+    hconcat: Option<DTensor>,
 }
 
 impl SavedFused {
@@ -166,6 +172,11 @@ impl SavedFused {
     fn yhat(&self) -> &DTensor {
         self.yhat.as_ref().expect("mLSTM: yhat is parked on the host")
     }
+    fn hconcat(&self) -> &DTensor {
+        self.hconcat
+            .as_ref()
+            .expect("mLSTM: hconcat is parked on the host")
+    }
     fn qh(&self) -> &ops::SlabBuf {
         self.qh.as_ref().expect("mLSTM: qh is parked on the host")
     }
@@ -174,6 +185,59 @@ impl SavedFused {
     }
     fn vh(&self) -> &ops::SlabBuf {
         self.vh.as_ref().expect("mLSTM: vh is parked on the host")
+    }
+
+    /// Device bytes held. Parked tensors count as zero — they are on the host, which
+    /// is the whole point of parking them.
+    fn retained_bytes(&self) -> usize {
+        let opt_f32: usize = [&self.xf, &self.o, &self.yhat, &self.hconcat]
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .map(|t| t.capacity() * 4)
+            .sum();
+        let slabs: usize = [&self.qh, &self.kh, &self.vh]
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .map(|s| s.retained_bytes())
+            .sum();
+        opt_f32
+            + slabs
+            + (self.igh.capacity() + self.fgh.capacity()) * 4
+            + self.fused.retained_bytes()
+    }
+}
+
+impl Saved {
+    /// Device bytes held by the legacy (op-at-a-time) cache. Only reachable under
+    /// `MLSTM_LEGACY=1`; the per-chunk `[BH, L, L]` matrices dominate it, which is
+    /// why the fused path exists.
+    fn retained_bytes(&self) -> usize {
+        let flat: usize = [
+            &self.xf,
+            &self.qh,
+            &self.kh,
+            &self.vh,
+            &self.fgh,
+            &self.o,
+            &self.yhat,
+            &self.hconcat,
+        ]
+            .iter()
+            .map(|t| t.capacity() * 4)
+            .sum();
+        let chunks: usize = self
+            .chunks
+            .iter()
+            .map(|c| {
+                [
+                    &c.bvec, &c.avec, &c.qn, &c.psi, &c.m, &c.num, &c.dbar, &c.ds,
+                ]
+                .iter()
+                .map(|t| t.capacity() * 4)
+                .sum::<usize>()
+            })
+            .sum();
+        flat + chunks
     }
 }
 
@@ -211,7 +275,12 @@ pub struct MLstm {
     lin_out: Linear,
     headnorm: RmsNorm, // head-wise (group == dhv)
 
-    saved: Option<Cache>,
+    /// Forward caches awaiting a backward, one per chunk in eviction order.
+    ///
+    /// A chunked sweep forwards every chunk before unwinding any, so chunk c's cache
+    /// must survive chunk c+1's forward; backward pops from the end (right to left).
+    /// The unchunked path is this with a single element.
+    saved: Vec<Cache>,
     /// Scratch buffers for this cell's temporaries, recycled by size. The
     /// projections and head-major reorgs produce a dozen values that die within
     /// the same call; pooling them means the cell converges on the peak number
@@ -224,6 +293,14 @@ pub struct MLstm {
     /// and in the backbone's block-major sweep those are a whole pass apart. Only the
     /// big ones ride — see `evict_saved` for which and why.
     park: Option<super::offload::HostPark>,
+    /// Continue the previous call's recurrence instead of starting at zero — set for a
+    /// chunked sweep. See [`MLstm::set_carry`].
+    carry: bool,
+    /// The state the previous chunk ended with, seeded into the next chunk's kernel.
+    /// `None` before the first chunk of a sweep (and whenever `carry` is off).
+    carry_state: Option<ops::MlstmState>,
+    /// BPTT state from the chunk to the right, for a chunked backward.
+    carry_dstate: Option<ops::MlstmDState>,
 }
 
 impl MLstm {
@@ -268,9 +345,12 @@ impl MLstm {
             lin_f: Linear::from_parts(gpu, wf, bf),
             lin_out: Linear::from_parts(gpu, w_out, b_out),
             headnorm: RmsNorm::from_parts_grouped(gpu, gamma, dhv),
-            saved: None,
+            saved: Vec::new(),
             pool: Pool::default(),
             park: None,
+            carry: false,
+            carry_state: None,
+            carry_dstate: None,
         }
     }
 
@@ -499,7 +579,23 @@ impl MLstm {
             let kh = ops::head_gather_slab(gpu, &k, b, h, t, dqk);
             let vh = ops::head_gather_slab(gpu, &v, b, h, t, dhv); // [BH, T, dhv]
             self.pool.put_all([q, k, v, ig, fg]);
-            let fused = ops::mlstm_fused_fw(gpu, &qh, &kh, &vh, &igh, &fgh, l);
+            // Carry the recurrent state in from the previous chunk when the surrounding
+            // sweep is chunked; `None` (the unchunked case) starts it at zero inside
+            // the kernel. The outgoing state is taken below, after the cache is built.
+            let fused = ops::mlstm_fused_fw(
+                gpu,
+                &qh,
+                &kh,
+                &vh,
+                &igh,
+                &fgh,
+                l,
+                if self.carry { self.carry_state.as_ref() } else { None },
+            );
+            if self.carry {
+                let bh = b * h;
+                self.carry_state = Some(fused.final_state(gpu, bh, dhv, dqk));
+            }
             // `h_tilde` and `hconcat` die inside this block; `yhat` is cached for
             // backward, so only the first two are pooled.
             let mut h_tilde = self.pool.take(gpu, &[n, d]); // [N, d]
@@ -507,11 +603,14 @@ impl MLstm {
             let mut yhat = DTensor::uninit(gpu, &[n, d]);
             self.headnorm.forward(gpu, &h_tilde, &mut yhat);
             self.pool.put(h_tilde);
-            let mut hconcat = self.pool.take(gpu, &[n, d]);
+            // `hconcat` is kept in the cache rather than pooled, and `lin_out` takes it
+            // back through `backward_with_x`: a chunked sweep would otherwise have the
+            // next chunk's forward overwrite the private copy `forward_alloc` saves.
+            let mut hconcat = DTensor::uninit(gpu, &[n, d]);
             ops::mul_into(gpu, &o, &yhat, &mut hconcat);
-            let out = self.lin_out.forward_alloc(gpu, &hconcat);
-            self.pool.put(hconcat);
-            self.saved = Some(Cache::Fused(SavedFused {
+            let mut out = DTensor::uninit(gpu, &[n, d]);
+            self.lin_out.forward_shared(gpu, &hconcat, &mut out);
+            self.saved.push(Cache::Fused(SavedFused {
                 b,
                 t,
                 xf: Some(xf),
@@ -523,6 +622,7 @@ impl MLstm {
                 fused,
                 o: Some(o),
                 yhat: Some(yhat),
+                hconcat: Some(hconcat),
             }));
             self.evict_saved(gpu);
             return out.reshaped(&[b, t, d]);
@@ -549,10 +649,8 @@ impl MLstm {
             let qc = ops::slice_t(gpu, &qh, c0, len); // [BH, L, dqk]
             let kc = ops::slice_t(gpu, &kh, c0, len);
             let vc = ops::slice_t(gpu, &vh, c0, len); // [BH, L, dhv]
-            let igc = ops::slice_t(gpu, &igh.dup(gpu).reshaped(&[bh, t, 1]), c0, len)
-                .reshaped(&[bh, len]);
-            let fgc = ops::slice_t(gpu, &fgh.dup(gpu).reshaped(&[bh, t, 1]), c0, len)
-                .reshaped(&[bh, len]);
+            let igc = ops::slice_t_as(gpu, &igh, bh, t, 1, c0, len).reshaped(&[bh, len]);
+            let fgc = ops::slice_t_as(gpu, &fgh, bh, t, 1, c0, len).reshaped(&[bh, len]);
 
             // Decay/stabilizer machinery, on the chunk-LOCAL cumulative log-forget.
             // `m_state` enters via the `fc_t + m_prev` branch of the row-max, which
@@ -596,8 +694,7 @@ impl MLstm {
             // it). a_j is the last row of D̄ and g = b_last, both already in hand:
             //   C ← g·C + (a⊙V)ᵀ·K ,  n ← g·n + Σ_j a_j k_j
             if ci != last_span {
-                let g = ops::slice_t(gpu, &bvec.dup(gpu).reshaped(&[bh, len, 1]), len - 1, 1)
-                    .reshaped(&[bh]); // [BH]
+                let g = ops::slice_t_as(gpu, &bvec, bh, len, 1, len - 1, 1).reshaped(&[bh]); // [BH]
                 let va = ops::mul_rows(gpu, &vc, &avec, dhv); // [BH, L, dhv]
                 let mut c_new = ops::matmul_batched_tn(gpu, &va, &kc); // [BH, dhv, dqk]
                 let a3 = avec.dup(gpu).reshaped(&[bh, len, 1]);
@@ -607,8 +704,7 @@ impl MLstm {
                 c_state = c_new;
                 n_state = n_new;
                 // m_new = the chunk's last-row stabilizer.
-                m_state = ops::slice_t(gpu, &m.dup(gpu).reshaped(&[bh, len, 1]), len - 1, 1)
-                    .reshaped(&[bh]);
+                m_state = ops::slice_t_as(gpu, &m, bh, len, 1, len - 1, 1).reshaped(&[bh]);
             }
 
             chunks.push(Chunk {
@@ -633,13 +729,16 @@ impl MLstm {
         let mut yhat = DTensor::uninit(gpu, &[n, d]);
         self.headnorm.forward(gpu, &h_tilde, &mut yhat);
         self.pool.put(h_tilde);
-        let mut hconcat = self.pool.take(gpu, &[n, d]);
+        // `hconcat` is cached rather than pooled, and `lin_out` takes it back through
+        // `backward_with_x`: under a chunked sweep the private copy `forward_alloc`
+        // saves would be overwritten by the next chunk's forward.
+        let mut hconcat = DTensor::uninit(gpu, &[n, d]);
         ops::mul_into(gpu, &o, &yhat, &mut hconcat); // o ⊙ ŷ  [N, d]
-        let out = self.lin_out.forward_alloc(gpu, &hconcat); // [N, d]
-        self.pool.put(hconcat);
+        let mut out = DTensor::uninit(gpu, &[n, d]);
+        self.lin_out.forward_shared(gpu, &hconcat, &mut out); // [N, d]
 
         // `o`/`yhat` are unused after `mul`, so move (not dup) them into the cache.
-        self.saved = Some(Cache::Legacy(Saved {
+        self.saved.push(Cache::Legacy(Saved {
             b,
             t,
             xf,
@@ -650,6 +749,7 @@ impl MLstm {
             chunks,
             o,
             yhat,
+            hconcat,
         }));
         out.reshaped(&[b, t, d])
     }
@@ -668,7 +768,8 @@ impl MLstm {
     fn evict_saved(&mut self, gpu: &Gpu) {
         use super::offload::Parked;
         let Some(park) = &mut self.park else { return };
-        let Some(Cache::Fused(sv)) = &mut self.saved else {
+        // The chunk just forwarded — the one this call is closing out.
+        let Some(Cache::Fused(sv)) = self.saved.last_mut() else {
             return;
         };
         // Fixed order, mirrored exactly by `restore_saved`.
@@ -696,7 +797,9 @@ impl MLstm {
     /// Put the parked activations back into the cache, in `evict_saved`'s order.
     fn restore_saved(&mut self, gpu: &Gpu) {
         let Some(park) = &mut self.park else { return };
-        let Some(Cache::Fused(sv)) = &mut self.saved else {
+        // Backward pops from the end, so the cache being refilled is the last one —
+        // matching the park's own LIFO restore order.
+        let Some(Cache::Fused(sv)) = self.saved.last_mut() else {
             return;
         };
         let mut it = park.restore(gpu).into_iter();
@@ -707,6 +810,111 @@ impl MLstm {
         sv.qh = Some(next("parked qh").into());
         sv.kh = Some(next("parked kh").into());
         sv.vh = Some(next("parked vh").into());
+    }
+
+    /// Device bytes held, split `(params, activations)`. Diagnostic — see
+    /// [`Hierarchical::retained_report`](super::hierarchical::Hierarchical::retained_report).
+    ///
+    /// Note the multiplier: this cell owns **seven** [`Linear`]s, each with its own
+    /// saved input and bf16 GEMM staging, plus a head-wise [`RmsNorm`] holding an
+    /// `x̂` the width of the cell. `drop_saved_act` clears only `saved` — the
+    /// per-`Linear` retention survives it.
+    pub fn retained_bytes(&self) -> (usize, usize) {
+        let (mut params, mut act) = (0, 0);
+        for l in [
+            &self.lin_q,
+            &self.lin_k,
+            &self.lin_v,
+            &self.lin_o,
+            &self.lin_i,
+            &self.lin_f,
+            &self.lin_out,
+        ] {
+            let (p, a) = l.retained_bytes();
+            params += p;
+            act += a;
+        }
+        let (hn_p, hn_a) = self.headnorm.retained_bytes();
+        params += hn_p;
+        act += hn_a + self.pool.retained_bytes();
+        act += self.saved_bytes();
+        (params, act)
+    }
+
+    /// Continue the previous call's recurrence rather than starting from zero.
+    ///
+    /// For a chunked sweep: the state `C`/`n`/`m` crosses the chunk borders, which is
+    /// what makes the split reproduce the unchunked recurrence (see
+    /// `mlstm_chunked_carry_matches_whole`). Clear it — or call
+    /// [`reset_state`](Self::reset_state) — before the first chunk of a sweep.
+    pub fn set_carry(&mut self, carry: bool) {
+        self.carry = carry;
+        self.headnorm.set_carry(carry);
+        if !carry {
+            self.carry_state = None;
+            self.carry_dstate = None;
+        }
+    }
+
+    /// Drop the carried state, so the next forward starts the recurrence at zero
+    /// whatever `carry` says.
+    pub fn reset_state(&mut self, _gpu: &Gpu) {
+        self.carry_state = None;
+    }
+
+    /// Drop the carried BPTT state, so the next backward starts with no incoming
+    /// gradient from the right. Call before the rightmost chunk's backward.
+    pub fn reset_bptt(&mut self, _gpu: &Gpu) {
+        self.carry_dstate = None;
+    }
+
+    /// Retained activation bytes split `(saved_cache, other)`.
+    ///
+    /// `saved_cache` is what `drop_saved_act` releases. `other` is the pooled scratch
+    /// plus what the **seven** projections and the head norm hold internally — their
+    /// saved inputs and bf16 GEMM staging — which no `drop_saved_act` reaches.
+    pub fn act_split(&self) -> (usize, usize) {
+        let saved = self.saved_bytes();
+        let (_, all) = self.retained_bytes();
+        (saved, all - saved)
+    }
+
+    /// Device bytes held by the forward caches, summed over every chunk still awaiting
+    /// its backward.
+    fn saved_bytes(&self) -> usize {
+        self.saved
+            .iter()
+            .map(|c| match c {
+                Cache::Fused(s) => s.retained_bytes(),
+                Cache::Legacy(s) => s.retained_bytes(),
+            })
+            .sum()
+    }
+
+    /// Release everything a forward left behind that no backward will read: the
+    /// saved cache, the pooled scratch, and each projection's saved input and bf16
+    /// staging. The broader companion to the `Cell::drop_saved_act`, which only
+    /// clears `saved`.
+    pub fn drop_all_act(&mut self, gpu: &Gpu) {
+        self.saved.clear();
+        // NOT `pool.trim(0)`: the pool is the cell's per-call scratch working set, and
+        // it is re-taken in full on the very next call. Emptying it at a group boundary
+        // means every group reallocates every temporary — the allocator back on the hot
+        // path, which is exactly what `Pool` exists to avoid. The window boundary
+        // (`Hierarchical::trim_pools`) is where it gets sized down, against the largest
+        // group that actually ran.
+        for l in [
+            &mut self.lin_q,
+            &mut self.lin_k,
+            &mut self.lin_v,
+            &mut self.lin_o,
+            &mut self.lin_i,
+            &mut self.lin_f,
+            &mut self.lin_out,
+        ] {
+            l.drop_saved_act(gpu);
+        }
+        self.headnorm.drop_saved_act();
     }
 
     /// Park this cell's saved activations on the host between forward and backward.
@@ -746,7 +954,11 @@ impl MLstm {
         // `take`, not `as_ref`: the cache holds a window's activations, and dropping
         // them at the end of this call (rather than when the next forward overwrites
         // the field) keeps them from staying resident across the optimizer step.
-        match self.saved.take().expect("MLstm::backward before forward") {
+        match self
+            .saved
+            .pop()
+            .expect("MLstm::backward before forward")
+        {
             Cache::Fused(sv) => self.backward_fused(gpu, dy, sv),
             Cache::Legacy(sv) => self.backward_legacy(gpu, dy, sv),
         }
@@ -764,7 +976,8 @@ impl MLstm {
         let mut dy_flat = self.pool.take(gpu, &[n, d]);
         dy_flat.copy_from(gpu, dy);
         let mut d_hconcat = self.pool.take(gpu, &[n, d]);
-        self.lin_out.backward(gpu, &dy_flat, &mut d_hconcat);
+        self.lin_out
+            .backward_with_x(gpu, sv.hconcat(), &dy_flat, &mut d_hconcat);
         self.pool.put(dy_flat);
         let (do_pre, d_yhat) = ops::ogate_bwd(gpu, &d_hconcat, sv.o(), sv.yhat());
         self.pool.put(d_hconcat);
@@ -776,9 +989,22 @@ impl MLstm {
         self.pool.put(d_h_tilde);
         drop(d_yhat);
 
-        let (dqh, dkh, dvh, digh, dfgh) = ops::mlstm_fused_bw(
-            gpu, &sv.fused, sv.qh(), sv.kh(), sv.vh(), &sv.igh, &sv.fgh, &d_ytil,
+        // Backward unwinds chunks right to left, so the carried BPTT state comes from
+        // the chunk to the RIGHT — `None` on the rightmost (and on any unchunked call).
+        let (dqh, dkh, dvh, digh, dfgh, dstate) = ops::mlstm_fused_bw(
+            gpu,
+            &sv.fused,
+            sv.qh(),
+            sv.kh(),
+            sv.vh(),
+            &sv.igh,
+            &sv.fgh,
+            &d_ytil,
+            if self.carry { self.carry_dstate.as_ref() } else { None },
         );
+        if self.carry {
+            self.carry_dstate = Some(dstate);
+        }
 
         let dq = ops::head_scatter(gpu, &dqh, b, h, t, dqk); // [N, dqk·H]
         let mut dk = ops::head_scatter(gpu, &dkh, b, h, t, dqk);
@@ -827,7 +1053,8 @@ impl MLstm {
 
         // Output projection + o-gate.
         let mut d_hconcat = self.pool.take(gpu, &[n, d]); // [N, d]
-        self.lin_out.backward(gpu, &dy_flat, &mut d_hconcat);
+        self.lin_out
+            .backward_with_x(gpu, &sv.hconcat, &dy_flat, &mut d_hconcat);
         self.pool.put(dy_flat);
         let (do_pre, d_yhat) = ops::ogate_bwd(gpu, &d_hconcat, &sv.o, &sv.yhat);
         self.pool.put(d_hconcat);
@@ -860,8 +1087,7 @@ impl MLstm {
             let qc = ops::slice_t(gpu, &sv.qh, c0, len); // [BH, L, dqk]
             let kc = ops::slice_t(gpu, &sv.kh, c0, len);
             let vc = ops::slice_t(gpu, &sv.vh, c0, len); // [BH, L, dhv]
-            let fgc = ops::slice_t(gpu, &sv.fgh.dup(gpu).reshaped(&[bh, t, 1]), c0, len)
-                .reshaped(&[bh, len]);
+            let fgc = ops::slice_t_as(gpu, &sv.fgh, bh, t, 1, c0, len).reshaped(&[bh, len]);
             let d_ytil_c = ops::slice_t(gpu, &d_ytil, c0, len); // [BH, L, dhv]
 
             // ỹ = num/ψ  → d_num, d_qn  (num/ψ/qn all include the inter term).
@@ -918,9 +1144,7 @@ impl MLstm {
                 // chunk 0 the state is zero, so g contributes nothing and there is no
                 // predecessor to hand dC_in to.
                 if let Some(it) = &ch.inter {
-                    let g =
-                        ops::slice_t(gpu, &ch.bvec.dup(gpu).reshaped(&[bh, len, 1]), len - 1, 1)
-                            .reshaped(&[bh]);
+                    let g = ops::slice_t_as(gpu, &ch.bvec, bh, len, 1, len - 1, 1).reshaped(&[bh]);
                     let mut dg = DTensor::zeros(gpu, &[bh]);
                     ops::group_dot_add(gpu, &mut dg, &dc_carry, &it.c_prev);
                     ops::group_dot_add(gpu, &mut dg, &dn_carry, &it.n_prev);
@@ -934,7 +1158,7 @@ impl MLstm {
 
                     // g IS b_last, so dg lands on the last column of db.
                     let mut dg_pad = DTensor::zeros(gpu, &[bh, len, 1]);
-                    ops::unslice_t(gpu, &mut dg_pad, &dg.reshaped(&[bh, 1, 1]), len - 1);
+                    ops::unslice_t_as(gpu, &mut dg_pad, &dg, 1, len - 1);
                     ops::add_assign(gpu, &mut db, &dg_pad.reshaped(&[bh, len]));
                 }
             }
@@ -1107,7 +1331,25 @@ impl Cell for MLstm {
         // The whole fused cache — qh/kh/vh slabs, o, yhat, xf and the `MlstmFused`
         // internals. Safe to drop wholesale because the only caller re-forwards to
         // rebuild it (see `Block::drop_saved_act`).
-        self.saved = None;
+        self.saved.clear();
+    }
+    fn retained_bytes(&self) -> (usize, usize) {
+        MLstm::retained_bytes(self)
+    }
+    fn drop_all_act(&mut self, gpu: &Gpu) {
+        MLstm::drop_all_act(self, gpu)
+    }
+    fn act_split(&self) -> (usize, usize) {
+        MLstm::act_split(self)
+    }
+    fn set_carry(&mut self, carry: bool) {
+        MLstm::set_carry(self, carry)
+    }
+    fn reset_state(&mut self, gpu: &Gpu) {
+        MLstm::reset_state(self, gpu)
+    }
+    fn reset_bptt(&mut self, gpu: &Gpu) {
+        MLstm::reset_bptt(self, gpu)
     }
     fn to_nn_block(
         &self,
@@ -1497,5 +1739,199 @@ mod tests {
             3e-3,
             "w_out",
         );
+    }
+
+    /// The fused forward, run in chunks with the state carried, must reproduce the
+    /// single whole-sequence call.
+    ///
+    /// This is the load-bearing property of the chunked sweep, tested at the kernel
+    /// level so a failure points at `mlstm_fw_C`'s `CARRY` seeding rather than at
+    /// anything layered above it. `m` is the stabilizer: seeding it wrong does not
+    /// crash and produces no NaN, it silently rescales every value in the chunk — so
+    /// comparing `ytil` (the kernel's output) across the split is the only thing that
+    /// actually catches it.
+    #[test]
+    fn mlstm_chunked_carry_matches_whole() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let _mma = with_mma(false); // scalar dots, so the split stays an fp32 question
+        let (bh, dqk, dhv, l) = (4, 64, 64, 32);
+        let parts = [64usize, 64, 32]; // ragged: the last chunk is short
+        let t: usize = parts.iter().sum();
+
+        let mk = |dims: &[usize], seed: u64| {
+            DTensor::from_host(&gpu, &Tensor::random_seeded(dims, 0.5, seed))
+        };
+        let q = mk(&[bh, t, dqk], 0xC1);
+        let k = mk(&[bh, t, dqk], 0xC2);
+        let v = mk(&[bh, t, dhv], 0xC3);
+        let ig = mk(&[bh, t], 0xC4);
+        let fg = mk(&[bh, t], 0xC5);
+        let slab = |src: &DTensor, _dims: &[usize]| ops::SlabBuf::from_f32(&gpu, src.dup(&gpu));
+        // `ytil` is slab-typed; widen it to fp32 to compare.
+        let ytil_host = |f: &ops::MlstmFused, n: usize| {
+            let mut scratch = DTensor::uninit(&gpu, &[n]);
+            f.ytil.as_f32(&gpu, &mut scratch).to_host(&gpu).data
+        };
+
+        // Reference: one call over the whole sequence.
+        let whole = ops::mlstm_fused_fw(
+            &gpu,
+            &slab(&q, &[bh, t, dqk]),
+            &slab(&k, &[bh, t, dqk]),
+            &slab(&v, &[bh, t, dhv]),
+            &ig,
+            &fg,
+            l,
+            None,
+        );
+        let want = ytil_host(&whole, bh * t * dhv);
+
+        // Chunked: slice the time axis, carrying the state across the borders.
+        let mut got: Vec<f32> = Vec::with_capacity(bh * t * dhv);
+        let mut state: Option<ops::MlstmState> = None;
+        let mut off = 0;
+        let mut per_chunk: Vec<Vec<f32>> = Vec::new();
+        for &c in &parts {
+            let cut = |src: &DTensor, w: usize| {
+                let h = src.to_host(&gpu);
+                let mut out = Vec::with_capacity(bh * c * w);
+                for b in 0..bh {
+                    let base = b * t * w + off * w;
+                    out.extend_from_slice(&h.data[base..base + c * w]);
+                }
+                DTensor::from_host(&gpu, &Tensor::new(&[bh, c, w], out))
+            };
+            let (qc, kc, vc) = (cut(&q, dqk), cut(&k, dqk), cut(&v, dhv));
+            let (igc, fgc) = (cut(&ig, 1), cut(&fg, 1));
+            let f = ops::mlstm_fused_fw(
+                &gpu,
+                &slab(&qc, &[bh, c, dqk]),
+                &slab(&kc, &[bh, c, dqk]),
+                &slab(&vc, &[bh, c, dhv]),
+                &igc.reshaped(&[bh, c]),
+                &fgc.reshaped(&[bh, c]),
+                l,
+                state.as_ref(),
+            );
+            per_chunk.push(ytil_host(&f, bh * c * dhv));
+            state = Some(f.final_state(&gpu, bh, dhv, dqk));
+            off += c;
+        }
+        // Re-interleave: each chunk holds `[bh, c, dhv]`, the reference `[bh, t, dhv]`.
+        for b in 0..bh {
+            let mut o = 0;
+            for (ci, &c) in parts.iter().enumerate() {
+                let base = b * c * dhv;
+                got.extend_from_slice(&per_chunk[ci][base..base + c * dhv]);
+                o += c;
+            }
+            let _ = o;
+        }
+
+        assert_eq!(got.len(), want.len(), "chunked output length");
+        // bf16 `ytil` storage, so this is a storage-precision comparison, not an exact
+        // one. What would signal a broken carry is a whole chunk being off — a
+        // stabilizer error is multiplicative and hits every element after the border.
+        assert_close(&got, &want, 3e-2, "chunked ytil vs whole");
+    }
+
+
+
+    /// The chunked **backward** must reproduce the whole-sequence one.
+    ///
+    /// `mlstm_chunked_carry_matches_whole` only compares the forward, and that gap hid
+    /// a real bug: `mlstm_bw_parallel` forced the last chunk's incoming state gradient
+    /// to zero (`is_last`), which is right for a whole sequence but wrong under CARRY,
+    /// where that chunk feeds the chunk to its right. The gradient stayed plausible and
+    /// the loss stayed right — only `dW` was off, and the error grew with the number of
+    /// chunk borders (measured 1.2% across one, 2.6% across two).
+    ///
+    /// A tolerance test: the two blockings sum the same terms in a different order.
+    /// `dx` is the observable, not `dW` — the projection gradients average the error
+    /// down to a factor of two, while `dx` separates the two states by ~700x.
+    #[test]
+    fn mlstm_chunked_backward_matches_whole() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let (inp, d, heads, dqk, b, t) = (8usize, 16usize, 2usize, 8usize, 1usize, 12usize);
+        // Seeded: this compares two blockings whose sums reassociate, so it must not
+        // redraw its instance every run.
+        let mut proto = CpuMLstm::new(inp, d, heads, dqk);
+        proto.wi = Tensor::random_seeded(&[inp, heads], 0.3, 0xE1);
+        proto.wf = Tensor::random_seeded(&[inp, heads], 0.3, 0xE2);
+        proto.wq = Tensor::random_seeded(&[inp, d], 0.3, 0xE5);
+        proto.wk = Tensor::random_seeded(&[inp, d], 0.3, 0xE6);
+        proto.wv = Tensor::random_seeded(&[inp, d], 0.3, 0xE7);
+        proto.wo = Tensor::random_seeded(&[inp, d], 0.3, 0xE8);
+        proto.w_out = Tensor::random_seeded(&[d, d], 0.3, 0xE9);
+        let x = Tensor::random_seeded(&[b, t, inp], 0.5, 0xE3);
+        let g = Tensor::random_seeded(&[b, t, d], 1.0, 0xE4);
+        let cut = |src: &Tensor, c0: usize, len: usize, w: usize| {
+            let mut o = Vec::new();
+            for bb in 0..b {
+                let base = bb * t * w + c0 * w;
+                o.extend_from_slice(&src.data[base..base + len * w]);
+            }
+            DTensor::from_host(&gpu, &Tensor::new(&[b, len, w], o))
+        };
+
+        // Reference: one call over the whole sequence.
+        // Internal chunk length 2, so each call has NC > 1. At the default (256) a
+        // 6-step call is a single internal chunk, `is_last` is true for it either way,
+        // and the CARRY path under test is never reached.
+        let mut whole = MLstm::from_cpu(&gpu, &proto);
+        let _ = whole.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
+        let want = whole
+            .backward_alloc(&gpu, &DTensor::from_host(&gpu, &g))
+            .to_host(&gpu)
+            .data
+            .to_vec();
+
+        // Scale-aware: `dW` has near-zero entries where a pointwise relative error
+        // says nothing.
+        let err = |got: &[f32]| -> f32 {
+            let scale = want
+                .iter()
+                .chain(got.iter())
+                .fold(0.0f32, |m, v| m.max(v.abs()))
+                .max(1e-12);
+            want.iter()
+                .zip(got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+                / scale
+        };
+
+        // One border, then two. The bug this pins made the error grow with the count.
+        for parts in [vec![(0usize, 6usize), (6, 6)], vec![(0, 4), (4, 4), (8, 4)]] {
+            let mut part = MLstm::from_cpu(&gpu, &proto);
+            part.set_carry(true);
+            part.reset_state(&gpu);
+            for &(c0, len) in &parts {
+                let _ = part.forward_alloc(&gpu, &cut(&x, c0, len, inp));
+            }
+            // Backward unwinds right to left, starting with no gradient from the right.
+            part.reset_bptt(&gpu);
+            let mut pieces: Vec<Vec<f32>> = vec![Vec::new(); parts.len()];
+            for (i, &(c0, len)) in parts.iter().enumerate().rev() {
+                pieces[i] = part
+                    .backward_alloc(&gpu, &cut(&g, c0, len, d))
+                    .to_host(&gpu)
+                    .data
+                    .to_vec();
+            }
+            let got: Vec<f32> = pieces.concat();
+            let e = err(&got);
+            // Measured on this instance: 1e-3 with the carry honoured, 0.69 without —
+            // the threshold sits between, far from both.
+            assert!(
+                e < 1e-2,
+                "chunked backward dx differs by {e} over {} chunks",
+                parts.len()
+            );
+        }
     }
 }

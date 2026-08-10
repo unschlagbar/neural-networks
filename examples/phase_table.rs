@@ -46,13 +46,13 @@ fn main() {
 
     let n_words = 1024;
     let mut tokens = Vec::new();
-    let mut words = Vec::new();
+    let mut words: Vec<std::range::Range<usize>> = Vec::new();
     for w in 0..n_words {
         let start = tokens.len();
         for c in 0..4 {
             tokens.push((w * 7 + c * 13) % 256);
         }
-        words.push((start, tokens.len()));
+        words.push((start..tokens.len()).into());
     }
 
     // Warm up (allocations, lazy kernel specialization) with recording off.

@@ -27,6 +27,12 @@ pub struct RmsNorm {
     /// Saved `x̂` / `inv_rms`, reused across calls: both are shape-determined, so
     /// a steady batch size means the forward reallocates nothing.
     fwd: Option<GpuRmsForward>,
+    /// Earlier chunks' `x̂`/`inv_rms`, oldest first. The single `fwd` slot holds one
+    /// chunk's, so without this chunk c+1's forward overwrites what chunk c's backward
+    /// reads. Empty unless [`set_carry`](Self::set_carry) is on.
+    chunk_saved: Vec<GpuRmsForward>,
+    /// Whether this norm is inside a chunked sweep. See [`set_carry`](Self::set_carry).
+    carry: bool,
 }
 
 impl RmsNorm {
@@ -53,6 +59,8 @@ impl RmsNorm {
             size,
             group,
             fwd: None,
+            chunk_saved: Vec::new(),
+            carry: false,
         }
     }
 
@@ -72,6 +80,13 @@ impl RmsNorm {
         let (b, f) = x.as_2d();
         assert_eq!(f, self.size, "RmsNorm::forward — width mismatch");
         let total_groups = b * (f / self.group);
+        // Chunked sweep: the previous chunk's `x̂`/`inv_rms` are still owed a backward,
+        // so set them aside rather than letting the refit below reuse their buffers.
+        if self.carry {
+            if let Some(prev) = self.fwd.take() {
+                self.chunk_saved.push(prev);
+            }
+        }
         // Refit the saved intermediates, reusing them whenever the shape holds.
         match &self.fwd {
             Some(s) if s.x_hat.len() == b * f && s.inv_rms.len() == total_groups => {}
@@ -111,6 +126,10 @@ impl RmsNorm {
         assert_eq!(f, self.size, "RmsNorm::backward — width mismatch");
         let fwd = self.fwd.as_ref().expect("RmsNorm::backward before forward");
         ops::rms_norm_backward_into(gpu, dy, fwd, &self.gamma, &mut self.dgamma, self.group, dx);
+        // Chunks unwind right to left, so hand the slot to the chunk on the left.
+        if let Some(prev) = self.chunk_saved.pop() {
+            self.fwd = Some(prev);
+        }
     }
 
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
@@ -120,6 +139,40 @@ impl RmsNorm {
 
     pub fn zero_grad(&mut self, gpu: &Gpu) {
         self.dgamma.zero_(gpu);
+    }
+
+    /// Device bytes held, split `(params, activations)`. Diagnostic — see
+    /// [`Hierarchical::retained_report`](super::hierarchical::Hierarchical::retained_report).
+    ///
+    /// The params are four `[F]` vectors — negligible. The activations are the saved
+    /// `x̂` `[B, F]` and `inv_rms`, which scale with the batch and are held across
+    /// calls, so a norm inside a per-word stage retains a full window's worth.
+    pub fn retained_bytes(&self) -> (usize, usize) {
+        let params = [&self.gamma, &self.dgamma, &self.m, &self.v]
+            .iter()
+            .map(|t| t.capacity() * 4)
+            .sum();
+        let act = self
+            .fwd
+            .as_ref()
+            .map_or(0, |s| (s.x_hat.capacity() + s.inv_rms.len()) * 4);
+        (params, act)
+    }
+
+    /// Keep one saved `x̂`/`inv_rms` per chunk, for a sweep whose chunks all forward
+    /// before any of them unwinds. Off means the single slot is reused per call, which
+    /// is what every unchunked caller wants.
+    pub fn set_carry(&mut self, carry: bool) {
+        self.carry = carry;
+        if !carry {
+            self.chunk_saved.clear();
+        }
+    }
+
+    /// Release the saved `x̂` / `inv_rms`. The next forward reallocates them.
+    pub fn drop_saved_act(&mut self) {
+        self.fwd = None;
+        self.chunk_saved.clear();
     }
 
     /// AdamW step (norm scale is never decayed). Clears the grad.

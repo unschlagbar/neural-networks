@@ -35,12 +35,27 @@ The binary reads one line from stdin to select its mode:
 | `s` | `sample_normal` — interactive sampling from the flat model |
 | `hs` | `sample_hierarchical` — interactive sampling from the hierarchical model |
 | `hqs` | `sample_chat` — interactive Q-A sampling from an SFT model (prompts for an instruction + optional context, generates the response until `<END>`) |
-| `i` | `inspect_model` — prompts for a model name, looks it up in `models/` and prints all layers with their settings |
+| `i` | `inspect_model` — prompts for a model name, looks it up in `models/` and prints all layers with their settings, plus how many chars/words it has trained on (pretraining and SFT counted separately) |
 
 ## Style 
 
 do not use `0.0_f32`, always prever the simple mumber: `0.0`
 All comments need to be in englisch not in german
+
+Comments describe the code, not the edit. Never write a comment about what you
+changed, added, moved, or why you changed it — no "was X, now Y", no "kept for
+compatibility", no "moved here from foo.rs", no "NEW:". That belongs in the commit
+message or the chat, not in the file: the next reader has no idea what the previous
+version looked like and does not care.
+
+Keep comments short. Only comment what is not immediately understandable from the
+code — a non-obvious invariant, a unit, a reason the naive approach fails, a
+reference to a paper or reference implementation. Do not restate what the line
+already says, and do not write a paragraph where a line does.
+
+No banner or separator lines in comments: no `// =====`, no `// -----`, no boxed
+headers. They add lines without adding information and make the file look more
+verbose than it is. A section heading is one plain comment line.
 
 ## Architecture
 

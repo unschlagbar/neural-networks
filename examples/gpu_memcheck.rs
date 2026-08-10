@@ -37,13 +37,13 @@ fn main() {
         let n_words = 40 + (it % 7) * 30; // 40..220 words
         let wlen = 3 + (it % 5) * 4; // 3..19 chars per word
         let mut tokens = Vec::new();
-        let mut words = Vec::new();
+        let mut words: Vec<std::range::Range<usize>> = Vec::new();
         for _ in 0..n_words {
             let s = tokens.len();
             for k in 0..wlen {
                 tokens.push(1 + (k % 90));
             }
-            words.push((s, tokens.len()));
+            words.push((s..tokens.len()).into());
         }
         let loss = model.forward_backward(&gpu, &tokens, &words);
         opt.t += 1;

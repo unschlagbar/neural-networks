@@ -282,14 +282,6 @@ impl Parked {
         }
     }
 
-    /// Elements, in units of the buffer's own element type.
-    fn len(&self) -> usize {
-        match self {
-            Parked::F32(t) => t.len(),
-            Parked::Bf16(t) => t.len(),
-        }
-    }
-
     /// Size in `u16` units — the pinned slots' element type, so fp32 counts double.
     fn u16_len(&self) -> usize {
         match self {
@@ -316,6 +308,10 @@ impl Parked {
     /// ever written here and read back by `fill_from_host` below, which applies the
     /// inverse view, so no value is ever interpreted at the wrong width.
     fn copy_to_host(&self, xfer: &Arc<CudaStream>, dst: &mut PinnedHostSlice<u16>) {
+        // The slot is reused by capacity and may be longer than this buffer, so both
+        // sides are cut to `u16_len()` — the copy must not be sized by the slot.
+        let n16 = self.u16_len();
+        let dst = &mut dst.as_mut_slice().expect("offload: pinned slot view")[..n16];
         match self {
             Parked::Bf16(t) => {
                 let n = t.len();
@@ -338,6 +334,9 @@ impl Parked {
     /// Fill this buffer from a pinned `u16` host slot, on `xfer`. Inverse of
     /// [`copy_to_host`](Self::copy_to_host).
     fn fill_from_host(&mut self, xfer: &Arc<CudaStream>, src: &PinnedHostSlice<u16>) {
+        // Cut to this buffer's length, not the slot's — see `copy_to_host`.
+        let n16 = self.u16_len();
+        let src = &src.as_slice().expect("offload: pinned slot view")[..n16];
         match self {
             Parked::Bf16(t) => {
                 let n = t.len();
@@ -423,8 +422,6 @@ impl From<BTensor> for Parked {
 /// Shape and kind of one parked buffer, enough to rebuild it on restore.
 struct ParkedShape {
     dims: Vec<usize>,
-    /// Elements in the buffer's own element type.
-    len: usize,
     bf16: bool,
 }
 
@@ -442,16 +439,27 @@ struct ParkedShape {
 /// [`restore`](Self::restore) brings them back. Same transfer stream, same hand-placed
 /// events, no ring.
 pub struct HostPark {
-    /// One pinned slot per parked buffer, in eviction order.
+    /// One generation per parked chunk, in eviction order; within a generation, one
+    /// pinned slot per parked buffer.
     ///
-    /// Typed `u16` and sized in *elements of u16* so one park can hold both fp32
-    /// tensors and bf16 slabs — see [`Parked`]. A bf16 slab must come back as bf16:
-    /// this module moves bytes and never changes a value's width, because the
+    /// A chunked backbone sweep evicts once per `(block, chunk)` and unwinds chunks
+    /// right to left, so a park owes as many restores as the sweep made evictions.
+    /// Holding a single generation would let chunk c+1's eviction overwrite the slots
+    /// chunk c's backward still has to read — a wrong gradient, not a crash. The
+    /// unchunked path is exactly this with `gens.len() == 1`.
+    ///
+    /// Slots are typed `u16` and sized in *elements of u16* so one park can hold both
+    /// fp32 tensors and bf16 slabs — see [`Parked`]. A bf16 slab must come back as
+    /// bf16: this module moves bytes and never changes a value's width, because the
     /// precision split is decided at each value's production point (`gpu::bf16`), not
     /// on the way to host memory.
-    slots: Vec<PinnedHostSlice<u16>>,
-    /// What each parked buffer was, so `restore` can rebuild it.
-    shapes: Vec<ParkedShape>,
+    gens: Vec<ParkedGen>,
+    /// How many of `gens` currently hold live data, i.e. how many restores are owed.
+    ///
+    /// Distinct from `gens.len()`: a restore pops the data but leaves the pinned slots
+    /// allocated so the next step's eviction of the same shape reuses them instead of
+    /// page-locking again. `gens[..live]` is live; `gens[live..]` is spare capacity.
+    live: usize,
     xfer: Arc<CudaStream>,
     /// Device tensors handed over by [`evict`](Self::evict), held until their D2H copy
     /// completes.
@@ -469,8 +477,35 @@ pub struct HostPark {
     /// at all. Sharing bounds it at one block's worth, released one block later.
     in_flight: SharedInFlight,
     /// Uploads started by [`prefetch`](Self::prefetch) but not yet consumed, with the
-    /// event that says they have landed.
+    /// event that says they have landed. Belongs to the generation that
+    /// [`restore`](Self::restore) will take next — the last one evicted.
     prefetched: Option<(Vec<Parked>, CudaEvent)>,
+    /// Pinned slots not currently held by a generation, reusable by capacity.
+    ///
+    /// Page-locking costs ~640 us per slot, so a park that allocated on every eviction
+    /// would spend most of a step in `cuMemHostAlloc`. Slots come back here when a
+    /// generation is displaced and are handed out again by [`evict`](Self::evict).
+    ///
+    /// Bounded by [`SPARE_MAX`] — an unbounded pool would pin host memory in proportion
+    /// to the largest shape ever evicted and never give it back.
+    spare: Vec<PinnedHostSlice<u16>>,
+    /// Page-locking calls this park has made, for the reuse test to observe.
+    #[cfg(test)]
+    allocs: usize,
+}
+
+
+/// Cap on retained spare pinned slots per park.
+///
+/// A sweep's working set is one slot per buffer per in-flight generation — six buffers
+/// at `IN_FLIGHT_DEPTH` generations, plus the alternating FFN/cell shapes. 32 leaves
+/// room for that without letting a park hoard page-locked memory it will not reuse.
+const SPARE_MAX: usize = 32;
+
+/// One eviction's pinned slots and the shapes needed to rebuild its tensors.
+struct ParkedGen {
+    slots: Vec<PinnedHostSlice<u16>>,
+    shapes: Vec<ParkedShape>,
 }
 
 /// The one block's worth of evicted buffers that may be awaiting a copy at any time.
@@ -559,25 +594,32 @@ impl HostPark {
     /// An empty park, sharing `in_flight` with every other park in the model.
     pub fn new(gpu: &Gpu, in_flight: SharedInFlight) -> Result<Self, String> {
         Ok(Self {
-            slots: Vec::new(),
-            shapes: Vec::new(),
+            gens: Vec::new(),
+            live: 0,
             xfer: gpu
                 .context
                 .new_stream()
                 .map_err(|e| format!("offload: transfer stream creation failed: {e:?}"))?,
             in_flight,
             prefetched: None,
+            spare: Vec::new(),
+            #[cfg(test)]
+            allocs: 0,
         })
     }
 
-    /// Bytes currently parked on the host.
+    /// Bytes currently parked on the host, over every generation.
     pub fn host_bytes(&self) -> usize {
-        self.slots.iter().map(|s| s.num_bytes()).sum()
+        self.gens[..self.live]
+            .iter()
+            .flat_map(|g| g.slots.iter())
+            .map(|s| s.num_bytes())
+            .sum()
     }
 
     /// Whether anything is parked (i.e. a [`restore`](Self::restore) is owed).
     pub fn is_parked(&self) -> bool {
-        !self.slots.is_empty()
+        self.gens[..self.live].iter().any(|g| !g.slots.is_empty())
     }
 
     /// Copy `bufs` to pinned host memory.
@@ -592,14 +634,13 @@ impl HostPark {
     /// Reuses its pinned slots across steps when the shapes repeat, so a steady
     /// training loop page-locks nothing after the first window.
     pub fn evict(&mut self, gpu: &Gpu, bufs: Vec<Parked>) {
-        // The slot must be empty: the next block's forward releases the previous
-        // eviction (see `Block::forward`), and with a serial sweep that has always
-        // happened by the time control reaches here.
+        // Make room for this eviction. `Block::forward` and `MLstm::forward_alloc`
+        // release before allocating, which is what keeps the wait off the hot path, but
+        // a block releases twice and then evicts twice — so the second eviction can
+        // still arrive with the queue full. Draining here bounds the queue at the
+        // depth regardless of how the callers interleave.
         let mut in_flight = self.in_flight.borrow_mut();
-        debug_assert!(
-            in_flight.pending.len() < IN_FLIGHT_DEPTH,
-            "offload: evicting with the in-flight queue already full"
-        );
+        in_flight.release(gpu);
 
         let produced = gpu
             .stream
@@ -607,32 +648,67 @@ impl HostPark {
             .expect("offload: record produced");
         self.xfer.wait(&produced).expect("offload: xfer waits");
 
-        // Reuse the existing pinned slots when the shapes are unchanged — the steady
-        // state of a training loop. Page-locking is expensive and must not recur.
-        let same = self.shapes.len() == bufs.len()
-            && self
-                .shapes
-                .iter()
-                .zip(&bufs)
-                .all(|(s, b)| s.len == b.len() && s.dims == b.dims() && s.bf16 == b.is_bf16());
-        if !same {
-            self.slots.clear();
-            self.shapes.clear();
-            for b in &bufs {
-                // SAFETY: uninitialised pinned memory, fully written by the copy below
-                // before any read (`restore` is the only reader).
-                let mem = unsafe { gpu.context.alloc_pinned::<u16>(b.u16_len()) }
-                    .expect("offload: pinned host alloc");
-                self.slots.push(mem);
-                self.shapes.push(ParkedShape {
-                    dims: b.dims().to_vec(),
-                    len: b.len(),
-                    bf16: b.is_bf16(),
-                });
+        // Append a generation rather than overwriting the last: a chunked sweep evicts
+        // once per chunk and every one of them is owed a restore.
+        let depth = self.live;
+        // Take each slot from the spare pool by capacity rather than matching the whole
+        // generation shape-for-shape. Two things defeat an exact per-depth match: one
+        // park serves both the cell and the FFN, whose evictions differ in buffer count
+        // and land at the same depth alternately, and a balanced `chunk_spans` makes the
+        // last chunk one row shorter than the rest. Either alone means a depth's shapes
+        // never repeat, and page-locking is expensive enough (~640 us per slot) that
+        // missing puts it squarely on the hot path.
+        //
+        // A slot is reusable when it is at least as large as the buffer: the copy writes
+        // `u16_len()` elements and `restore` rebuilds the tensor from `ParkedShape`, so
+        // the slot's own length is never read back. Reusing a larger slot wastes only
+        // the tail.
+        // Reclaim the generations this eviction displaces *first*, so their slots are
+        // available to it. Reclaiming afterwards would make every re-eviction at a
+        // depth allocate before the slot it is about to replace comes back.
+        if self.gens.len() > depth {
+            for g in self.gens.drain(depth..) {
+                for s in g.slots {
+                    if self.spare.len() < SPARE_MAX {
+                        self.spare.push(s);
+                    }
+                }
             }
         }
 
-        for (slot, b) in self.slots.iter_mut().zip(&bufs) {
+        let mut slots = Vec::with_capacity(bufs.len());
+        let mut shapes = Vec::with_capacity(bufs.len());
+        for b in &bufs {
+            let need = b.u16_len();
+            let hit = self
+                .spare
+                .iter()
+                .position(|s| s.len() >= need)
+                .map(|i| self.spare.swap_remove(i));
+            let mem = match hit {
+                Some(m) => m,
+                None => {
+                    #[cfg(test)]
+                    {
+                        self.allocs += 1;
+                    }
+                    // SAFETY: uninitialised pinned memory, fully written by the copy
+                    // below before any read (`restore` is the only reader).
+                    unsafe { gpu.context.alloc_pinned::<u16>(need) }
+                        .expect("offload: pinned host alloc")
+                }
+            };
+            slots.push(mem);
+            shapes.push(ParkedShape {
+                dims: b.dims().to_vec(),
+                bf16: b.is_bf16(),
+            });
+        }
+        self.gens.push(ParkedGen { slots, shapes });
+
+        self.live = depth + 1;
+        let cur = &mut self.gens[depth];
+        for (slot, b) in cur.slots.iter_mut().zip(&bufs) {
             b.copy_to_host(&self.xfer, slot);
         }
         // Hand the sources, and the event that says their copy has landed, to the
@@ -670,7 +746,7 @@ impl HostPark {
     /// Idempotent: a second call before [`take_prefetched`](Self::take_prefetched) is
     /// a no-op.
     pub fn prefetch(&mut self, gpu: &Gpu) {
-        if self.prefetched.is_some() || self.slots.is_empty() {
+        if self.prefetched.is_some() || self.live == 0 {
             return;
         }
         self.prefetched = Some(self.issue_uploads(gpu));
@@ -691,8 +767,12 @@ impl HostPark {
 
     /// Allocate the destinations and queue their H2D copies, returning them with the
     /// event that says the copies have landed. Shared by prefetch and restore.
+    /// Reads the newest live generation — backward unwinds chunks right to left, so the
+    /// last chunk evicted is the first one restored. Popping is `restore`'s job: a
+    /// prefetch runs a block ahead of the take and must leave the generation in place.
     fn issue_uploads(&mut self, gpu: &Gpu) -> (Vec<Parked>, CudaEvent) {
-        let mut out: Vec<Parked> = self
+        let cur = &self.gens[self.live - 1];
+        let mut out: Vec<Parked> = cur
             .shapes
             .iter()
             .map(|s| {
@@ -714,7 +794,7 @@ impl HostPark {
             .expect("offload: record allocated");
         self.xfer.wait(&allocated).expect("offload: xfer waits");
 
-        for (slot, t) in self.slots.iter().zip(&mut out) {
+        for (slot, t) in self.gens[self.live - 1].slots.iter().zip(&mut out) {
             t.fill_from_host(&self.xfer, slot);
         }
         let filled = self.xfer.record_event(None).expect("offload: record fill");
@@ -727,8 +807,12 @@ impl HostPark {
     /// tensors are safe for compute to read. Consumes a [`prefetch`](Self::prefetch)
     /// if one is outstanding, which is how the transfer gets hidden; without one it
     /// issues and waits, correct but fully exposed.
+    /// Pops the generation it consumed, so a chunked sweep's next restore reads the
+    /// chunk to its left. The pinned slots stay allocated for the next step to reuse.
     pub fn restore(&mut self, gpu: &Gpu) -> Vec<Parked> {
-        self.take_prefetched(gpu)
+        let out = self.take_prefetched(gpu);
+        self.live -= 1;
+        out
     }
 }
 
@@ -966,19 +1050,51 @@ mod tests {
 
         park.evict(&gpu, vec![DTensor::from_host(&gpu, &src).into()]);
         park.sync_parked();
-        let first = park.slots[0].as_ptr().expect("ptr");
 
+        // Each step evicts and restores once, as a real sweep does — the restore is
+        // what returns the generation to the spare pool for the next step to reuse.
+        let settled = park.allocs;
         for _ in 0..4 {
+            let _ = park.restore(&gpu);
             park.evict(&gpu, vec![DTensor::from_host(&gpu, &src).into()]);
             park.sync_parked();
-            assert_eq!(
-                park.slots[0].as_ptr().expect("ptr"),
-                first,
-                "re-evicting the same shape re-allocated pinned memory"
-            );
         }
+        assert_eq!(
+            park.allocs, settled,
+            "re-evicting the same shape re-allocated pinned memory"
+        );
 
-        // A changed shape legitimately reallocates.
+        // The shapes a real sweep alternates between at one depth: one park serves both
+        // the cell and the FFN (different buffer counts), and a balanced `chunk_spans`
+        // makes the last chunk one row short. A smaller shape must reuse the slot it
+        // already has rather than page-locking a fresh one.
+        let short = Tensor::random(&[15, 32], 1.0);
+        let pair = Tensor::random(&[16, 32], 1.0);
+        let settled = park.allocs;
+        for _ in 0..4 {
+            let _ = park.restore(&gpu);
+            park.evict(&gpu, vec![DTensor::from_host(&gpu, &short).into()]);
+            park.sync_parked();
+            let _ = park.restore(&gpu);
+            park.evict(
+                &gpu,
+                vec![
+                    DTensor::from_host(&gpu, &pair).into(),
+                    DTensor::from_host(&gpu, &short).into(),
+                ],
+            );
+            park.sync_parked();
+        }
+        // The two-buffer eviction needs one slot more than the pool held, so one
+        // allocation is legitimate; what must not happen is one per eviction.
+        let grew = park.allocs - settled;
+        assert!(
+            grew <= 1,
+            "alternating shapes page-locked {grew} times, expected at most 1"
+        );
+
+        // A larger shape legitimately reallocates: no spare is big enough.
+        let _ = park.restore(&gpu);
         let b = Tensor::random(&[16, 64], 1.0);
         park.evict(&gpu, vec![DTensor::from_host(&gpu, &b).into()]);
         park.sync_parked();

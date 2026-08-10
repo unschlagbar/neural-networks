@@ -55,6 +55,38 @@ fn fits(capacity: usize, want: usize) -> bool {
     capacity >= want && capacity <= want.saturating_mul(RETAIN_SLACK)
 }
 
+/// Round an allocation up to a **size class**, so near-identical shapes share one
+/// buffer instead of each pinning its own.
+///
+/// `RETAIN_SLACK` alone bounds how oversized any single reuse may be, but it does not
+/// bound *how many distinct sizes* the free list accumulates — and that is the leak
+/// that actually aborts a run. Real windows vary continuously (word count, and one
+/// encoder/decoder rectangle per length bucket: 14-16 buckets per window measured on
+/// the real `hg` path), so essentially every window asks for a handful of sizes no
+/// previous window used. Each is individually within slack of something, so `trim`
+/// keeps it, and the free list grows without bound: measured over 40 varying windows
+/// it went 60 distinct sizes / 182 buffers -> 238 / 542, and device memory climbed
+/// 7571 MB -> 10307 MB in lockstep. Real training showed the same shape, 12.9 -> 16.4
+/// GB, and then OOMed.
+///
+/// Quantizing collapses that. `1/16`-granular classes (mantissa rounded up within
+/// each power of two) waste at most 6.25% per buffer and reduce the reachable size
+/// count to ~16 per octave — a constant, independent of how many distinct shapes the
+/// corpus produces.
+#[inline]
+fn size_class(n: usize) -> usize {
+    // Small allocations are left exact: the waste would be proportionally large and
+    // there are few enough distinct small sizes for them not to be the problem.
+    const MIN_CLASS: usize = 1024;
+    if n <= MIN_CLASS {
+        return n;
+    }
+    let bits = usize::BITS - n.leading_zeros(); // position of the top set bit
+    let shift = bits.saturating_sub(5); // keep 4 mantissa bits below the top
+    let step = 1usize << shift;
+    n.div_ceil(step) * step
+}
+
 /// A device buffer owned by a layer across calls, resized only when the shape
 /// it is asked for changes.
 ///
@@ -70,6 +102,15 @@ impl Buf {
     /// An empty slot. The first [`get`](Self::get) does the allocation.
     pub const fn new() -> Self {
         Self { slot: None }
+    }
+
+    /// Device bytes this slot is holding. Diagnostic — see
+    /// [`Hierarchical::retained_report`](crate::gpu::hierarchical::Hierarchical::retained_report).
+    ///
+    /// Counts **capacity**, not the shape the buffer was last used at: reuse here is
+    /// by capacity, so the allocation is what occupies memory.
+    pub fn retained_bytes(&self) -> usize {
+        self.slot.as_ref().map_or(0, |t| t.capacity() * 4)
     }
 
     /// The buffer, shaped `dims` — reusing the existing allocation when it
@@ -94,7 +135,13 @@ impl Buf {
             // that keeps every allocation it has ever been big enough for ratchets to
             // the largest window in the corpus and stays there.
             Some(t) if fits(t.capacity(), n) => t.shrink_to(dims),
-            _ => self.slot = Some(DTensor::uninit(gpu, dims)),
+            // Allocate at the size class so the next window's slightly-different shape
+            // reuses this allocation instead of replacing it. See `size_class`.
+            _ => {
+                let mut t = DTensor::uninit(gpu, &[size_class(n)]);
+                t.shrink_to(dims);
+                self.slot = Some(t);
+            }
         }
         self.slot.as_mut().expect("just filled")
     }
@@ -109,7 +156,11 @@ impl Buf {
                 t.shrink_to(dims);
                 t.zero_(gpu);
             }
-            _ => self.slot = Some(DTensor::zeros(gpu, dims)),
+            _ => {
+                let mut t = DTensor::zeros(gpu, &[size_class(n)]);
+                t.shrink_to(dims);
+                self.slot = Some(t);
+            }
         }
         self.slot.as_mut().expect("just filled")
     }
@@ -202,6 +253,18 @@ impl Pool {
         }
     }
 
+    /// Device bytes held on the free list. Diagnostic — see
+    /// [`Hierarchical::retained_report`](crate::gpu::hierarchical::Hierarchical::retained_report).
+    ///
+    /// Buffers currently on loan are not counted: they belong to whoever borrowed
+    /// them, and after a completed step there should be none (`lent == 0`).
+    pub fn retained_bytes(&self) -> usize {
+        self.free
+            .iter()
+            .map(|(_, bufs)| bufs.iter().map(|t| t.capacity() * 4).sum::<usize>())
+            .sum()
+    }
+
     /// A scratch buffer holding at least `dims`, recycled from the free list when
     /// a large enough one is available, else freshly allocated.
     ///
@@ -239,7 +302,13 @@ impl Pool {
             t.shrink_to(dims);
             return t;
         }
-        DTensor::uninit(gpu, dims)
+        // Allocate at the SIZE CLASS, not the exact request, then present it at the
+        // asked-for shape. That is what makes the free list converge: the next window's
+        // slightly-different shape rounds to the same class and reuses this buffer
+        // instead of adding another entry. See `size_class`.
+        let mut t = DTensor::uninit(gpu, &[size_class(n)]);
+        t.shrink_to(dims);
+        t
     }
 
     /// Like [`take`](Self::take) but zeroed, for a buffer that is accumulated
@@ -293,6 +362,79 @@ impl Pool {
     pub fn trim(&mut self, want: usize) {
         let cap = want.saturating_mul(RETAIN_SLACK);
         self.free.retain(|(size, bufs)| *size <= cap && !bufs.is_empty());
+        // At most one spare per size class. A class holding several buffers means
+        // several were live at once *within* a pass — but the next pass re-takes them
+        // one at a time, so the extras are dead weight until then, and at the
+        // encoder/decoder's one-rectangle-per-length-bucket rate they accumulate fast:
+        // measured at 686 MB (encoder) + 615 MB (decoder) of pure spares.
+        //
+        // Keeping one means the common case (a class the next pass touches once) still
+        // hits the free list; the rest reallocate, which at a window boundary is off
+        // the hot path.
+        for (_, bufs) in self.free.iter_mut() {
+            bufs.truncate(1);
+        }
+        self.cap_free_list();
+    }
+
+    /// Hard cap on how many distinct size classes the free list may hold.
+    ///
+    /// `size_class` bounds the classes *reachable per octave*, and the size bound in
+    /// `trim` bounds how oversized any one buffer may be — but neither bounds the
+    /// count when the workload spans many octaves at once. Real training does exactly
+    /// that: measured on `hg`, a window carries 12-16 word-length buckets and the word
+    /// count ranges 100..2048, so the encoder and decoder alone ask for dozens of
+    /// unrelated rectangles per window. The free list reached 320 classes / 820
+    /// buffers and the run OOMed, while a synthetic sweep converged at 218.
+    ///
+    /// Capping by count is what makes the footprint bounded *regardless* of how much
+    /// shape diversity the corpus has. The evicted entries are the largest ones beyond
+    /// the cap: they are the most expensive to keep and the least likely to be reused
+    /// (a big rectangle comes from a big window, which is rare), while the small
+    /// classes that every window touches stay resident.
+    /// Sized against what ONE pool needs, not the model-wide total. Each block owns its
+    /// own pool, so a 16-block stack reporting "320 classes" is ~20 per pool — a cap of
+    /// 48 there never fires. A single block's forward+backward touches a handful of
+    /// distinct shapes per window (the SwiGLU widths, the cell's reorgs), so 8 classes
+    /// covers the working set with room for the window-to-window drift, and anything
+    /// beyond that is a record of shapes that are no longer being asked for.
+    const MAX_FREE_CLASSES: usize = 8;
+
+    /// Drop the classes holding the most bytes, down to [`MAX_FREE_CLASSES`].
+    ///
+    /// Only the *duplicates* within a class are dropped first: a class holding four
+    /// spare buffers of one size is four times the cost of one holding a single
+    /// buffer, and the spares are what accumulate when window sizes drift. Dropping a
+    /// whole class outright is the last resort, because the next window of that shape
+    /// then reallocates it — thrash rather than a saving.
+    fn cap_free_list(&mut self) {
+        if self.free.len() <= Self::MAX_FREE_CLASSES {
+            return;
+        }
+        // First pass: keep at most one spare per class. That alone usually brings the
+        // total down without losing the ability to serve any shape.
+        for (_, bufs) in self.free.iter_mut() {
+            bufs.truncate(1);
+        }
+        if self.free.len() <= Self::MAX_FREE_CLASSES {
+            return;
+        }
+        // Still too many distinct shapes: drop the largest classes, which cost the
+        // most and recur the least (a big rectangle needs a big window).
+        self.free.sort_unstable_by_key(|(size, _)| *size);
+        self.free.truncate(Self::MAX_FREE_CLASSES);
+    }
+
+    /// Distinct sizes on the free list, and total buffers. Diagnostic: a pool that is
+    /// working holds a handful of sizes, one per shape the pass actually uses. A count
+    /// that climbs window over window is the free list accumulating one entry per
+    /// distinct shape ever seen — each individually within `RETAIN_SLACK`, so `trim`
+    /// keeps all of them, and together unbounded.
+    pub fn free_list_shape(&self) -> (usize, usize) {
+        (
+            self.free.len(),
+            self.free.iter().map(|(_, b)| b.len()).sum(),
+        )
     }
 
     /// How many buffers are currently out on loan. Zero between passes if every

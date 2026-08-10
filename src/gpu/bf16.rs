@@ -158,7 +158,8 @@ impl BTensor {
         let n_i32 = n as i32;
         let mut b = gpu.stream.launch_builder(&f);
         b.arg(&src.buf).arg(&mut self.buf).arg(&n_i32);
-        unsafe { b.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("cast to bf16");
+        unsafe { b.launch(LaunchConfig::for_num_elems(n.div_ceil(4) as u32)) }
+            .expect("cast to bf16");
     }
 
     /// Widen this tensor into `dst` (bf16 -> fp32, exact: every bf16 value is a
@@ -171,7 +172,8 @@ impl BTensor {
         let n_i32 = n as i32;
         let mut b = gpu.stream.launch_builder(&f);
         b.arg(&self.buf).arg(&mut dst.buf).arg(&n_i32);
-        unsafe { b.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("cast from bf16");
+        unsafe { b.launch(LaunchConfig::for_num_elems(n.div_ceil(4) as u32)) }
+            .expect("cast from bf16");
     }
 
     /// Present this tensor at `dims`, which must fit within its allocation — the
@@ -349,6 +351,33 @@ mod tests {
             mean_bias.abs() < 1e-3,
             "bf16 rounding is biased ({mean_bias}); expected round-to-nearest-even"
         );
+    }
+
+    /// The vectorized cast handles 4 elements per thread and leaves `n % 4` to a
+    /// scalar tail. `bf16_roundtrip_is_close_and_unbiased` uses 4096 elements — a
+    /// multiple of 4 — so it never exercises that tail. Every remainder class must
+    /// round-trip, including sizes below one vector.
+    #[test]
+    fn bf16_roundtrip_covers_the_vector_tail() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        if !gpu.kernels.has_bf16 {
+            return;
+        }
+        for n in [1, 2, 3, 4, 5, 7, 8, 17, 63, 255, 257, 1023, 4097] {
+            let t = Tensor::random(&[n], 3.0);
+            let d = DTensor::from_host(&gpu, &t);
+            let mut b = BTensor::uninit(&gpu, &[n]);
+            b.store(&gpu, &d);
+            let mut back = DTensor::uninit(&gpu, &[n]);
+            b.load(&gpu, &mut back);
+            let got = back.to_host(&gpu);
+            for (i, (a, g)) in t.data.iter().zip(got.data.iter()).enumerate() {
+                let rel = (a - g).abs() / a.abs().max(1e-6);
+                assert!(rel < 3.91e-3, "n={n} element {i}: {a} round-tripped to {g}");
+            }
+        }
     }
 
     /// The point of the exercise: a bf16 slab must occupy half the bytes of the

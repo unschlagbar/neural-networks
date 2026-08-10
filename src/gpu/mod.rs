@@ -220,6 +220,33 @@ fn test_gpu() -> Option<TestGpu> {
     }
 }
 
+/// Device memory currently **allocated** from the async pool, in MB.
+///
+/// Distinct from `mem_get_info`, which reports everything the driver has handed the
+/// process — including blocks the allocator is merely caching for reuse. That cached
+/// portion is reclaimable and is *not* a reason to OOM, so a memory report built on
+/// `mem_get_info` alone cannot tell "the model grew" from "the allocator is holding
+/// cache". This is the number that decides whether the next allocation succeeds.
+///
+/// `None` if the pool attribute cannot be read.
+pub fn pool_used_mb() -> Option<f64> {
+    use cudarc::driver::sys;
+    let pool = unsafe {
+        let dev = cudarc::driver::result::device::get(0).ok()?;
+        cudarc::driver::result::device::get_default_mem_pool(dev).ok()?
+    };
+    let mut v: u64 = 0;
+    unsafe {
+        cudarc::driver::result::mem_pool::get_attribute(
+            pool,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+            &mut v as *mut u64 as *mut std::ffi::c_void,
+        )
+        .ok()?;
+    }
+    Some(v as f64 / (1024.0 * 1024.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

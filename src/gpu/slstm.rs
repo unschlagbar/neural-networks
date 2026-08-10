@@ -139,6 +139,15 @@ pub struct SLstm {
     /// them.
     pub force_fused_time: Option<bool>,
 
+    /// Continue the previous call's recurrence instead of starting from zero.
+    ///
+    /// Off by default: a `forward` is a whole sequence, and its state is private to
+    /// the call. Set for a **chunked** sweep, where one sequence is split across
+    /// several calls and the state has to cross the chunk borders — forward carries
+    /// `h/c/n/m`, backward carries the BPTT channels (in reverse chunk order). See
+    /// [`set_carry`](Self::set_carry).
+    carry: bool,
+
     // Recurrent state carried across timesteps within one call, [B, H].
     h_state: DTensor,
     c_state: DTensor,
@@ -169,6 +178,18 @@ pub struct SLstm {
     slabs: Option<SlstmSlabs>,
     x_saved: Option<DTensor>,
     out_buf: Option<DTensor>,
+    /// Forward caches of earlier chunks of a chunked sweep, oldest first.
+    ///
+    /// The buffers above are reused call to call to keep the graphs' device pointers
+    /// valid, which is exactly what a chunked sweep cannot have: chunk c+1's forward
+    /// would overwrite what chunk c's backward reads. So each chunk's `(g, slabs,
+    /// x_saved)` is moved aside here when the next chunk's forward takes fresh
+    /// buffers, and backward pops them right to left. Only what backward *reads*
+    /// moves; `out_buf`/`dy_buf` are written through and stay stable, so replay
+    /// survives.
+    ///
+    /// Empty on the unchunked path, where the reuse above is untouched.
+    chunk_saved: Vec<SlstmChunk>,
     /// Backward's incoming `dy`, copied into a stable buffer: the caller hands us a
     /// fresh `DTensor` every time, whose pointer a graph cannot depend on.
     dy_buf: Option<DTensor>,
@@ -182,6 +203,14 @@ pub struct SLstm {
     fwd_graph: Option<LoopGraph>,
     bwd_graph: Option<LoopGraph>,
     batch: usize,
+}
+
+/// One chunk's forward cache, set aside so a later chunk's forward can take fresh
+/// buffers without destroying it. See [`SLstm::chunk_saved`].
+struct SlstmChunk {
+    g: DTensor,
+    slabs: SlstmSlabs,
+    x_saved: DTensor,
 }
 
 /// Keep `slot`'s buffer when it already has the wanted shape, else allocate a
@@ -286,6 +315,7 @@ impl SLstm {
             mbcat: DTensor::zeros(gpu, &[h4]),
             vbcat: DTensor::zeros(gpu, &[h4]),
             force_fused_time: None,
+            carry: false,
             h_state: DTensor::zeros(gpu, &[0, 0]),
             c_state: DTensor::zeros(gpu, &[0, 0]),
             n_state: DTensor::zeros(gpu, &[0, 0]),
@@ -302,6 +332,7 @@ impl SLstm {
             dy_buf: None,
             h_prev_f32: None,
             buf_shape: None,
+            chunk_saved: Vec::new(),
             fwd_graph: None,
             bwd_graph: None,
             batch: 0,
@@ -497,14 +528,36 @@ impl SLstm {
         // `wx`/`whr`/`bcat` are the parameters themselves — already in the layout the
         // GEMMs below want, so there is nothing to pack here.
 
-        // Recurrent state starts at zero.
+        // Recurrent state starts at zero — unless this call continues a sequence the
+        // previous call left off (see `set_carry`), where it starts at whatever that
+        // call ended with. Carrying is what makes a chunked sweep reproduce the
+        // unchunked recurrence exactly rather than resetting at every chunk border.
+        //
+        // A shape change forces zeros regardless: a carried state is only meaningful
+        // for the batch it was produced at, and `fit_zeros` would have reallocated it
+        // anyway.
+        let carry = self.carry && self.h_state.dims() == [b, h];
         for s in [
             &mut self.h_state,
             &mut self.c_state,
             &mut self.n_state,
             &mut self.m_state,
         ] {
-            fit_zeros(gpu, s, &[b, h]);
+            if !carry {
+                fit_zeros(gpu, s, &[b, h]);
+            }
+        }
+
+        // A chunked sweep continues the recurrence (`carry`) and forwards every chunk
+        // before unwinding any, so the previous chunk's cache is still owed a backward:
+        // set it aside instead of letting `take_uninit` hand its buffers to this chunk.
+        // Unchunked, there is nothing to preserve and the buffers are reused as before.
+        if carry {
+            if let (Some(g), Some(slabs), Some(x_saved)) =
+                (self.g.take(), self.slabs.take(), self.x_saved.take())
+            {
+                self.chunk_saved.push(SlstmChunk { g, slabs, x_saved });
+            }
         }
 
         // The input half of every gate pre-activation, for all timesteps at once —
@@ -719,8 +772,15 @@ impl SLstm {
         let mut slabs = self.slabs.take().expect("forward before backward");
         let x_flat = self.x_saved.take().expect("forward before backward");
 
+        // BPTT channels start at zero — unless this call continues the backward of a
+        // sequence whose later chunk ran first (see `set_carry`), where they start at
+        // the gradient flowing back across the chunk border. Chunks run in reverse, so
+        // "the previous call" is the chunk to the right.
+        let carry = self.carry && self.dh_bptt.dims() == [b, h];
         for buf in [&mut self.dh_bptt, &mut self.dc_bptt, &mut self.dn_bptt] {
-            fit_zeros(gpu, buf, &[b, h]);
+            if !carry {
+                fit_zeros(gpu, buf, &[b, h]);
+            }
         }
         fit_uninit(gpu, &mut self.gh, &[b, h4]);
 
@@ -795,6 +855,18 @@ impl SLstm {
         self.g = Some(dg.reshaped(&[b, t, h4]));
         self.slabs = Some(slabs);
         self.x_saved = Some(x_flat);
+
+        // Chunked sweep: this chunk is done, so the chunk to its left — the next one
+        // to unwind — takes the live slots. Its buffers are the ones its own forward
+        // wrote, so backward reads exactly what that chunk produced. Dropping what was
+        // just handed back releases this chunk's activations now rather than at the
+        // next forward, which is what keeps only the chunks still owed a backward
+        // resident.
+        if let Some(prev) = self.chunk_saved.pop() {
+            self.g = Some(prev.g);
+            self.slabs = Some(prev.slabs);
+            self.x_saved = Some(prev.x_saved);
+        }
 
         dx.reshape_to(&[b, t, inp]);
     }
@@ -903,6 +975,162 @@ impl SLstm {
     pub fn drop_saved_act(&mut self) {
         self.slabs = None;
         self.x_saved = None;
+        self.chunk_saved.clear();
+    }
+
+    /// Continue the previous call's recurrence rather than starting from zero.
+    ///
+    /// For a **chunked** sweep: one sequence split across several `forward` calls,
+    /// where the state must cross the chunk borders for the result to match the
+    /// unchunked recurrence. Forward carries `h/c/n/m`; backward carries the BPTT
+    /// channels, and because chunks unwind right-to-left "the previous call" there is
+    /// the chunk to its right.
+    ///
+    /// The caller is responsible for the boundaries: clear it (or call
+    /// [`reset_state`](Self::reset_state)) before the **first** forward chunk and
+    /// before the **last** backward chunk, so each sweep starts from zero. Leaving it
+    /// set across a window silently seeds the next window with the previous one's
+    /// final state.
+    pub fn set_carry(&mut self, carry: bool) {
+        self.carry = carry;
+        self.post_norm.set_carry(carry);
+    }
+
+    /// Zero the carried **forward** state, so the next `forward` starts the recurrence
+    /// from scratch whatever `carry` says.
+    ///
+    /// Call before the first chunk of a sweep. Separate from
+    /// [`reset_bptt`](Self::reset_bptt) because the two are reset at opposite ends: a
+    /// chunked forward runs left-to-right and resets here, while its backward runs
+    /// right-to-left and resets at the *last* chunk.
+    pub fn reset_state(&mut self, gpu: &Gpu) {
+        for s in [
+            &mut self.h_state,
+            &mut self.c_state,
+            &mut self.n_state,
+            &mut self.m_state,
+        ] {
+            if !s.is_empty() {
+                s.zero_(gpu);
+            }
+        }
+        // A sweep that ended early (a caller that forwarded chunks and never unwound
+        // them) would otherwise leave its caches to accumulate across steps.
+        self.chunk_saved.clear();
+    }
+
+    /// Zero the carried **BPTT** channels, so the next `backward` starts with no
+    /// incoming gradient from the right. Call before the rightmost chunk's backward.
+    pub fn reset_bptt(&mut self, gpu: &Gpu) {
+        for s in [
+            &mut self.dh_bptt,
+            &mut self.dc_bptt,
+            &mut self.dn_bptt,
+        ] {
+            if !s.is_empty() {
+                s.zero_(gpu);
+            }
+        }
+    }
+
+    /// Retained activation bytes split `(saved_cache, other)`.
+    ///
+    /// `saved_cache` is the `[B, T, ·]` slabs and saved input that
+    /// [`drop_saved_act`](Self::drop_saved_act) releases. `other` is everything it
+    /// keeps: the gate buffer, the stable `out`/`dy` buffers, the widening scratch,
+    /// the per-batch state and BPTT channels, and the post-norm's saved `x̂`.
+    pub fn act_split(&self) -> (usize, usize) {
+        let saved = self.slabs.as_ref().map_or(0, |s| s.retained_bytes())
+            + self.x_saved.as_ref().map_or(0, |t| t.capacity() * 4)
+            + self
+                .chunk_saved
+                .iter()
+                .map(|c| {
+                    c.slabs.retained_bytes()
+                        + c.x_saved.capacity() * 4
+                        + c.g.capacity() * 4
+                })
+                .sum::<usize>();
+        let (_, all) = self.retained_bytes();
+        (saved, all - saved)
+    }
+
+    /// Release every activation this cell holds — the saved slabs and input, the
+    /// gate/output/dy buffers and the widening scratch.
+    ///
+    /// Broader than [`drop_saved_act`](Self::drop_saved_act), which keeps the stable
+    /// buffers on purpose: their addresses are what a captured graph replays against.
+    /// Dropping them invalidates the graphs, so this also clears those — the next
+    /// forward recaptures. For a window boundary, not the hot path.
+    pub fn drop_all_act(&mut self) {
+        // The big per-`[B, T, ·]` buffers: these are what scale with the rectangle and
+        // what a group boundary needs back.
+        self.slabs = None;
+        self.x_saved = None;
+        self.chunk_saved.clear();
+        self.post_norm.drop_saved_act();
+
+        // `g`, `out_buf`, `dy_buf`, `h_prev_f32` and the two graphs are deliberately
+        // KEPT.
+        //
+        // A captured graph bakes in the raw device pointers of every buffer its nodes
+        // touch, so dropping those buffers means dropping the graphs, and the next call
+        // at the same `(b, t)` has to re-capture. That is not a rare event: the
+        // encoder and decoder run one rectangle per length bucket and the buckets
+        // repeat window after window, so the graphs are hit constantly — clearing them
+        // per group turned every one of those hits into a re-capture and roughly halved
+        // the step rate.
+        //
+        // Keeping them costs the `[B, T, 4H]` gate buffer and two `[B, T, H]` staging
+        // buffers at the LARGEST bucket's shape, which at the encoder/decoder's
+        // CHAR_HIDDEN=256 is single-digit MB — against the ~1.2 GB that releasing the
+        // slabs and saved input recovers.
+    }
+
+    /// Device bytes held, split `(params, activations)`. Diagnostic — see
+    /// [`Hierarchical::retained_report`](super::hierarchical::Hierarchical::retained_report).
+    ///
+    /// `activations` covers everything that scales with the window: the saved slabs
+    /// and input, the gate buffer, the stable `out`/`dy` buffers, the per-batch
+    /// recurrent state and BPTT channels, and the `h_prev` widening scratch. Only the
+    /// first two are released by [`drop_saved_act`](Self::drop_saved_act) — the rest
+    /// are kept deliberately, because a captured graph holds their raw pointers.
+    pub fn retained_bytes(&self) -> (usize, usize) {
+        let params: usize = [
+            &self.wx, &self.whr, &self.bcat, &self.dwx, &self.dwhr, &self.dbcat, &self.mwx,
+            &self.vwx, &self.mwhr, &self.vwhr, &self.mbcat, &self.vbcat,
+        ]
+        .iter()
+        .map(|t| t.capacity() * 4)
+        .sum();
+        let opt: usize = [
+            &self.g,
+            &self.x_saved,
+            &self.out_buf,
+            &self.dy_buf,
+            &self.h_prev_f32,
+        ]
+        .iter()
+        .filter_map(|s| s.as_ref())
+        .map(|t| t.capacity() * 4)
+        .sum();
+        let live: usize = [
+            &self.h_state,
+            &self.c_state,
+            &self.n_state,
+            &self.m_state,
+            &self.gh,
+            &self.ones,
+            &self.dh_bptt,
+            &self.dc_bptt,
+            &self.dn_bptt,
+        ]
+        .iter()
+        .map(|t| t.capacity() * 4)
+        .sum();
+        let slabs = self.slabs.as_ref().map_or(0, |s| s.retained_bytes());
+        let (pn_p, _) = self.post_norm.retained_bytes();
+        (params + pn_p, opt + live + slabs)
     }
 
     pub fn zero_grad(&mut self, gpu: &Gpu) {
@@ -1280,6 +1508,115 @@ mod tests {
         for gi in 0..4 {
             assert_close(&per_step.gate_dw(&gpu, gi), &fused.gate_dw(&gpu, gi), 1e-4);
             assert_close(&per_step.gate_db(&gpu, gi), &fused.gate_db(&gpu, gi), 1e-4);
+        }
+    }
+
+    /// A chunked sweep with `carry` must reproduce the unchunked one.
+    ///
+    /// This is the load-bearing property of chunked training: splitting the sequence
+    /// is supposed to change only *when* memory is live, never the arithmetic. Forward
+    /// carries `h/c/n/m` left-to-right; backward carries the BPTT channels
+    /// right-to-left, so the chunks unwind in reverse. The weight gradients accumulate
+    /// across chunks, so comparing them checks the whole sweep at once rather than any
+    /// single chunk.
+    ///
+    /// The tolerance is not zero: chunking re-associates the `dWx = xᵀ·dg` GEMM into
+    /// per-chunk partial sums, and fp32 addition is not associative. What must hold is
+    /// that the difference stays at rounding, not that the bits match.
+    #[test]
+    fn chunked_carry_matches_unchunked() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let (b, inp, h) = (1, 8, 12);
+        let chunks = [48usize, 48, 32]; // ragged: the last chunk is a different length
+        let t: usize = chunks.iter().sum();
+
+        let cpu = CpuSLstm::new(inp, h);
+        let x = Tensor::random(&[b, t, inp], 0.5);
+        let dy = Tensor::random(&[b, t, h], 1.0);
+
+        // Reference: one call over the whole sequence.
+        let mut whole = from_cpu(&gpu, &cpu);
+        let y_whole = whole
+            .forward_alloc(&gpu, &DTensor::from_host(&gpu, &x))
+            .to_host(&gpu);
+        let dx_whole = whole
+            .backward_alloc(&gpu, &DTensor::from_host(&gpu, &dy))
+            .to_host(&gpu);
+
+        // Chunked: same weights, same input, one call per chunk.
+        let mut part = from_cpu(&gpu, &cpu);
+        part.set_carry(true);
+        part.reset_state(&gpu);
+
+        // `[B, T, F]` with B=1 means a time chunk is a contiguous row range, so the
+        // slices are plain host sub-vectors — no device-side time slicing needed.
+        let cut = |src: &Tensor, f: usize, off: usize, len: usize| {
+            Tensor::new(&[b, len, f], src.data[off * f..(off + len) * f].to_vec())
+        };
+
+        let mut y_parts = Vec::with_capacity(t * h);
+        let mut off = 0;
+        for &c in &chunks {
+            let xc = DTensor::from_host(&gpu, &cut(&x, inp, off, c));
+            y_parts.extend(part.forward_alloc(&gpu, &xc).to_host(&gpu).data);
+            off += c;
+        }
+        assert_close(&y_parts, &y_whole.data, 1e-4);
+
+        // Backward runs the chunks in REVERSE, so the BPTT channels carry leftward.
+        //
+        // A chunk's backward reads the forward cache its own forward left behind, and
+        // a cell holds exactly one such cache — so the chunks are re-forwarded here,
+        // rightmost first, each from the state its predecessors produced. That is the
+        // ordering a real chunked sweep has to arrange too (by keeping per-chunk
+        // caches rather than replaying, which is what the offload path is for); the
+        // point of the test is the arithmetic, not the scheduling.
+        let mut ends: Vec<usize> = Vec::with_capacity(chunks.len());
+        let mut acc = 0;
+        for &c in &chunks {
+            ends.push(acc);
+            acc += c;
+        }
+        // Grads accumulate at beta=1 across chunks, so start from a clean slate: the
+        // forward pass above touched none of them, but `whole` is a separate cell and
+        // the comparison is against ITS single-call totals.
+        part.zero_grad(&gpu);
+
+        let mut dx_parts: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+        for (i, &c) in chunks.iter().enumerate().rev() {
+            // Rebuild this chunk's cache: replay the recurrence from zero up to the
+            // chunk's start, then forward the chunk itself. Only the last of those
+            // forwards leaves the cache backward will read.
+            part.set_carry(true);
+            part.reset_state(&gpu);
+            let mut o = 0;
+            for &pc in &chunks[..i] {
+                let xp = DTensor::from_host(&gpu, &cut(&x, inp, o, pc));
+                part.forward_alloc(&gpu, &xp);
+                o += pc;
+            }
+            let xc = DTensor::from_host(&gpu, &cut(&x, inp, ends[i], c));
+            part.forward_alloc(&gpu, &xc);
+
+            // The BPTT channels must carry from the chunk to the right, so they are
+            // NOT reset here — except for the rightmost chunk, which starts at zero.
+            if i + 1 == chunks.len() {
+                part.reset_bptt(&gpu);
+            }
+            let dyc = DTensor::from_host(&gpu, &cut(&dy, h, ends[i], c));
+            dx_parts.push(part.backward_alloc(&gpu, &dyc).to_host(&gpu).data);
+        }
+        dx_parts.reverse();
+        let dx_flat: Vec<f32> = dx_parts.concat();
+        assert_close(&dx_flat, &dx_whole.data, 1e-4);
+
+        // The gate weight gradients summed over the chunks must equal the single
+        // call's: chunking re-associates that sum, it does not change it.
+        for gi in 0..4 {
+            assert_close(&part.gate_dw(&gpu, gi), &whole.gate_dw(&gpu, gi), 1e-3);
+            assert_close(&part.gate_db(&gpu, gi), &whole.gate_db(&gpu, gi), 1e-3);
         }
     }
 }

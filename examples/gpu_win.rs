@@ -45,14 +45,14 @@ fn main() {
 
     // Synthetic window: `words_n` words of 3..8 chars, like the real corpus.
     let mut tokens: Vec<usize> = Vec::new();
-    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut words: Vec<std::range::Range<usize>> = Vec::new();
     for w in 0..words_n {
         let start = tokens.len();
         let len = 3 + (w % 5);
         for k in 0..len {
             tokens.push(1 + (w + k) % 90);
         }
-        words.push((start, tokens.len()));
+        words.push((start..tokens.len()).into());
     }
 
     let loss = model.forward_backward(&gpu, &tokens, &words); // warm up

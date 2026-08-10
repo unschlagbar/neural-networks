@@ -67,7 +67,7 @@ fn main() {
     // uniform window exercises exactly one rectangle shape and badly under-reports
     // what a real corpus makes resident.
     let mut tokens = Vec::with_capacity(words * 4);
-    let mut spans = Vec::with_capacity(words);
+    let mut spans: Vec<std::range::Range<usize>> = Vec::with_capacity(words);
     for w in 0..words {
         let s = tokens.len();
         // Cycle the whole legal range so every length bucket gets built.
@@ -75,7 +75,7 @@ fn main() {
         for k in 0..wlen {
             tokens.push(1 + (k % 90));
         }
-        spans.push((s, tokens.len()));
+        spans.push((s..tokens.len()).into());
     }
 
     // Warm up: first step allocates the caches and grows the pools, so its delta is

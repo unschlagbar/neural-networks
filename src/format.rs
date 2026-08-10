@@ -16,6 +16,8 @@
 // ├──────────────────────────────────────────────────────────┤ ← typed head
 // │ (Flat)          — no head                                 │
 // │ (Hierarchical)  vocab u32, context u32, step u64          │
+// │                 + since v2: pretrain chars/words u64,     │
+// │                             sft chars/words u64           │
 // ├──────────────────────────────────────────────────────────┤ ← sections
 // │ N_SECTIONS  u32                                           │
 // │ for each: name <string>, stack <layer blob>              │
@@ -38,7 +40,11 @@ use crate::{
 /// "NNM1" — the one and only container magic.
 pub const MAGIC: u32 = 0x4E4E_4D31;
 /// Container version. Bump when the container framing (not a layer codec) changes.
-pub const VERSION: u8 = 1;
+/// v1 files still load; their hierarchical head simply stops after `step` and the
+/// data counters read back as zero.
+pub const VERSION: u8 = 2;
+/// Oldest container version this reader accepts.
+pub const MIN_VERSION: u8 = 1;
 
 /// What kind of model a container holds. The tag is stored so a single reader
 /// (and `inspect`) can dispatch without guessing.
@@ -74,6 +80,156 @@ pub struct Meta {
     pub vocab_size: u32,
     pub context_size: u32,
     pub step: u64,
+    /// How much data the weights have actually seen, split by training phase.
+    pub seen: Seen,
+}
+
+/// Cumulative data the checkpoint has been trained on, counted separately for
+/// pretraining and SFT. A "char" is one tokenizer token of the training window
+/// (byte-level, so a UTF-8 char can be several); a "word" is one
+/// `segment::word_ends` unit. Both count every window fed to the model,
+/// including re-visits across epochs — this is exposure, not corpus size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Seen {
+    pub pretrain_chars: u64,
+    pub pretrain_words: u64,
+    /// SFT counts the whole formatted example, prompt included (the backbone
+    /// reads all of it); [`sft_resp_chars`](Self::sft_resp_chars) is the
+    /// loss-carrying subset.
+    pub sft_chars: u64,
+    pub sft_words: u64,
+    /// The masked-in part of the SFT counts: tokens/words the loss came from.
+    pub sft_resp_chars: u64,
+    pub sft_resp_words: u64,
+}
+
+impl Seen {
+    /// Add a pretraining window.
+    pub fn add_pretrain(&mut self, chars: usize, words: usize) {
+        self.pretrain_chars += chars as u64;
+        self.pretrain_words += words as u64;
+    }
+
+    /// Add one SFT example: the full window plus the response-only subset.
+    pub fn add_sft(&mut self, chars: usize, words: usize, resp_chars: usize, resp_words: usize) {
+        self.sft_chars += chars as u64;
+        self.sft_words += words as u64;
+        self.sft_resp_chars += resp_chars as u64;
+        self.sft_resp_words += resp_words as u64;
+    }
+
+    /// Whether this checkpoint has been fine-tuned at all.
+    pub fn has_sft(&self) -> bool {
+        self.sft_chars > 0 || self.sft_words > 0
+    }
+
+    /// Multi-line human report of both phases, one indented line per figure.
+    /// Ends with a newline, so it prints with `print!`.
+    pub fn report(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!(
+            "  pretrain : {} chars, {} words\n",
+            group(self.pretrain_chars),
+            group(self.pretrain_words),
+        ));
+        if self.has_sft() {
+            s.push_str(&format!(
+                "  sft      : {} chars, {} words  (response only: {} chars, {} words)\n",
+                group(self.sft_chars),
+                group(self.sft_words),
+                group(self.sft_resp_chars),
+                group(self.sft_resp_words),
+            ));
+        } else {
+            s.push_str("  sft      : none\n");
+        }
+        s.push_str(&format!(
+            "  total    : {} chars, {} words\n",
+            group(self.pretrain_chars + self.sft_chars),
+            group(self.pretrain_words + self.sft_words),
+        ));
+        s
+    }
+
+    /// One-line summary for a training banner.
+    pub fn summary(&self) -> String {
+        format!(
+            "pretrain {} chars / {} words, sft {} chars / {} words",
+            group(self.pretrain_chars),
+            group(self.pretrain_words),
+            group(self.sft_chars),
+            group(self.sft_words),
+        )
+    }
+
+    /// Compact one-liner printed next to every checkpoint save. Shows only the
+    /// phase that has data, and both phases once the model has been fine-tuned.
+    pub fn save_line(&self) -> String {
+        let pre = format!(
+            "pretrain {} chars / {} words",
+            compact(self.pretrain_chars),
+            compact(self.pretrain_words),
+        );
+        if !self.has_sft() {
+            return pre;
+        }
+        format!(
+            "{pre} | sft {} chars / {} words (resp {} / {})",
+            compact(self.sft_chars),
+            compact(self.sft_words),
+            compact(self.sft_resp_chars),
+            compact(self.sft_resp_words),
+        )
+    }
+}
+
+/// Compact magnitude: `12_500_000` → `12.5m`. Three significant digits at most,
+/// and a trailing `.0` is dropped (`2000` → `2k`, not `2.0k`).
+pub fn compact(n: u64) -> String {
+    const UNITS: [(u64, char); 4] = [
+        (1_000_000_000_000, 't'),
+        (1_000_000_000, 'b'),
+        (1_000_000, 'm'),
+        (1_000, 'k'),
+    ];
+    // Largest unit first, so 999_999 rounds into "1m" rather than "1000k".
+    for (scale, suffix) in UNITS {
+        // Round at this unit's precision before comparing, so a value just under
+        // the boundary (999_999) is caught by the unit it rounds *into*.
+        let v = n as f64 / scale as f64;
+        if v < 0.9995 {
+            continue;
+        }
+        // Keep the number three digits wide: 12.5m, 125m, 1.25b.
+        let decimals = if v < 9.9995 {
+            2
+        } else if v < 99.995 {
+            1
+        } else {
+            0
+        };
+        let mut s = format!("{v:.decimals$}");
+        if s.contains('.') {
+            s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+        }
+        s.push(suffix);
+        return s;
+    }
+    n.to_string()
+}
+
+/// Group a count into thousands (`1234567` → `1_234_567`) — these run to the
+/// billions and are unreadable otherwise.
+fn group(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('_');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// One named model stage to write: a stable name plus its layer stack. A stage
@@ -137,6 +293,13 @@ impl<'a> Writer<'a> {
             write_u32(w, self.meta.vocab_size)?;
             write_u32(w, self.meta.context_size)?;
             write_u64(w, self.meta.step)?;
+            let s = &self.meta.seen;
+            write_u64(w, s.pretrain_chars)?;
+            write_u64(w, s.pretrain_words)?;
+            write_u64(w, s.sft_chars)?;
+            write_u64(w, s.sft_words)?;
+            write_u64(w, s.sft_resp_chars)?;
+            write_u64(w, s.sft_resp_words)?;
         }
 
         // Named sections.
@@ -179,19 +342,33 @@ impl Reader {
     /// Used by `inspect` to label a file before deciding how to read it.
     pub fn peek_kind(path: &str) -> io::Result<ModelKind> {
         let r = &mut File::open(path)? as &mut dyn Read;
-        read_header(r)
+        read_header(r).map(|(_, kind)| kind)
     }
 
     /// Read a whole container from any reader.
     pub fn read_from(r: &mut dyn Read) -> io::Result<Self> {
-        let kind = read_header(r)?;
+        let (version, kind) = read_header(r)?;
 
         let meta = if kind == ModelKind::Hierarchical {
-            Meta {
+            let mut meta = Meta {
                 vocab_size: read_u32(r)?,
                 context_size: read_u32(r)?,
                 step: read_u64(r)?,
+                seen: Seen::default(),
+            };
+            // The data counters were added in v2; a v1 head ends at `step` and
+            // leaves them zero.
+            if version >= 2 {
+                meta.seen = Seen {
+                    pretrain_chars: read_u64(r)?,
+                    pretrain_words: read_u64(r)?,
+                    sft_chars: read_u64(r)?,
+                    sft_words: read_u64(r)?,
+                    sft_resp_chars: read_u64(r)?,
+                    sft_resp_words: read_u64(r)?,
+                };
             }
+            meta
         } else {
             Meta::default()
         };
@@ -234,15 +411,20 @@ impl Reader {
     }
 }
 
-/// Read and validate the fixed header (magic + version), returning the kind.
-fn read_header(r: &mut dyn Read) -> io::Result<ModelKind> {
+/// Read and validate the fixed header (magic + version), returning the file's
+/// version and kind. Older versions in `MIN_VERSION..=VERSION` are accepted; the
+/// caller uses the version to decide which head fields are present.
+fn read_header(r: &mut dyn Read) -> io::Result<(u8, ModelKind)> {
     if read_u32(r)? != MAGIC {
         return Err(invalid("not an NNM1 model file (wrong magic)".into()));
     }
-    if read_u8(r)? != VERSION {
-        return Err(invalid("unsupported NNM1 version".into()));
+    let version = read_u8(r)?;
+    if !(MIN_VERSION..=VERSION).contains(&version) {
+        return Err(invalid(format!(
+            "unsupported NNM1 version {version} (this build reads {MIN_VERSION}..={VERSION})"
+        )));
     }
-    ModelKind::from_tag(read_u8(r)?)
+    Ok((version, ModelKind::from_tag(read_u8(r)?)?))
 }
 
 fn invalid(msg: String) -> io::Error {
@@ -299,6 +481,14 @@ mod tests {
             vocab_size: 8,
             context_size: 16,
             step: 4242,
+            seen: Seen {
+                pretrain_chars: 12_345,
+                pretrain_words: 3_456,
+                sft_chars: 789,
+                sft_words: 210,
+                sft_resp_chars: 456,
+                sft_resp_words: 120,
+            },
         };
         let mut buf = Cursor::new(Vec::new());
         Writer::new(ModelKind::Hierarchical, meta)
@@ -314,6 +504,7 @@ mod tests {
         assert_eq!(reader.meta.vocab_size, 8);
         assert_eq!(reader.meta.context_size, 16);
         assert_eq!(reader.meta.step, 4242);
+        assert_eq!(reader.meta.seen, meta.seen, "data counters lost");
 
         // Every section present and pullable by name.
         for name in ["encoder", "word_model", "char2_model"] {
@@ -339,7 +530,77 @@ mod tests {
             .write_to(&mut buf)
             .unwrap();
         let bytes = buf.into_inner();
-        let kind = read_header(&mut Cursor::new(bytes.as_slice())).unwrap();
+        let (version, kind) = read_header(&mut Cursor::new(bytes.as_slice())).unwrap();
+        assert_eq!(version, VERSION);
         assert_eq!(kind, ModelKind::Flat);
+    }
+
+    /// Compact magnitudes stay three digits wide and never keep a dead `.0`.
+    #[test]
+    fn compact_magnitudes() {
+        assert_eq!(compact(0), "0");
+        assert_eq!(compact(999), "999");
+        assert_eq!(compact(1_000), "1k");
+        assert_eq!(compact(12_500), "12.5k");
+        // Rounding at a unit boundary steps up rather than printing "1000k".
+        assert_eq!(compact(999_999), "1m");
+        assert_eq!(compact(999_499), "999k");
+        assert_eq!(compact(1_000_000), "1m");
+        assert_eq!(compact(12_500_000), "12.5m");
+        assert_eq!(compact(125_000_000), "125m");
+        assert_eq!(compact(1_250_000_000), "1.25b");
+        assert_eq!(compact(3_000_000_000_000), "3t");
+    }
+
+    /// The save line names both phases only once the model has SFT data.
+    #[test]
+    fn save_line_shows_sft_only_when_present() {
+        let mut seen = Seen::default();
+        seen.add_pretrain(12_500_000, 3_400_000);
+        assert_eq!(seen.save_line(), "pretrain 12.5m chars / 3.4m words");
+
+        seen.add_sft(2_000_000, 500_000, 750_000, 200_000);
+        assert_eq!(
+            seen.save_line(),
+            "pretrain 12.5m chars / 3.4m words | sft 2m chars / 500k words (resp 750k / 200k)"
+        );
+    }
+
+    /// A v1 hierarchical head stops after `step`; it must still load, with the
+    /// data counters reading back as zero rather than eating section bytes.
+    #[test]
+    fn v1_header_loads_with_zero_counters() {
+        let fwd = SequentialBuilder::new(8).embedding(16).build();
+        let wm = SequentialBuilder::new(16).linear(16).build();
+        let dec = SequentialBuilder::new(16).linear(8).build();
+
+        // Hand-build a v1 container: same framing, short head, no counters.
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let w = &mut buf as &mut dyn Write;
+            write_u32(w, MAGIC).unwrap();
+            write_u8(w, 1).unwrap();
+            write_u8(w, ModelKind::Hierarchical.tag()).unwrap();
+            write_u32(w, 8).unwrap();
+            write_u32(w, 16).unwrap();
+            write_u64(w, 99).unwrap();
+            write_u32(w, 3).unwrap();
+            for (name, layers) in [
+                ("encoder", &fwd.layers),
+                ("word_model", &wm.layers),
+                ("char2_model", &dec.layers),
+            ] {
+                write_string(w, name).unwrap();
+                write_layers(w, layers).unwrap();
+            }
+        }
+
+        let mut reader = Reader::read_from(&mut Cursor::new(buf.into_inner())).unwrap();
+        assert_eq!(reader.meta.step, 99);
+        assert_eq!(reader.meta.seen, Seen::default());
+        // Sections still parse — proof the head length was read correctly.
+        for name in ["encoder", "word_model", "char2_model"] {
+            assert!(reader.take_stack(name).is_ok(), "missing {name}");
+        }
     }
 }

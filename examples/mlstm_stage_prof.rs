@@ -150,11 +150,11 @@ fn main() {
     let dyt = DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dhv], 1.0));
 
     let f_fw = timed(&gpu, 3, 20, || {
-        let _ = ops::mlstm_fused_fw(&gpu, &qh, &kh, &vh, &igh, &fgh, lf);
+        let _ = ops::mlstm_fused_fw(&gpu, &qh, &kh, &vh, &igh, &fgh, lf, None);
     });
     let f_all = timed(&gpu, 3, 20, || {
-        let sv = ops::mlstm_fused_fw(&gpu, &qh, &kh, &vh, &igh, &fgh, lf);
-        let _ = ops::mlstm_fused_bw(&gpu, &sv, &qh, &kh, &vh, &igh, &fgh, &dyt);
+        let sv = ops::mlstm_fused_fw(&gpu, &qh, &kh, &vh, &igh, &fgh, lf, None);
+        let _ = ops::mlstm_fused_bw(&gpu, &sv, &qh, &kh, &vh, &igh, &fgh, &dyt, None);
     });
     println!("fused fwd only:      {:>7.2} ms", f_fw * 1e3);
     println!(

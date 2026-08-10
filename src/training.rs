@@ -91,6 +91,8 @@ pub fn train_hierarchical(model_path: &str) {
     let mut model = match Hierarchical::load(model_path, tokenizer) {
         Ok(m) => {
             println!("Loaded HM-RNN from '{model_path}'.");
+            println!("Trained on so far:");
+            print!("{}", m.seen.report());
             m
         }
         Err(e) => {
@@ -161,9 +163,12 @@ pub fn train_hierarchical(model_path: &str) {
         total_time += epoch_time;
 
         match model.save(model_path) {
-            Ok(()) => println!(
-                "  ✓ end-of-epoch save to '{model_path}'  (epoch {epoch_time:.0?}, total {total_time:.0?})"
-            ),
+            Ok(()) => {
+                println!(
+                    "  ✓ end-of-epoch save to '{model_path}'  (epoch {epoch_time:.0?}, total {total_time:.0?})"
+                );
+                println!("    trained on: {}", model.seen.save_line());
+            }
             Err(e) => eprintln!("  ✗ end-of-epoch save failed: {e}"),
         }
     }
@@ -189,6 +194,8 @@ pub fn train_sft(model_path: &str) {
     let mut model = match Hierarchical::load(model_path, tokenizer) {
         Ok(m) => {
             println!("Loaded hierarchical model from '{model_path}' (step {}).", m.step);
+            println!("Trained on so far:");
+            print!("{}", m.seen.report());
             m
         }
         Err(e) => {
@@ -281,6 +288,7 @@ pub fn train_sft(model_path: &str) {
                 println!(
                     "  ✓ end-of-epoch save to '{model_path}'  (epoch {epoch_time:.0?}, total {total_time:.0?})"
                 );
+                println!("    trained on: {}", model.seen.save_line());
             }
             Err(e) => eprintln!("  ✗ save failed: {e}"),
         }

@@ -80,7 +80,7 @@ fn main() {
     'outer: while let Some(chunk) = data.next_chunk() {
         for batch in chunk.iter() {
             let tokens: Vec<usize> = batch.tokens.iter().map(|&t| t as usize).collect();
-            let words: Vec<(usize, usize)> = batch.words.iter().map(|r| (r.start, r.end)).collect();
+            let words = &batch.words;
             if words.len() < 2 {
                 continue;
             }
@@ -93,7 +93,7 @@ fn main() {
                 full += 1;
             }
 
-            loss_sum += model.forward_backward(&gpu, &tokens, &words);
+            loss_sum += model.forward_backward(&gpu, &tokens, words);
             seen += 1;
             if seen % BATCH_SIZE == 0 {
                 opt.t += 1;

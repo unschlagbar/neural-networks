@@ -7,7 +7,7 @@ use crate::{
     config::{
         BACKBONE_WEIGHT_DECAY, DECODER_WEIGHT_DECAY, ENC_W_EOS, ENCODER_WEIGHT_DECAY, MAX_SEQ_LEN,
     },
-    format::{Meta, ModelKind, Reader, Writer},
+    format::{Meta, ModelKind, Reader, Seen, Writer},
     nn::{
         mlstm_block::{MLSTMBlock, MLSTMBlockCache},
         softmax::{nll_from_logits, sample_top_p, softmax_inplace},
@@ -86,6 +86,9 @@ pub struct Hierarchical {
     pub last_char1_grad_signal: f32,
     pub last_word_loss: f32,
     pub step: usize,
+    /// Cumulative chars/words this model has trained on (see `format::Seen`).
+    /// Advanced by the training loops, persisted in the checkpoint.
+    pub seen: Seen,
 
     /// SFT loss mask, one flag per DECODED word (word `w` decodes word `w+1`).
     /// `None` = every word trains (pretraining). `Some(flags)` masks prompt
@@ -169,6 +172,7 @@ impl Hierarchical {
             last_char1_grad_signal: 0.0,
             last_word_loss: 0.0,
             step: 0,
+            seen: Seen::default(),
             dec_word_loss: None,
             backbone_mode: BackboneMode::Normal,
             trace_io: false,
@@ -715,6 +719,7 @@ impl Hierarchical {
             let word_loss = self.word_loss();
             self.last_word_loss = word_loss;
             tokens += window.len();
+            self.seen.add_pretrain(window.len(), words.len());
 
             self.backwards_sequence();
             state.log_tokens(window.len());
@@ -751,8 +756,9 @@ impl Hierarchical {
                 time = Instant::now();
             }
             if state.save() {
+                let seen = self.seen.save_line();
                 match self.save(state.save_path()) {
-                    Ok(()) => println!("saved"),
+                    Ok(()) => println!("saved | trained on: {seen}"),
                     Err(e) => eprintln!("save failed: {e}"),
                 }
             }
@@ -799,6 +805,9 @@ impl Hierarchical {
             let loss = self.decode_loss();
             self.last_word_loss = loss;
             tokens += window.len();
+            let (resp_chars, resp_words) = ex.response_extent();
+            self.seen
+                .add_sft(window.len(), words.len(), resp_chars, resp_words);
 
             self.backwards_sequence();
             state.log_tokens(window.len());
@@ -830,6 +839,7 @@ impl Hierarchical {
                 time = Instant::now();
             }
             if state.save() {
+                let seen = self.seen.save_line();
                 match self.save(state.save_path()) {
                     Ok(()) => {
                         // Written right after the weights so the recorded
@@ -838,7 +848,7 @@ impl Hierarchical {
                         if let Err(e) = crate::sft_progress::save(state.save_path(), progress) {
                             eprintln!("progress save failed: {e}");
                         }
-                        println!("saved");
+                        println!("saved | trained on: {seen}");
                     }
                     Err(e) => eprintln!("save failed: {e}"),
                 }
@@ -1062,6 +1072,7 @@ impl Hierarchical {
                 vocab_size: self.vocab_size as u32,
                 context_size: self.context_size as u32,
                 step: self.step as u64,
+                seen: self.seen,
             },
         )
         .section("encoder", &self.encoder.chars.layers)
@@ -1093,6 +1104,7 @@ impl Hierarchical {
             word_model,
             char2_model,
             step: reader.meta.step as usize,
+            seen: reader.meta.seen,
         })
     }
 
@@ -1107,6 +1119,7 @@ impl Hierarchical {
         );
         debug_assert_eq!(model.context_size, stacks.context_size);
         model.step = stacks.step;
+        model.seen = stacks.seen;
         Ok(model)
     }
 }
@@ -1129,6 +1142,7 @@ pub struct HierStacks {
     pub word_model: Sequential,
     pub char2_model: Sequential,
     pub step: usize,
+    pub seen: Seen,
 }
 
 pub(crate) fn backward_through_layers(

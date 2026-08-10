@@ -5,7 +5,7 @@ pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 
 // Word-grouped training (both the flat and the hierarchical model train on
 // these K-word windows, so WORDS_PER_SEQ is the one binding knob).
-pub const WORDS_PER_SEQ: usize = 1024 * 2; // K — words per window / backbone unroll length
+pub const WORDS_PER_SEQ: usize = 1024 * 4; // K — words per window / backbone unroll length
 pub const MIN_WORDS_PER_SEQ: usize = 8; // keep a trailing window only if >= this
 
 /// Cap on the bytes of a single word (see `crate::segment`). Words longer than
@@ -17,18 +17,18 @@ pub const MAX_WORD_BYTES: usize = 16;
 /// is meant to bind first — this only guards against a pathological run with no
 /// boundary token. Caches are sized to the *actual* longest window
 /// (`WordChunk::max_window_tokens`), never to this cap, so raising it is free.
-pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 4;
+pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 6;
 
 // Training-Schedule
 
-pub const LR: f32 = 2e-4;
-pub const MIN_LR: f32 = 2e-5;
+pub const LR: f32 = 1e-4;
+pub const MIN_LR: f32 = 1e-5;
 pub const WARMUP_STEPS: usize = 150;
 pub const DECAY_STEPS: usize = 150_000;
 // Windows whose gradients are accumulated before one optimizer step. Muon
 // (matrices) is scale-invariant via the Frobenius normalization and aux-Adam
 // (vectors) via its second moment, so summed grads need no manual rescaling.
-pub const BATCH_SIZE: usize = 4;
+pub const BATCH_SIZE: usize = 8;
 pub const EPOCHS: usize = 1;
 
 pub const SAVE_EVERY: usize = 100;
@@ -58,7 +58,7 @@ pub const TOP_P: f32 = 0.9;
 
 pub const CHAR_HIDDEN: usize = 256;
 pub const OUT_HIDDEN: usize = 256;
-pub const WORD_HIDDEN: usize = 1024;
+pub const WORD_HIDDEN: usize = 768;
 
 /// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).
 /// Bounds the logits and removes the cross-entropy incentive for unbounded
@@ -66,7 +66,41 @@ pub const WORD_HIDDEN: usize = 1024;
 pub const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 16;
+pub const WORD_BLOCKS: usize = 32;
+
+/// Backbone sweep chunk length, in words. `0` disables chunking (one whole-sequence
+/// sweep, the pre-chunking behaviour).
+///
+/// The backbone runs one row per word across every block, and its activations must
+/// survive from a block's forward to its backward — so an unchunked sweep holds
+/// `O(words)` per block and device memory scales with the window. Chunking the row
+/// axis makes that `O(BACKBONE_CHUNK)` instead: the sweep runs chunk by chunk, each
+/// chunk passing through all blocks with the recurrent state carried across the chunk
+/// borders, so only the chunks in flight are resident.
+///
+/// Sized above the sLSTM's `GRAPH_MIN_T` (32) so every chunk still takes the captured-
+/// graph path — the backbone is launch-bound at batch 1, and dropping to the per-step
+/// loop would cost far more than the memory is worth.
+pub const BACKBONE_CHUNK: usize = 512;
+
+/// Largest encoder/decoder group, in rows (`words_in_group × tmax`). `0` disables the
+/// cap (one group per length bucket, the pre-cap behaviour).
+///
+/// The encoder and decoder run length-bucketed groups strictly one after another, and a
+/// group's activations die before the next one starts — so the resident set is one
+/// group, not the window. But a bucket holds *every* word of that length in the window,
+/// so the largest group grows with the window and every buffer in the stage sizes to it
+/// (`trim_pools`). Measured 66 -> 264 MB (encoder) and 80 -> 322 MB (decoder) going from
+/// 512 to 2048 words.
+///
+/// Splitting an oversized bucket into several same-shape sub-groups bounds that at the
+/// cap instead. It changes no arithmetic: the groups were already independent — each is
+/// its own rectangle, and the per-group grads accumulate — so a split is a pure batching
+/// choice, exactly like `BACKBONE_CHUNK` on the backbone.
+///
+/// Sized so the rectangle still fills the device: too small and the stage becomes
+/// launch-bound at batch 1 per word, which costs far more than the memory is worth.
+pub const GROUP_MAX_ROWS: usize = 2048;
 
 /// GPU mLSTM: chunk length for the chunkwise formulation, or `0` for the
 /// single-chunk (whole-sequence) form.

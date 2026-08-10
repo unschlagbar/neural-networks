@@ -67,6 +67,8 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                 "Loaded GPU hierarchical model from '{model_path}' (step {}).",
                 m.step_count
             );
+            println!("Trained on so far:");
+            print!("{}", m.seen.report());
             m
         }
         Err(e) => {
@@ -143,6 +145,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                 }
 
                 let loss = model.forward_backward(&gpu, &tokens, words);
+                model.seen.add_pretrain(tokens.len(), words.len());
                 tokens_since_print += tokens.len();
                 state.log_tokens(tokens.len());
 
@@ -176,6 +179,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                             // past the checkpoint just written.
                             state.flush_log();
                             println!("saved -> {}", state.save_path());
+                            println!("  trained on: {}", model.seen.save_line());
                         }
                         Err(e) => eprintln!("save failed: {e}"),
                     }
@@ -190,6 +194,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         Ok(()) => {
             state.flush_log();
             println!("final save -> {}", state.save_path());
+            println!("  trained on: {}", model.seen.save_line());
         }
         Err(e) => eprintln!("final save failed: {e}"),
     }
@@ -226,6 +231,8 @@ pub fn train_sft_gpu(model_path: &str) {
                 "Loaded GPU hierarchical model from '{model_path}' (step {}).",
                 m.step_count
             );
+            println!("Trained on so far:");
+            print!("{}", m.seen.report());
             m
         }
         Err(e) => {
@@ -323,6 +330,10 @@ pub fn train_sft_gpu(model_path: &str) {
             let word_loss: Vec<bool> = ex.loss[1..].to_vec();
 
             let loss = model.forward_backward_masked(&gpu, &tokens, words, &word_loss);
+            let (resp_chars, resp_words) = ex.response_extent();
+            model
+                .seen
+                .add_sft(tokens.len(), words.len(), resp_chars, resp_words);
             tokens_since_print += tokens.len();
             state.log_tokens(tokens.len());
             state.log_metric("resp_ppl", loss.exp());
@@ -359,6 +370,7 @@ pub fn train_sft_gpu(model_path: &str) {
                             eprintln!("progress save failed: {e}");
                         }
                         println!("saved -> {model_path}");
+                        println!("  trained on: {}", model.seen.save_line());
                     }
                     Err(e) => eprintln!("save failed: {e}"),
                 }
@@ -377,6 +389,7 @@ pub fn train_sft_gpu(model_path: &str) {
             if let Err(e) = sft_progress::save(model_path, &progress) {
                 eprintln!("progress save failed: {e}");
             }
+            println!("  trained on: {}", model.seen.save_line());
         }
     }
 
@@ -387,6 +400,7 @@ pub fn train_sft_gpu(model_path: &str) {
             // invocation starts a new run instead of resuming a completed one.
             sft_progress::clear(model_path);
             println!("final SFT save -> {model_path}");
+            println!("  trained on: {}", model.seen.save_line());
         }
         Err(e) => eprintln!("final save failed: {e}"),
     }
