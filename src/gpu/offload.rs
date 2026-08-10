@@ -486,21 +486,28 @@ pub struct HostPark {
     /// would spend most of a step in `cuMemHostAlloc`. Slots come back here when a
     /// generation is displaced and are handed out again by [`evict`](Self::evict).
     ///
-    /// Bounded by [`SPARE_MAX`] — an unbounded pool would pin host memory in proportion
-    /// to the largest shape ever evicted and never give it back.
+    /// Bounded by [`peak_slots`](Self::peak_slots) plus [`SPARE_SLACK`] — an unbounded
+    /// pool would pin host memory in proportion to the largest shape ever evicted and
+    /// never give it back.
     spare: Vec<PinnedHostSlice<u16>>,
+    /// Most slots this park has ever owned at once, across every generation and the
+    /// spare pool. The retention bound follows this, so a park keeps exactly the slots
+    /// its own sweep shape turns over and no more.
+    peak_slots: usize,
     /// Page-locking calls this park has made, for the reuse test to observe.
     #[cfg(test)]
     allocs: usize,
 }
 
 
-/// Cap on retained spare pinned slots per park.
+/// Headroom above a park's observed peak demand, in slots.
 ///
-/// A sweep's working set is one slot per buffer per in-flight generation — six buffers
-/// at `IN_FLIGHT_DEPTH` generations, plus the alternating FFN/cell shapes. 32 leaves
-/// room for that without letting a park hoard page-locked memory it will not reuse.
-const SPARE_MAX: usize = 32;
+/// The retention bound cannot be a fixed constant: a chunked sweep keeps one generation
+/// per chunk, so peak demand scales with sequence length (at 4069 words a backbone park
+/// peaks at 40 slots — a fixed 32 dropped 256 slots per step and page-locked them again,
+/// ~225 ms of `cuMemHostAlloc` on the critical path). The slack absorbs the ragged last
+/// chunk and the alternating FFN/cell buffer counts without a second round of misses.
+const SPARE_SLACK: usize = 8;
 
 /// One eviction's pinned slots and the shapes needed to rebuild its tensors.
 struct ParkedGen {
@@ -603,6 +610,7 @@ impl HostPark {
             in_flight,
             prefetched: None,
             spare: Vec::new(),
+            peak_slots: 0,
             #[cfg(test)]
             allocs: 0,
         })
@@ -651,25 +659,36 @@ impl HostPark {
         // Append a generation rather than overwriting the last: a chunked sweep evicts
         // once per chunk and every one of them is owed a restore.
         let depth = self.live;
-        // Take each slot from the spare pool by capacity rather than matching the whole
-        // generation shape-for-shape. Two things defeat an exact per-depth match: one
-        // park serves both the cell and the FFN, whose evictions differ in buffer count
-        // and land at the same depth alternately, and a balanced `chunk_spans` makes the
-        // last chunk one row shorter than the rest. Either alone means a depth's shapes
-        // never repeat, and page-locking is expensive enough (~640 us per slot) that
-        // missing puts it squarely on the hot path.
+        // Slots are matched by capacity rather than generation shape-for-shape. Two
+        // things defeat an exact per-depth match: one park serves both the cell and the
+        // FFN, whose evictions differ in buffer count and land at the same depth
+        // alternately, and a balanced `chunk_spans` makes the last chunk one row shorter
+        // than the rest. Either alone means a depth's shapes never repeat, and
+        // page-locking is expensive enough (~640 us per slot) that missing puts it
+        // squarely on the hot path.
         //
         // A slot is reusable when it is at least as large as the buffer: the copy writes
         // `u16_len()` elements and `restore` rebuilds the tensor from `ParkedShape`, so
         // the slot's own length is never read back. Reusing a larger slot wastes only
         // the tail.
+
+        // Peak slots this park circulates: everything it currently owns — live
+        // generations, restored-but-not-yet-displaced ones, and the spares between them
+        // — plus what this eviction takes. The spares must be counted: with capacity
+        // matching a smaller slot can sit unused while a larger request misses, and a
+        // bound that ignored them would discard exactly the slots the next sweep needs.
+        let owned: usize =
+            self.gens.iter().map(|g| g.slots.len()).sum::<usize>() + self.spare.len();
+        self.peak_slots = self.peak_slots.max(owned + bufs.len());
+        let spare_max = self.peak_slots + SPARE_SLACK;
+
         // Reclaim the generations this eviction displaces *first*, so their slots are
         // available to it. Reclaiming afterwards would make every re-eviction at a
         // depth allocate before the slot it is about to replace comes back.
         if self.gens.len() > depth {
             for g in self.gens.drain(depth..) {
                 for s in g.slots {
-                    if self.spare.len() < SPARE_MAX {
+                    if self.spare.len() < spare_max {
                         self.spare.push(s);
                     }
                 }
@@ -680,10 +699,19 @@ impl HostPark {
         let mut shapes = Vec::with_capacity(bufs.len());
         for b in &bufs {
             let need = b.u16_len();
+            // Best fit, not first fit. The pool holds several capacities at once (the
+            // chunked sweep's ragged last chunk, the alternating FFN/cell shapes), and
+            // taking the first slot that merely fits lets a small request consume a
+            // large slot — the large requests then find nothing and page-lock, once per
+            // sweep, forever. Picking the tightest slot keeps each capacity class for
+            // the requests that need it.
             let hit = self
                 .spare
                 .iter()
-                .position(|s| s.len() >= need)
+                .enumerate()
+                .filter(|(_, s)| s.len() >= need)
+                .min_by_key(|(_, s)| s.len())
+                .map(|(i, _)| i)
                 .map(|i| self.spare.swap_remove(i));
             let mem = match hit {
                 Some(m) => m,
@@ -1099,6 +1127,59 @@ mod tests {
         park.evict(&gpu, vec![DTensor::from_host(&gpu, &b).into()]);
         park.sync_parked();
         assert_eq!(park.host_bytes(), 16 * 64 * 4);
+    }
+
+    /// A chunked sweep holds one generation per chunk, so a park's peak slot demand
+    /// scales with the number of chunks — not with `IN_FLIGHT_DEPTH`. Retention must
+    /// follow that demand, and the restored data must survive the reuse.
+    ///
+    /// With a fixed cap below the peak, every step displaced more slots than it could
+    /// retain and page-locked them again (measured: 256 allocations per step, ~225 ms
+    /// of `cuMemHostAlloc` on the critical path).
+    #[test]
+    fn park_reuses_slots_across_a_chunked_sweep() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let mut park = HostPark::new(&gpu, InFlight::shared()).expect("park");
+        // Enough chunks that the live generations alone exceed any small fixed cap.
+        let chunks = 12;
+        let bufs_per_evict = 6;
+        let src: Vec<Tensor> = (0..chunks)
+            .map(|c| Tensor::random(&[8 + c % 3, 32], 1.0))
+            .collect();
+
+        let mut settled = 0;
+        for step in 0..4 {
+            // Forward: evict every chunk, all staying live at increasing depth.
+            for s in &src {
+                let bufs = (0..bufs_per_evict)
+                    .map(|_| DTensor::from_host(&gpu, s).into())
+                    .collect();
+                park.evict(&gpu, bufs);
+            }
+            // Backward: unwind right to left, checking each chunk comes back intact.
+            for s in src.iter().rev() {
+                for got in park.restore(&gpu) {
+                    assert_eq!(
+                        got.to_host(&gpu).data,
+                        s.data,
+                        "a reused pinned slot returned the wrong data"
+                    );
+                }
+            }
+            park.sync_parked();
+            // The first sweep legitimately page-locks its working set; later sweeps
+            // turn over the same shapes and must allocate nothing.
+            if step == 0 {
+                settled = park.allocs;
+            } else {
+                assert_eq!(
+                    park.allocs, settled,
+                    "sweep {step} re-page-locked slots the pool should have retained"
+                );
+            }
+        }
     }
 
     /// Device staging must stay at `2·k` timesteps no matter how long the timeline is
