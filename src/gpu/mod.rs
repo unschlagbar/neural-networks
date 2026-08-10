@@ -161,9 +161,19 @@ impl Gpu {
 /// where the model's own arithmetic lives, and the reference (`mlstm_kernels`) puts
 /// them on the tensor cores too. cuBLAS's math mode, by contrast, reaches *every*
 /// GEMM in the backend — including the ones the parity tests use as an exact-fp32
-/// oracle — and measures at ~1.35x on the GEMMs but only ~4% on a training step,
-/// because the step is dominated by the backbone's sLSTM, not by matmul. That is a
-/// poor trade to take silently, so it is a switch rather than a default.
+/// oracle — so it is a switch rather than a default.
+///
+/// What it buys has grown as the rest of the step got faster: GEMMs are now 43% of
+/// kernel time, and enabling this cuts GEMM time 191.1 -> 161.9 ms and whole-step
+/// kernel time 447.9 -> 416.0 ms (~7%), against the ~4% measured when the step was
+/// still dominated by the backbone's sLSTM.
+///
+/// The cost is that six parity tests fail with it on — the three `gemm_*_matches_cpu`
+/// oracles plus `slstm_fused_time_matches_per_step` and the two hierarchical grouping
+/// tests. The error is ~1.3e-3 relative (TF32's ~10-bit mantissa) against their 1e-3
+/// tolerance, i.e. the kernels are right and the tolerance is simply tighter than TF32
+/// can meet. Turning this on by default therefore means retuning those tolerances and
+/// giving up the exact-fp32 oracle, which is a numerics decision, not a perf one.
 fn set_tf32(blas: &CudaBlas) -> Result<(), String> {
     let mode = if std::env::var("GPU_TF32").as_deref() == Ok("1") {
         cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH

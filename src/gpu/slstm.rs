@@ -1147,6 +1147,18 @@ impl SLstm {
     /// — the decay/no-decay split that actually matters is weights vs. bias, and that
     /// survives the fusion because `bcat` is still its own tensor.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
+        self.step_q(gpu, cfg, None);
+    }
+
+    /// [`step`](Self::step), optionally queueing instead of launching.
+    pub fn step_q(&mut self, gpu: &Gpu, cfg: &AdamCfg, q: Option<&mut ops::AdamwQueue>) {
+        if let Some(q) = q {
+            q.push(gpu, &mut self.wx, &self.dwx, &mut self.mwx, &mut self.vwx, cfg, true);
+            q.push(gpu, &mut self.whr, &self.dwhr, &mut self.mwhr, &mut self.vwhr, cfg, true);
+            q.push(gpu, &mut self.bcat, &self.dbcat, &mut self.mbcat, &mut self.vbcat, cfg, false);
+            self.post_norm.step_q(gpu, cfg, Some(q));
+            return;
+        }
         ops::adamw(
             gpu,
             &mut self.wx,

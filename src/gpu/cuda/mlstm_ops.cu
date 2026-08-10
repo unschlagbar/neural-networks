@@ -118,6 +118,80 @@ extern "C" __global__ void cumsum_logsig(const float* f, float* fc, int T, int B
     for (int t = 0; t < T; ++t) { acc += log_sigmoid(f[g * T + t]); fc[g * T + t] = acc; }
 }
 
+// Inclusive scan of `v` across the block, returned per thread. `carry` receives the
+// block total. Hillis-Steele within a warp via shuffles, then one pass over warp
+// totals in shared memory — O(log n) instead of the serial walk.
+__device__ __forceinline__ float block_scan_inclusive(float v, float* carry) {
+    __shared__ float wsum[32];
+    int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    int nwarps = (blockDim.x + 31) >> 5;
+    for (int off = 1; off < 32; off <<= 1) {
+        float n = __shfl_up_sync(0xffffffff, v, off);
+        if (lane >= off) v += n;
+    }
+    if (lane == 31) wsum[wid] = v;
+    __syncthreads();
+    // Warp 0 scans the per-warp totals (nwarps <= 32).
+    if (wid == 0) {
+        float w = (lane < nwarps) ? wsum[lane] : 0.0f;
+        for (int off = 1; off < 32; off <<= 1) {
+            float n = __shfl_up_sync(0xffffffff, w, off);
+            if (lane >= off) w += n;
+        }
+        if (lane < nwarps) wsum[lane] = w;
+    }
+    __syncthreads();
+    float base = (wid > 0) ? wsum[wid - 1] : 0.0f;
+    if (carry) *carry = wsum[nwarps - 1];
+    return base + v;
+}
+
+// `cumsum_logsig` with one BLOCK per row instead of one thread.
+//
+// The thread-per-row form has adjacent lanes reading `f[g*T + t]` a full row apart,
+// so every warp touches 32 cache lines per iteration and the launch is one block
+// wide (grid=1 at BH=1024) — one SM of 84, walking T serially. A block per row makes
+// the row contiguous across lanes and turns the serial walk into a shuffle scan.
+extern "C" __global__ void cumsum_logsig_block(const float* f, float* fc, int T, int BH) {
+    int g = blockIdx.x;
+    if (g >= BH) return;
+    const float* fr = f + (long)g * T;
+    float* fcr = fc + (long)g * T;
+    float running = 0.0f;
+    for (int base = 0; base < T; base += blockDim.x) {
+        int t = base + threadIdx.x;
+        float v = (t < T) ? log_sigmoid(fr[t]) : 0.0f;
+        float carry;
+        float s = block_scan_inclusive(v, &carry);
+        if (t < T) fcr[t] = running + s;
+        __syncthreads();
+        running += carry;
+    }
+}
+
+// `revcumsum_dlogsig` with one BLOCK per row; see `cumsum_logsig_block`. The scan
+// runs over the reversed row, so lane 0 holds the last element of each tile.
+extern "C" __global__ void revcumsum_dlogsig_block(const float* dfc, const float* f, float* df,
+                                                    int T, int BH) {
+    int g = blockIdx.x;
+    if (g >= BH) return;
+    const float* dr = dfc + (long)g * T;
+    const float* fr = f + (long)g * T;
+    float* outr = df + (long)g * T;
+    float running = 0.0f;
+    for (int base = 0; base < T; base += blockDim.x) {
+        // Tile [T-1-base-blockDim+1 .. T-1-base], walked so threadIdx.x 0 is the
+        // highest index — a forward scan over the reversed row.
+        int t = T - 1 - base - (int)threadIdx.x;
+        float v = (t >= 0) ? dr[t] : 0.0f;
+        float carry;
+        float s = block_scan_inclusive(v, &carry);
+        if (t >= 0) outr[t] = (running + s) * (1.0f - stable_sigmoid(fr[t]));
+        __syncthreads();
+        running += carry;
+    }
+}
+
 // Per-row stabilizer m[g,t] = max( max_{j<=t}(fc_t - fc_j + ig_j), fc_t + m_prev_g ).
 // One BLOCK per (g,t) over BH*T. `ig` is the input-gate logit [BH,T].
 extern "C" __global__ void mlstm_rowmax_m(const float* fc, const float* ig, const float* m_prev,
@@ -199,6 +273,58 @@ extern "C" __global__ void slice_t(const float* x, float* out, int T, int L, int
     int t = (idx / W) % L;
     int g = idx / (W * L);
     out[idx] = x[((long)g * T + c0 + t) * W + w];
+}
+
+// Several `slice_t` calls sharing T, L and c0, fused into one launch.
+//
+// The chunked sweep slices q/k/v (and on the backward side five gradient tensors)
+// out of the same time range back to back: identical geometry, different buffers
+// and row widths. As separate launches they are ~2.3 us each and the step issues
+// thousands of them, so the launch dominates the copy. One grid covers all of them
+// by giving each tensor a contiguous span of the flat index space.
+//
+// The descriptor is passed **by value** as a kernel argument, not through a device
+// array: a pointer array would need its own H2D copy (plus the event to order it)
+// per call, which costs more than the launches being saved.
+//
+// `off[i]` is the running sum of each tensor's element count, so `off[N]` is the
+// grand total; a short linear scan maps a flat index back to its tensor.
+#define SLICE_BATCH_MAX 8
+struct SliceBatch {
+    const float* src[SLICE_BATCH_MAX];
+    float* dst[SLICE_BATCH_MAX];
+    int W[SLICE_BATCH_MAX];
+    int off[SLICE_BATCH_MAX + 1];
+    int n;
+};
+
+extern "C" __global__ void slice_t_batch(SliceBatch b, int T, int L, int c0, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    // n is <= 8, so a linear scan beats a branchy binary search and stays in registers.
+    int i = 0;
+    while (i + 1 < b.n && idx >= b.off[i + 1]) i++;
+    int local = idx - b.off[i];
+    int W = b.W[i];
+    int w = local % W;
+    int t = (local / W) % L;
+    int g = local / (W * L);
+    b.dst[i][local] = b.src[i][((long)g * T + c0 + t) * W + w];
+}
+
+// Batched `unslice_t`; `src` is the chunk and `dst` the full tensor, so the
+// indexing is `slice_t_batch`'s with the two sides swapped.
+extern "C" __global__ void unslice_t_batch(SliceBatch b, int T, int L, int c0, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int i = 0;
+    while (i + 1 < b.n && idx >= b.off[i + 1]) i++;
+    int local = idx - b.off[i];
+    int W = b.W[i];
+    int w = local % W;
+    int t = (local / W) % L;
+    int g = local / (W * L);
+    b.dst[i][((long)g * T + c0 + t) * W + w] = b.src[i][local];
 }
 
 // Write a chunk back: dst[BH, c0..c0+L, W] = src[BH,L,W]. Chunks partition T, so
@@ -340,6 +466,77 @@ extern "C" __global__ void masked_softmax_ce(const float* logits, const unsigned
         if ((unsigned)j == t) p -= 1.0f;
         d[j] = p * inv;
     }
+}
+
+// `masked_softmax_ce` with one BLOCK per row.
+//
+// The thread-per-row form walks the C-wide row four times (max, sum, then the
+// gradient) with adjacent lanes a full row apart, and at R=1024 fits in two blocks —
+// two SMs of 84, 341 us a launch. A block per row makes the row contiguous across
+// lanes and turns each pass into a block reduction.
+extern "C" __global__ void masked_softmax_ce_block(const float* logits, const unsigned* targets,
+                                                    const unsigned* mask, float* dlogits,
+                                                    float* row_loss, int C, float inv, int R) {
+    int r = blockIdx.x;
+    if (r >= R) return;
+    const float* z = logits + (long)r * C;
+    float* d = dlogits + (long)r * C;
+    if (!mask[r]) {
+        for (int j = threadIdx.x; j < C; j += blockDim.x) d[j] = 0.0f;
+        if (threadIdx.x == 0) row_loss[r] = 0.0f;
+        return;
+    }
+    float mx = -1e30f;
+    for (int j = threadIdx.x; j < C; j += blockDim.x) mx = fmaxf(mx, z[j]);
+    mx = block_reduce_max(mx);
+    __shared__ float s_mx;
+    if (threadIdx.x == 0) s_mx = mx;
+    __syncthreads();
+    mx = s_mx;
+
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < C; j += blockDim.x) sum += expf(z[j] - mx);
+    sum = block_reduce_sum(sum);
+    __shared__ float s_sum;
+    if (threadIdx.x == 0) s_sum = sum;
+    __syncthreads();
+    sum = s_sum;
+
+    unsigned t = targets[r];
+    if (threadIdx.x == 0) {
+        float pt = expf(z[t] - mx) / sum;
+        row_loss[r] = -logf(fmaxf(pt, 1e-30f));
+    }
+    for (int j = threadIdx.x; j < C; j += blockDim.x) {
+        float p = expf(z[j] - mx) / sum;
+        if ((unsigned)j == t) p -= 1.0f;
+        d[j] = p * inv;
+    }
+}
+
+// `mlstm_chunk_ab_bwd` with the last-row reduction spread across a block.
+//
+// The elementwise part is unchanged, but in the thread-per-row form the single
+// thread holding `t == L-1` walks the whole row serially while every other thread in
+// the launch waits on it. Here one block owns a row `g`: the elementwise terms are
+// strided across lanes and the row sum is a block reduction.
+extern "C" __global__ void mlstm_chunk_ab_bwd_block(const float* db, const float* da,
+                                                     const float* b, const float* a,
+                                                     float* dfc, float* dig, int L, int BH) {
+    int g = blockIdx.x;
+    if (g >= BH) return;
+    long base = (long)g * L;
+    float part = 0.0f;
+    for (int t = threadIdx.x; t < L; t += blockDim.x) {
+        long idx = base + t;
+        float pa = da[idx] * a[idx];
+        dig[idx] += pa;
+        dfc[idx] += db[idx] * b[idx] - pa;
+        part += pa;
+    }
+    // Σ_j da·a over the row, added onto the last element only.
+    float tot = block_reduce_sum(part);
+    if (threadIdx.x == 0) dfc[base + L - 1] += tot;
 }
 
 // mLSTM parallel-form backward

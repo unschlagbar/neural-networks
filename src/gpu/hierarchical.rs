@@ -1300,31 +1300,54 @@ impl Hierarchical {
     /// AdamW across every stage. Tied table and the logit head are undecayed;
     /// interior projections decay (matching the project's optimizer convention).
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        ops::adamw(
-            gpu,
-            &mut self.table,
-            &self.dtable,
-            &mut self.m_tbl,
-            &mut self.v_tbl,
-            cfg,
-            false,
-        );
-        self.dtable.zero_(gpu);
+        // Every parameter tensor in the model queues its update and one flush issues
+        // them a batch at a time. Stepping eagerly is ~883 launches, most of them a
+        // single block (biases, norm scales), i.e. almost pure launch overhead.
+        // `GPU_NO_ADAMW_BATCH=1` restores the per-tensor path.
+        let mut queue = (!ops::no_adamw_batch()).then(ops::AdamwQueue::new);
+        let mut q = queue.as_mut();
+
+        match q.as_deref_mut() {
+            Some(q) => q.push(
+                gpu,
+                &mut self.table,
+                &self.dtable,
+                &mut self.m_tbl,
+                &mut self.v_tbl,
+                cfg,
+                false,
+            ),
+            None => {
+                ops::adamw(
+                    gpu,
+                    &mut self.table,
+                    &self.dtable,
+                    &mut self.m_tbl,
+                    &mut self.v_tbl,
+                    cfg,
+                    false,
+                );
+                self.dtable.zero_(gpu);
+            }
+        }
         for b in self.encoder.blocks.iter_mut() {
-            b.step(gpu, cfg);
+            b.step_q(gpu, cfg, q.as_deref_mut());
         }
-        self.bb_front.step(gpu, cfg);
+        self.bb_front.step_wd_q(gpu, cfg, true, q.as_deref_mut());
         for b in self.bb_blocks.iter_mut() {
-            b.step(gpu, cfg);
+            b.step_q(gpu, cfg, q.as_deref_mut());
         }
-        self.bb_back.step(gpu, cfg);
+        self.bb_back.step_wd_q(gpu, cfg, true, q.as_deref_mut());
         for b in self.dec_blocks.iter_mut() {
-            b.step(gpu, cfg);
+            b.step_q(gpu, cfg, q.as_deref_mut());
         }
-        self.dec_norm.step(gpu, cfg);
+        self.dec_norm.step_q(gpu, cfg, q.as_deref_mut());
         // Logit head: no weight decay and no bias (bias stays at its zero init) so
         // it matches `nn::linear_no_bias` and exports faithfully to the HIER head.
-        self.dec_head.step_w_only(gpu, cfg, false);
+        self.dec_head.step_w_only_q(gpu, cfg, false, q.as_deref_mut());
+        if let Some(q) = queue.as_mut() {
+            q.flush(gpu, cfg);
+        }
         self.step_count += 1;
     }
 

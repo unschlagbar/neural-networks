@@ -177,6 +177,16 @@ impl RmsNorm {
 
     /// AdamW step (norm scale is never decayed). Clears the grad.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
+        self.step_q(gpu, cfg, None);
+    }
+
+    /// [`step`](Self::step), optionally queueing instead of launching. A queued grad
+    /// is cleared by [`AdamwQueue::flush`], not here.
+    pub fn step_q(&mut self, gpu: &Gpu, cfg: &AdamCfg, q: Option<&mut ops::AdamwQueue>) {
+        if let Some(q) = q {
+            q.push(gpu, &mut self.gamma, &self.dgamma, &mut self.m, &mut self.v, cfg, false);
+            return;
+        }
         ops::adamw(
             gpu,
             &mut self.gamma,

@@ -498,6 +498,80 @@ ncu on `add`/`broadcast_row`: DRAM **0.2–8.7%**, SM **2–5%**, *"grid too sma
 0.25 full waves across all SMs"* (21 blocks on an 84-SM GPU). They do essentially no
 work and pay full launch cost.
 
+## Block-per-row rewrites (done)
+
+Four kernels used the thread-per-row antipattern — one thread walks a row serially,
+so adjacent lanes sit a full row apart (uncoalesced) and the whole launch fits in
+one or two blocks on an 84-SM GPU. Rewritten block-per-row with warp-shuffle scans
+and `block_reduce_sum`; `GPU_NO_BLOCK_SCAN=1` reverts all four.
+
+| kernel | before | after |
+|---|---|---|
+| `cumsum_logsig` | 17.76 ms | 0.49 ms |
+| `revcumsum_dlogsig` | 19.62 ms | 0.57 ms |
+| `masked_softmax_ce` | 6.83 ms | 0.16 ms |
+| `mlstm_chunk_ab_bwd` | 2.12 ms | 0.73 ms |
+
+Whole-step kernel time **529.0 → 447.9 ms**. Occupancy is the tell: `grid=1` or
+`grid=2` at `block=1024` is one or two SMs of 84 — check `gridX` against `sm_count`
+before assuming a slow kernel is doing real work.
+
+Batched `slice_t`/`unslice_t` (`slice_t_batch`, `GPU_NO_SLICE_BATCH=1` to revert)
+also landed: 8,704 → 2,560 launches/step, ~8 ms.
+
+## Batched-GEMM TF32 (done, −183 ms/10 steps)
+
+`matmul_batched_{nn,nt,tn}` (the chunkwise-mLSTM per-head GEMMs) ran on the **CUDA
+cores** in fp32 while the *same algorithm's* fused-kernel dots were already TF32
+(`MMA_TF32`, matching the reference, where Triton's `tl.dot` is TF32 on fp32 inputs).
+Switching them to `CUBLAS_COMPUTE_32F_FAST_TF32` via `gemm_strided_batched_ex` moved
+them to the tensor cores. `GPU_NO_BATCHED_TF32=1` reverts.
+
+Measured over 10 steps, and the diff is **entirely GEMM kernels** — nothing unrelated
+moved, so this is not clock drift:
+
+| | on | off |
+|---|---|---|
+| `simt_sgemm` + `magma_sgemmEx` (CUDA cores) | 119.8 ms | 520.1 ms |
+| `tensorop` + `tf32_mma` (tensor cores) | 217.0 ms | 0 ms |
+| **total kernel time** | **4765.1 ms** | 4948.2 ms |
+
+Accuracy at production shapes (K=96/256): max abs error **4.3e-3 against a max |ref| of
+15.4**, i.e. ~2.8e-4 relative — exactly TF32's ~10-bit mantissa. fp32 is ~1000× tighter
+(3.8e-6), which is the A/B that proves the path is actually engaged.
+
+This is distinct from the handle-wide `gpu::set_tf32` (`GPU_TF32=1`), which stays
+opt-in because it also reaches the GEMMs the `gemm_*_matches_cpu` tests use as an
+exact-fp32 oracle. These three wrappers are not on that path.
+
+**`matmul_batched_matches_cpu` cannot catch a regression here** — it runs K=6, where
+the TF32 error is 2.4e-7. Do not read it as evidence about production accuracy.
+
+## `db` is not bit-reproducible (`add_col_sum`)
+
+`add_col_sum` splits the row axis over `blockIdx.y` and combines slices with
+`atomicAdd`, so summation order varies with scheduling; float addition is not
+associative. Any test asserting **exact equality** on a `db` / bias gradient is
+unsound and will flake. `forward_shared_matches_forward_and_saves_nothing` asserted
+this and failed ~1-in-3 once TF32 changed GEMM timing enough to perturb scheduling —
+the test was wrong, not the code. GEMM outputs (`y`, `dx`, `dw`) *are* exact.
+
+## CUDA graphs: blocked, and why
+
+Whole-step graph capture would be worth ~24% (the CPU sits 74% inside CUDA API calls
+while the GPU is 76% busy), and the launch structure is ideal — **all ~78k launches
+per step are bit-identical across steps**, 87% of them inside 67 repeating signatures.
+
+It is blocked by **allocation instability**. A captured graph bakes in raw device
+pointers; `GPU_PTR_PROBE=1` (see `gpu::dtensor::ptr_probe`) measures 44,066 allocations
+per step of which only **0.8–1.3% reuse the previous step's address**, at both 4096 and
+512 words. Replaying a graph would read and write reassigned memory — silent
+corruption. This is why the existing sLSTM graph (`src/gpu/slstm.rs:632`) works: it
+captures a loop over *persistent* state buffers, keyed on `(b,t)`.
+
+Consequence: **the flat parameter tensor is the gate on the graph win**, not a ~2%
+optimization in its own right. That reprices it well above where it sits below.
+
 ## Ranked next steps
 
 With idle down to 24%, the remaining wall time is mostly real kernel time, so this list
@@ -524,9 +598,17 @@ assuming any of it.
 
 1. **Measure GPU busy-vs-idle before optimizing anything.** If busy% is low, kernel
    time is not the problem.
-2. **Benchmark noise here is ~25%, driven by GPU thermal state.** The same binary reads
-   ~1150 ms warm and ~880 ms settled. Never compare numbers taken far apart — A/B
-   back-to-back, and prefer nsys `sum(end-start)` over wall clock.
+2. **Wall clock cannot measure a sub-50 ms change on this machine — use nsys kernel
+   time.** `nvidia-smi` reports the SM clock idling at **1612 MHz against a 3090 MHz
+   max**, so a run's speed depends on where it catches the boost ramp. Measured:
+   interleaved same-process A/B of a change worth a known ~45 ms of GPU time gave
+   711/522, 548/703, 548/537 ms — the sign flipped between reps. Thermal drift is
+   real too (the same binary reads ~1150 ms warm and ~880 ms settled), but the clock
+   swing is the larger effect and back-to-back A/B does **not** control for it.
+   The reliable signal is nsys `sum(end-start)` per kernel over the measured region;
+   a change in *kernel* time is trustworthy, a change in wall clock is not. A useful
+   cross-check that a "regression" is really clock state: if kernels you did not
+   touch moved by a uniform percentage at identical launch counts, it is the clock.
 3. **NVRTC failures are silent.** A broken `.cu` makes GPU tests *skip* and report `ok`;
    the tell is the suite finishing suspiciously fast (~1 s instead of ~20 s). Verify:
    `cargo test … -- --nocapture 2>&1 | grep -c "skipping GPU test"` must print **0**.
@@ -539,9 +621,12 @@ assuming any of it.
    Back up to the scratchpad instead. (Recovery, if it happens: `git fsck --lost-found`
    and grep the dangling blobs.)
 6. **Run narrow test filters**, not the full ~85 s suite repeatedly. It is flaky under
-   concurrency — `slstm_fused_time_matches_per_step`, `group_cap_matches_uncapped`,
-   `forward_shared_matches_forward_and_saves_nothing` have each failed once and passed
-   3/3 in isolation. Re-run the single filter before believing a failure.
+   concurrency — `slstm_fused_time_matches_per_step`, `group_cap_matches_uncapped`
+   have each failed once and passed 3/3 in isolation. Re-run the single filter before
+   believing a failure. **But do not assume a failure is the known flake**: a repeat
+   run under the A/B toggle told apart "flaky" from "my change broke it" for
+   `forward_shared_…` — it passed 3/3 with the change off and failed 1/3 with it on,
+   which is a real defect, not noise. `--test-threads=4` gives a clean 70/70.
 7. **No long training runs.** Validate with `vram_audit` / `kern_prof` / `determinism`,
    never `hg`. Kill background GPU jobs and check `nvidia-smi` before handing back.
 8. **Bisect toggles** (these localized a race in minutes): `GPU_NO_GROUP`,

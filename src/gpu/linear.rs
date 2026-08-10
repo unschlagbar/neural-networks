@@ -309,7 +309,25 @@ impl Linear {
     /// AdamW step with explicit weight-decay control on `w` (pass `false` for an
     /// undecayed logit head).
     pub fn step_wd(&mut self, gpu: &Gpu, cfg: &AdamCfg, decay_w: bool) {
+        self.step_wd_q(gpu, cfg, decay_w, None);
+    }
+
+    /// [`step_wd`](Self::step_wd), optionally queueing the updates instead of
+    /// launching them. The grads are *not* cleared when queued — the caller must
+    /// zero them after flushing, since the kernel has not read them yet.
+    pub fn step_wd_q(
+        &mut self,
+        gpu: &Gpu,
+        cfg: &AdamCfg,
+        decay_w: bool,
+        q: Option<&mut ops::AdamwQueue>,
+    ) {
         self.gemm.invalidate_w();
+        if let Some(q) = q {
+            q.push(gpu, &mut self.w, &self.dw, &mut self.mw, &mut self.vw, cfg, decay_w);
+            q.push(gpu, &mut self.b, &self.db, &mut self.mb, &mut self.vb, cfg, false);
+            return;
+        }
         ops::adamw(
             gpu,
             &mut self.w,
@@ -335,7 +353,26 @@ impl Linear {
     /// a bias-free head: `b` stays at its (zero) init so the layer is equivalent
     /// to `nn::LinearNBLayer` and exports to the no-bias `HIER` head faithfully.
     pub fn step_w_only(&mut self, gpu: &Gpu, cfg: &AdamCfg, decay_w: bool) {
+        self.step_w_only_q(gpu, cfg, decay_w, None);
+    }
+
+    /// [`step_w_only`](Self::step_w_only), optionally queueing instead of launching.
+    ///
+    /// `db` is zeroed here even on the queued path: the queue only clears gradients it
+    /// was given, and `b` is deliberately not stepped, so nothing else would clear it.
+    pub fn step_w_only_q(
+        &mut self,
+        gpu: &Gpu,
+        cfg: &AdamCfg,
+        decay_w: bool,
+        q: Option<&mut ops::AdamwQueue>,
+    ) {
         self.gemm.invalidate_w();
+        if let Some(q) = q {
+            q.push(gpu, &mut self.w, &self.dw, &mut self.mw, &mut self.vw, cfg, decay_w);
+            self.db.zero_(gpu);
+            return;
+        }
         ops::adamw(
             gpu,
             &mut self.w,
@@ -500,8 +537,8 @@ mod tests {
         let mut shared = Linear::from_parts(&gpu, &w, &b);
 
         // Both paths issue the identical GEMM over the identical data — the only
-        // difference is whether `x` was copied first — so this is exact equality,
-        // not a tolerance.
+        // difference is whether `x` was copied first — so the GEMM outputs compare by
+        // exact equality, not a tolerance. `db` is the exception; see below.
         let eq = |got: &[f32], want: &[f32], what: &str| {
             assert_eq!(got, want, "{what}: shared path diverged from the saving one");
         };
@@ -521,7 +558,16 @@ mod tests {
 
         eq(&dx_shared.to_host(&gpu).data, &dx_saving.to_host(&gpu).data, "dx");
         eq(&shared.dw.to_host(&gpu).data, &saving.dw.to_host(&gpu).data, "dw");
-        eq(&shared.db.to_host(&gpu).data, &saving.db.to_host(&gpu).data, "db");
+
+        // `db` is the one output that is not bit-reproducible: `add_col_sum` splits the
+        // row axis over `blockIdx.y` and combines the slices with `atomicAdd`, so the
+        // summation order varies with scheduling and float addition is not associative.
+        // Its value is still the same sum, hence a tolerance rather than equality.
+        assert_close(
+            &shared.db.to_host(&gpu).data,
+            &saving.db.to_host(&gpu).data,
+            1e-6,
+        );
     }
 
     /// `backward_with_x` over contiguous **row blocks** must sum to the whole-batch

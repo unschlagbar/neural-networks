@@ -192,6 +192,51 @@ extern "C" __global__ void softmax_ce(const float* logits, const unsigned* targe
 //   - multi-tensor apply (batching many tensors per launch): 66% of this model's adamw
 //     launches are under 4 us, but they are only 10% of its time. The cost sits in
 //     mid-sized tensors that are bandwidth-bound, so fewer launches cannot help.
+// `adamw` over many parameter tensors in one launch.
+//
+// The step issues one `adamw` per tensor — 883 launches at ~11 us of mostly launch
+// overhead, since most parameter tensors are far too small to fill the GPU. The
+// update is elementwise and identical for every tensor, so the only per-tensor state
+// is the four base pointers and the decay flag; batching them costs nothing but the
+// index lookup. `wd` is per slot because the convention decays interior projections
+// and not embeddings or logit heads.
+//
+// The descriptor is passed by value, so no device-side pointer array is needed (an
+// H2D copy per step would eat the saving). `off[i]` is the running element count.
+#define ADAMW_BATCH_MAX 24
+struct AdamwBatch {
+    float* param[ADAMW_BATCH_MAX];
+    const float* grad[ADAMW_BATCH_MAX];
+    float* m[ADAMW_BATCH_MAX];
+    float* v[ADAMW_BATCH_MAX];
+    float wd[ADAMW_BATCH_MAX];
+    int off[ADAMW_BATCH_MAX + 1];
+    int n;
+};
+
+extern "C" __global__ void adamw_batch(AdamwBatch b, float lr, float b1, float b2,
+                                        float eps, float bc1, float bc2, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    // Binary search the owning tensor: n can be 24, so this beats a linear scan.
+    int lo = 0, hi = b.n - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (idx >= b.off[mid]) lo = mid; else hi = mid - 1;
+    }
+    int k = idx - b.off[lo];
+    float g = b.grad[lo][k];
+    float mk = b1 * b.m[lo][k] + (1.0f - b1) * g;
+    float vk = b2 * b.v[lo][k] + (1.0f - b2) * g * g;
+    b.m[lo][k] = mk; b.v[lo][k] = vk;
+    float mh = mk / bc1;
+    float vh = vk / bc2;
+    float p = b.param[lo][k];
+    p -= lr * b.wd[lo] * p;
+    p -= lr * mh / (sqrtf(vh) + eps);
+    b.param[lo][k] = p;
+}
+
 extern "C" __global__ void adamw(float* param, const float* grad, float* m, float* v,
                                  float lr, float b1, float b2, float eps, float wd,
                                  float bc1, float bc2, int n) {

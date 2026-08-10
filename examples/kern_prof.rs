@@ -89,4 +89,5 @@ fn main() {
     gpu.stream.synchronize().unwrap();
     let el = t0.elapsed().as_secs_f64();
     println!("{steps} steps in {:.3} s -> {:.1} ms/step", el, el * 1000.0 / steps as f64);
+    neural_networks::gpu::dtensor::ptr_probe::dump(warmup + steps);
 }

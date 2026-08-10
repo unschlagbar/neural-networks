@@ -547,6 +547,79 @@ pub fn matmul_tn(gpu: &Gpu, a: &DTensor, b: &DTensor) -> DTensor {
 // matrix element count. Same row-major-over-column-major operand-swap as the
 // single GEMMs (pass B first, A second, compute Cᵀ), applied per batch.
 
+/// Whether the batched GEMMs round their operands to TF32 (`GPU_NO_BATCHED_TF32=1`
+/// turns it off).
+///
+/// On by default, unlike the handle-wide [`gpu::set_tf32`](super::set_tf32), and the
+/// difference is which GEMMs each one reaches. These three serve only the chunkwise
+/// mLSTM, whose *other* dots — the fused kernels' `mma.sync...f32.tf32.tf32.f32` —
+/// are already TF32 by default, matching the reference (`mlstm_kernels`, where
+/// Triton's `tl.dot` is TF32 on fp32 inputs). Leaving these on the CUDA cores made
+/// one half of the same algorithm fp32 and the other TF32 for no stated reason.
+///
+/// The handle-wide switch stays opt-in because it also reaches the GEMMs the
+/// `gemm_*_matches_cpu` tests use as an exact-fp32 oracle. These wrappers are not on
+/// that path, so the oracle survives.
+pub fn batched_tf32() -> bool {
+    std::env::var("GPU_NO_BATCHED_TF32").as_deref() != Ok("1")
+}
+
+/// Strided-batched `Cᵀ = op(B)·op(A)` in fp32, optionally on the TF32 tensor cores.
+///
+/// The caller passes the already-swapped operands and leading dimensions — this only
+/// chooses the compute type, so the layouts below stay identical to what the fp32
+/// path used. `CUBLAS_COMPUTE_32F_FAST_TF32` keeps the buffers, the accumulator and
+/// the result fp32 and narrows only the multiplicand mantissas to 10 bits.
+#[allow(clippy::too_many_arguments)]
+fn batched_gemm(gpu: &Gpu, cfg: StridedBatchedConfig<f32>, b: &DTensor, a: &DTensor, c: &mut DTensor, what: &str) {
+    if !batched_tf32() {
+        // SAFETY: shapes and leading dimensions are the caller's, which the shape
+        // asserts above validate; all three buffers are live device allocations.
+        unsafe { gpu.blas.gemm_strided_batched(cfg, &b.buf, &a.buf, &mut c.buf) }
+            .unwrap_or_else(|e| panic!("cublas gemm_strided_batched {what}: {e:?}"));
+        return;
+    }
+
+    use cudarc::cublas::sys;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    let g = cfg.gemm;
+    let (pb, _rb) = b.buf.device_ptr(&gpu.stream);
+    let (pa, _ra) = a.buf.device_ptr(&gpu.stream);
+    let (pc, _rc) = c.buf.device_ptr_mut(&gpu.stream);
+
+    // SAFETY: same operands, leading dimensions and strides the typed wrapper would
+    // pass; only the compute type differs.
+    unsafe {
+        cudarc::cublas::result::gemm_strided_batched_ex(
+            *gpu.blas.handle(),
+            g.transa,
+            g.transb,
+            g.m,
+            g.n,
+            g.k,
+            (&g.alpha) as *const f32 as *const _,
+            pb as *const _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            g.lda,
+            cfg.stride_a,
+            pa as *const _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            g.ldb,
+            cfg.stride_b,
+            (&g.beta) as *const f32 as *const _,
+            pc as *mut _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            g.ldc,
+            cfg.stride_c,
+            cfg.batch_size,
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        )
+    }
+    .unwrap_or_else(|e| panic!("cublas gemm_strided_batched_ex {what}: {e:?}"));
+}
+
 /// `C[g] = A[g] · B[g]` for `A[batch,M,K]`, `B[batch,K,N]` → `C[batch,M,N]`.
 pub fn matmul_batched_nn(gpu: &Gpu, a: &DTensor, b: &DTensor) -> DTensor {
     let (batch, m, ka) = (a.shape[0], a.shape[1], a.shape[2]);
@@ -573,11 +646,7 @@ pub fn matmul_batched_nn(gpu: &Gpu, a: &DTensor, b: &DTensor) -> DTensor {
         stride_b: (m * ka) as i64,
         stride_c: (m * n) as i64,
     };
-    unsafe {
-        gpu.blas
-            .gemm_strided_batched(cfg, &b.buf, &a.buf, &mut c.buf)
-    }
-    .expect("cublas gemm_strided_batched nn");
+    batched_gemm(gpu, cfg, b, a, &mut c, "nn");
     c
 }
 
@@ -607,11 +676,7 @@ pub fn matmul_batched_nt(gpu: &Gpu, a: &DTensor, b: &DTensor) -> DTensor {
         stride_b: (m * ka) as i64,
         stride_c: (m * n) as i64,
     };
-    unsafe {
-        gpu.blas
-            .gemm_strided_batched(cfg, &b.buf, &a.buf, &mut c.buf)
-    }
-    .expect("cublas gemm_strided_batched nt");
+    batched_gemm(gpu, cfg, b, a, &mut c, "nt");
     c
 }
 
@@ -641,11 +706,7 @@ pub fn matmul_batched_tn(gpu: &Gpu, a: &DTensor, b: &DTensor) -> DTensor {
         stride_b: (ka * m) as i64,
         stride_c: (m * n) as i64,
     };
-    unsafe {
-        gpu.blas
-            .gemm_strided_batched(cfg, &b.buf, &a.buf, &mut c.buf)
-    }
-    .expect("cublas gemm_strided_batched tn");
+    batched_gemm(gpu, cfg, b, a, &mut c, "tn");
     c
 }
 
@@ -974,6 +1035,176 @@ pub fn softmax_cross_entropy(gpu: &Gpu, logits: &DTensor, targets: &[usize]) -> 
 
 /// One AdamW step of `param` from `grad`, updating moments `m`/`v` in place.
 /// `decay` toggles the decoupled weight-decay term. Mirrors `nn2::optim`.
+/// Most parameter tensors one batched AdamW launch can carry. Must match
+/// `ADAMW_BATCH_MAX` in `common.cu`.
+pub const ADAMW_BATCH_MAX: usize = 24;
+
+/// Kernel-argument twin of `AdamwBatch` in `common.cu`. Passed by value, so field
+/// order and types must match the `.cu` definition exactly.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AdamwBatchArg {
+    param: [u64; ADAMW_BATCH_MAX],
+    grad: [u64; ADAMW_BATCH_MAX],
+    m: [u64; ADAMW_BATCH_MAX],
+    v: [u64; ADAMW_BATCH_MAX],
+    wd: [f32; ADAMW_BATCH_MAX],
+    off: [i32; ADAMW_BATCH_MAX + 1],
+    n: i32,
+}
+
+// SAFETY: plain-old-data — pointers and scalars — passed by value as a kernel
+// argument exactly as `cudarc` does for the scalar types.
+unsafe impl cudarc::driver::DeviceRepr for AdamwBatchArg {}
+
+/// `GPU_NO_ADAMW_BATCH=1` steps each parameter tensor with its own `adamw` launch.
+pub fn no_adamw_batch() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("GPU_NO_ADAMW_BATCH").is_ok_and(|v| v != "0"))
+}
+
+/// Collects AdamW updates and issues them a batch at a time.
+///
+/// One `adamw` launch per parameter tensor is ~11 us of mostly launch overhead for
+/// tensors far too small to fill the GPU. Layers push their tensors here instead and
+/// the model flushes once, turning hundreds of launches into a handful.
+///
+/// This holds raw device pointers rather than `&mut DTensor` because the tensors
+/// live in different layers all over the model, so no single `&mut` can span them.
+/// The contract the caller must keep: every queued tensor stays alive and is not
+/// reallocated until [`flush`](Self::flush), and no tensor is queued twice in a step
+/// (a duplicate would race with itself).
+///
+/// The pointer guards `device_ptr` returns are dropped immediately rather than held.
+/// Under `disable_event_tracking` (see `Gpu::new`) they are `SyncOnDrop::Record(None)`
+/// — a no-op — and the buffers are owned by the model for the whole step, so there is
+/// nothing for them to order.
+#[derive(Default)]
+pub struct AdamwQueue {
+    param: Vec<u64>,
+    grad: Vec<u64>,
+    m: Vec<u64>,
+    v: Vec<u64>,
+    wd: Vec<f32>,
+    len: Vec<usize>,
+}
+
+impl AdamwQueue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue one tensor's update. `decay` follows the project convention: interior
+    /// projections decay, embeddings and logit heads do not.
+    pub fn push(
+        &mut self,
+        gpu: &Gpu,
+        param: &mut DTensor,
+        grad: &DTensor,
+        mm: &mut DTensor,
+        vv: &mut DTensor,
+        cfg: &AdamCfg,
+        decay: bool,
+    ) {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let n = param.len();
+        debug_assert_eq!(grad.len(), n, "AdamwQueue: grad length != param length");
+        let (pp, _g0) = param.buf.device_ptr_mut(&gpu.stream);
+        let (pg, _g1) = grad.buf.device_ptr(&gpu.stream);
+        let (pm, _g2) = mm.buf.device_ptr_mut(&gpu.stream);
+        let (pv, _g3) = vv.buf.device_ptr_mut(&gpu.stream);
+        self.param.push(pp);
+        self.grad.push(pg);
+        self.m.push(pm);
+        self.v.push(pv);
+        self.wd.push(if decay { cfg.weight_decay } else { 0.0 });
+        self.len.push(n);
+    }
+
+    /// Issue every queued update, `ADAMW_BATCH_MAX` tensors per launch, then zero
+    /// every queued gradient.
+    ///
+    /// Zeroing belongs here, not at the push site: a queued update has not read the
+    /// gradient yet, so a layer that cleared its own grads at queue time would feed
+    /// zeros to the kernel. Doing it here makes that ordering impossible to get wrong
+    /// — and the memsets batch into the same pass.
+    pub fn flush(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
+        let bc1 = 1.0 - cfg.beta1.powi(cfg.t as i32);
+        let bc2 = 1.0 - cfg.beta2.powi(cfg.t as i32);
+        let (lr, b1, b2, eps) = (cfg.lr, cfg.beta1, cfg.beta2, cfg.eps);
+        let f = gpu.kernels.get("adamw_batch");
+
+        for chunk in (0..self.param.len()).collect::<Vec<_>>().chunks(ADAMW_BATCH_MAX) {
+            let mut a = AdamwBatchArg {
+                param: [0; ADAMW_BATCH_MAX],
+                grad: [0; ADAMW_BATCH_MAX],
+                m: [0; ADAMW_BATCH_MAX],
+                v: [0; ADAMW_BATCH_MAX],
+                wd: [0.0; ADAMW_BATCH_MAX],
+                off: [0; ADAMW_BATCH_MAX + 1],
+                n: chunk.len() as i32,
+            };
+            let mut total = 0usize;
+            for (slot, &i) in chunk.iter().enumerate() {
+                a.param[slot] = self.param[i];
+                a.grad[slot] = self.grad[i];
+                a.m[slot] = self.m[i];
+                a.v[slot] = self.v[i];
+                a.wd[slot] = self.wd[i];
+                a.off[slot] = total as i32;
+                total += self.len[i];
+            }
+            a.off[chunk.len()] = total as i32;
+            let total_i = total as i32;
+            let mut lb = gpu.stream.launch_builder(&f);
+            lb.arg(&a)
+                .arg(&lr)
+                .arg(&b1)
+                .arg(&b2)
+                .arg(&eps)
+                .arg(&bc1)
+                .arg(&bc2)
+                .arg(&total_i);
+            unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("adamw_batch");
+        }
+
+        // Clear the gradients now that every queued update has consumed them.
+        for (&g, &n) in self.grad.iter().zip(self.len.iter()) {
+            // SAFETY: `g` is a live device allocation of at least `n` floats (it was
+            // read from a `DTensor` of that length above and the caller guarantees it
+            // is still alive), and the memset is queued on the same stream as the
+            // launches that just read it, so it cannot run early.
+            unsafe {
+                let r = cudarc::driver::sys::cuMemsetD8Async(
+                    g,
+                    0,
+                    n * std::mem::size_of::<f32>(),
+                    gpu.stream.cu_stream(),
+                );
+                assert_eq!(
+                    r,
+                    cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "AdamwQueue: zeroing gradient failed: {r:?}"
+                );
+            }
+        }
+        self.clear();
+    }
+
+    fn clear(&mut self) {
+        self.param.clear();
+        self.grad.clear();
+        self.m.clear();
+        self.v.clear();
+        self.wd.clear();
+        self.len.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.param.is_empty()
+    }
+}
+
 pub fn adamw(
     gpu: &Gpu,
     param: &mut DTensor,
@@ -2070,11 +2301,38 @@ pub fn cumsum_logsig(gpu: &Gpu, f: &DTensor) -> DTensor {
     let (bh, t) = (f.rows(), f.cols());
     let mut fc = DTensor::uninit(gpu, &[bh, t]);
     let (ti, bhi) = (t as i32, bh as i32);
+    if !no_block_scan() {
+        // One block per row: the row is contiguous across lanes and the scan is a
+        // shuffle tree. The thread-per-row form below reads a full row apart per
+        // lane and fits the whole launch in one block (grid=1 at BH=1024).
+        let func = gpu.kernels.get("cumsum_logsig_block");
+        let mut lb = gpu.stream.launch_builder(&func);
+        lb.arg(&f.buf).arg(&mut fc.buf).arg(&ti).arg(&bhi);
+        let cfg = LaunchConfig {
+            grid_dim: (bh as u32, 1, 1),
+            block_dim: (scan_block_dim(t), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { lb.launch(cfg) }.expect("cumsum_logsig_block");
+        return fc;
+    }
     let func = gpu.kernels.get("cumsum_logsig");
     let mut lb = gpu.stream.launch_builder(&func);
     lb.arg(&f.buf).arg(&mut fc.buf).arg(&ti).arg(&bhi);
     unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("cumsum_logsig");
     fc
+}
+
+/// `GPU_NO_BLOCK_SCAN=1` reverts the gate scans to the thread-per-row kernels.
+fn no_block_scan() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("GPU_NO_BLOCK_SCAN").is_ok_and(|v| v != "0"))
+}
+
+/// Block width for the per-row scans: the row length rounded up to a warp, capped at
+/// 1024. A row shorter than the block leaves the tail lanes idle but still coalesced.
+fn scan_block_dim(t: usize) -> u32 {
+    t.div_ceil(32).clamp(1, 32) as u32 * 32
 }
 
 /// Per-row stabilizer `m` `[BH, T]` = `max(max_{j≤t}(fc_t−fc_j+ig_j), fc_t+m_prev)`.
@@ -2181,6 +2439,161 @@ fn slice_t_inner(
         .arg(&total_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("slice_t");
     out
+}
+
+/// Most tensors one batched slice/unslice launch can carry. Must match
+/// `SLICE_BATCH_MAX` in `mlstm_ops.cu`.
+pub const SLICE_BATCH_MAX: usize = 8;
+
+/// `GPU_NO_SLICE_BATCH=1` reverts slice/unslice to one launch per tensor.
+fn no_slice_batch() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GPU_NO_SLICE_BATCH").is_ok_and(|v| v != "0"))
+}
+
+/// Kernel-argument twin of `SliceBatch` in `mlstm_ops.cu`. Passed by value, so the
+/// field order and types must match the `.cu` definition exactly.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SliceBatchArg {
+    src: [u64; SLICE_BATCH_MAX],
+    dst: [u64; SLICE_BATCH_MAX],
+    w: [i32; SLICE_BATCH_MAX],
+    off: [i32; SLICE_BATCH_MAX + 1],
+    n: i32,
+}
+
+// SAFETY: a plain-old-data struct of pointers and integers, passed by value as a
+// kernel argument exactly as `cudarc` does for the scalar types.
+unsafe impl cudarc::driver::DeviceRepr for SliceBatchArg {}
+
+/// Slice the same T-range out of several tensors in one launch.
+///
+/// The chunked mLSTM sweep slices q/k/v and the two gate rows (forward), and five
+/// gradient tensors (backward), out of an identical time range back to back. Each is
+/// a ~2 us copy, so separate launches are dominated by launch cost.
+///
+/// Each entry is `(tensor, W)` with the width given explicitly rather than read from
+/// `shape[2]`: the gate tensors are rank-2 `[BH, T]` (width 1), so a rank-3 reading
+/// would take a garbage width. `bh` and `t` are likewise explicit — this is the
+/// batched [`slice_t_as`], and outputs come back in input order as `[BH, len, W]`.
+pub fn slice_t_batch(
+    gpu: &Gpu,
+    srcs: &[(&DTensor, usize)],
+    bh: usize,
+    t: usize,
+    c0: usize,
+    len: usize,
+) -> Vec<DTensor> {
+    assert!(
+        srcs.len() <= SLICE_BATCH_MAX,
+        "slice_t_batch: {} tensors exceeds SLICE_BATCH_MAX",
+        srcs.len()
+    );
+    assert!(c0 + len <= t, "slice_t_batch: chunk [{c0}, {}) out of range T={t}", c0 + len);
+
+    // A/B toggle: fall back to one launch per tensor, so both paths can be measured
+    // in the same process (thermal drift makes cross-process timings incomparable).
+    if no_slice_batch() {
+        return srcs.iter().map(|&(x, w)| slice_t_as(gpu, x, bh, t, w, c0, len)).collect();
+    }
+
+    let mut outs: Vec<DTensor> =
+        srcs.iter().map(|&(_, w)| DTensor::uninit(gpu, &[bh, len, w])).collect();
+    let mut a = SliceBatchArg {
+        src: [0; SLICE_BATCH_MAX],
+        dst: [0; SLICE_BATCH_MAX],
+        w: [0; SLICE_BATCH_MAX],
+        off: [0; SLICE_BATCH_MAX + 1],
+        n: srcs.len() as i32,
+    };
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let mut total = 0usize;
+    // The guards keep each buffer's pointer valid for this stream; they are scoped so
+    // they release the borrow on `outs` right after the launch is queued.
+    {
+        let mut guards = Vec::with_capacity(srcs.len() * 2);
+        for (i, (&(x, w), out)) in srcs.iter().zip(outs.iter_mut()).enumerate() {
+            assert_eq!(bh * t * w, x.len(), "slice_t_batch: dims do not cover the tensor");
+            let (ps, gs) = x.buf.device_ptr(&gpu.stream);
+            let (pd, gd) = out.buf.device_ptr_mut(&gpu.stream);
+            a.src[i] = ps;
+            a.dst[i] = pd;
+            guards.push(gs);
+            guards.push(gd);
+            a.w[i] = w as i32;
+            a.off[i] = total as i32;
+            total += bh * len * w;
+        }
+        a.off[srcs.len()] = total as i32;
+
+        let (ti, li, c0i, total_i) = (t as i32, len as i32, c0 as i32, total as i32);
+        let f = gpu.kernels.get("slice_t_batch");
+        let mut lb = gpu.stream.launch_builder(&f);
+        lb.arg(&a).arg(&ti).arg(&li).arg(&c0i).arg(&total_i);
+        unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("slice_t_batch");
+    }
+    outs
+}
+
+/// Write several chunks back into their full tensors in one launch — the
+/// [`slice_t_batch`] inverse. Each entry is `(dst, src, W)`, with `W` explicit for
+/// the same reason as in `slice_t_batch`: a source may be rank-2.
+pub fn unslice_t_batch(
+    gpu: &Gpu,
+    pairs: &mut [(&mut DTensor, &DTensor, usize)],
+    bh: usize,
+    t: usize,
+    c0: usize,
+    len: usize,
+) {
+    assert!(
+        pairs.len() <= SLICE_BATCH_MAX,
+        "unslice_t_batch: {} tensors exceeds SLICE_BATCH_MAX",
+        pairs.len()
+    );
+    assert!(c0 + len <= t, "unslice_t_batch: chunk [{c0}, {}) out of range T={t}", c0 + len);
+
+    if no_slice_batch() {
+        for (dst, src, w) in pairs.iter_mut() {
+            unslice_t_inner(gpu, dst, src, bh, t, *w, len, c0);
+        }
+        return;
+    }
+
+    let mut a = SliceBatchArg {
+        src: [0; SLICE_BATCH_MAX],
+        dst: [0; SLICE_BATCH_MAX],
+        w: [0; SLICE_BATCH_MAX],
+        off: [0; SLICE_BATCH_MAX + 1],
+        n: pairs.len() as i32,
+    };
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let n_pairs = pairs.len();
+    let mut guards = Vec::with_capacity(n_pairs * 2);
+    let mut total = 0usize;
+    for (i, (dst, src, w)) in pairs.iter_mut().enumerate() {
+        let w = *w;
+        assert_eq!(bh * t * w, dst.len(), "unslice_t_batch: dims do not cover the destination");
+        assert_eq!(src.len(), bh * len * w, "unslice_t_batch: source size mismatch");
+        let (ps, gs) = src.buf.device_ptr(&gpu.stream);
+        let (pd, gd) = dst.buf.device_ptr_mut(&gpu.stream);
+        a.src[i] = ps;
+        a.dst[i] = pd;
+        guards.push(gs);
+        guards.push(gd);
+        a.w[i] = w as i32;
+        a.off[i] = total as i32;
+        total += bh * len * w;
+    }
+    a.off[n_pairs] = total as i32;
+
+    let (ti, li, c0i, total_i) = (t as i32, len as i32, c0 as i32, total as i32);
+    let f = gpu.kernels.get("unslice_t_batch");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&a).arg(&ti).arg(&li).arg(&c0i).arg(&total_i);
+    unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("unslice_t_batch");
 }
 
 /// Write `src` `[BH, len, W]` back into the T-range `[c0, c0+len)` of `dst`
@@ -2357,6 +2770,28 @@ pub fn mlstm_chunk_ab_bwd(
 ) {
     let (bh, l) = (b.rows(), b.cols());
     let (li, bhl) = (l as i32, (bh * l) as i32);
+    if !no_block_scan() {
+        // One block per row: the `t == L-1` thread's serial row sum becomes a block
+        // reduction, and the whole launch stops fitting in two blocks.
+        let bh_i = bh as i32;
+        let f = gpu.kernels.get("mlstm_chunk_ab_bwd_block");
+        let mut lb = gpu.stream.launch_builder(&f);
+        lb.arg(&db.buf)
+            .arg(&da.buf)
+            .arg(&b.buf)
+            .arg(&a.buf)
+            .arg(&mut dfc.buf)
+            .arg(&mut dig.buf)
+            .arg(&li)
+            .arg(&bh_i);
+        let cfg = LaunchConfig {
+            grid_dim: (bh as u32, 1, 1),
+            block_dim: (scan_block_dim(l), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { lb.launch(cfg) }.expect("mlstm_chunk_ab_bwd_block");
+        return;
+    }
     let f = gpu.kernels.get("mlstm_chunk_ab_bwd");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&db.buf)
@@ -2470,7 +2905,10 @@ pub fn masked_softmax_ce_u32_into(
     let mut dlogits = DTensor::uninit(gpu, &[r, c]);
     let mut row_loss = gpu.stream.alloc_zeros::<f32>(r).expect("alloc row_loss");
     let (c_i, r_i) = (c as i32, r as i32);
-    let f = gpu.kernels.get("masked_softmax_ce");
+    let block = !no_block_scan();
+    let f = gpu
+        .kernels
+        .get(if block { "masked_softmax_ce_block" } else { "masked_softmax_ce" });
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&logits.buf)
         .arg(dtargets)
@@ -2480,7 +2918,17 @@ pub fn masked_softmax_ce_u32_into(
         .arg(&c_i)
         .arg(&inv)
         .arg(&r_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(r as u32)) }.expect("masked_softmax_ce");
+    let cfg = if block {
+        // One block per row; the row is C wide, so size the block to it.
+        LaunchConfig {
+            grid_dim: (r as u32, 1, 1),
+            block_dim: (scan_block_dim(c), 1, 1),
+            shared_mem_bytes: 0,
+        }
+    } else {
+        LaunchConfig::for_num_elems(r as u32)
+    };
+    unsafe { lb.launch(cfg) }.expect("masked_softmax_ce");
     match acc {
         Some(dst) => {
             sum_into(gpu, &row_loss, r, inv, dst);
@@ -2626,6 +3074,22 @@ pub fn revcumsum_dlogsig(gpu: &Gpu, dfc: &DTensor, f: &DTensor) -> DTensor {
     let (bh, t) = (dfc.rows(), dfc.cols());
     let mut df = DTensor::uninit(gpu, &[bh, t]);
     let (ti, bhi) = (t as i32, bh as i32);
+    if !no_block_scan() {
+        let func = gpu.kernels.get("revcumsum_dlogsig_block");
+        let mut lb = gpu.stream.launch_builder(&func);
+        lb.arg(&dfc.buf)
+            .arg(&f.buf)
+            .arg(&mut df.buf)
+            .arg(&ti)
+            .arg(&bhi);
+        let cfg = LaunchConfig {
+            grid_dim: (bh as u32, 1, 1),
+            block_dim: (scan_block_dim(t), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { lb.launch(cfg) }.expect("revcumsum_dlogsig_block");
+        return df;
+    }
     let func = gpu.kernels.get("revcumsum_dlogsig");
     let mut lb = gpu.stream.launch_builder(&func);
     lb.arg(&dfc.buf)
@@ -3300,6 +3764,258 @@ mod tests {
         assert_eq!(got.len(), want.len(), "length mismatch");
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
             assert!((g - w).abs() < 1e-3, "index {i}: gpu {g} vs cpu {w}");
+        }
+    }
+
+    /// A queued+flushed AdamW must leave params, moments and grads exactly where the
+    /// per-tensor `adamw` leaves them.
+    ///
+    /// Tensor sizes are deliberately uneven and the decay flags mixed, so the
+    /// kernel's per-slot offset search and per-slot `wd` are both exercised — a
+    /// kernel that used slot 0's `wd` for every slot would pass a uniform test.
+    #[test]
+    fn adamw_batch_matches_per_tensor_adamw() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let sizes = [1usize, 17, 256, 1000, 4096];
+        let decays = [true, false, true, true, false];
+        let mk = |seed: f32, n: usize| {
+            let d: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.19 + seed).sin())).collect();
+            DTensor::from_host(&gpu, &Tensor::new(&[n], d))
+        };
+        // The second moment is a running mean of squares, so it is non-negative by
+        // construction; seeding it from `sin` would put `sqrt` on negative input.
+        let mk_v = |seed: f32, n: usize| {
+            let d: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.19 + seed).sin()).abs()).collect();
+            DTensor::from_host(&gpu, &Tensor::new(&[n], d))
+        };
+        // lr·wd must be large enough for a wrong per-slot `wd` to exceed the 1e-3
+        // comparison tolerance — at the production 1e-3/0.05 the decay term is 5e-5
+        // and a kernel using slot 0's `wd` everywhere would pass unnoticed.
+        let cfg = AdamCfg { t: 3, ..AdamCfg::new(0.5, 0.5) };
+
+        let mut fast: Vec<_> = sizes
+            .iter()
+            .enumerate()
+            .map(|(k, &n)| {
+                (
+                    mk(k as f32, n),
+                    mk(k as f32 + 10.0, n),
+                    mk(k as f32 + 20.0, n),
+                    mk_v(k as f32 + 30.0, n),
+                )
+            })
+            .collect();
+        let mut slow: Vec<_> = sizes
+            .iter()
+            .enumerate()
+            .map(|(k, &n)| {
+                (
+                    mk(k as f32, n),
+                    mk(k as f32 + 10.0, n),
+                    mk(k as f32 + 20.0, n),
+                    mk_v(k as f32 + 30.0, n),
+                )
+            })
+            .collect();
+
+        let mut q = AdamwQueue::new();
+        for (i, (p, g, m, v)) in fast.iter_mut().enumerate() {
+            q.push(&gpu, p, g, m, v, &cfg, decays[i]);
+        }
+        q.flush(&gpu, &cfg);
+
+        for (i, (p, g, m, v)) in slow.iter_mut().enumerate() {
+            adamw(&gpu, p, g, m, v, &cfg, decays[i]);
+            g.zero_(&gpu);
+        }
+
+        for (i, ((pf, gf, mf, vf), (ps, gs, ms, vs))) in fast.iter().zip(slow.iter()).enumerate() {
+            assert_close(&pf.to_host(&gpu).data, &ps.to_host(&gpu).data);
+            assert_close(&mf.to_host(&gpu).data, &ms.to_host(&gpu).data);
+            assert_close(&vf.to_host(&gpu).data, &vs.to_host(&gpu).data);
+            // Both paths must leave the gradient zeroed.
+            let gd = gf.to_host(&gpu).data;
+            assert!(gd.iter().all(|x| *x == 0.0), "tensor {i}: queued grad not zeroed");
+            assert_close(&gd, &gs.to_host(&gpu).data);
+        }
+    }
+
+    /// The block-per-row CE and chunk-ab backward must match their thread-per-row
+    /// twins. Masked rows are included: a masked row must zero its gradient row and
+    /// contribute no loss, which the block form does on a separate early-out path.
+    #[test]
+    fn block_ce_and_chunk_ab_bwd_match_thread_per_row() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        for &(r, c) in &[(5usize, 9usize), (7, 32), (4, 260), (3, 700)] {
+            let logits = {
+                let d: Vec<f32> = (0..r * c).map(|i| ((i as f32 * 0.31).cos()) * 4.0).collect();
+                DTensor::from_host(&gpu, &Tensor::new(&[r, c], d))
+            };
+            let targets: Vec<u32> = (0..r).map(|i| (i * 7 % c) as u32).collect();
+            // Mask out every third row, so both branches are exercised.
+            let mask: Vec<u32> = (0..r).map(|i| u32::from(i % 3 != 0)).collect();
+            let dt = gpu.stream.clone_htod(&targets).expect("targets");
+            let dm = gpu.stream.clone_htod(&mask).expect("mask");
+            let inv = 0.25;
+
+            let (tv, mv) = (dt.slice(..), dm.slice(..));
+            let (_, fast) = masked_softmax_ce_u32_into(&gpu, &logits, &tv, &mv, inv, None);
+
+            let (c_i, r_i) = (c as i32, r as i32);
+            let mut slow = DTensor::uninit(&gpu, &[r, c]);
+            let mut rl = gpu.stream.alloc_zeros::<f32>(r).expect("row_loss");
+            let f = gpu.kernels.get("masked_softmax_ce");
+            let mut lb = gpu.stream.launch_builder(&f);
+            lb.arg(&logits.buf)
+                .arg(&tv)
+                .arg(&mv)
+                .arg(&mut slow.buf)
+                .arg(&mut rl)
+                .arg(&c_i)
+                .arg(&inv)
+                .arg(&r_i);
+            unsafe { lb.launch(LaunchConfig::for_num_elems(r as u32)) }.expect("slow ce");
+            assert_close(&fast.to_host(&gpu).data, &slow.to_host(&gpu).data);
+        }
+
+        // chunk_ab backward: dfc/dig are accumulated onto, so both paths start from
+        // the same non-zero state to catch a kernel that overwrites instead of adds.
+        for &(bh, l) in &[(3usize, 8usize), (6, 64), (4, 256)] {
+            let mk = |s: f32| {
+                let d: Vec<f32> = (0..bh * l).map(|i| ((i as f32 * 0.23 + s).sin())).collect();
+                DTensor::from_host(&gpu, &Tensor::new(&[bh, l], d))
+            };
+            let (db, da, b, a) = (mk(0.0), mk(1.0), mk(2.0), mk(3.0));
+            let (mut dfc_f, mut dig_f) = (mk(4.0), mk(5.0));
+            let (mut dfc_s, mut dig_s) = (mk(4.0), mk(5.0));
+
+            mlstm_chunk_ab_bwd(&gpu, &db, &da, &b, &a, &mut dfc_f, &mut dig_f);
+
+            let (li, bhl) = (l as i32, (bh * l) as i32);
+            let f = gpu.kernels.get("mlstm_chunk_ab_bwd");
+            let mut lb = gpu.stream.launch_builder(&f);
+            lb.arg(&db.buf)
+                .arg(&da.buf)
+                .arg(&b.buf)
+                .arg(&a.buf)
+                .arg(&mut dfc_s.buf)
+                .arg(&mut dig_s.buf)
+                .arg(&li)
+                .arg(&bhl);
+            unsafe { lb.launch(LaunchConfig::for_num_elems((bh * l) as u32)) }.expect("slow ab");
+
+            assert_close(&dfc_f.to_host(&gpu).data, &dfc_s.to_host(&gpu).data);
+            assert_close(&dig_f.to_host(&gpu).data, &dig_s.to_host(&gpu).data);
+        }
+    }
+
+    /// The block-per-row gate scans must match the thread-per-row kernels exactly.
+    ///
+    /// Row lengths straddle the block width on purpose: `T` below the warp size, at a
+    /// warp boundary, and above one block's worth (so the kernel's tile loop and its
+    /// `running` carry between tiles are both exercised). A scan that lost the carry
+    /// would still be right for `T <= blockDim` and wrong only past it.
+    #[test]
+    fn block_scans_match_thread_per_row() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        for &(bh, t) in &[(3usize, 7usize), (5, 32), (4, 100), (9, 256), (2, 1100)] {
+            // Values spanning both signs, so log_sigmoid/sigmoid are exercised away
+            // from their saturated tails where everything agrees trivially.
+            let mk = |seed: f32| {
+                let data: Vec<f32> = (0..bh * t)
+                    .map(|i| ((i as f32 * 0.37 + seed).sin()) * 3.0)
+                    .collect();
+                DTensor::from_host(&gpu, &Tensor::new(&[bh, t], data))
+            };
+            let f = mk(0.0);
+            let dfc = mk(1.7);
+
+            let fast_fc = cumsum_logsig(&gpu, &f).to_host(&gpu);
+            let fast_df = revcumsum_dlogsig(&gpu, &dfc, &f).to_host(&gpu);
+
+            // Same inputs through the thread-per-row kernels.
+            let (ti, bhi) = (t as i32, bh as i32);
+            let mut slow_fc = DTensor::uninit(&gpu, &[bh, t]);
+            let func = gpu.kernels.get("cumsum_logsig");
+            let mut lb = gpu.stream.launch_builder(&func);
+            lb.arg(&f.buf).arg(&mut slow_fc.buf).arg(&ti).arg(&bhi);
+            unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slow cumsum");
+
+            let mut slow_df = DTensor::uninit(&gpu, &[bh, t]);
+            let func = gpu.kernels.get("revcumsum_dlogsig");
+            let mut lb = gpu.stream.launch_builder(&func);
+            lb.arg(&dfc.buf)
+                .arg(&f.buf)
+                .arg(&mut slow_df.buf)
+                .arg(&ti)
+                .arg(&bhi);
+            unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slow revcumsum");
+
+            assert_close(&fast_fc.data, &slow_fc.to_host(&gpu).data);
+            assert_close(&fast_df.data, &slow_df.to_host(&gpu).data);
+        }
+    }
+
+    /// The batched slice/unslice must agree element-for-element with the per-tensor
+    /// kernels, including at differing row widths and a ragged final chunk.
+    ///
+    /// Widths differ on purpose: q/k/v share `dqk` but the backward pass batches
+    /// `[dqk, dqk, dhv, 1, 1]`-wide tensors together, so a kernel that assumed one
+    /// common `W` would pass a uniform test and corrupt the real sweep.
+    #[test]
+    fn slice_batch_matches_per_tensor_slice() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let (bh, t) = (6, 20);
+        let widths = [4usize, 4, 7, 1, 3];
+        let srcs: Vec<DTensor> = widths
+            .iter()
+            .enumerate()
+            .map(|(k, &w)| {
+                let data: Vec<f32> =
+                    (0..bh * t * w).map(|i| (i as f32) * 0.25 + k as f32 * 1000.0).collect();
+                DTensor::from_host(&gpu, &Tensor::new(&[bh, t, w], data))
+            })
+            .collect();
+        let refs: Vec<(&DTensor, usize)> =
+            srcs.iter().zip(widths.iter()).map(|(x, &w)| (x, w)).collect();
+
+        // A chunk that does not divide T, so the last one is ragged.
+        for (c0, len) in [(0usize, 7usize), (7, 7), (14, 6)] {
+            let batched = slice_t_batch(&gpu, &refs, bh, t, c0, len);
+            for (i, x) in srcs.iter().enumerate() {
+                let want = slice_t(&gpu, x, c0, len).to_host(&gpu);
+                assert_close(&batched[i].to_host(&gpu).data, &want.data);
+            }
+
+            // Round-trip: unslice the chunks back into fresh tensors and compare
+            // against the per-tensor path doing the same.
+            let mut got: Vec<DTensor> =
+                widths.iter().map(|&w| DTensor::zeros(&gpu, &[bh, t, w])).collect();
+            let mut want: Vec<DTensor> =
+                widths.iter().map(|&w| DTensor::zeros(&gpu, &[bh, t, w])).collect();
+            {
+                let mut pairs: Vec<(&mut DTensor, &DTensor, usize)> = got
+                    .iter_mut()
+                    .zip(batched.iter())
+                    .zip(widths.iter())
+                    .map(|((d, s), &w)| (d, s, w))
+                    .collect();
+                unslice_t_batch(&gpu, &mut pairs, bh, t, c0, len);
+            }
+            for (w, b) in want.iter_mut().zip(batched.iter()) {
+                unslice_t(&gpu, w, b, c0);
+            }
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert_close(&g.to_host(&gpu).data, &w.to_host(&gpu).data);
+            }
         }
     }
 

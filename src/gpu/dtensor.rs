@@ -13,6 +13,56 @@ use cudarc::driver::CudaSlice;
 use super::Gpu;
 use crate::tensor::{MAX_RANK, Tensor};
 
+/// Records the device address of every `uninit` allocation, so a run can be checked
+/// for pointer stability across steps — the precondition for replaying a captured
+/// CUDA graph, whose nodes bake in raw pointers.
+///
+/// Diagnostic only, off unless `GPU_PTR_PROBE=1`; `dump` prints per-step overlap.
+pub mod ptr_probe {
+    use super::{CudaSlice, Gpu};
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static SEQ: OnceLock<Mutex<Vec<u64>>> = OnceLock::new();
+
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("GPU_PTR_PROBE").is_ok_and(|v| v != "0"))
+    }
+
+    pub fn record(gpu: &Gpu, buf: &CudaSlice<f32>) {
+        if !on() {
+            return;
+        }
+        use cudarc::driver::DevicePtr;
+        let (p, _g) = buf.device_ptr(&gpu.stream);
+        SEQ.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap().push(p);
+    }
+
+    /// Split the recorded addresses into `steps` equal parts and report, for each
+    /// consecutive pair, how often the same allocation index yields the same address.
+    pub fn dump(steps: usize) {
+        if !on() {
+            return;
+        }
+        let v = SEQ.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
+        let n = v.len() / steps;
+        println!("ptr_probe: {} allocs total, {} per step", v.len(), n);
+        for s in 1..steps {
+            let (a, b) = (&v[(s - 1) * n..s * n], &v[s * n..(s + 1) * n]);
+            let same = a.iter().zip(b).filter(|(x, y)| x == y).count();
+            println!(
+                "  step {} vs {}: {}/{} identical addresses ({:.1}%)",
+                s - 1,
+                s,
+                same,
+                n,
+                100.0 * same as f64 / n as f64
+            );
+        }
+    }
+}
+
 /// A dense, row-major, contiguous `f32` tensor resident in device memory.
 /// Shape layout mirrors [`Tensor`]: only `shape[..rank]` are meaningful.
 pub struct DTensor {
@@ -69,6 +119,9 @@ impl DTensor {
         let n: usize = dims.iter().product();
         // SAFETY: contract above — every element is written before it is read.
         let buf = unsafe { gpu.stream.alloc::<f32>(n) }.expect("device alloc");
+        if ptr_probe::on() {
+            ptr_probe::record(gpu, &buf);
+        }
         let mut shape = [0usize; MAX_RANK];
         shape[..dims.len()].copy_from_slice(dims);
         Self {

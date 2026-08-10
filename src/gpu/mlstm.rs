@@ -646,11 +646,22 @@ impl MLstm {
         let mut chunks = Vec::with_capacity(spans.len());
 
         for (ci, &(c0, len)) in spans.iter().enumerate() {
-            let qc = ops::slice_t(gpu, &qh, c0, len); // [BH, L, dqk]
-            let kc = ops::slice_t(gpu, &kh, c0, len);
-            let vc = ops::slice_t(gpu, &vh, c0, len); // [BH, L, dhv]
-            let igc = ops::slice_t_as(gpu, &igh, bh, t, 1, c0, len).reshaped(&[bh, len]);
-            let fgc = ops::slice_t_as(gpu, &fgh, bh, t, 1, c0, len).reshaped(&[bh, len]);
+            // One launch for all five: q/k/v are [BH, T, dqk|dhv] and the two gate
+            // tensors are [BH, T, 1], so they share BH and T and differ only in width.
+            let mut sl = ops::slice_t_batch(
+                gpu,
+                &[(&qh, dqk), (&kh, dqk), (&vh, dhv), (&igh, 1), (&fgh, 1)],
+                bh,
+                t,
+                c0,
+                len,
+            )
+            .into_iter();
+            let qc = sl.next().expect("qc"); // [BH, L, dqk]
+            let kc = sl.next().expect("kc");
+            let vc = sl.next().expect("vc"); // [BH, L, dhv]
+            let igc = sl.next().expect("igc").reshaped(&[bh, len]);
+            let fgc = sl.next().expect("fgc").reshaped(&[bh, len]);
 
             // Decay/stabilizer machinery, on the chunk-LOCAL cumulative log-forget.
             // `m_state` enters via the `fc_t + m_prev` branch of the row-max, which
@@ -1084,11 +1095,26 @@ impl MLstm {
             let (c0, len) = (ch.c0, ch.len);
             let is_last = ci + 1 == sv.chunks.len();
 
-            let qc = ops::slice_t(gpu, &sv.qh, c0, len); // [BH, L, dqk]
-            let kc = ops::slice_t(gpu, &sv.kh, c0, len);
-            let vc = ops::slice_t(gpu, &sv.vh, c0, len); // [BH, L, dhv]
-            let fgc = ops::slice_t_as(gpu, &sv.fgh, bh, t, 1, c0, len).reshaped(&[bh, len]);
-            let d_ytil_c = ops::slice_t(gpu, &d_ytil, c0, len); // [BH, L, dhv]
+            let mut sl = ops::slice_t_batch(
+                gpu,
+                &[
+                    (&sv.qh, dqk),
+                    (&sv.kh, dqk),
+                    (&sv.vh, dhv),
+                    (&sv.fgh, 1),
+                    (&d_ytil, dhv),
+                ],
+                bh,
+                t,
+                c0,
+                len,
+            )
+            .into_iter();
+            let qc = sl.next().expect("qc"); // [BH, L, dqk]
+            let kc = sl.next().expect("kc");
+            let vc = sl.next().expect("vc"); // [BH, L, dhv]
+            let fgc = sl.next().expect("fgc").reshaped(&[bh, len]);
+            let d_ytil_c = sl.next().expect("d_ytil_c"); // [BH, L, dhv]
 
             // ỹ = num/ψ  → d_num, d_qn  (num/ψ/qn all include the inter term).
             let (d_num, d_qn) =
@@ -1205,11 +1231,22 @@ impl MLstm {
             // is the chunk-local cumsum.
             let d_fgc = ops::revcumsum_dlogsig(gpu, &dfc, &fgc); // [BH, L]
 
-            ops::unslice_t(gpu, &mut dqh, &dqc, c0);
-            ops::unslice_t(gpu, &mut dkh, &dkc, c0);
-            ops::unslice_t(gpu, &mut dvh, &dvc, c0);
-            ops::unslice_t(gpu, &mut digh, &dig.reshaped(&[bh, len, 1]), c0);
-            ops::unslice_t(gpu, &mut d_fgh3, &d_fgc.reshaped(&[bh, len, 1]), c0);
+            // One launch for all five; the widths are explicit, so the rank-2 gate
+            // gradients need no reshape (and hence no temporary).
+            ops::unslice_t_batch(
+                gpu,
+                &mut [
+                    (&mut dqh, &dqc, dqk),
+                    (&mut dkh, &dkc, dqk),
+                    (&mut dvh, &dvc, dhv),
+                    (&mut digh, &dig, 1),
+                    (&mut d_fgh3, &d_fgc, 1),
+                ],
+                bh,
+                t,
+                c0,
+                len,
+            );
 
             // Hand the incoming-state grads to the predecessor chunk.
             dc_carry = dc_in.unwrap_or_else(|| DTensor::zeros(gpu, &[bh, dhv, dqk]));
@@ -1281,6 +1318,11 @@ impl MLstm {
     /// AdamW step: projection + output matrices decay; biases and head-norm γ
     /// don't (all handled by the sub-layers). Clears the grads.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
+        self.step_q(gpu, cfg, None);
+    }
+
+    /// [`step`](Self::step), optionally queueing instead of launching.
+    pub fn step_q(&mut self, gpu: &Gpu, cfg: &AdamCfg, mut q: Option<&mut ops::AdamwQueue>) {
         for l in [
             &mut self.lin_q,
             &mut self.lin_k,
@@ -1290,9 +1332,9 @@ impl MLstm {
             &mut self.lin_f,
             &mut self.lin_out,
         ] {
-            l.step(gpu, cfg);
+            l.step_wd_q(gpu, cfg, true, q.as_deref_mut());
         }
-        self.headnorm.step(gpu, cfg);
+        self.headnorm.step_q(gpu, cfg, q.as_deref_mut());
     }
 }
 
@@ -1308,6 +1350,9 @@ impl Cell for MLstm {
     }
     fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
         MLstm::step(self, gpu, cfg)
+    }
+    fn step_q(&mut self, gpu: &Gpu, cfg: &AdamCfg, q: Option<&mut ops::AdamwQueue>) {
+        MLstm::step_q(self, gpu, cfg, q)
     }
     fn params_mut(&mut self) -> Vec<&mut DTensor> {
         MLstm::params_mut(self)
