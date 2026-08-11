@@ -1874,13 +1874,20 @@ mod tests {
         let (loss_single, w_single) = run(false);
         unsafe { std::env::remove_var("GPU_NO_GROUP") };
 
+        // Splitting a bucket changes only which rows share a rectangle, so under fp32
+        // the two legs agree to reassociation. The sLSTM's fused path stages `Wh` in
+        // bf16 (see `ops::fused_bf16_enabled`), and the two groupings then reduce the
+        // recurrence in a different order at 8-bit mantissas — so the bound follows the
+        // staging dtype. A real batching bug (a row in the wrong rectangle, a grad
+        // dropped on a split) moves these by orders of magnitude, not by 1e-5.
+        let tol = if ops::fused_bf16_enabled() { 1e-3 } else { 1e-5 };
         assert!(
-            (loss_grouped - loss_single).abs() < 1e-5,
+            (loss_grouped - loss_single).abs() < tol,
             "grouped loss {loss_grouped} != single-rectangle loss {loss_single}"
         );
         for (i, (a, b)) in w_grouped.iter().zip(&w_single).enumerate() {
             assert!(
-                (a - b).abs() < 1e-5,
+                (a - b).abs() < tol,
                 "post-step weight {i} diverged: grouped {a} vs single {b}"
             );
         }

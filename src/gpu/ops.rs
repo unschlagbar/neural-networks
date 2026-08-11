@@ -1735,27 +1735,32 @@ pub fn slstm_step_fused(
 /// round-trip per timestep — which is exactly why that version lost at H=512.
 ///
 /// Halving the weights' shared footprint also lets a block own more units, which
-/// is a second-order win on top of the traffic.
+/// is what decides whether the fused path exists at all above H=640.
 ///
-/// **Off by default** (`SLSTM_BF16=1` enables it), because at the backbone's shape
-/// it measured *neutral*: 5.66ms against 5.60ms for fp32 staging.
+/// **On by default**; `SLSTM_NO_BF16=1` forces fp32 staging, which is the A/B
+/// baseline.
 ///
-/// The reason is structural, and worth recording so it is not re-attempted blindly.
-/// bf16 halves the shared footprint (56 KB -> 29 KB per block), but the grid size
-/// here is pinned by the SM count, not by shared memory: a cooperative launch needs
-/// the whole grid co-resident, so `geometry` picks 84 blocks — one per SM — under
-/// either dtype, giving the same 7 units per block and the same number of FMAs. The
-/// freed shared memory would allow 3 blocks per SM instead of 1, but a cooperative
-/// grid has no additional blocks to place there. So bf16 buys a smaller footprint
-/// that nothing consumes, in exchange for 8-bit mantissas.
+/// At H=512 this was neutral (5.66ms against 5.60ms) and the path was off: the grid
+/// there is pinned by the SM count, not by shared memory, so `geometry` picks one
+/// block per SM under either dtype and the freed shared memory buys nothing a
+/// cooperative grid can use.
 ///
-/// It would start paying if the grid ever became shared-memory-bound rather than
-/// SM-bound — a much larger H, or a non-cooperative formulation — which is why the
-/// path is kept rather than deleted. It is also the prerequisite for a tensor-core
-/// (WMMA) reduction, whose fragments must be 16-bit.
+/// At H=768 — the backbone's width — the grid becomes shared-memory-bound instead,
+/// which is the case that paragraph predicted. A block's fp32 slice needs
+/// `H*4*units*4` bytes, so `max_units` falls to 8 and the grid would need 96 blocks
+/// of an 84-SM card: the cooperative launch cannot be co-resident and the fused path
+/// **declines entirely**, dropping the cell to the per-step loop. bf16 staging halves
+/// the slice, 10 units fit per block, 77 blocks suffice, and the path exists again.
+/// Measured on the sLSTM cell at B=1, T=1024: 20.50 -> 9.56ms; on a whole 4096-word
+/// training step, 1017 -> 715ms.
+///
+/// The cost is an 8-bit mantissa on the staged operand: parity against the per-step
+/// loop moves from ~1e-6 to ~1e-3 relative (see `examples/fused_bf16_parity.rs`),
+/// which is the storage dtype's noise floor, not a defect. The accumulator stays
+/// fp32 throughout.
 pub fn fused_bf16_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SLSTM_BF16").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("SLSTM_NO_BF16").is_err())
 }
 
 /// Launch geometry for [`slstm_fused_time`]: `(blocks, threads, cols_per_block,
@@ -1828,13 +1833,17 @@ pub fn slstm_fused_time_geometry(
 pub fn slstm_fused_time_bwd_geometry(
     gpu: &Gpu,
     h: usize,
-    _b: usize,
+    b: usize,
 ) -> Option<(usize, usize, usize, usize)> {
     let h4 = 4 * h;
     let threads = 256usize;
     let smem_cap = gpu.max_shared_optin.saturating_sub(1024);
-    let per_unit = h4 * 4; // one fp32 Wh row
-    let max_units = smem_cap / per_unit;
+    // One staged Wh row, 2 bytes per entry under bf16 staging.
+    let per_unit = h4 * if fused_bf16_enabled() { 2 } else { 4 };
+    // Plus one fp32 [B, 4H] copy of the step's gate deltas, shared by every warp in
+    // the block (see the kernel's `dgsh`). Fixed cost, independent of the unit count.
+    let dg_bytes = b * h4 * 4;
+    let max_units = smem_cap.saturating_sub(dg_bytes) / per_unit;
     if max_units == 0 {
         return None;
     }
@@ -1842,7 +1851,7 @@ pub fn slstm_fused_time_bwd_geometry(
     let blocks = gpu.sm_count.max(min_blocks).min(h);
     let units_per_block = h.div_ceil(blocks);
     let blocks = h.div_ceil(units_per_block);
-    let shared_bytes = units_per_block * per_unit;
+    let shared_bytes = units_per_block * per_unit + dg_bytes;
     if shared_bytes > smem_cap || blocks > gpu.sm_count {
         return None;
     }
@@ -1880,8 +1889,14 @@ pub fn slstm_fused_time_bwd(
     let (t_i, h_i, b_i, upb_i) = (t as i32, h as i32, b as i32, units_per_block as i32);
     let f = gpu
         .kernels
-        .specialized(&gpu.context, "slstm_fused_time_bwd", h, b, false)
-        .unwrap_or_else(|| gpu.kernels.get("slstm_fused_time_bwd"));
+        .specialized(&gpu.context, "slstm_fused_time_bwd", h, b, fused_bf16_enabled());
+    // The unspecialized module is built without -DFUSED_BF16, so it would read the
+    // staged rows at the wrong stride. Under bf16 there is no fallback to take.
+    let f = match f {
+        Some(f) => f,
+        None if !fused_bf16_enabled() => gpu.kernels.get("slstm_fused_time_bwd"),
+        None => return false,
+    };
     if let Err(e) = f.set_attribute(
         cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         shared_bytes as i32,

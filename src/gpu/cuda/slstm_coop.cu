@@ -29,8 +29,8 @@ namespace cg = cooperative_groups;
 //
 // Shape contract: gridDim.x * cols_per_block >= 4H, blockDim.x threads per block,
 // B*H <= blockDim.x * gridDim.x for the state update. `wh` is [H, 4H] row-major.
-// Everything is fp32: this kernel removes traffic by staying on-chip, so unlike
-// the bf16 experiment there is nothing to gain from narrowing the dtype here.
+// Under FUSED_BF16 the staged operands are bf16 and the accumulators fp32; above
+// H=640 that is what keeps the grid co-resident at all (see `fused_bf16_enabled`).
 // SPECIALIZATION (FlashRNN's `-DFLASHRNN_HIDDEN_SIZE=... -DFLASHRNN_BATCH_SIZE=...`
 // in `flashrnn.py`): when SLSTM_H / SLSTM_B are defined, H and B become compile-time
 // constants and the runtime arguments are ignored. That lets the compiler give the
@@ -275,11 +275,29 @@ extern "C" __global__ void slstm_fused_time_bwd(
     const int j0 = blockIdx.x * units_per_block;
     const int nj = max(0, min(units_per_block, FUSED_H - j0));
 
-    // Stage this block's Wh rows: smem[u * H4 + c] = wh[(j0 + u) * H4 + c].
+    // Stage this block's Wh rows: wsh[u * H4 + c] = wh[(j0 + u) * H4 + c].
     // Row-major keeps the contraction's lane stride contiguous in c.
+    //
+    // Under FUSED_BF16 the staged rows are bf16, halving a block's footprint so it
+    // can own twice the units. That is what decides whether this path exists at all
+    // above H=640: a row costs 4H, so at fp32 the grid needs more blocks than the
+    // device has SMs and the cooperative launch is declined. Storage is bf16, the
+    // accumulator below stays fp32 — the same split as the forward.
+#ifdef FUSED_BF16
+    __nv_bfloat16* wsh = (__nv_bfloat16*)smem;
+    float* dgsh = (float*)(wsh + (long long)nj * H4);
+#else
+    float* wsh = smem;
+    float* dgsh = wsh + (long long)nj * H4;
+#endif
     for (int i = threadIdx.x; i < nj * H4; i += blockDim.x) {
         int u = i / H4, c = i - u * H4;
-        smem[i] = wh[(long long)(j0 + u) * H4 + c];
+        float v = wh[(long long)(j0 + u) * H4 + c];
+#ifdef FUSED_BF16
+        wsh[i] = __float2bfloat16(v);
+#else
+        wsh[i] = v;
+#endif
     }
     grid.sync();
 
@@ -329,6 +347,15 @@ extern "C" __global__ void slstm_fused_time_bwd(
         }
         grid.sync(); // all gate deltas visible before any block contracts them
 
+        // Stage the whole [B, 4H] delta vector into shared memory once. Every warp
+        // below reduces against it, and without this each would re-read it from
+        // global — the same 4H floats fetched by all `gridDim.x` blocks on the
+        // critical path of every timestep.
+        for (int i = threadIdx.x; i < FUSED_B * H4; i += blockDim.x) {
+            dgsh[i] = dgates_all[i];
+        }
+        __syncthreads();
+
         // --- contraction: dh_recur[b, j] = sum_c dgates_all[b, c] * Wh[j, c] ---
         // One warp per (batch, owned unit), lanes striding the 4H reduction. The
         // staged row is contiguous in c, so the lane reads are coalesced.
@@ -337,10 +364,16 @@ extern "C" __global__ void slstm_fused_time_bwd(
         const int warps = blockDim.x >> 5;
         for (int i = warp; i < FUSED_B * nj; i += warps) {
             int b = i / nj, u = i - b * nj;
-            const float* dg = dgates_all + (long long)b * H4;
-            const float* wrow = smem + (long long)u * H4;
+            const float* dg = dgsh + (long long)b * H4;
             float acc = 0.0f;
+#ifdef FUSED_BF16
+            const __nv_bfloat16* wrow = wsh + (long long)u * H4;
+            for (int c = lane; c < H4; c += 32)
+                acc = fmaf(dg[c], __bfloat162float(wrow[c]), acc);
+#else
+            const float* wrow = wsh + (long long)u * H4;
             for (int c = lane; c < H4; c += 32) acc = fmaf(dg[c], wrow[c], acc);
+#endif
             #pragma unroll
             for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
             if (lane == 0) dh_recur[b * FUSED_H + j0 + u] = acc;
