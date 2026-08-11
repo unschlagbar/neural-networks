@@ -520,6 +520,64 @@ impl GemmBf16 {
         let rhs = self.w.as_ref().expect("staged");
         matmul_bf16_into(gpu, form, lhs, rhs, c, beta);
     }
+
+    /// A Linear's two backward GEMMs, `dW += Xᵀ·dY` and `dX = dY·Wᵀ`, driven from a
+    /// **single** narrowed `dy`.
+    ///
+    /// Running them as separate `run`/`run_wb` calls narrows `dy` twice — the same
+    /// values, through two different slots. The cast is launch-bound at these shapes
+    /// (two thirds of them are under 1.5 µs), so the duplicate is nearly all overhead.
+    pub fn run_backward(
+        &mut self,
+        gpu: &Gpu,
+        x: &DTensor,
+        dy: &DTensor,
+        w: &DTensor,
+        dw: &mut DTensor,
+        dx: &mut DTensor,
+    ) {
+        // `dy` is the shared operand: right for `Tn`, left for `Nt`. It lives in `rhs`
+        // so `lhs` stays free for `x`.
+        let n = dy.len();
+        match &mut self.rhs {
+            Some(t) if t.capacity() >= n => t.shrink_to(dy.dims()),
+            _ => self.rhs = Some(super::BTensor::uninit(gpu, dy.dims())),
+        }
+        self.rhs.as_mut().expect("just filled").store(gpu, dy);
+
+        let nx = x.len();
+        match &mut self.lhs {
+            Some(t) if t.capacity() >= nx => t.shrink_to(x.dims()),
+            _ => self.lhs = Some(super::BTensor::uninit(gpu, x.dims())),
+        }
+        self.lhs.as_mut().expect("just filled").store(gpu, x);
+
+        {
+            let lhs = self.lhs.as_ref().expect("staged");
+            let rhs = self.rhs.as_ref().expect("staged");
+            matmul_bf16_into(gpu, MmForm::Tn, lhs, rhs, dw, 1.0);
+        }
+
+        // `dX = dY·Wᵀ`. Without the weight cache the weight has to go somewhere, and
+        // `lhs` (holding `x`, already consumed above) is the free slot.
+        if !wcache_enabled() {
+            let n2 = w.len();
+            match &mut self.lhs {
+                Some(t) if t.capacity() >= n2 => t.shrink_to(w.dims()),
+                _ => self.lhs = Some(super::BTensor::uninit(gpu, w.dims())),
+            }
+            self.lhs.as_mut().expect("just filled").store(gpu, w);
+        } else {
+            self.stage_w(gpu, w);
+        }
+        let dy_b = self.rhs.as_ref().expect("staged");
+        let w_b = if wcache_enabled() {
+            self.w.as_ref().expect("staged")
+        } else {
+            self.lhs.as_ref().expect("staged")
+        };
+        matmul_bf16_into(gpu, MmForm::Nt, dy_b, w_b, dx, 0.0);
+    }
 }
 
 /// `C = A · B` (fresh allocation). Convenience wrapper over [`matmul_nn_into`].
@@ -1763,6 +1821,14 @@ pub fn fused_bf16_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("SLSTM_NO_BF16").is_err())
 }
 
+/// Grid width for the fused kernels, overriding the geometry's own choice. Clamped
+/// to what shared memory allows, so an override can only ever widen the grid beyond
+/// `min_blocks`, never break the contract.
+fn fused_blocks_override() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("SLSTM_BLOCKS").ok().and_then(|v| v.parse().ok()))
+}
+
 /// Launch geometry for [`slstm_fused_time`]: `(blocks, threads, cols_per_block,
 /// shared_bytes)`, or `None` when the shape does not fit the kernel's contract.
 ///
@@ -1801,6 +1867,10 @@ pub fn slstm_fused_time_geometry(
     // costs far more than the extra sync saves.
     let min_blocks = h.div_ceil(max_units);
     let blocks = gpu.sm_count.max(min_blocks).min(h);
+    // `SLSTM_BLOCKS` re-opens that tradeoff to measurement: it is a choice, not a
+    // derived optimum, and it moves with H and the staging dtype. Swept at H=768/bf16
+    // (60 -> 10.57ms, 77 -> 9.90ms, 84 -> 9.92ms): wider still wins, default stands.
+    let blocks = fused_blocks_override().unwrap_or(blocks).max(min_blocks).min(h);
     let cols_per_block = h.div_ceil(blocks);
     // Recompute: rounding the slice up may need fewer blocks than requested.
     let blocks = h.div_ceil(cols_per_block);
@@ -1849,6 +1919,7 @@ pub fn slstm_fused_time_bwd_geometry(
     }
     let min_blocks = h.div_ceil(max_units);
     let blocks = gpu.sm_count.max(min_blocks).min(h);
+    let blocks = fused_blocks_override().unwrap_or(blocks).max(min_blocks).min(h);
     let units_per_block = h.div_ceil(blocks);
     let blocks = h.div_ceil(units_per_block);
     let shared_bytes = units_per_block * per_unit + dg_bytes;

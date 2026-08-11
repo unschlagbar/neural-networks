@@ -245,9 +245,17 @@ impl Linear {
             [dy.rows(), self.input],
             "Linear::backward — dx shape"
         );
-        Self::grad_w(gpu, &mut self.gemm, self.bf16, x, dy, &mut self.dw);
-        ops::add_col_sum(gpu, &mut self.db, dy);
-        self.grad_x(gpu, dy, dx);
+        if self.bf16 {
+            // Both GEMMs read `dy`; narrowing it once for the pair drops a cast launch
+            // per Linear backward.
+            self.gemm
+                .run_backward(gpu, x, dy, &self.w, &mut self.dw, dx);
+            ops::add_col_sum(gpu, &mut self.db, dy);
+        } else {
+            Self::grad_w(gpu, &mut self.gemm, self.bf16, x, dy, &mut self.dw);
+            ops::add_col_sum(gpu, &mut self.db, dy);
+            self.grad_x(gpu, dy, dx);
+        }
     }
 
     /// `dW += Xᵀ · dY` (accumulating, `beta = 1`).
