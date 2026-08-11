@@ -727,6 +727,17 @@ impl TrainingState {
         self.step.is_multiple_of(self.print_interval)
     }
 
+    /// Running mean of an extra column since the last log, without consuming it.
+    /// `get_loss` resets the accumulators, so read this before calling it.
+    pub fn metric_mean(&self, name: &str) -> f32 {
+        match self.extra_cols.iter().position(|c| c == name) {
+            Some(i) if self.extra_vals[i].1 > 0 => {
+                self.extra_vals[i].0 / self.extra_vals[i].1 as f32
+            }
+            _ => 0.0,
+        }
+    }
+
     pub fn get_loss(&mut self) -> f32 {
         let loss = self.loss / self.loss_steps as f32;
         self.loss = 0.0;

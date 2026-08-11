@@ -31,7 +31,7 @@ pub const DECAY_STEPS: usize = 150_000;
 pub const BATCH_SIZE: usize = 8;
 pub const EPOCHS: usize = 1;
 
-pub const SAVE_EVERY: usize = 100;
+pub const SAVE_EVERY: usize = 1000;
 pub const LOG_EVERY: usize = 10;
 
 // Per-stack decoupled weight decay (λ), passed at optimizer-step time. `0.0`

@@ -310,7 +310,11 @@ pub fn matmul_bf16_into(
         MmForm::Tn => (a.dims()[1], a.dims()[0], b.dims()[1], b.dims()[0]),
     };
     assert_eq!(ka, kb, "matmul_bf16: inner dims {ka} != {kb}");
-    assert_eq!((c.rows(), c.cols()), (m, n), "matmul_bf16: C shape mismatch");
+    assert_eq!(
+        (c.rows(), c.cols()),
+        (m, n),
+        "matmul_bf16: C shape mismatch"
+    );
 
     // Mirrors the fp32 wrappers' (transa, transb, lda, ldb) per form.
     let (transa, transb, lda, ldb) = match form {
@@ -413,10 +417,7 @@ impl GemmBf16 {
         // sound while the weight's shape is fixed — which it is: a layer's `w` is
         // allocated once at `[in, out]` and only ever stepped in place. A shape change
         // therefore means a different tensor, and is treated as a miss.
-        let same_shape = self
-            .w
-            .as_ref()
-            .is_some_and(|t| t.dims() == src.dims());
+        let same_shape = self.w.as_ref().is_some_and(|t| t.dims() == src.dims());
         if !(self.w_valid && same_shape) {
             let n = src.len();
             match &mut self.w {
@@ -571,12 +572,22 @@ pub fn batched_tf32() -> bool {
 /// path used. `CUBLAS_COMPUTE_32F_FAST_TF32` keeps the buffers, the accumulator and
 /// the result fp32 and narrows only the multiplicand mantissas to 10 bits.
 #[allow(clippy::too_many_arguments)]
-fn batched_gemm(gpu: &Gpu, cfg: StridedBatchedConfig<f32>, b: &DTensor, a: &DTensor, c: &mut DTensor, what: &str) {
+fn batched_gemm(
+    gpu: &Gpu,
+    cfg: StridedBatchedConfig<f32>,
+    b: &DTensor,
+    a: &DTensor,
+    c: &mut DTensor,
+    what: &str,
+) {
     if !batched_tf32() {
         // SAFETY: shapes and leading dimensions are the caller's, which the shape
         // asserts above validate; all three buffers are live device allocations.
-        unsafe { gpu.blas.gemm_strided_batched(cfg, &b.buf, &a.buf, &mut c.buf) }
-            .unwrap_or_else(|e| panic!("cublas gemm_strided_batched {what}: {e:?}"));
+        unsafe {
+            gpu.blas
+                .gemm_strided_batched(cfg, &b.buf, &a.buf, &mut c.buf)
+        }
+        .unwrap_or_else(|e| panic!("cublas gemm_strided_batched {what}: {e:?}"));
         return;
     }
 
@@ -830,7 +841,14 @@ pub fn embedding_scatter_add(
     dy: &DTensor,
     dim: usize,
 ) {
-    embedding_scatter_add_u32(gpu, dtable, &upload_ids(gpu, ids).slice(..), ids.len(), dy, dim);
+    embedding_scatter_add_u32(
+        gpu,
+        dtable,
+        &upload_ids(gpu, ids).slice(..),
+        ids.len(),
+        dy,
+        dim,
+    );
 }
 
 /// [`embedding_scatter_add`] against ids already resident on the device.
@@ -1025,10 +1043,7 @@ pub fn softmax_cross_entropy(gpu: &Gpu, logits: &DTensor, targets: &[usize]) -> 
         .arg(&inv_b)
         .arg(&b_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems(b as u32)) }.expect("softmax_ce");
-    let losses = gpu
-        .stream
-        .clone_dtoh(&row_loss)
-        .expect("download row_loss");
+    let losses = gpu.stream.clone_dtoh(&row_loss).expect("download row_loss");
     let loss = losses.iter().sum::<f32>() * inv_b;
     (loss, dlogits)
 }
@@ -1134,7 +1149,10 @@ impl AdamwQueue {
         let (lr, b1, b2, eps) = (cfg.lr, cfg.beta1, cfg.beta2, cfg.eps);
         let f = gpu.kernels.get("adamw_batch");
 
-        for chunk in (0..self.param.len()).collect::<Vec<_>>().chunks(ADAMW_BATCH_MAX) {
+        for chunk in (0..self.param.len())
+            .collect::<Vec<_>>()
+            .chunks(ADAMW_BATCH_MAX)
+        {
             let mut a = AdamwBatchArg {
                 param: [0; ADAMW_BATCH_MAX],
                 grad: [0; ADAMW_BATCH_MAX],
@@ -2238,14 +2256,7 @@ pub fn head_scatter_into(
 /// **more** than fp32 alone. That was measured: the naive ordering made a training
 /// step 32 MB larger rather than smaller. Writing narrow from the start is what
 /// removes the wide buffer from the working set.
-pub fn head_gather_slab(
-    gpu: &Gpu,
-    x: &DTensor,
-    b: usize,
-    h: usize,
-    t: usize,
-    w: usize,
-) -> SlabBuf {
+pub fn head_gather_slab(gpu: &Gpu, x: &DTensor, b: usize, h: usize, t: usize, w: usize) -> SlabBuf {
     let mut out = SlabBuf::new(gpu, &[b * h, t, w]);
     let (bi, hi, ti, wi) = (b as i32, h as i32, t as i32, w as i32);
     let name = match out {
@@ -2287,11 +2298,7 @@ pub fn head_scatter_slab_into(
     let f = gpu.kernels.get(name);
     let mut lb = gpu.stream.launch_builder(&f);
     push_slab_ref!(lb, *x);
-    lb.arg(&mut out.buf)
-        .arg(&bi)
-        .arg(&hi)
-        .arg(&ti)
-        .arg(&wi);
+    lb.arg(&mut out.buf).arg(&bi).arg(&hi).arg(&ti).arg(&wi);
     unsafe { lb.launch(LaunchConfig::for_num_elems((b * h * t * w) as u32)) }
         .expect("head_scatter_slab");
 }
@@ -2401,7 +2408,11 @@ pub fn slice_t_as(
     c0: usize,
     len: usize,
 ) -> DTensor {
-    assert_eq!(bh * t * w, x.len(), "slice_t_as: dims do not cover the tensor");
+    assert_eq!(
+        bh * t * w,
+        x.len(),
+        "slice_t_as: dims do not cover the tensor"
+    );
     slice_t_inner(gpu, x, bh, t, w, c0, len)
 }
 
@@ -2491,16 +2502,25 @@ pub fn slice_t_batch(
         "slice_t_batch: {} tensors exceeds SLICE_BATCH_MAX",
         srcs.len()
     );
-    assert!(c0 + len <= t, "slice_t_batch: chunk [{c0}, {}) out of range T={t}", c0 + len);
+    assert!(
+        c0 + len <= t,
+        "slice_t_batch: chunk [{c0}, {}) out of range T={t}",
+        c0 + len
+    );
 
     // A/B toggle: fall back to one launch per tensor, so both paths can be measured
     // in the same process (thermal drift makes cross-process timings incomparable).
     if no_slice_batch() {
-        return srcs.iter().map(|&(x, w)| slice_t_as(gpu, x, bh, t, w, c0, len)).collect();
+        return srcs
+            .iter()
+            .map(|&(x, w)| slice_t_as(gpu, x, bh, t, w, c0, len))
+            .collect();
     }
 
-    let mut outs: Vec<DTensor> =
-        srcs.iter().map(|&(_, w)| DTensor::uninit(gpu, &[bh, len, w])).collect();
+    let mut outs: Vec<DTensor> = srcs
+        .iter()
+        .map(|&(_, w)| DTensor::uninit(gpu, &[bh, len, w]))
+        .collect();
     let mut a = SliceBatchArg {
         src: [0; SLICE_BATCH_MAX],
         dst: [0; SLICE_BATCH_MAX],
@@ -2515,7 +2535,11 @@ pub fn slice_t_batch(
     {
         let mut guards = Vec::with_capacity(srcs.len() * 2);
         for (i, (&(x, w), out)) in srcs.iter().zip(outs.iter_mut()).enumerate() {
-            assert_eq!(bh * t * w, x.len(), "slice_t_batch: dims do not cover the tensor");
+            assert_eq!(
+                bh * t * w,
+                x.len(),
+                "slice_t_batch: dims do not cover the tensor"
+            );
             let (ps, gs) = x.buf.device_ptr(&gpu.stream);
             let (pd, gd) = out.buf.device_ptr_mut(&gpu.stream);
             a.src[i] = ps;
@@ -2553,7 +2577,11 @@ pub fn unslice_t_batch(
         "unslice_t_batch: {} tensors exceeds SLICE_BATCH_MAX",
         pairs.len()
     );
-    assert!(c0 + len <= t, "unslice_t_batch: chunk [{c0}, {}) out of range T={t}", c0 + len);
+    assert!(
+        c0 + len <= t,
+        "unslice_t_batch: chunk [{c0}, {}) out of range T={t}",
+        c0 + len
+    );
 
     if no_slice_batch() {
         for (dst, src, w) in pairs.iter_mut() {
@@ -2575,8 +2603,16 @@ pub fn unslice_t_batch(
     let mut total = 0usize;
     for (i, (dst, src, w)) in pairs.iter_mut().enumerate() {
         let w = *w;
-        assert_eq!(bh * t * w, dst.len(), "unslice_t_batch: dims do not cover the destination");
-        assert_eq!(src.len(), bh * len * w, "unslice_t_batch: source size mismatch");
+        assert_eq!(
+            bh * t * w,
+            dst.len(),
+            "unslice_t_batch: dims do not cover the destination"
+        );
+        assert_eq!(
+            src.len(),
+            bh * len * w,
+            "unslice_t_batch: source size mismatch"
+        );
         let (ps, gs) = src.buf.device_ptr(&gpu.stream);
         let (pd, gd) = dst.buf.device_ptr_mut(&gpu.stream);
         a.src[i] = ps;
@@ -2906,9 +2942,11 @@ pub fn masked_softmax_ce_u32_into(
     let mut row_loss = gpu.stream.alloc_zeros::<f32>(r).expect("alloc row_loss");
     let (c_i, r_i) = (c as i32, r as i32);
     let block = !no_block_scan();
-    let f = gpu
-        .kernels
-        .get(if block { "masked_softmax_ce_block" } else { "masked_softmax_ce" });
+    let f = gpu.kernels.get(if block {
+        "masked_softmax_ce_block"
+    } else {
+        "masked_softmax_ce"
+    });
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&logits.buf)
         .arg(dtargets)
@@ -2935,10 +2973,7 @@ pub fn masked_softmax_ce_u32_into(
             (0.0, dlogits)
         }
         None => {
-            let losses = gpu
-                .stream
-                .clone_dtoh(&row_loss)
-                .expect("download row_loss");
+            let losses = gpu.stream.clone_dtoh(&row_loss).expect("download row_loss");
             (losses.iter().sum::<f32>() * inv, dlogits)
         }
     }
@@ -3446,7 +3481,6 @@ pub struct MlstmDState {
     pub dn: DTensor, // [BH, dqk]
 }
 
-
 /// One launch for the whole `[BH, stride]` <-> `[BH, slots, stride]` slot copy.
 ///
 /// `gather` reads slot `idx` into a flat tensor; otherwise it writes the flat tensor
@@ -3464,8 +3498,13 @@ fn state_slot_copy(
 ) {
     let n = bh * stride;
     let f = gpu.kernels.get("state_slot_copy");
-    let (bh_i, slots_i, idx_i, stride_i, g_i) =
-        (bh as i32, slots as i32, idx as i32, stride as i32, i32::from(gather));
+    let (bh_i, slots_i, idx_i, stride_i, g_i) = (
+        bh as i32,
+        slots as i32,
+        idx as i32,
+        stride as i32,
+        i32::from(gather),
+    );
     let mut b = gpu.stream.launch_builder(&f);
     b.arg(&src.buf)
         .arg(&mut dst.buf)
@@ -3510,7 +3549,14 @@ fn read_state_slot_n(
 /// The destination holds `slots` states per `bh`, each `stride` elements; the source
 /// holds one per `bh`. So `bh`'s slot 0 lives at `bh * slots * stride`, and this walks
 /// `bh` copying `stride` elements into each.
-fn seed_state_slot0(gpu: &Gpu, src: &DTensor, dst: &mut DTensor, bh: usize, slots: usize, stride: usize) {
+fn seed_state_slot0(
+    gpu: &Gpu,
+    src: &DTensor,
+    dst: &mut DTensor,
+    bh: usize,
+    slots: usize,
+    stride: usize,
+) {
     debug_assert_eq!(src.len(), bh * stride, "carry state: wrong source size");
     state_slot_copy(gpu, src, dst, bh, slots, 0, stride, false);
 }
@@ -3781,19 +3827,24 @@ mod tests {
         let sizes = [1usize, 17, 256, 1000, 4096];
         let decays = [true, false, true, true, false];
         let mk = |seed: f32, n: usize| {
-            let d: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.19 + seed).sin())).collect();
+            let d: Vec<f32> = (0..n).map(|i| (i as f32 * 0.19 + seed).sin()).collect();
             DTensor::from_host(&gpu, &Tensor::new(&[n], d))
         };
         // The second moment is a running mean of squares, so it is non-negative by
         // construction; seeding it from `sin` would put `sqrt` on negative input.
         let mk_v = |seed: f32, n: usize| {
-            let d: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.19 + seed).sin()).abs()).collect();
+            let d: Vec<f32> = (0..n)
+                .map(|i| ((i as f32 * 0.19 + seed).sin()).abs())
+                .collect();
             DTensor::from_host(&gpu, &Tensor::new(&[n], d))
         };
         // lr·wd must be large enough for a wrong per-slot `wd` to exceed the 1e-3
         // comparison tolerance — at the production 1e-3/0.05 the decay term is 5e-5
         // and a kernel using slot 0's `wd` everywhere would pass unnoticed.
-        let cfg = AdamCfg { t: 3, ..AdamCfg::new(0.5, 0.5) };
+        let cfg = AdamCfg {
+            t: 3,
+            ..AdamCfg::new(0.5, 0.5)
+        };
 
         let mut fast: Vec<_> = sizes
             .iter()
@@ -3837,7 +3888,10 @@ mod tests {
             assert_close(&vf.to_host(&gpu).data, &vs.to_host(&gpu).data);
             // Both paths must leave the gradient zeroed.
             let gd = gf.to_host(&gpu).data;
-            assert!(gd.iter().all(|x| *x == 0.0), "tensor {i}: queued grad not zeroed");
+            assert!(
+                gd.iter().all(|x| *x == 0.0),
+                "tensor {i}: queued grad not zeroed"
+            );
             assert_close(&gd, &gs.to_host(&gpu).data);
         }
     }
@@ -3852,7 +3906,9 @@ mod tests {
         };
         for &(r, c) in &[(5usize, 9usize), (7, 32), (4, 260), (3, 700)] {
             let logits = {
-                let d: Vec<f32> = (0..r * c).map(|i| ((i as f32 * 0.31).cos()) * 4.0).collect();
+                let d: Vec<f32> = (0..r * c)
+                    .map(|i| ((i as f32 * 0.31).cos()) * 4.0)
+                    .collect();
                 DTensor::from_host(&gpu, &Tensor::new(&[r, c], d))
             };
             let targets: Vec<u32> = (0..r).map(|i| (i * 7 % c) as u32).collect();
@@ -3886,7 +3942,7 @@ mod tests {
         // the same non-zero state to catch a kernel that overwrites instead of adds.
         for &(bh, l) in &[(3usize, 8usize), (6, 64), (4, 256)] {
             let mk = |s: f32| {
-                let d: Vec<f32> = (0..bh * l).map(|i| ((i as f32 * 0.23 + s).sin())).collect();
+                let d: Vec<f32> = (0..bh * l).map(|i| (i as f32 * 0.23 + s).sin()).collect();
                 DTensor::from_host(&gpu, &Tensor::new(&[bh, l], d))
             };
             let (db, da, b, a) = (mk(0.0), mk(1.0), mk(2.0), mk(3.0));
@@ -3979,13 +4035,17 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(k, &w)| {
-                let data: Vec<f32> =
-                    (0..bh * t * w).map(|i| (i as f32) * 0.25 + k as f32 * 1000.0).collect();
+                let data: Vec<f32> = (0..bh * t * w)
+                    .map(|i| (i as f32) * 0.25 + k as f32 * 1000.0)
+                    .collect();
                 DTensor::from_host(&gpu, &Tensor::new(&[bh, t, w], data))
             })
             .collect();
-        let refs: Vec<(&DTensor, usize)> =
-            srcs.iter().zip(widths.iter()).map(|(x, &w)| (x, w)).collect();
+        let refs: Vec<(&DTensor, usize)> = srcs
+            .iter()
+            .zip(widths.iter())
+            .map(|(x, &w)| (x, w))
+            .collect();
 
         // A chunk that does not divide T, so the last one is ragged.
         for (c0, len) in [(0usize, 7usize), (7, 7), (14, 6)] {
@@ -3997,10 +4057,14 @@ mod tests {
 
             // Round-trip: unslice the chunks back into fresh tensors and compare
             // against the per-tensor path doing the same.
-            let mut got: Vec<DTensor> =
-                widths.iter().map(|&w| DTensor::zeros(&gpu, &[bh, t, w])).collect();
-            let mut want: Vec<DTensor> =
-                widths.iter().map(|&w| DTensor::zeros(&gpu, &[bh, t, w])).collect();
+            let mut got: Vec<DTensor> = widths
+                .iter()
+                .map(|&w| DTensor::zeros(&gpu, &[bh, t, w]))
+                .collect();
+            let mut want: Vec<DTensor> = widths
+                .iter()
+                .map(|&w| DTensor::zeros(&gpu, &[bh, t, w]))
+                .collect();
             {
                 let mut pairs: Vec<(&mut DTensor, &DTensor, usize)> = got
                     .iter_mut()
@@ -4053,7 +4117,11 @@ mod tests {
         // mid-sequence — the case where a naive implementation reallocates under an
         // in-flight copy.
         let groups: Vec<Vec<u32>> = (0..8)
-            .map(|g| (0..(3 + g * 5)).map(|i| ((g * 7 + i) % rows) as u32).collect())
+            .map(|g| {
+                (0..(3 + g * 5))
+                    .map(|i| ((g * 7 + i) % rows) as u32)
+                    .collect()
+            })
             .collect();
 
         // Something slow between the upload and the gather, so the copy for group
@@ -4129,10 +4197,7 @@ mod tests {
             };
             let a = Tensor::random(&ad, 1.0);
             let b = Tensor::random(&bd, 1.0);
-            let (da, db) = (
-                DTensor::from_host(&gpu, &a),
-                DTensor::from_host(&gpu, &b),
-            );
+            let (da, db) = (DTensor::from_host(&gpu, &a), DTensor::from_host(&gpu, &b));
 
             let mut want = DTensor::uninit(&gpu, &[m, n]);
             match form {
@@ -4179,8 +4244,20 @@ mod tests {
         use cudarc::driver::DevicePtr;
         let mut g = GemmBf16::new();
         let addr = |g: &GemmBf16| {
-            let l = g.lhs.as_ref().expect("staged").buf.device_ptr(&gpu.stream).0;
-            let r = g.rhs.as_ref().expect("staged").buf.device_ptr(&gpu.stream).0;
+            let l = g
+                .lhs
+                .as_ref()
+                .expect("staged")
+                .buf
+                .device_ptr(&gpu.stream)
+                .0;
+            let r = g
+                .rhs
+                .as_ref()
+                .expect("staged")
+                .buf
+                .device_ptr(&gpu.stream)
+                .0;
             (l, r)
         };
 
@@ -4191,7 +4268,11 @@ mod tests {
         let first = addr(&g);
         for _ in 0..5 {
             g.run(&gpu, MmForm::Nn, &a, &b, &mut c, 0.0);
-            assert_eq!(first, addr(&g), "steady shape must reuse the staging buffers");
+            assert_eq!(
+                first,
+                addr(&g),
+                "steady shape must reuse the staging buffers"
+            );
         }
 
         // A smaller call fits the existing allocation, so it must not reallocate —
@@ -4199,7 +4280,11 @@ mod tests {
         let a2 = DTensor::from_host(&gpu, &Tensor::random(&[32, 32], 1.0));
         let mut c2 = DTensor::uninit(&gpu, &[32, 16]);
         g.run(&gpu, MmForm::Nn, &a2, &b, &mut c2, 0.0);
-        assert_eq!(first, addr(&g), "a smaller shape must fit the existing buffers");
+        assert_eq!(
+            first,
+            addr(&g),
+            "a smaller shape must fit the existing buffers"
+        );
     }
 
     /// `beta = 1` must accumulate into C rather than overwrite it — the weight

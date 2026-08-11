@@ -99,7 +99,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
     );
 
     let mut state = TrainingState::from_step(model.step_count);
-    state.init_log(model_path, &[]);
+    state.init_log(model_path, &["word_loss"]);
     // Buffer CSV rows and only flush them when the model is saved (every
     // SAVE_EVERY steps), so the on-disk log never gets ahead of the checkpoint.
     state.set_defer_log_flush(true);
@@ -148,6 +148,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                 model.seen.add_pretrain(tokens.len(), words.len());
                 tokens_since_print += tokens.len();
                 state.log_tokens(tokens.len());
+                state.log_metric("word_loss", model.last_word_loss());
 
                 // `state.step` returns Some(lr) only on a batch boundary, so grads
                 // accumulate over BATCH_SIZE windows before each optimizer step.
@@ -159,12 +160,14 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                 model.step_count = state.step;
 
                 if state.print() {
+                    let word_loss = state.metric_mean("word_loss");
                     let loss = state.get_loss();
                     println!(
-                        "{} | char loss {:.4} | ppl {:.4} | lr {:.2e} | {} tok | {:.1?}",
+                        "{} | char loss {:.4} | ppl {:.4} | word loss {:.4} | lr {:.2e} | {} tok | {:.1?}",
                         state.step,
                         loss,
                         loss.exp(),
+                        word_loss,
                         opt.lr,
                         tokens_since_print,
                         time.elapsed(),

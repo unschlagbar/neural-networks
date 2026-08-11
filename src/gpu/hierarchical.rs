@@ -401,6 +401,10 @@ pub struct Hierarchical {
     /// inside the decode loop — it drains the stream and page-locks a staging buffer,
     /// per group, for a number only used in logging.
     loss_acc: Option<cudarc::driver::CudaSlice<f32>>,
+    /// Mean NLL per decoded word of the last window — the same quantity the CPU
+    /// path logs as `word_loss`. Derived from the window's row loss on the host,
+    /// so it costs no extra device work.
+    last_word_loss: f32,
 }
 
 /// Environment switches, resolved once when the model is built.
@@ -495,6 +499,7 @@ impl Hierarchical {
             scratch: Scratch::default(),
             ids: ops::IdBatch::new(),
             loss_acc: None,
+            last_word_loss: 0.0,
         };
         model.enable_backbone_offload(gpu);
         model
@@ -531,6 +536,11 @@ impl Hierarchical {
     /// Forward + backward over one window; accumulates all grads and returns the
     /// mean decode cross-entropy. `tokens` are char ids; `words` are `(start,
     /// end)` char ranges. Word 0 is encode-only; words 1..n are decoded.
+    /// Mean NLL per decoded word of the last window (`word_loss` in the logs).
+    pub fn last_word_loss(&self) -> f32 {
+        self.last_word_loss
+    }
+
     pub fn forward_backward(&mut self, gpu: &Gpu, tokens: &[usize], words: &[Range<usize>]) -> f32 {
         let loss = self.forward_backward_window(gpu, tokens, words, None);
         gpu.stream.synchronize().expect("stream sync");
@@ -953,6 +963,11 @@ impl Hierarchical {
             .clone_dtoh(&acc)
             .expect("download loss_acc")[0];
         self.loss_acc = Some(acc);
+        // Per-word NLL from the same total: `loss` is the row sum over `valid_rows`,
+        // so scaling by rows/words re-averages it over words instead. Both counts are
+        // already on the host, so the second metric costs no device work.
+        let scored_words = (0..dw).filter(|&w| word_on(w)).count();
+        self.last_word_loss = loss * (valid_rows as f32) / (scored_words.max(1) as f32);
         mark("decoder fwd + bwd");
 
         // Backbone backward.
@@ -1695,6 +1710,55 @@ mod tests {
                 "rep {rep}: loss {got} != {first} — nondeterministic forward/backward"
             );
         }
+    }
+
+    /// `word_loss` is the window's summed NLL re-averaged over words instead of
+    /// rows, so it must equal the char loss scaled by the true rows-per-word ratio.
+    /// The ratio here is recomputed from the word lengths, independently of the
+    /// counters the model itself used — including the `+1` for each `[W]` step.
+    #[test]
+    fn word_loss_is_char_loss_rescaled_by_rows_per_word() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let cfg = HierCfg {
+            vocab: 12,
+            hc: 32,
+            wh: 48,
+            enc_blocks: 2,
+            bb_blocks: 2,
+            dec_blocks: 2,
+            heads: 4,
+            dqk: 8,
+            w_token: 11,
+            cap: 30.0,
+        };
+        // Mixed lengths, so rows-per-word is not a whole number and a mistaken
+        // `+1` (or a missing one) cannot coincidentally match.
+        let mut tokens: Vec<usize> = Vec::new();
+        let mut words: Vec<Range<usize>> = Vec::new();
+        for w in 0..32 {
+            let s = tokens.len();
+            let len = 1 + (w * 5) % 7;
+            for k in 0..len {
+                tokens.push(1 + (k + w) % 9);
+            }
+            words.push(Range { start: s, end: tokens.len() });
+        }
+
+        let mut model = Hierarchical::new(&gpu, &cfg);
+        let char_loss = model.forward_backward(&gpu, &tokens, &words);
+        let word_loss = model.last_word_loss();
+
+        // Word 0 is encode-only; every decoded word contributes its chars plus [W].
+        let decoded = &words[1..];
+        let rows: usize = decoded.iter().map(|r| r.end - r.start + 1).sum();
+        let expect = char_loss * rows as f32 / decoded.len() as f32;
+        assert!(
+            (word_loss - expect).abs() <= 1e-4 * expect.abs().max(1.0),
+            "word_loss {word_loss} != {expect} (char {char_loss}, {rows} rows, {} words)",
+            decoded.len()
+        );
     }
 
     /// Splitting a window into length groups is a pure batching change: it must
