@@ -142,6 +142,13 @@ pub trait Cell {
     }
     /// Learnable tensors in a fixed order (checkpoint save/load).
     fn params_mut(&mut self) -> Vec<&mut DTensor>;
+    /// Gradient accumulators, matching `params_mut`'s order. Diagnostic.
+    fn grads(&self) -> Vec<&DTensor>;
+    /// Forward-cache extremes, for cells that carry a stabilized normalizer.
+    /// `None` when the cell has nothing of the sort. Diagnostic.
+    fn state_extremes(&self, _gpu: &Gpu) -> Option<(f32, f32, f32)> {
+        None
+    }
     /// Which phase buckets this cell's forward/backward count toward, so a mixed
     /// stack can be attributed per cell kind. See [`phase`].
     fn phase_buckets(&self) -> (phase::Bucket, phase::Bucket);
@@ -215,6 +222,12 @@ impl Cell for SLstm {
     }
     fn params_mut(&mut self) -> Vec<&mut DTensor> {
         SLstm::params_mut(self)
+    }
+    fn grads(&self) -> Vec<&DTensor> {
+        SLstm::grads(self)
+    }
+    fn state_extremes(&self, gpu: &Gpu) -> Option<(f32, f32, f32)> {
+        SLstm::state_extremes(self, gpu)
     }
     fn phase_buckets(&self) -> (phase::Bucket, phase::Bucket) {
         (phase::Bucket::SlstmCellFwd, phase::Bucket::SlstmCellBwd)
@@ -297,6 +310,10 @@ pub trait BlockLike {
     }
     /// Learnable tensors in a fixed order (checkpoint save/load).
     fn params_mut(&mut self) -> Vec<&mut DTensor>;
+    /// Gradient accumulators, matching `params_mut`'s order. Diagnostic.
+    fn grads(&self) -> Vec<&DTensor>;
+    /// The cell's forward-cache extremes. See [`Cell::state_extremes`].
+    fn state_extremes(&self, gpu: &Gpu) -> Option<(f32, f32, f32)>;
     /// Park this block's FFN activations on the host between forward and backward.
     /// See [`Block::enable_offload`] — only valid for a whole-forward-then-backward
     /// stack, i.e. the backbone.
@@ -352,6 +369,12 @@ impl<C: Cell> BlockLike for Block<C> {
     }
     fn params_mut(&mut self) -> Vec<&mut DTensor> {
         Block::params_mut(self)
+    }
+    fn grads(&self) -> Vec<&DTensor> {
+        Block::grads(self)
+    }
+    fn state_extremes(&self, gpu: &Gpu) -> Option<(f32, f32, f32)> {
+        self.cell.state_extremes(gpu)
     }
     fn enable_offload(&mut self, gpu: &Gpu, in_flight: offload::SharedInFlight) {
         Block::enable_offload(self, gpu, in_flight)
@@ -1077,6 +1100,18 @@ impl<C: Cell> Block<C> {
         v.extend(self.lin_gate.params_mut());
         v.extend(self.lin_value.params_mut());
         v.extend(self.lin_down.params_mut());
+        v
+    }
+
+    /// Gradient accumulators, matching `params_mut`'s order. Diagnostic.
+    pub fn grads(&self) -> Vec<&DTensor> {
+        let mut v = vec![&self.pre_norm1.dgamma];
+        v.extend(self.cell.grads());
+        v.push(&self.pre_norm2.dgamma);
+        for l in [&self.lin_gate, &self.lin_value, &self.lin_down] {
+            v.push(&l.dw);
+            v.push(&l.db);
+        }
         v
     }
 

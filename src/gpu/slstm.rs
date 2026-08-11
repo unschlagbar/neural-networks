@@ -71,7 +71,35 @@ const GRAPH_MIN_T: usize = 32;
 struct LoopGraph {
     b: usize,
     t: usize,
+    /// Device addresses of every buffer the capture baked in. A graph replays the
+    /// pointers it was captured against, so a matching `(b, t)` is not enough: the
+    /// chunked sweep hands each chunk its own `g`/`slabs` (see `chunk_saved`), and
+    /// replaying across that swap reads the previous chunk's freed allocations.
+    ptrs: Vec<u64>,
     graph: CudaGraph,
+}
+
+/// The device addresses a captured sLSTM loop depends on, in a fixed order.
+fn loop_ptrs(gpu: &Gpu, g: &DTensor, slabs: &SlstmSlabs, dy: &DTensor) -> Vec<u64> {
+    use cudarc::driver::DevicePtr;
+    let f32_ptr = |t: &DTensor| t.buf.device_ptr(&gpu.stream).0;
+    let slab_ptr = |s: &ops::SlabBuf| match s {
+        ops::SlabBuf::F32(t) => t.buf.device_ptr(&gpu.stream).0,
+        ops::SlabBuf::Bf16(t) => t.buf.device_ptr(&gpu.stream).0,
+    };
+    vec![
+        f32_ptr(g),
+        f32_ptr(dy),
+        f32_ptr(&slabs.c_prev),
+        f32_ptr(&slabs.n_prev),
+        f32_ptr(&slabs.i_prime),
+        f32_ptr(&slabs.f_prime),
+        f32_ptr(&slabs.c),
+        f32_ptr(&slabs.n),
+        slab_ptr(&slabs.zt),
+        slab_ptr(&slabs.ot),
+        slab_ptr(&slabs.h_prev),
+    ]
 }
 
 /// `GPU_NO_GRAPH=1` forces the eager per-timestep launch path — the A/B baseline
@@ -672,10 +700,11 @@ impl SLstm {
             self.fwd_steps(gpu, g, slabs, out, t);
             return;
         }
+        let ptrs = loop_ptrs(gpu, g, slabs, out);
         if self
             .fwd_graph
             .as_ref()
-            .map_or(true, |c| (c.b, c.t) != (b, t))
+            .map_or(true, |c| (c.b, c.t) != (b, t) || c.ptrs != ptrs)
         {
             // Drop the stale exec first: its nodes point into buffers that the shape
             // change above has just reallocated.
@@ -697,7 +726,7 @@ impl SLstm {
                 )
                 .expect("end capture")
                 .expect("stream was not capturing");
-            self.fwd_graph = Some(LoopGraph { b, t, graph });
+            self.fwd_graph = Some(LoopGraph { b, t, ptrs, graph });
         }
         self.fwd_graph
             .as_ref()
@@ -905,10 +934,11 @@ impl SLstm {
             self.bwd_steps(gpu, dy, g, slabs, t);
             return;
         }
+        let ptrs = loop_ptrs(gpu, g, slabs, dy);
         if self
             .bwd_graph
             .as_ref()
-            .map_or(true, |c| (c.b, c.t) != (b, t))
+            .map_or(true, |c| (c.b, c.t) != (b, t) || c.ptrs != ptrs)
         {
             self.bwd_graph = None;
             gpu.stream
@@ -922,7 +952,7 @@ impl SLstm {
                 )
                 .expect("end capture")
                 .expect("stream was not capturing");
-            self.bwd_graph = Some(LoopGraph { b, t, graph });
+            self.bwd_graph = Some(LoopGraph { b, t, ptrs, graph });
         }
         self.bwd_graph
             .as_ref()
@@ -963,6 +993,30 @@ impl SLstm {
         let mut v = vec![&mut self.wx, &mut self.whr, &mut self.bcat];
         v.extend(self.post_norm.params_mut());
         v
+    }
+
+    /// Gradient accumulators, in the same order as `params_mut`. Diagnostic.
+    pub fn grads(&self) -> Vec<&DTensor> {
+        vec![&self.dwx, &self.dwhr, &self.dbcat, &self.post_norm.dgamma]
+    }
+
+    /// Forward-cache extremes of the last sweep: `(min |n|, max |c|, max |c/n|)`.
+    ///
+    /// The backward divides by `n` and by `n²`, so a normalizer that collapses is the
+    /// difference between a finite gradient and a NaN. Diagnostic — downloads the
+    /// whole `[B, T, H]` slabs, so it belongs in a probe.
+    pub fn state_extremes(&self, gpu: &Gpu) -> Option<(f32, f32, f32)> {
+        let slabs = self.slabs.as_ref()?;
+        let n = slabs.n.to_host(gpu).data.to_vec();
+        let c = slabs.c.to_host(gpu).data.to_vec();
+        let min_n = n.iter().map(|v| v.abs()).fold(f32::INFINITY, f32::min);
+        let max_c = c.iter().map(|v| v.abs()).fold(0.0, f32::max);
+        let max_ratio = c
+            .iter()
+            .zip(&n)
+            .map(|(a, b)| (a / b).abs())
+            .fold(0.0, f32::max);
+        Some((min_n, max_c, max_ratio))
     }
 
     /// Release the forward cache — the `[B, T, ·]` slabs and the saved input — without

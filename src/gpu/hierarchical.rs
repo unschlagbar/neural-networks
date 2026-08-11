@@ -54,7 +54,7 @@ pub struct HierCfg {
     pub hc: usize, // char/context hidden (tied embedding + decoder width)
     pub wh: usize, // backbone width
     pub enc_blocks: usize,
-    pub bb_blocks: usize, // alternates sLSTM (even) / mLSTM (odd)
+    pub bb_blocks: usize, // sLSTM every 4th block, mLSTM otherwise (see `model.rs`)
     pub dec_blocks: usize,
     pub heads: usize, // mLSTM heads
     pub dqk: usize,
@@ -442,13 +442,22 @@ impl Flags {
 impl Hierarchical {
     pub fn new(gpu: &Gpu, cfg: &HierCfg) -> Self {
         let bb_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.bb_blocks)
-            .map(|_| {
-                Box::new(Block::from_cell(
-                    gpu,
-                    cfg.wh,
-                    up_of(cfg.wh),
-                    MLstm::new_rand(gpu, cfg.wh, cfg.wh, cfg.heads, cfg.dqk),
-                )) as Box<dyn BlockLike>
+            .map(|i| {
+                if i.is_multiple_of(4) {
+                    Box::new(Block::from_cell(
+                        gpu,
+                        cfg.wh,
+                        up_of(cfg.wh),
+                        SLstm::new_rand(gpu, cfg.wh, cfg.wh),
+                    )) as Box<dyn BlockLike>
+                } else {
+                    Box::new(Block::from_cell(
+                        gpu,
+                        cfg.wh,
+                        up_of(cfg.wh),
+                        MLstm::new_rand(gpu, cfg.wh, cfg.wh, cfg.heads, cfg.dqk),
+                    )) as Box<dyn BlockLike>
+                }
             })
             .collect();
         let dec_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.dec_blocks)
@@ -1139,6 +1148,46 @@ impl Hierarchical {
     /// [`config::GROUP_MAX_ROWS`]; `Some(0)` disables the cap.
     pub fn set_group_cap(&mut self, cap: Option<usize>) {
         self.group_cap = cap;
+    }
+
+    /// L2 norm of each block's accumulated gradient, for one stage ("encoder",
+    /// "backbone", "decoder"). Diagnostic — one host round-trip per tensor, so this
+    /// belongs in a probe, not a training loop.
+    pub fn grad_norms_by_block(&self, gpu: &Gpu, stage: &str) -> Vec<f32> {
+        let blocks = match stage {
+            "encoder" => &self.encoder.blocks,
+            "backbone" => &self.bb_blocks,
+            "decoder" => &self.dec_blocks,
+            other => panic!("grad_norms_by_block: unknown stage {other}"),
+        };
+        blocks
+            .iter()
+            .map(|b| {
+                let sq: f32 = b
+                    .grads()
+                    .iter()
+                    .flat_map(|g| g.to_host(gpu).data.to_vec())
+                    .map(|v| v * v)
+                    .sum();
+                sq.sqrt()
+            })
+            .collect()
+    }
+
+    /// Per-block `(min |n|, max |c|, max |c/n|)` for one stage, `None` for blocks
+    /// whose cell carries no stabilized normalizer. Diagnostic.
+    pub fn state_extremes_by_block(
+        &self,
+        gpu: &Gpu,
+        stage: &str,
+    ) -> Vec<Option<(f32, f32, f32)>> {
+        let blocks = match stage {
+            "encoder" => &self.encoder.blocks,
+            "backbone" => &self.bb_blocks,
+            "decoder" => &self.dec_blocks,
+            other => panic!("state_extremes_by_block: unknown stage {other}"),
+        };
+        blocks.iter().map(|b| b.state_extremes(gpu)).collect()
     }
 
     pub fn release_activation_buffers(&mut self) {
@@ -1928,6 +1977,97 @@ mod tests {
             assert!(
                 worst < 2e-2 * slab,
                 "{what} gradient diverged: worst {worst} relative to magnitude {scale}"
+            );
+        };
+        check(&table_c, &table_u, "tied table");
+        check(&front_c, &front_u, "bb_front");
+    }
+
+    /// A backbone sweep of three or more chunks must give the same gradients as one.
+    ///
+    /// Distinct from `backbone_chunked_matches_unchunked`, which runs chunks shorter
+    /// than `GRAPH_MIN_T` and so never exercises the captured-graph path. Here every
+    /// chunk is long enough to be captured *and* there are three of them, which is what
+    /// it takes to replay a graph after `chunk_saved` has swapped the buffers it was
+    /// captured against — a replay against freed allocations, i.e. NaN gradients from
+    /// an out-of-bounds read rather than a wrong-but-finite number. Two chunks cannot
+    /// catch it: the first replay still sees its own buffers.
+    #[test]
+    fn backbone_three_chunks_match_unchunked() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        // Wide enough that a chunk's buffers are a real allocation: at a toy width the
+        // pool hands every chunk the same address back and the stale-pointer replay is
+        // accidentally harmless, so the bug does not reproduce.
+        let cfg = HierCfg {
+            vocab: 64,
+            hc: 256,
+            wh: 768,
+            enc_blocks: 1,
+            // Block 0 is sLSTM under the `i % 4` rule — the cell whose loop is captured.
+            bb_blocks: 2,
+            dec_blocks: 1,
+            heads: 8,
+            dqk: 96,
+            w_token: 63,
+            cap: 30.0,
+        };
+        // 384 decoded words in chunks of 128: three chunks, each well over GRAPH_MIN_T.
+        let words_n = 385;
+        let tokens: Vec<usize> = (0..words_n * 2).map(|i| 1 + i % 9).collect();
+        let words: Vec<Range<usize>> = (0..words_n)
+            .map(|w| Range { start: w * 2, end: w * 2 + 2 })
+            .collect();
+
+        let run = |chunk: usize| -> (f32, Vec<f32>, Vec<f32>) {
+            let mut model = Hierarchical::new(&gpu, &cfg);
+            let seed = std::env::temp_dir().join("gpu_three_chunk_seed.hier");
+            let seed = seed.to_str().unwrap();
+            if chunk != usize::MAX {
+                model.save(&gpu, seed, &[]).expect("save seed");
+            } else {
+                model = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
+            }
+            model.bb_chunk = Some(chunk);
+            let loss = model.forward_backward(&gpu, &tokens, &words);
+            let table: Vec<f32> = model.dtable.to_host(&gpu).data.to_vec();
+            let front: Vec<f32> = model.bb_front.dw.to_host(&gpu).data.to_vec();
+            (loss, table, front)
+        };
+
+        let (loss_c, table_c, front_c) = run(128);
+        let (loss_u, table_u, front_u) = run(usize::MAX);
+
+        assert!(
+            loss_c.is_finite() && table_c.iter().all(|v| v.is_finite()),
+            "three-chunk sweep produced a non-finite loss/gradient (loss {loss_c})"
+        );
+        let slab = if gpu.kernels.slab_bf16 { 8.0 } else { 1.0 };
+        // Relative, and looser than the toy-width test's absolute bound: at this width
+        // the unchunked leg is one 384-step sweep against three 128-step ones, so the
+        // reassociation spread is genuinely larger. What must be caught is a replay
+        // against another chunk's buffers, which is a NaN or an order-of-magnitude
+        // miss, not a third decimal place.
+        assert!(
+            (loss_c - loss_u).abs() < 1e-3 * slab * loss_u.abs().max(1.0),
+            "three-chunk loss {loss_c} != unchunked loss {loss_u}"
+        );
+        // Every gradient finite, and the two legs agreeing in aggregate. A pointwise
+        // bound cannot be tight here — 384 recurrent steps reassociated three ways
+        // spread individual entries by tens of percent — but a replay against another
+        // chunk's buffers moves the whole vector's norm, which this does catch.
+        let check = |c: &Vec<f32>, u: &Vec<f32>, what: &str| {
+            assert!(
+                c.iter().all(|v| v.is_finite()),
+                "{what} gradient has a non-finite entry"
+            );
+            let norm = |v: &Vec<f32>| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let (nc, nu) = (norm(c), norm(u));
+            let rel = (nc - nu).abs() / nu.max(1e-12);
+            assert!(
+                rel < 5e-2 * slab,
+                "{what} gradient norm diverged: {nc} vs {nu} ({rel} relative)"
             );
         };
         check(&table_c, &table_u, "tied table");

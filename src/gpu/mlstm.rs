@@ -1300,6 +1300,25 @@ impl MLstm {
         v
     }
 
+    /// Gradient accumulators, in the same order as `params_mut`. Diagnostic.
+    pub fn grads(&self) -> Vec<&DTensor> {
+        let mut v = Vec::new();
+        for l in [
+            &self.lin_q,
+            &self.lin_k,
+            &self.lin_v,
+            &self.lin_o,
+            &self.lin_i,
+            &self.lin_f,
+            &self.lin_out,
+        ] {
+            v.push(&l.dw);
+            v.push(&l.db);
+        }
+        v.push(&self.headnorm.dgamma);
+        v
+    }
+
     pub fn zero_grad(&mut self, gpu: &Gpu) {
         for l in [
             &mut self.lin_q,
@@ -1356,6 +1375,9 @@ impl Cell for MLstm {
     }
     fn params_mut(&mut self) -> Vec<&mut DTensor> {
         MLstm::params_mut(self)
+    }
+    fn grads(&self) -> Vec<&DTensor> {
+        MLstm::grads(self)
     }
     fn phase_buckets(&self) -> (super::block::phase::Bucket, super::block::phase::Bucket) {
         use super::block::phase::Bucket;
