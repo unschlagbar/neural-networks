@@ -539,22 +539,25 @@ impl MLstm {
         // (`assert_drained` at the top of `backward_alloc`).
         let mut xf = DTensor::uninit(gpu, &[n, inp]);
         xf.copy_from(gpu, x);
+        // All six read `xf`: narrow it once into the shared scratch instead of once per
+        // projection. `o` is kept in the cache for backward, so it is NOT pooled: the
+        // pool must get back everything it lends, and this one never comes back.
         let mut q = self.pool.take(gpu, &[n, self.lin_q.output_size()]);
-        self.lin_q.forward_shared(gpu, &xf, &mut q);
         let mut k = self.pool.take(gpu, &[n, self.lin_k.output_size()]);
-        self.lin_k.forward_shared(gpu, &xf, &mut k);
-        ops::scale_(gpu, &mut k, self.inv_sqrt_dqk);
         let mut v = self.pool.take(gpu, &[n, self.lin_v.output_size()]);
-        self.lin_v.forward_shared(gpu, &xf, &mut v);
-        // `o` is kept in the cache for backward, so it is NOT pooled: the pool must
-        // get back everything it lends, and this one never comes back.
         let mut o = DTensor::uninit(gpu, &[n, self.lin_o.output_size()]);
-        self.lin_o.forward_shared(gpu, &xf, &mut o);
-        ops::sigmoid_(gpu, &mut o);
         let mut ig = self.pool.take(gpu, &[n, self.lin_i.output_size()]); // [N, H]
-        self.lin_i.forward_shared(gpu, &xf, &mut ig);
         let mut fg = self.pool.take(gpu, &[n, self.lin_f.output_size()]); // [N, H]
-        self.lin_f.forward_shared(gpu, &xf, &mut fg);
+        ops::with_shared_lhs(gpu, &xf, |xf_b| {
+            self.lin_q.forward_staged(gpu, &xf, xf_b, &mut q);
+            self.lin_k.forward_staged(gpu, &xf, xf_b, &mut k);
+            self.lin_v.forward_staged(gpu, &xf, xf_b, &mut v);
+            self.lin_o.forward_staged(gpu, &xf, xf_b, &mut o);
+            self.lin_i.forward_staged(gpu, &xf, xf_b, &mut ig);
+            self.lin_f.forward_staged(gpu, &xf, xf_b, &mut fg);
+        });
+        ops::scale_(gpu, &mut k, self.inv_sqrt_dqk);
+        ops::sigmoid_(gpu, &mut o);
 
         // The gate logits go head-major as fp32 on either path: the reference pins
         // vecI/vecB to fp32, and they are [BH, T] — a factor of `dqk` smaller than
@@ -848,6 +851,8 @@ impl MLstm {
         let (hn_p, hn_a) = self.headnorm.retained_bytes();
         params += hn_p;
         act += hn_a + self.pool.retained_bytes();
+        // The bf16 staging scratch is process-wide, not per-cell — counting it here
+        // would report it once per block. See `ops::shared_lhs_bytes`.
         act += self.saved_bytes();
         (params, act)
     }
@@ -926,6 +931,10 @@ impl MLstm {
             l.drop_saved_act(gpu);
         }
         self.headnorm.drop_saved_act();
+        // The bf16 staging scratch is process-wide and is NOT released here: this runs
+        // per block, mid-sweep, so freeing it would pull the buffer out from under the
+        // blocks still to come. `Hierarchical::drop_all_act` clears it once, at the
+        // point where the whole stack is done.
     }
 
     /// Park this cell's saved activations on the host between forward and backward.
@@ -1029,19 +1038,23 @@ impl MLstm {
         //
         // All six read the one shared `sv.xf` (see `forward_alloc`), so they take
         // `backward_with_x` rather than each consulting a private saved copy.
+        // `sv.xf` is narrowed once for all six, as in forward.
         let mut acc = DTensor::uninit(gpu, &[n, inp]);
-        self.lin_q.backward_with_x(gpu, sv.xf(), &dq, &mut acc);
         let mut part = self.pool.take(gpu, &[n, inp]);
-        for (lin, grad) in [
-            (&mut self.lin_k, &dk),
-            (&mut self.lin_v, &dv),
-            (&mut self.lin_o, &do_pre),
-            (&mut self.lin_i, &d_ig),
-            (&mut self.lin_f, &d_fg),
-        ] {
-            lin.backward_with_x(gpu, sv.xf(), grad, &mut part);
-            ops::add_assign(gpu, &mut acc, &part);
-        }
+        ops::with_shared_lhs(gpu, sv.xf(), |xf_b| {
+            self.lin_q
+                .backward_staged_x(gpu, sv.xf(), xf_b, &dq, &mut acc);
+            for (lin, grad) in [
+                (&mut self.lin_k, &dk),
+                (&mut self.lin_v, &dv),
+                (&mut self.lin_o, &do_pre),
+                (&mut self.lin_i, &d_ig),
+                (&mut self.lin_f, &d_fg),
+            ] {
+                lin.backward_staged_x(gpu, sv.xf(), xf_b, grad, &mut part);
+                ops::add_assign(gpu, &mut acc, &part);
+            }
+        });
         // Only `part` came from the pool; `dq`..`d_fg` were allocated by
         // `head_scatter` and `ogate_bwd`, so they are dropped, not donated. Handing
         // the pool buffers it never lent would grow the free list every window —
@@ -1266,18 +1279,21 @@ impl MLstm {
         // dx is the sum of the six projection backwards, accumulated into one
         // buffer with one pooled scratch — not a fresh [N, in] per term.
         let mut dxf = DTensor::uninit(gpu, &[n, inp]);
-        self.lin_q.backward_with_x(gpu, &sv.xf, &dq, &mut dxf);
         let mut part = self.pool.take(gpu, &[n, inp]);
-        for (lin, grad) in [
-            (&mut self.lin_k, &dk),
-            (&mut self.lin_v, &dv),
-            (&mut self.lin_o, &do_pre),
-            (&mut self.lin_i, &d_ig),
-            (&mut self.lin_f, &d_fg),
-        ] {
-            lin.backward_with_x(gpu, &sv.xf, grad, &mut part);
-            ops::add_assign(gpu, &mut dxf, &part);
-        }
+        ops::with_shared_lhs(gpu, &sv.xf, |xf_b| {
+            self.lin_q
+                .backward_staged_x(gpu, &sv.xf, xf_b, &dq, &mut dxf);
+            for (lin, grad) in [
+                (&mut self.lin_k, &dk),
+                (&mut self.lin_v, &dv),
+                (&mut self.lin_o, &do_pre),
+                (&mut self.lin_i, &d_ig),
+                (&mut self.lin_f, &d_fg),
+            ] {
+                lin.backward_staged_x(gpu, &sv.xf, xf_b, grad, &mut part);
+                ops::add_assign(gpu, &mut dxf, &part);
+            }
+        });
         self.pool.put(part);
         dxf.reshaped(&[b, t, inp])
     }

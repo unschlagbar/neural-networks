@@ -66,6 +66,31 @@ pub(crate) fn tensor_from_slice(s: &[f32]) -> crate::tensor::Tensor {
     crate::tensor::Tensor::new(&[s.len()], s.to_vec())
 }
 
+/// Whether host waits park the thread instead of spinning. On unless
+/// `GPU_SPIN_SYNC` is set, which restores the driver's default busy-wait.
+///
+/// Costs nothing measurable: 679 vs 675 ms/step over three `step_time` runs each,
+/// inside run-to-run noise. It also recovers less than one might hope — 100% -> 95%
+/// of a core — because the submitting thread is not mostly *waiting*: at 4096 words
+/// a step's launches put 40% of its CPU in `libcuda` and 28% in libc marshalling
+/// launch arguments. Only the residual sync time is spin, and that is the 5%.
+///
+/// Read through a `OnceLock` so the context flag and the event-creation flags,
+/// which are set at different times, cannot disagree.
+pub fn blocking_sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GPU_SPIN_SYNC").is_err())
+}
+
+/// Flags for an event the host will wait on with `synchronize`. The context's
+/// scheduling policy does not reach `cuEventSynchronize` — an event spins unless it
+/// was *created* with `CU_EVENT_BLOCKING_SYNC` — so host-waited events need this.
+/// Events only ordered device-side (`stream.wait`) never block a thread and can
+/// keep the cheaper default.
+pub fn host_wait_event_flags() -> Option<cudarc::driver::sys::CUevent_flags> {
+    blocking_sync().then_some(cudarc::driver::sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC)
+}
+
 /// A live CUDA device: the context, its default stream, a cuBLAS handle, and the
 /// NVRTC-compiled kernel set. Cheap to clone (every field is an `Arc`). Created
 /// once via [`Gpu::new`].
@@ -111,6 +136,16 @@ impl Gpu {
         // is a single stream, so program order *is* the synchronization. Must happen
         // before any allocation — the flag only affects slices created after it.
         unsafe { context.disable_event_tracking() };
+        // `cuDevicePrimaryCtxRetain` leaves the scheduling policy at CU_CTX_SCHED_AUTO,
+        // which with one active context on a many-core host resolves to a busy-wait: a
+        // host core sits at 100% spinning inside every `synchronize()`. BLOCKING_SYNC
+        // parks the thread on an interrupt instead, trading a few microseconds of wake
+        // latency per sync for an idle core.
+        if blocking_sync() {
+            context
+                .set_blocking_synchronize()
+                .map_err(|e| format!("setting blocking sync failed: {e:?}"))?;
+        }
         let stream = context
             .new_stream()
             .map_err(|e| format!("stream creation failed: {e:?}"))?;

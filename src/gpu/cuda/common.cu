@@ -12,9 +12,33 @@ extern "C" __global__ void softcap_backward(const float* dy, const float* y, flo
 }
 
 // Copy bias[n] into every row of out[rows, n].
+//
+// Grid-stride over rows with the column from `threadIdx.x`, rather than one flat index
+// and `bias[i % n]`: the modulo was an integer division per element, and this shape is
+// pure bandwidth (every projection seeds its output here before the GEMM accumulates
+// on top). Threads of a warp still hold adjacent columns, so stores stay coalesced.
 extern "C" __global__ void broadcast_row(float* out, const float* bias, int rows, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < rows * n) out[i] = bias[i % n];
+    for (int r = blockIdx.x; r < rows; r += gridDim.x) {
+        const float* b = bias;
+        float* o = out + (size_t)r * n;
+        for (int c = threadIdx.x; c < n; c += blockDim.x) o[c] = b[c];
+    }
+}
+
+// out[r, c] = resid[r, c] + bias[c] — `broadcast_row` with a residual folded in.
+//
+// A projection that feeds a residual seeds its output here instead, so the trailing
+// `y = resid + proj(x)` add costs no kernel of its own: the GEMM then accumulates on
+// top at beta = 1 exactly as before. The add it replaces was a separate [N, H] pass
+// running at ~92 GB/s of a ~900 GB/s card, i.e. launch-bound rather than
+// bandwidth-bound, so what this saves is the launch, not the traffic.
+extern "C" __global__ void broadcast_row_resid(
+        float* out, const float* resid, const float* bias, int rows, int n) {
+    for (int r = blockIdx.x; r < rows; r += gridDim.x) {
+        const float* s = resid + (size_t)r * n;
+        float* o = out + (size_t)r * n;
+        for (int c = threadIdx.x; c < n; c += blockDim.x) o[c] = s[c] + bias[c];
+    }
 }
 
 // db[o] += sum over rows of dy[r*n + o].

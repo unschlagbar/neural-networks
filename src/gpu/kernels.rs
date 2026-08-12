@@ -48,6 +48,7 @@ const NAMES: &[&str] = &[
     "softcap_forward",
     "softcap_backward",
     "broadcast_row",
+    "broadcast_row_resid",
     "add_col_sum",
     "embedding_gather",
     "embedding_scatter_add",

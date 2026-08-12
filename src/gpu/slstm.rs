@@ -231,6 +231,16 @@ pub struct SLstm {
     fwd_graph: Option<LoopGraph>,
     bwd_graph: Option<LoopGraph>,
     batch: usize,
+    /// bf16 staging for the three **whole-sequence** GEMMs (`x·Wx`, `dg·Wxᵀ`,
+    /// `xᵀ·dg`). Those run once per call over `[N, ·]`, exactly like a `Linear`'s, and
+    /// were the last fp32 SIMT matmuls left on the profile. The recurrent `Wh` GEMMs
+    /// are deliberately NOT included: they run per timestep inside the loop, where the
+    /// staging would cost a cast per step, and the fused kernels own that path anyway.
+    gemm_x: ops::GemmBf16,
+    gemm_dx: ops::GemmBf16,
+    /// Whether those three take the bf16 path. Pinned at construction so forward and
+    /// backward cannot disagree.
+    bf16: bool,
 }
 
 /// One chunk's forward cache, set aside so a later chunk's forward can take fresh
@@ -364,6 +374,9 @@ impl SLstm {
             fwd_graph: None,
             bwd_graph: None,
             batch: 0,
+            gemm_x: ops::GemmBf16::new(),
+            gemm_dx: ops::GemmBf16::new(),
+            bf16: ops::gemm_bf16_enabled(gpu),
         }
     }
 
@@ -609,8 +622,13 @@ impl SLstm {
         // One buffer, two views: the GEMM wants [N, 4H], the time loop wants
         // [B, T, 4H]. `reshaped` is metadata-only, so the allocation is untouched.
         let mut g = take_uninit(gpu, self.g.take(), &[b, t, h4]).reshaped(&[n, h4]);
+        let (bf16, gemm_x, wx_w) = (self.bf16, &mut self.gemm_x, &self.wx);
         phase::timed(gpu, phase::Bucket::SlstmGemmFwd, || {
-            ops::matmul_nn_into(gpu, &x_flat, &self.wx, &mut g, 0.0);
+            if bf16 {
+                gemm_x.run_wb(gpu, ops::MmForm::Nn, &x_flat, wx_w, &mut g, 0.0);
+            } else {
+                ops::matmul_nn_into(gpu, &x_flat, wx_w, &mut g, 0.0);
+            }
         });
         let mut g = g.reshaped(&[b, t, h4]);
 
@@ -836,17 +854,20 @@ impl SLstm {
         // bias grads are three GEMMs and one reduction over it.
         let dg = g.reshaped(&[n, h4]);
         dx.reshape_to(&[n, inp]);
+        // `dx = dg·Wxᵀ` and `dWx = x_flatᵀ·dg` both read `dg`, so on the bf16 path they
+        // go through one `run_backward` and narrow it once. The gate grads land in the
+        // parameter layout directly, so `dWx` writes with beta = 1: cuBLAS does the
+        // accumulation across windows that the unpack kernel used to do by hand.
         let wx = &self.wx;
-        phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || {
-            ops::matmul_nt_into(gpu, &dg, wx, dx, 0.0);
-        });
-
-        // The gate grads land in the parameter layout directly, so these GEMMs write
-        // into `dwx`/`dwhr` with beta = 1: cuBLAS does the accumulation across
-        // windows that the unpack kernel used to do by hand.
         let dwx = &mut self.dwx;
+        let (bf16, gemm_dx) = (self.bf16, &mut self.gemm_dx);
         phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || {
-            ops::matmul_tn_into(gpu, &x_flat, &dg, dwx, 1.0);
+            if bf16 {
+                gemm_dx.run_backward(gpu, &x_flat, &dg, wx, dwx, dx);
+            } else {
+                ops::matmul_nt_into(gpu, &dg, wx, dx, 0.0);
+                ops::matmul_tn_into(gpu, &x_flat, &dg, dwx, 1.0);
+            }
         });
         // dWh = h_prevᵀ · dg goes through cuBLAS, which needs an fp32 operand, so a
         // bf16 `h_prev` slab is widened into reusable scratch first. The scratch is
@@ -990,6 +1011,10 @@ impl SLstm {
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
     /// The post-cell norm's γ comes last, where the enclosing block used to emit it.
     pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
+        // The caller gets a mutable handle on `wx` (checkpoint load overwrites it), so
+        // the cached bf16 copy must be assumed stale from here on.
+        self.gemm_x.invalidate_w();
+        self.gemm_dx.invalidate_w();
         let mut v = vec![&mut self.wx, &mut self.whr, &mut self.bcat];
         v.extend(self.post_norm.params_mut());
         v
@@ -1030,6 +1055,10 @@ impl SLstm {
         self.slabs = None;
         self.x_saved = None;
         self.chunk_saved.clear();
+        // The GEMM staging deliberately stays: `drop_saved_act` runs between the chunks
+        // of a sweep, and dropping the cached bf16 `Wx` there costs a re-narrow per
+        // chunk. It is bounded by the window, not the corpus, and `clear` on the layer
+        // is what releases it.
     }
 
     /// Continue the previous call's recurrence rather than starting from zero.
@@ -1183,8 +1212,9 @@ impl SLstm {
         .map(|t| t.capacity() * 4)
         .sum();
         let slabs = self.slabs.as_ref().map_or(0, |s| s.retained_bytes());
+        let staging = self.gemm_x.retained_bytes() + self.gemm_dx.retained_bytes();
         let (pn_p, _) = self.post_norm.retained_bytes();
-        (params + pn_p, opt + live + slabs)
+        (params + pn_p, opt + live + slabs + staging)
     }
 
     pub fn zero_grad(&mut self, gpu: &Gpu) {
@@ -1206,6 +1236,10 @@ impl SLstm {
 
     /// [`step`](Self::step), optionally queueing instead of launching.
     pub fn step_q(&mut self, gpu: &Gpu, cfg: &AdamCfg, q: Option<&mut ops::AdamwQueue>) {
+        // `wx` is about to change, so the cached bf16 copy the whole-sequence GEMMs
+        // read is stale. Missing this shows up as training silently not learning.
+        self.gemm_x.invalidate_w();
+        self.gemm_dx.invalidate_w();
         if let Some(q) = q {
             q.push(gpu, &mut self.wx, &self.dwx, &mut self.mwx, &mut self.vwx, cfg, true);
             q.push(gpu, &mut self.whr, &self.dwhr, &mut self.mwhr, &mut self.vwhr, cfg, true);
@@ -1363,6 +1397,53 @@ mod tests {
         fn step(&mut self, cfg: &AdamCfg) {
             self.cell.step(cfg);
             self.norm.step(cfg);
+        }
+    }
+
+    /// The whole-sequence GEMMs cache a bf16 copy of `Wx`, so every write to `Wx` must
+    /// invalidate it. A stale cache does not error and does not go non-finite — the
+    /// forward simply keeps reading the weight the optimizer has already moved past, so
+    /// the observable is that the output stops tracking `Wx`.
+    ///
+    /// An end-to-end "does the loss fall" check does NOT catch this: one step of
+    /// staleness is a small perturbation, and a small model converges either way
+    /// (measured — identical final loss with the invalidation removed). Hence this
+    /// direct test.
+    #[test]
+    fn wx_cache_follows_optimizer_steps() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let (b, t, inp, h) = (2, 4, 5, 6);
+        let mut cell = SLstm::new_rand(&gpu, inp, h);
+        let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, inp], 0.5));
+
+        // `Wx` is overwritten DIRECTLY rather than stepped: a real optimizer step also
+        // moves `Whr`, `bcat` and the norm's γ, and those alone change the output — so
+        // a stale `Wx` stays hidden and the test passes with the invalidation removed
+        // (measured). Writing only `Wx` makes the cache the single variable.
+        for round in 1..=3 {
+            let before = cell.forward_alloc(&gpu, &x).to_host(&gpu).data;
+
+            let mut hw = cell.wx.to_host(&gpu);
+            for (i, v) in hw.data.iter_mut().enumerate() {
+                *v += 0.25 * ((i % 7) as f32 - 3.0) * round as f32;
+            }
+            cell.wx = DTensor::from_host(&gpu, &hw);
+            // The write above is exactly what `params_mut` exists to guard.
+            cell.params_mut();
+
+            let after = cell.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let changed = before
+                .iter()
+                .zip(&after)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                changed > 1e-4,
+                "round {round}: Wx was overwritten but the output did not change — the \
+                 bf16 weight cache was not invalidated"
+            );
         }
     }
 
@@ -1530,14 +1611,27 @@ mod tests {
     /// the bf16 path is what made this test fail under `SLSTM_BF16=1`.
     #[test]
     fn slstm_fused_time_matches_per_step() {
+        // B=1 is the backbone's shape, where the backward stages the `[B, 4H]` gate
+        // deltas in shared memory. The larger batches are the encoder/decoder's: there
+        // the staging does not fit, so the contraction reads them from global instead
+        // (`stage_dg = false` in `slstm_fused_time_bwd_geometry`). Both are the same
+        // arithmetic and both must match the per-step path.
+        for b in [1usize, 64, 256] {
+            fused_time_matches_per_step_at(b);
+        }
+    }
+
+    fn fused_time_matches_per_step_at(b: usize) {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
         if !gpu.kernels.has_coop {
             return; // cooperative kernels unavailable (no CUDA headers)
         }
-        let (b, t, h) = (1usize, 64usize, 64usize);
-        if ops::slstm_fused_time_geometry(&gpu, h, b).is_none() {
+        let (t, h) = (64usize, 64usize);
+        if ops::slstm_fused_time_geometry(&gpu, h, b).is_none()
+            || ops::slstm_fused_time_bwd_geometry(&gpu, h, b).is_none()
+        {
             return; // shape does not fit the fused path on this device
         }
         // 1/sqrt(H) weight scale, i.e. the initialization the cell actually trains at.
@@ -1574,7 +1668,7 @@ mod tests {
         for (i, (a, c)) in want.data.iter().zip(got.data.iter()).enumerate() {
             assert!(
                 (a - c).abs() <= rel_tol * a.abs().max(1.0),
-                "fused vs per-step forward diverged at {i}: {a} vs {c}"
+                "fused vs per-step forward diverged at {i} (B={b}): {a} vs {c}"
             );
         }
 
@@ -1597,29 +1691,52 @@ mod tests {
         // larger. What survives is reassociation noise, and the two paths reassociate
         // differently by construction. Every other slice here is O(1)-O(100), so this
         // skips the degenerate case without weakening the real checks.
-        const DEAD: f32 = 0.1;
-        let close_rel = |want: &[f32], got: &[f32], what: &str| {
+        //
+        // The floor is relative to the largest bias gradient in the same backward, not
+        // an absolute constant: every gradient here scales with B, so a fixed floor
+        // that skips the degenerate slice at B=1 stops skipping it at B=256 while the
+        // slice is just as degenerate — same ~1e-3 ratio to its siblings, same pure
+        // cancellation noise.
+        // The fused backward's contraction walks each lane's columns four at a time, so
+        // the compiler contracts that body's multiply-adds differently from the per-step
+        // path's strided loop. Same column set, same order, different FMA fusion — the
+        // gap is ~1e-4 of the tensor's scale and does not grow with T, while the forward
+        // (untouched) stays at `rel_tol`.
+        let bwd_tol = if ops::fused_bf16_enabled() { rel_tol } else { 1e-3 };
+        let close_rel = |dead: f32, want: &[f32], got: &[f32], what: &str| {
             let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-            if scale < DEAD {
+            if scale < dead {
                 return;
             }
             for (i, (a, c)) in want.iter().zip(got).enumerate() {
                 assert!(
-                    (a - c).abs() <= rel_tol * scale,
-                    "{what} diverged at {i}: {a} vs {c} (scale {scale})"
+                    (a - c).abs() <= bwd_tol * scale,
+                    "{what} diverged at {i} (B={b}): {a} vs {c} (scale {scale})"
                 );
             }
         };
         let want_dx = per_step.backward_alloc(&gpu, &gy).to_host(&gpu);
         let got_dx = fused.backward_alloc(&gpu, &gy).to_host(&gpu);
-        close_rel(&want_dx.data, &got_dx.data, "dx");
+        close_rel(0.0, &want_dx.data, &got_dx.data, "dx");
+        // Measured separation at B = 1/64/256: the degenerate input-gate slice sits at
+        // 2-4e-4 of the largest bias gradient, the healthy ones at 0.05-0.14. Two
+        // orders of gap, stable across batch, so 1e-3 skips exactly the one slice.
+        // The bias gradients only exist once the backward above has run.
+        let db_scale = (0..4)
+            .flat_map(|gi| per_step.gate_db(&gpu, gi))
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max);
+        let dead = db_scale * 1e-3;
         for gi in 0..4 {
+            // `dW` runs orders above the bias floor, so it is checked unconditionally.
             close_rel(
+                0.0,
                 &per_step.gate_dw(&gpu, gi),
                 &fused.gate_dw(&gpu, gi),
                 &format!("dW[{gi}]"),
             );
             close_rel(
+                dead,
                 &per_step.gate_db(&gpu, gi),
                 &fused.gate_db(&gpu, gi),
                 &format!("db[{gi}]"),

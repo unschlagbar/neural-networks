@@ -158,6 +158,38 @@ impl Linear {
         self.forward_raw(gpu, x, y);
     }
 
+    /// [`forward_shared`](Self::forward_shared) writing `y = resid + b + x·W`, for a
+    /// projection whose output feeds a residual add. The add rides along in the bias
+    /// seed the GEMM already needs, so it costs no kernel of its own — see
+    /// [`ops::broadcast_row_resid`]. `resid` and `y` may not alias.
+    pub fn forward_shared_resid(
+        &mut self,
+        gpu: &Gpu,
+        x: &DTensor,
+        resid: &DTensor,
+        y: &mut DTensor,
+    ) {
+        assert_eq!(
+            x.cols(),
+            self.input,
+            "Linear::forward_shared_resid — input width mismatch"
+        );
+        assert_eq!(
+            y.dims(),
+            [x.rows(), self.output],
+            "Linear::forward_shared_resid — output shape"
+        );
+        if !self.x.is_empty() {
+            self.x = DTensor::uninit(gpu, &[0, self.input]);
+        }
+        ops::broadcast_row_resid(gpu, y, resid, &self.b);
+        if self.bf16 {
+            self.gemm.run_wb(gpu, ops::MmForm::Nn, x, &self.w, y, 1.0);
+        } else {
+            ops::matmul_nn_into(gpu, x, &self.w, y, 1.0);
+        }
+    }
+
     /// The GEMM half of forward, without the input-saving policy. Shared by
     /// [`forward`](Self::forward) and [`forward_shared`](Self::forward_shared) so the
     /// two cannot drift apart.
@@ -169,6 +201,70 @@ impl Linear {
             self.gemm.run_wb(gpu, ops::MmForm::Nn, x, &self.w, y, 1.0);
         } else {
             ops::matmul_nn_into(gpu, x, &self.w, y, 1.0);
+        }
+    }
+
+    /// [`forward_shared`](Self::forward_shared) where `x` has already been narrowed
+    /// into a [`ops::SharedLhs`] by the caller — saves the per-layer cast when several
+    /// layers project the same input. `x` is the fp32 original, used only when this
+    /// layer is pinned to fp32.
+    pub fn forward_staged(
+        &mut self,
+        gpu: &Gpu,
+        x: &DTensor,
+        x_b: &super::BTensor,
+        y: &mut DTensor,
+    ) {
+        assert_eq!(
+            x.cols(),
+            self.input,
+            "Linear::forward_staged — input width mismatch"
+        );
+        assert_eq!(
+            y.dims(),
+            [x.rows(), self.output],
+            "Linear::forward_staged — output shape"
+        );
+        if !self.x.is_empty() {
+            self.x = DTensor::uninit(gpu, &[0, self.input]);
+        }
+        ops::broadcast_row(gpu, y, &self.b);
+        if self.bf16 {
+            self.gemm
+                .run_staged_lhs(gpu, ops::MmForm::Nn, x_b, &self.w, y, 1.0);
+        } else {
+            ops::matmul_nn_into(gpu, x, &self.w, y, 1.0);
+        }
+    }
+
+    /// [`backward_with_x`](Self::backward_with_x) where the saved input is already
+    /// narrowed into a [`ops::SharedLhs`].
+    pub fn backward_staged_x(
+        &mut self,
+        gpu: &Gpu,
+        x: &DTensor,
+        x_b: &super::BTensor,
+        dy: &DTensor,
+        dx: &mut DTensor,
+    ) {
+        assert_eq!(
+            dy.cols(),
+            self.output,
+            "Linear::backward_staged_x — grad width mismatch"
+        );
+        assert_eq!(
+            x.rows(),
+            dy.rows(),
+            "Linear::backward_staged_x — saved input / grad row mismatch"
+        );
+        if self.bf16 {
+            self.gemm
+                .run_backward_staged_x(gpu, x_b, dy, &self.w, &mut self.dw, dx);
+            ops::add_col_sum(gpu, &mut self.db, dy);
+        } else {
+            Self::grad_w(gpu, &mut self.gemm, self.bf16, x, dy, &mut self.dw);
+            ops::add_col_sum(gpu, &mut self.db, dy);
+            self.grad_x(gpu, dy, dx);
         }
     }
 

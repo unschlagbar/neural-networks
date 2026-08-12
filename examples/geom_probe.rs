@@ -60,8 +60,9 @@ fn main() {
         print!("{:>6}", h);
         for b in bs {
             match ops::slstm_fused_time_bwd_geometry(&gpu, h, b) {
-                Some((blocks, _threads, _cpb, smem)) => {
-                    print!("{:>12}", format!("{}bl/{}K", blocks, smem / 1024));
+                Some((blocks, _threads, _cpb, smem, stage_dg)) => {
+                    let tag = if stage_dg { "" } else { "*" };
+                    print!("{:>12}", format!("{}bl/{}K{}", blocks, smem / 1024, tag));
                 }
                 None => print!("{:>12}", "DECLINE"),
             }

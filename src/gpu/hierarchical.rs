@@ -407,6 +407,24 @@ pub struct Hierarchical {
     last_word_loss: f32,
 }
 
+/// Bit-exact checksum of a device tensor, printed when `GPU_HASH` is set.
+///
+/// Hashes the raw bits, not the values: a one-ULP difference between two runs of
+/// the same window has to show up, which is the whole point when localizing
+/// nondeterminism to a phase. Blocking D2H — debug only.
+fn hash_dbg(gpu: &Gpu, name: &str, t: &DTensor) {
+    if std::env::var("GPU_HASH").is_err() {
+        return;
+    }
+    let h = t.to_host(gpu);
+    let mut acc = 0xcbf29ce484222325u64;
+    for v in h.data.iter() {
+        acc = (acc ^ v.to_bits() as u64).wrapping_mul(0x100000001b3);
+    }
+    let sum: f64 = h.data.iter().map(|&v| v as f64).sum();
+    println!("  #{name:<10} {acc:#018x}  n={:<8} sum={sum:+.9e}", h.data.len());
+}
+
 /// Environment switches, resolved once when the model is built.
 #[derive(Clone, Copy, Default)]
 struct Flags {
@@ -745,6 +763,7 @@ impl Hierarchical {
             }
         }
         mark("encoder fwd");
+        hash_dbg(gpu, "e_w", &e_w);
 
         // PHASE 2: BACKBONE
         //
@@ -809,6 +828,8 @@ impl Hierarchical {
             concat_rows(gpu, &o_parts, dw, hc)
         };
         mark("backbone fwd");
+        hash_dbg(gpu, "bb_in", &bb_in);
+        hash_dbg(gpu, "o", &o);
 
         // PHASE 3: DECODER (forward + backward, per length group)
         // Word w's decode target is word w+1, so groups are keyed on the length of
@@ -1314,6 +1335,9 @@ impl Hierarchical {
             l.drop_saved_act(gpu);
         }
         self.dec_norm.drop_saved_act();
+        // Safe here and not per block: the whole stack is done, so no cell is mid-sweep
+        // holding a reference to the shared staging scratch.
+        ops::clear_shared_lhs();
     }
 
     /// Release the retained activations of one stage only, for the memory audit.

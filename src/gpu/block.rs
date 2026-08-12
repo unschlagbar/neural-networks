@@ -865,7 +865,6 @@ impl<C: Cell> Block<C> {
         // block beats `Linear::forward` saving its own copy: `lin_gate` and
         // `lin_value` share `zn`, so that path would hold it twice (4 MB per block at
         // the backbone's shape, 64 MB across 16 blocks) for one tensor.
-        let mut down = a.pool.take(gpu, &[n, h]);
         self.pre_norm2.forward(gpu, &z, a.zn.get(gpu, &[n, h]));
         // The saved buffers are disjoint `Buf` slots, but each `get`/`expect` borrows
         // `a` as a whole — so take the handles apart once, up front.
@@ -890,13 +889,14 @@ impl<C: Cell> Block<C> {
                 gate_act.get(gpu, &[n, u]),
                 mixed.get(gpu, &[n, u]),
             );
+            // `y = z + down(mixed)`: the residual rides in `lin_down`'s bias seed, so
+            // there is no separate add and no `down` buffer to hold its output.
+            y.reshape_to(&[n, h]);
             self.lin_down
-                .forward_shared(gpu, mixed.expect("mixed"), &mut down);
+                .forward_shared_resid(gpu, mixed.expect("mixed"), &z, y);
         });
-        y.reshape_to(&[n, h]);
-        ops::add_into(gpu, &z, &down, y);
         y.reshape_to(&[b, t, h]);
-        a.pool.put_all([down, z]);
+        a.pool.put(z);
         // With offload on, this block's saved activations go to the host now and the
         // device buffers are released. Backward restores them (see `restore_act`).
         self.evict_act(gpu);
@@ -1293,13 +1293,19 @@ mod tests {
     }
 
     fn rel(gpu: &Gpu) -> f32 {
-        // Two independent bf16 sources now, not one: the saved slabs AND the
-        // projections' GEMM operands (`ops::GemmBf16`). A block chains several
-        // matmuls, each contributing ~2^-8 relative on its own operands, so the
-        // budget against an all-fp32 CPU reference is a small multiple of the
-        // single-quantization bound rather than exactly it.
+        // Three independent bf16 sources, not one: the saved slabs, the projections'
+        // GEMM operands, and the sLSTM's own whole-sequence GEMMs (`x·Wx`, `dg·Wxᵀ`,
+        // `xᵀ·dg`, also `ops::GemmBf16`). A block chains several matmuls, each
+        // contributing ~2^-8 relative on its own operands, so the budget against an
+        // all-fp32 CPU reference is a small multiple of the single-quantization bound
+        // rather than exactly it.
+        //
+        // 1e-2 was calibrated before the sLSTM GEMMs joined and sat right on the
+        // measured maximum, so it failed roughly one run in three. Ten runs of the
+        // worst element: `y` peaks at 0.0094, `dx` at 0.0110 — the error is bounded and
+        // does not grow, the bound simply had no margin. 2e-2 is ~1.8x the observed max.
         if ops::gemm_bf16_enabled(gpu) || gpu.kernels.slab_bf16 {
-            1e-2
+            2e-2
         } else {
             0.0
         }

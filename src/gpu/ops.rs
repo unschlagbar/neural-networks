@@ -164,7 +164,7 @@ impl IdBatch {
             .expect("IdBatch: H2D");
         self.copied[half] = Some(
             gpu.stream
-                .record_event(None)
+                .record_event(super::host_wait_event_flags())
                 .expect("IdBatch: record H2D completion"),
         );
     }
@@ -356,6 +356,178 @@ pub fn matmul_bf16_into(
     .expect("cublas gemm_ex bf16");
 }
 
+/// One bf16 copy of an activation that several layers read.
+///
+/// mLSTM hands the same `xf` to six projections, and the same `xf` again to their six
+/// backwards. Each `Linear` owns a private [`GemmBf16`], so none can see the others'
+/// staged copy and the tensor is narrowed twelve times per cell. This holds the single
+/// narrowed copy; the layers take it through [`Linear::forward_staged`] and
+/// [`Linear::backward_staged_x`].
+///
+/// It is **scratch**, live only within one cell's forward or backward. Blocks run
+/// strictly one at a time (`Lm` sweeps `blocks.iter_mut()`, and `.rev()` backward), so
+/// one buffer serves the whole stack — a per-cell copy would hold 32 of them at the
+/// backbone, 31 of which are idle. [`with_shared_lhs`] is that single instance.
+///
+/// Deliberately not a `Pool`: the shape is the cell's `[N, inp]`, the same on every
+/// call, so there is nothing to search for and nothing to round up.
+#[derive(Default)]
+pub struct SharedLhs {
+    t: Option<super::BTensor>,
+}
+
+thread_local! {
+    /// The staging scratch, and the CUDA stream it was allocated on.
+    ///
+    /// Thread-local because the CPU-side replica pool runs stacks on several threads at
+    /// once and a device buffer must not be shared across them. The stream tag is what
+    /// makes it safe to keep across calls: a buffer belongs to the context that
+    /// allocated it, and reusing one under a *different* context is a stale device
+    /// pointer — silent corruption, not an error. Tests hit exactly that (each builds
+    /// its own `Gpu` while the thread-local survives), which is how it was caught.
+    static SHARED_LHS: std::cell::RefCell<(Option<usize>, SharedLhs)> =
+        const { std::cell::RefCell::new((None, SharedLhs { t: None })) };
+}
+
+/// Run `f` with the shared staging buffer holding `src` narrowed to bf16.
+///
+/// The closure form is what keeps this sound: the borrow cannot outlive the call, so
+/// nothing can hold the buffer across a point where another cell would restage it.
+pub fn with_shared_lhs<R>(gpu: &Gpu, src: &DTensor, f: impl FnOnce(&super::BTensor) -> R) -> R {
+    SHARED_LHS.with(|s| {
+        let mut s = s.borrow_mut();
+        let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
+        if s.0 != Some(tag) {
+            s.1.clear();
+            s.0 = Some(tag);
+        }
+        let staged = s.1.stage(gpu, src);
+        f(staged)
+    })
+}
+
+/// Device bytes the shared staging scratch holds on this thread. Diagnostic.
+pub fn shared_lhs_bytes() -> usize {
+    SHARED_LHS.with(|s| s.borrow().1.retained_bytes())
+}
+
+thread_local! {
+    /// Ping-pong partner buffers for the fused sLSTM T-loops: `[B, H]` for the
+    /// forward's h, `[B, 4H]` for the backward's gate deltas, and `[B, H]` for the
+    /// backward's `dh_recur`.
+    ///
+    /// Kept across calls because they are a few KB and every cell in the stack wants
+    /// the same shapes; reallocating per launch would churn the pool inside the
+    /// hot loop. Stream-tagged for the same reason as [`SHARED_LHS`] — a buffer
+    /// reused under a different context is a stale device pointer.
+    static FUSED_ALT: std::cell::RefCell<(
+        Option<usize>,
+        Option<DTensor>,
+        Option<DTensor>,
+        Option<DTensor>,
+    )> = const { std::cell::RefCell::new((None, None, None, None)) };
+}
+
+/// Run `f` with a zeroed `[rows, cols]` scratch tensor, reallocated only on a shape
+/// or context change. `bwd` picks which of the two slots to use.
+fn with_fused_alt<R>(gpu: &Gpu, rows: usize, cols: usize, bwd: bool, f: impl FnOnce(&mut DTensor) -> R) -> R {
+    FUSED_ALT.with(|s| {
+        let mut s = s.borrow_mut();
+        let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
+        if s.0 != Some(tag) {
+            s.1 = None;
+            s.2 = None;
+            s.3 = None;
+            s.0 = Some(tag);
+        }
+        let slot = if bwd { &mut s.2 } else { &mut s.1 };
+        if slot.as_ref().map_or(true, |t| t.dims() != [rows, cols]) {
+            *slot = Some(DTensor::zeros(gpu, &[rows, cols]));
+        }
+        f(slot.as_mut().unwrap())
+    })
+}
+
+/// Run `f` with the backward's two ping-pong scratches: the `[B, 4H]` gate-delta
+/// partner and the `[B, H]` `dh_recur` partner. Both are reallocated only on a shape
+/// or context change, like [`with_fused_alt`].
+fn with_fused_alt_bwd<R>(
+    gpu: &Gpu,
+    rows: usize,
+    h: usize,
+    f: impl FnOnce(&mut DTensor, &mut DTensor) -> R,
+) -> R {
+    FUSED_ALT.with(|s| {
+        let mut s = s.borrow_mut();
+        let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
+        if s.0 != Some(tag) {
+            s.1 = None;
+            s.2 = None;
+            s.3 = None;
+            s.0 = Some(tag);
+        }
+        let (_, _, dg, dh) = &mut *s;
+        if dg.as_ref().map_or(true, |t| t.dims() != [rows, 4 * h]) {
+            *dg = Some(DTensor::zeros(gpu, &[rows, 4 * h]));
+        }
+        if dh.as_ref().map_or(true, |t| t.dims() != [rows, h]) {
+            *dh = Some(DTensor::zeros(gpu, &[rows, h]));
+        }
+        f(dg.as_mut().unwrap(), dh.as_mut().unwrap())
+    })
+}
+
+/// Release the fused ping-pong scratch on this thread.
+pub fn clear_fused_alt() {
+    FUSED_ALT.with(|s| {
+        let mut s = s.borrow_mut();
+        s.1 = None;
+        s.2 = None;
+        s.3 = None;
+        s.0 = None;
+    });
+}
+
+/// Release the shared staging scratch on this thread.
+pub fn clear_shared_lhs() {
+    SHARED_LHS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.1.clear();
+        s.0 = None;
+    });
+}
+
+impl SharedLhs {
+    /// Narrow `src` into the shared buffer and hand back a reference to it.
+    ///
+    /// Reuse is bounded, unlike the fixed-shape staging inside [`GemmBf16`]: one buffer
+    /// serves every cell width and every window size, so keeping whatever the largest
+    /// one left would ratchet to the biggest shape ever seen and hold it forever.
+    pub fn stage(&mut self, gpu: &Gpu, src: &DTensor) -> &super::BTensor {
+        let n = src.len();
+        let keep = self
+            .t
+            .as_ref()
+            .is_some_and(|t| t.capacity() >= n && t.capacity() <= n.saturating_mul(4));
+        if keep {
+            self.t.as_mut().expect("checked").shrink_to(src.dims());
+        } else {
+            self.t = Some(super::BTensor::uninit(gpu, src.dims()));
+        }
+        self.t.as_mut().expect("just filled").store(gpu, src);
+        self.t.as_ref().expect("staged")
+    }
+
+    /// Device bytes held (2 bytes/element). Diagnostic.
+    pub fn retained_bytes(&self) -> usize {
+        self.t.as_ref().map_or(0, |t| t.capacity() * 2)
+    }
+
+    pub fn clear(&mut self) {
+        self.t = None;
+    }
+}
+
 /// Reusable bf16 staging for a layer's GEMM operands.
 ///
 /// [`matmul_bf16_into`] needs both operands already in bf16, but the tensors a
@@ -519,6 +691,74 @@ impl GemmBf16 {
         let lhs = self.lhs.as_ref().expect("staged");
         let rhs = self.w.as_ref().expect("staged");
         matmul_bf16_into(gpu, form, lhs, rhs, c, beta);
+    }
+
+    /// `Y = X·W` where `X` is **already narrowed** into a [`SharedLhs`], so this
+    /// launches no cast for it. The weight still comes from the cache.
+    pub fn run_staged_lhs(
+        &mut self,
+        gpu: &Gpu,
+        form: MmForm,
+        lhs: &super::BTensor,
+        w: &DTensor,
+        c: &mut DTensor,
+        beta: f32,
+    ) {
+        if !wcache_enabled() {
+            let n2 = w.len();
+            match &mut self.rhs {
+                Some(t) if t.capacity() >= n2 => t.shrink_to(w.dims()),
+                _ => self.rhs = Some(super::BTensor::uninit(gpu, w.dims())),
+            }
+            self.rhs.as_mut().expect("just filled").store(gpu, w);
+            let rhs = self.rhs.as_ref().expect("staged");
+            matmul_bf16_into(gpu, form, lhs, rhs, c, beta);
+            return;
+        }
+        self.stage_w(gpu, w);
+        let rhs = self.w.as_ref().expect("staged");
+        matmul_bf16_into(gpu, form, lhs, rhs, c, beta);
+    }
+
+    /// [`run_backward`](Self::run_backward) where `x` is already narrowed into a
+    /// [`SharedLhs`] — only `dy` is cast here.
+    pub fn run_backward_staged_x(
+        &mut self,
+        gpu: &Gpu,
+        x: &super::BTensor,
+        dy: &DTensor,
+        w: &DTensor,
+        dw: &mut DTensor,
+        dx: &mut DTensor,
+    ) {
+        let n = dy.len();
+        match &mut self.rhs {
+            Some(t) if t.capacity() >= n => t.shrink_to(dy.dims()),
+            _ => self.rhs = Some(super::BTensor::uninit(gpu, dy.dims())),
+        }
+        self.rhs.as_mut().expect("just filled").store(gpu, dy);
+        {
+            let rhs = self.rhs.as_ref().expect("staged");
+            matmul_bf16_into(gpu, MmForm::Tn, x, rhs, dw, 1.0);
+        }
+        // `dX = dY·Wᵀ`. `lhs` is free here — the shared `x` lives outside this struct.
+        if !wcache_enabled() {
+            let n2 = w.len();
+            match &mut self.lhs {
+                Some(t) if t.capacity() >= n2 => t.shrink_to(w.dims()),
+                _ => self.lhs = Some(super::BTensor::uninit(gpu, w.dims())),
+            }
+            self.lhs.as_mut().expect("just filled").store(gpu, w);
+        } else {
+            self.stage_w(gpu, w);
+        }
+        let dy_b = self.rhs.as_ref().expect("staged");
+        let w_b = if wcache_enabled() {
+            self.w.as_ref().expect("staged")
+        } else {
+            self.lhs.as_ref().expect("staged")
+        };
+        matmul_bf16_into(gpu, MmForm::Nt, dy_b, w_b, dx, 0.0);
     }
 
     /// A Linear's two backward GEMMs, `dW += Xᵀ·dY` and `dX = dY·Wᵀ`, driven from a
@@ -836,7 +1076,41 @@ pub fn broadcast_row(gpu: &Gpu, out: &mut DTensor, bias: &DTensor) {
     let f = gpu.kernels.get("broadcast_row");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut out.buf).arg(&bias.buf).arg(&rows_i).arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((rows * n) as u32)) }.expect("broadcast_row");
+    // One block per row, grid-strided so a tall output does not need a huge grid.
+    // Threads cover the width, which is where the coalescing is.
+    let threads = n.clamp(32, 256).next_power_of_two().min(1024) as u32;
+    let blocks = rows.min(65535).max(1) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe { lb.launch(cfg) }.expect("broadcast_row");
+}
+
+/// [`broadcast_row`] with a residual folded in: `out = resid + bias`, so a projection
+/// feeding a residual seeds its output with the sum and the trailing add needs no
+/// kernel. `resid` and `out` may not alias.
+pub fn broadcast_row_resid(gpu: &Gpu, out: &mut DTensor, resid: &DTensor, bias: &DTensor) {
+    let (rows, n) = (out.rows(), out.cols());
+    assert_eq!(resid.dims(), out.dims(), "broadcast_row_resid — residual shape");
+    assert_eq!(bias.len(), n, "broadcast_row_resid — bias width");
+    let (rows_i, n_i) = (rows as i32, n as i32);
+    let f = gpu.kernels.get("broadcast_row_resid");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut out.buf)
+        .arg(&resid.buf)
+        .arg(&bias.buf)
+        .arg(&rows_i)
+        .arg(&n_i);
+    let threads = n.clamp(32, 256).next_power_of_two().min(1024) as u32;
+    let blocks = rows.min(65535).max(1) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe { lb.launch(cfg) }.expect("broadcast_row_resid");
 }
 
 /// Accumulate the column sum of `dy` (`[rows, N]`) into `db` (`[N]`) — the bias
@@ -1829,6 +2103,27 @@ fn fused_blocks_override() -> Option<usize> {
     *N.get_or_init(|| std::env::var("SLSTM_BLOCKS").ok().and_then(|v| v.parse().ok()))
 }
 
+/// Block width for the fused kernels. Both phases of both kernels are strided
+/// loops, so any width is correct; it only trades warps-in-flight against lanes
+/// left idle when a phase has less work than the block is wide.
+///
+/// 768 measured best at the backbone shape (H=768, B=1, 77 blocks), swept against
+/// the real step: bwd 2566 -> 2059 us/call, fwd 1822 -> 1690, 352.6 -> 331.9 ms/step.
+/// The intuition that a narrow block would suit the pointwise phase — which fills
+/// only B*nj = 10 lanes there — is backwards: that phase is a short prologue, while
+/// the reduction that follows it is the whole cost, and the reduction scales with
+/// warps. Narrowing starves the reduction to save nothing (64 threads: bwd 4768).
+fn fused_block_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("SLSTM_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|t: &usize| *t >= 32 && *t <= 1024 && t % 32 == 0)
+            .unwrap_or(768)
+    })
+}
+
 /// Launch geometry for [`slstm_fused_time`]: `(blocks, threads, cols_per_block,
 /// shared_bytes)`, or `None` when the shape does not fit the kernel's contract.
 ///
@@ -1843,7 +2138,7 @@ pub fn slstm_fused_time_geometry(
     b: usize,
 ) -> Option<(usize, usize, usize, usize)> {
     let h4 = 4 * h;
-    let threads = 256usize;
+    let threads = fused_block_threads();
     // Leave a little headroom under the opt-in cap for the driver's own use.
     let smem_cap = gpu.max_shared_optin.saturating_sub(1024);
     // `cols_per_block` counts HIDDEN UNITS; each carries four Wh columns, so a block
@@ -1900,19 +2195,30 @@ pub fn slstm_fused_time_geometry(
 /// owning `units` output units holds `units` whole **rows** of `Wh` (`4H` each),
 /// where the forward held `4*units` columns of `H`. Same total per unit, different
 /// axis — see the kernel for why the ownership transposes.
+///
+/// The trailing `bool` is whether the `[B, 4H]` gate-delta cache is staged; the
+/// kernel must be told, since it changes how the contraction reads `dg`.
 pub fn slstm_fused_time_bwd_geometry(
     gpu: &Gpu,
     h: usize,
     b: usize,
-) -> Option<(usize, usize, usize, usize)> {
+) -> Option<(usize, usize, usize, usize, bool)> {
     let h4 = 4 * h;
-    let threads = 256usize;
+    let threads = fused_block_threads();
     let smem_cap = gpu.max_shared_optin.saturating_sub(1024);
     // One staged Wh row, 2 bytes per entry under bf16 staging.
     let per_unit = h4 * if fused_bf16_enabled() { 2 } else { 4 };
-    // Plus one fp32 [B, 4H] copy of the step's gate deltas, shared by every warp in
-    // the block (see the kernel's `dgsh`). Fixed cost, independent of the unit count.
+    // Optionally an fp32 [B, 4H] copy of the step's gate deltas, shared by every warp
+    // in the block (the kernel's `dgsh`). It is a coalescing cache, not a correctness
+    // requirement: a warp owning (b, u) reads only row `b`, so without it the warp
+    // reads that row straight from global. Staging pays off when B is small — the
+    // backbone's B=1 — but the cost is `B * 4H * 4`, which at the encoder's real batch
+    // sizes (B in the hundreds) is 256 KB - 4 MB against a ~100 KB cap and would
+    // decline the whole path. So it is taken only when it fits alongside at least one
+    // unit, and dropped otherwise rather than giving up the fused kernel.
     let dg_bytes = b * h4 * 4;
+    let stage_dg = dg_bytes + per_unit <= smem_cap;
+    let dg_bytes = if stage_dg { dg_bytes } else { 0 };
     let max_units = smem_cap.saturating_sub(dg_bytes) / per_unit;
     if max_units == 0 {
         return None;
@@ -1926,7 +2232,7 @@ pub fn slstm_fused_time_bwd_geometry(
     if shared_bytes > smem_cap || blocks > gpu.sm_count {
         return None;
     }
-    Some((blocks, threads, units_per_block, shared_bytes))
+    Some((blocks, threads, units_per_block, shared_bytes, stage_dg))
 }
 
 /// The whole backward T-loop as **one cooperative launch**: see
@@ -1952,12 +2258,13 @@ pub fn slstm_fused_time_bwd(
         return false;
     }
     let (b, h) = (dc_recur.rows(), dc_recur.cols());
-    let Some((blocks, threads, units_per_block, shared_bytes)) =
+    let Some((blocks, threads, units_per_block, shared_bytes, stage_dg)) =
         slstm_fused_time_bwd_geometry(gpu, h, b)
     else {
         return false;
     };
     let (t_i, h_i, b_i, upb_i) = (t as i32, h as i32, b as i32, units_per_block as i32);
+    let stage_i = i32::from(stage_dg);
     let f = gpu
         .kernels
         .specialized(&gpu.context, "slstm_fused_time_bwd", h, b, fused_bf16_enabled());
@@ -1980,34 +2287,39 @@ pub fn slstm_fused_time_bwd(
         block_dim: (threads as u32, 1, 1),
         shared_mem_bytes: shared_bytes as u32,
     };
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&wh.buf)
-        .arg(&dy.buf)
-        .arg(&mut g.buf)
-        .arg(&mut dgates_all.buf)
-        .arg(&mut dh_recur.buf)
-        .arg(&mut dc_recur.buf)
-        .arg(&mut dn_recur.buf);
-    push_slab_ref!(lb, slabs.ot);
-    lb.arg(&slabs.c.buf)
-        .arg(&slabs.n.buf)
-        .arg(&slabs.c_prev.buf)
-        .arg(&slabs.n_prev.buf);
-    push_slab_ref!(lb, slabs.zt);
-    lb.arg(&slabs.i_prime.buf)
-        .arg(&slabs.f_prime.buf)
-        .arg(&t_i)
-        .arg(&h_i)
-        .arg(&b_i)
-        .arg(&upb_i);
-    // SAFETY: geometry guarantees a co-resident grid and a fitting shared slice.
-    match unsafe { lb.launch_cooperative(cfg) } {
-        Ok(_) => true,
-        Err(e) => {
-            eprintln!("slstm_fused_time_bwd: cooperative launch failed: {e:?}");
-            false
+    with_fused_alt_bwd(gpu, b, h, |dg_alt, dh_alt| {
+        let mut lb = gpu.stream.launch_builder(&f);
+        lb.arg(&wh.buf)
+            .arg(&dy.buf)
+            .arg(&mut g.buf)
+            .arg(&mut dgates_all.buf)
+            .arg(&mut dg_alt.buf)
+            .arg(&mut dh_recur.buf)
+            .arg(&mut dh_alt.buf)
+            .arg(&mut dc_recur.buf)
+            .arg(&mut dn_recur.buf);
+        push_slab_ref!(lb, slabs.ot);
+        lb.arg(&slabs.c.buf)
+            .arg(&slabs.n.buf)
+            .arg(&slabs.c_prev.buf)
+            .arg(&slabs.n_prev.buf);
+        push_slab_ref!(lb, slabs.zt);
+        lb.arg(&slabs.i_prime.buf)
+            .arg(&slabs.f_prime.buf)
+            .arg(&t_i)
+            .arg(&h_i)
+            .arg(&b_i)
+            .arg(&upb_i)
+            .arg(&stage_i);
+        // SAFETY: geometry guarantees a co-resident grid and a fitting shared slice.
+        match unsafe { lb.launch_cooperative(cfg) } {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("slstm_fused_time_bwd: cooperative launch failed: {e:?}");
+                false
+            }
         }
-    }
+    })
 }
 
 /// The whole forward T-loop as **one cooperative launch**: see `slstm_fused_time`
@@ -2068,35 +2380,38 @@ pub fn slstm_fused_time(
         block_dim: (threads as u32, 1, 1),
         shared_mem_bytes: shared_bytes as u32,
     };
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&wh.buf).arg(&mut g.buf).arg(&bcat.buf);
-    push_slab!(lb, slabs.h_prev);
-    lb.arg(&mut c_state.buf)
-        .arg(&mut n_state.buf)
-        .arg(&mut m_state.buf)
-        .arg(&mut h_state.buf)
-        .arg(&mut slabs.c_prev.buf)
-        .arg(&mut slabs.n_prev.buf);
-    push_slab!(lb, slabs.zt);
-    push_slab!(lb, slabs.ot);
-    lb.arg(&mut slabs.i_prime.buf)
-        .arg(&mut slabs.f_prime.buf)
-        .arg(&mut slabs.c.buf)
-        .arg(&mut slabs.n.buf)
-        .arg(&mut out.buf)
-        .arg(&t_i)
-        .arg(&h_i)
-        .arg(&b_i)
-        .arg(&cpb_i);
-    // SAFETY: the geometry above guarantees the grid is co-resident (a cooperative
-    // launch deadlocks otherwise) and that every block's shared slice fits.
-    match unsafe { lb.launch_cooperative(cfg) } {
-        Ok(_) => true,
-        Err(e) => {
-            eprintln!("slstm_fused_time: cooperative launch failed: {e:?}");
-            false
+    with_fused_alt(gpu, b, h, false, |h_alt| {
+        let mut lb = gpu.stream.launch_builder(&f);
+        lb.arg(&wh.buf).arg(&mut g.buf).arg(&bcat.buf);
+        push_slab!(lb, slabs.h_prev);
+        lb.arg(&mut c_state.buf)
+            .arg(&mut n_state.buf)
+            .arg(&mut m_state.buf)
+            .arg(&mut h_state.buf)
+            .arg(&mut h_alt.buf)
+            .arg(&mut slabs.c_prev.buf)
+            .arg(&mut slabs.n_prev.buf);
+        push_slab!(lb, slabs.zt);
+        push_slab!(lb, slabs.ot);
+        lb.arg(&mut slabs.i_prime.buf)
+            .arg(&mut slabs.f_prime.buf)
+            .arg(&mut slabs.c.buf)
+            .arg(&mut slabs.n.buf)
+            .arg(&mut out.buf)
+            .arg(&t_i)
+            .arg(&h_i)
+            .arg(&b_i)
+            .arg(&cpb_i);
+        // SAFETY: the geometry above guarantees the grid is co-resident (a cooperative
+        // launch deadlocks otherwise) and that every block's shared slice fits.
+        match unsafe { lb.launch_cooperative(cfg) } {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("slstm_fused_time: cooperative launch failed: {e:?}");
+                false
+            }
         }
-    }
+    })
 }
 
 /// One fused backward step of the sLSTM cell.

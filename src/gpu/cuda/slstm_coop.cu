@@ -56,7 +56,7 @@ namespace cg = cooperative_groups;
 extern "C" __global__ void slstm_fused_time(
         const float* __restrict__ wh, float* g, const float* __restrict__ bcat,
         slab_t* h_prev, float* c_state, float* n_state, float* m_state, float* h_state,
-        float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
+        float* h_alt, float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
         float* i_prime, float* f_prime, float* c_out, float* n_out,
         float* out, int T, int H_rt, int B_rt, int cols_per_block) {
     extern __shared__ float smem[];
@@ -127,15 +127,24 @@ extern "C" __global__ void slstm_fused_time(
     }
     grid.sync(); // Wh staged everywhere AND initial h_state visible to all blocks
 
-#ifdef FUSED_BF16
-    // Seed the mirror with h_0 (the loop refreshes it at the end of every step).
-    for (int i = threadIdx.x; i < FUSED_B * FUSED_H; i += blockDim.x) {
-        hsh[i] = __float2bfloat16(h_state[i]);
-    }
-    __syncthreads();
-#endif
+    // h ping-pong. The mirror below reads the WHOLE h vector while the pointwise
+    // phase writes only this block's slice, so reading and writing the same buffer
+    // is a cross-block write-after-read hazard that costs a second grid barrier per
+    // step to close. Writing step t's h into the other buffer removes the hazard
+    // itself: nothing overwrites what a straggler is still mirroring.
+    float* h_cur = h_state;
+    float* h_nxt = h_alt;
 
     for (int t = 0; t < T; ++t) {
+#ifdef FUSED_BF16
+        // Refresh this block's bf16 mirror of the FULL h vector. It cannot be filled
+        // in-register by the pointwise phase: a block computes h only for the units
+        // it owns, while the reduction below contracts over all H of them.
+        for (int i = threadIdx.x; i < FUSED_B * FUSED_H; i += blockDim.x) {
+            hsh[i] = __float2bfloat16(h_cur[i]);
+        }
+        __syncthreads(); // mirror complete before this block's reduction reads it
+#endif
         // --- recurrent half: gh[b, col] = sum_r h_state[b, r] * Wh[r, col] ---
         // ONE WARP PER COLUMN, reducing over the H rows. Assigning one *thread* per
         // column instead would leave almost every thread idle at the shape that
@@ -156,7 +165,7 @@ extern "C" __global__ void slstm_fused_time(
             for (int r = lane; r < FUSED_H; r += 32)
                 acc = fmaf(__bfloat162float(hrow[r]), __bfloat162float(wcol[r]), acc);
 #else
-            const float* hrow = h_state + b * FUSED_H;
+            const float* hrow = h_cur + b * FUSED_H;
             const float* wcol = wsh + (long long)c * FUSED_H; // column c, contiguous
             for (int r = lane; r < FUSED_H; r += 32) acc = fmaf(hrow[r], wcol[r], acc);
 #endif
@@ -187,7 +196,7 @@ extern "C" __global__ void slstm_fused_time(
             float o_pre = g[go + 3 * FUSED_H] + ga[3 * nj]     + bcat[3 * FUSED_H + j];
             g[go + 2 * FUSED_H] = f_pre; // biased forget pre-activation, saved for backward
 
-            slab_st(h_prev, s, h_state[k]);
+            slab_st(h_prev, s, h_cur[k]);
 
             float z = tanhf(z_pre);
             float o = stable_sigmoid(o_pre);
@@ -209,23 +218,21 @@ extern "C" __global__ void slstm_fused_time(
             c_state[k] = c; n_state[k] = n; m_state[k] = m;
 
             float hh = o * c / n;
-            h_state[k] = hh;
+            h_nxt[k] = hh;
             out[s] = hh;
         }
-        grid.sync(); // h_t complete before step t+1's GEMV reads it
+        grid.sync(); // h_t complete before step t+1's GEMV (and mirror) reads it
 
-#ifdef FUSED_BF16
-        // Refresh this block's bf16 mirror of the FULL h vector. It cannot be
-        // filled in-register above: a block computes h only for the units it owns,
-        // while the reduction contracts over all H of them, so every block needs
-        // every other block's h — which is exactly what the grid.sync() above just
-        // made visible. This is a shared-memory write of B*H bf16 values per step,
-        // not a global round-trip, and no extra launch.
-        for (int i = threadIdx.x; i < FUSED_B * FUSED_H; i += blockDim.x) {
-            hsh[i] = __float2bfloat16(h_state[i]);
+        float* tmp = h_cur; h_cur = h_nxt; h_nxt = tmp;
+    }
+
+    // The caller's `h_state` must hold h_T on return. After T swaps the newest h is
+    // in `h_cur`, which is `h_alt` for odd T.
+    if (h_cur != h_state) {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < FUSED_B * FUSED_H;
+             i += blockDim.x * gridDim.x) {
+            h_state[i] = h_cur[i];
         }
-        __syncthreads(); // mirror complete before this block's next reduction
-#endif
     }
 }
 // Time-fused sLSTM BACKWARD: the whole reverse T-loop in one cooperative launch,
@@ -237,13 +244,14 @@ extern "C" __global__ void slstm_fused_time(
 // units [j0, j0+nj) needs those ROWS of Wh -- all 4H entries of each. That is what
 // this kernel stages: `wh_rows[nj][4H]`, read once before the loop.
 //
-// Unlike the forward, TWO grid syncs per step are structural and cannot be merged
-// away. The forward got to one because a unit's pointwise update needed only that
+// Unlike the forward, the pointwise/contraction split needs a grid sync between the
+// two phases. The forward got to one because a unit's pointwise update needed only that
 // unit's own gates; here the pointwise update at step t needs dh_recur[j], which
 // is a full contraction over every OTHER unit's gate deltas. So: pointwise (needs
-// dh_recur from t+1) -> sync -> contraction (needs all gate deltas) -> sync. At
-// T=2047 the pair costs ~2.3us*T total, against ~19.8ms of per-layer backward, so
-// it is well worth paying to delete the per-step launches.
+// dh_recur from t+1) -> sync -> contraction (needs all gate deltas). The trailing
+// sync the contraction used to need is gone whenever the deltas are staged in shared
+// memory — see the `stage_dg` note at the swap below — which is the case for the
+// backbone, where this kernel spends nearly all of its time.
 //
 // `dgates_all` is a [B, 4H] grid-visible scratch: the pointwise phase writes this
 // step's deltas there for the contraction phase to read across blocks. The kernel
@@ -251,12 +259,13 @@ extern "C" __global__ void slstm_fused_time(
 // per-step path does, so the post-loop dWx/dWh/db GEMMs are unchanged.
 extern "C" __global__ void slstm_fused_time_bwd(
         const float* __restrict__ wh, const float* __restrict__ dy, float* g,
-        float* dgates_all, float* dh_recur, float* dc_recur, float* dn_recur,
+        float* dgates_all, float* dgates_alt, float* dh_recur, float* dh_alt,
+        float* dc_recur, float* dn_recur,
         const slab_t* __restrict__ ot, const float* __restrict__ c_t,
         const float* __restrict__ n_t, const float* __restrict__ c_prev,
         const float* __restrict__ n_prev, const slab_t* __restrict__ zt,
         const float* __restrict__ i_gate, const float* __restrict__ f_gate,
-        int T, int H_rt, int B_rt, int units_per_block) {
+        int T, int H_rt, int B_rt, int units_per_block, int stage_dg) {
     extern __shared__ float smem[];
     cg::grid_group grid = cg::this_grid();
 
@@ -301,6 +310,21 @@ extern "C" __global__ void slstm_fused_time_bwd(
     }
     grid.sync();
 
+    // Delta ping-pong, for the same reason as the forward's h buffers: the staging
+    // loop below reads the whole [B, 4H] vector while the pointwise phase writes
+    // only this block's slice of it.
+    float* dg_cur = dgates_all;
+    float* dg_nxt = dgates_alt;
+    // `dh_recur` ping-pongs for the same reason: the pointwise phase READS step t+1's
+    // dh while the contraction below WRITES step t's. Sharing one buffer makes that a
+    // write-after-read across the grid, which is what the second barrier used to close
+    // — and a barrier here costs ~0.6us x T, the single largest item in this kernel.
+    // Writing into the other buffer removes the hazard itself, so the barrier goes.
+    // Each block only ever touches its own [j0, j0+nj) units of dh, so no block can
+    // observe another's half-written slice.
+    float* dh_cur = dh_recur;
+    float* dh_nxt = dh_alt;
+
     for (int t = T - 1; t >= 0; --t) {
         // --- pointwise: one thread per (batch, owned unit) ---
         // Identical math to slstm_step_fused_bwd; see it for the derivation.
@@ -312,7 +336,7 @@ extern "C" __global__ void slstm_fused_time_bwd(
             long long s = ((long long)b * T + t) * FUSED_H + j;
 
             float f_pre = g[go + 2 * FUSED_H];
-            float d_h = dy[s] + dh_recur[k];
+            float d_h = dy[s] + dh_cur[k];
             float o = slab_ld(ot, s);
             float c = c_t[s];
             float n = n_t[s];
@@ -337,24 +361,28 @@ extern "C" __global__ void slstm_fused_time_bwd(
 
             // Grid-visible copy for the contraction below.
             long long fo = (long long)b * H4 + j;
-            dgates_all[fo]          = d_z_pre;
-            dgates_all[fo + FUSED_H]      = d_i_pre;
-            dgates_all[fo + 2 * FUSED_H]  = d_f_pre;
-            dgates_all[fo + 3 * FUSED_H]  = d_o_pre;
+            dg_cur[fo]          = d_z_pre;
+            dg_cur[fo + FUSED_H]      = d_i_pre;
+            dg_cur[fo + 2 * FUSED_H]  = d_f_pre;
+            dg_cur[fo + 3 * FUSED_H]  = d_o_pre;
 
             dc_recur[k] = d_c * f;
             dn_recur[k] = d_n * f;
         }
         grid.sync(); // all gate deltas visible before any block contracts them
 
-        // Stage the whole [B, 4H] delta vector into shared memory once. Every warp
-        // below reduces against it, and without this each would re-read it from
-        // global — the same 4H floats fetched by all `gridDim.x` blocks on the
-        // critical path of every timestep.
-        for (int i = threadIdx.x; i < FUSED_B * H4; i += blockDim.x) {
-            dgsh[i] = dgates_all[i];
+        // Stage the whole [B, 4H] delta vector into shared memory once, so the warps
+        // below reduce against shared rather than each re-reading the same floats from
+        // global on every timestep. The cache costs `B * 4H * 4` bytes, which only fits
+        // at small B; past that `stage_dg` is off and the contraction reads `dg_cur`
+        // directly (lane-contiguous either way, so the reads stay coalesced and L2
+        // absorbs the reuse across blocks).
+        if (stage_dg) {
+            for (int i = threadIdx.x; i < FUSED_B * H4; i += blockDim.x) {
+                dgsh[i] = dg_cur[i];
+            }
+            __syncthreads();
         }
-        __syncthreads();
 
         // --- contraction: dh_recur[b, j] = sum_c dgates_all[b, c] * Wh[j, c] ---
         // One warp per (batch, owned unit), lanes striding the 4H reduction. The
@@ -364,21 +392,63 @@ extern "C" __global__ void slstm_fused_time_bwd(
         const int warps = blockDim.x >> 5;
         for (int i = warp; i < FUSED_B * nj; i += warps) {
             int b = i / nj, u = i - b * nj;
-            const float* dg = dgsh + (long long)b * H4;
+            const float* dg = (stage_dg ? dgsh : dg_cur) + (long long)b * H4;
             float acc = 0.0f;
+            // Four columns per lane per trip, keeping the scalar loop's column set:
+            // lane L still covers L, L+32, L+64, ... in that order, so the sum is
+            // unchanged bit for bit, but the loop runs a quarter of the trips and the
+            // four loads issue together instead of each waiting on the previous.
+            // H4 is a multiple of 4 but not always of 128, hence the tail guards.
 #ifdef FUSED_BF16
             const __nv_bfloat16* wrow = wsh + (long long)u * H4;
-            for (int c = lane; c < H4; c += 32)
+            for (int c = lane; c < H4; c += 128) {
                 acc = fmaf(dg[c], __bfloat162float(wrow[c]), acc);
+                if (c + 32 < H4) acc = fmaf(dg[c + 32], __bfloat162float(wrow[c + 32]), acc);
+                if (c + 64 < H4) acc = fmaf(dg[c + 64], __bfloat162float(wrow[c + 64]), acc);
+                if (c + 96 < H4) acc = fmaf(dg[c + 96], __bfloat162float(wrow[c + 96]), acc);
+            }
 #else
             const float* wrow = wsh + (long long)u * H4;
-            for (int c = lane; c < H4; c += 32) acc = fmaf(dg[c], wrow[c], acc);
+            for (int c = lane; c < H4; c += 128) {
+                acc = fmaf(dg[c], wrow[c], acc);
+                if (c + 32 < H4) acc = fmaf(dg[c + 32], wrow[c + 32], acc);
+                if (c + 64 < H4) acc = fmaf(dg[c + 64], wrow[c + 64], acc);
+                if (c + 96 < H4) acc = fmaf(dg[c + 96], wrow[c + 96], acc);
+            }
 #endif
             #pragma unroll
             for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
-            if (lane == 0) dh_recur[b * FUSED_H + j0 + u] = acc;
+            if (lane == 0) dh_nxt[b * FUSED_H + j0 + u] = acc;
         }
-        grid.sync(); // dh_recur complete before step t-1's pointwise reads it
+        // The barrier after the contraction is only needed when the contraction reads
+        // `dg` straight from global: there a straggler is still reading the buffer that
+        // the next step's pointwise phase overwrites, and no rotation depth fixes it
+        // (measured — a deeper buffer rotation does not help; the barrier is what the
+        // straggler needs).
+        //
+        // When the deltas are staged, each block copies its `dg` into shared memory and
+        // stops touching the global buffer at the `__syncthreads()` above, so the
+        // write-after-read window closes inside the block and the barrier is dead
+        // weight — worth ~0.6us x T, the largest single cost in this kernel. The
+        // backbone (B=1) always stages, which is where essentially all of the time is.
+        if (!stage_dg) grid.sync();
+        float* tmp = dg_cur; dg_cur = dg_nxt; dg_nxt = tmp;
+        tmp = dh_cur; dh_cur = dh_nxt; dh_nxt = tmp;
+    }
+
+    // The caller reads dh_recur as the sequence's incoming state gradient, so it must
+    // hold the newest values. After T swaps the newest dh is in `dh_cur`, which is
+    // `dh_alt` for odd T — mirror it back, exactly as the forward does for h_state.
+    if (dh_cur != dh_recur) {
+        // The last step's contraction is no longer followed by a barrier, so the grid
+        // must be squared up before one block copies units another block wrote. This
+        // is one barrier per LAUNCH, not per timestep.
+        grid.sync();
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < FUSED_B * FUSED_H;
+             i += blockDim.x * gridDim.x) {
+            dh_recur[i] = dh_cur[i];
+        }
     }
 }
+
 #endif // COOP_KERNELS
