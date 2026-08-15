@@ -1,0 +1,1 @@
+step,batch,lr,loss,perplexity,ms_per_step,s_per_norm_seq,word_loss

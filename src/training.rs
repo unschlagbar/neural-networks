@@ -8,8 +8,8 @@ use std::{
 use crate::{
     batches::ChunkedWordDataSet,
     config::{
-        BATCH_SIZE, CHUNK_BYTES, DECAY_STEPS, EPOCHS, LOG_EVERY, LR, MAX_WINDOW_TOKENS, MIN_LR,
-        MIN_WORDS_PER_SEQ, SAVE_EVERY, SEQ_LEN, TRAIN_DATA, VAL_DATA, WARMUP_STEPS, WORDS_PER_SEQ,
+        BATCH_SIZE, CHUNK_BYTES, DECAY_WINDOWS, EPOCHS, LOG_EVERY, LR, MAX_WINDOW_TOKENS, MIN_LR,
+        MIN_WORDS_PER_SEQ, SAVE_EVERY, SEQ_LEN, TRAIN_DATA, VAL_DATA, WARMUP_WINDOWS, WORDS_PER_SEQ,
     },
     hierarchical::{BackboneMode, Hierarchical},
     model::{build_hierarchical_model, build_normal_model},
@@ -121,27 +121,43 @@ pub fn train_hierarchical(model_path: &str) {
     // Cache is sized to the longest window seen so far and grown on demand.
     let mut cache_tokens = 0;
 
-    // Resume needs the total window count for the modulo — one cheap counting
-    // pass (tokenize only, nothing stored). Skipped for a fresh model.
-    let resume_windows = if model.step > 0 {
-        let prep_start = Instant::now();
-        let total = data.count_windows();
+    // Where the last run stopped, from the sidecar next to the checkpoint. The
+    // step count cannot answer this: it spans every corpus the weights have seen.
+    let mut progress =
+        crate::pretrain_progress::resume_or_fresh(model_path, TRAIN_DATA, model.step, EPOCHS);
+    // Every run must stamp its window count into the sidecar, otherwise the
+    // resume it writes cannot be validated later. `windows == 0` marks a count
+    // that was never taken — unmeasured, not mismatched.
+    let prep_start = Instant::now();
+    let total = data.count_windows();
+    println!(
+        "  {total} windows total (counting pass took {:.1?})",
+        prep_start.elapsed()
+    );
+    if !progress.is_fresh() && progress.windows != 0 && total != progress.windows {
+        // A resume offset is only meaningful against the window count it was
+        // measured with, so verify it before skipping anything.
         println!(
-            "  {total} windows total (counting pass took {:.1?})",
-            prep_start.elapsed()
+            "  corpus has {total} windows but the progress file recorded {} — \
+             starting a fresh pass.",
+            progress.windows
         );
-        model.step % total.max(1)
-    } else {
-        0
-    };
+        progress = crate::pretrain_progress::PretrainProgress::fresh(TRAIN_DATA, model.step);
+    }
+    progress.windows = total;
+    let start_epoch = progress.epoch;
+    let start_done = progress.done;
 
-    for epoch in 1..=EPOCHS {
+    for epoch in start_epoch..=EPOCHS {
         println!("── Epoch {epoch} ───────────────────────────────────────");
 
-        let mut skip = if epoch == 1 { resume_windows } else { 0 };
+        // Only the resumed epoch skips; later epochs run whole.
+        let mut skip = if epoch == start_epoch { start_done } else { 0 };
         if skip > 0 {
             println!("  Resuming from window {skip} (step {})", model.step);
         }
+        progress.epoch = epoch;
+        progress.done = skip;
 
         let start = Instant::now();
         data.rewind();
@@ -155,7 +171,11 @@ pub fn train_hierarchical(model_path: &str) {
                 cache_tokens = chunk.max_window_tokens();
                 model.make_cache(WORDS_PER_SEQ, cache_tokens);
             }
+            let trained = chunk.len() - skip;
             model.train(chunk.iter().skip(skip), &mut training_state);
+            // Chunk granularity: `train` consumes the iterator whole, so a stop
+            // mid-chunk resumes from the chunk boundary before it.
+            progress.done += trained;
             skip = 0;
         }
 
@@ -168,10 +188,23 @@ pub fn train_hierarchical(model_path: &str) {
                     "  ✓ end-of-epoch save to '{model_path}'  (epoch {epoch_time:.0?}, total {total_time:.0?})"
                 );
                 println!("    trained on: {}", model.seen.save_line());
+                // The recorded position is the START of the next epoch, so a
+                // stop here resumes without redoing the epoch just finished.
+                progress.epoch = epoch + 1;
+                progress.done = 0;
+                progress.step = model.step;
+                if let Err(e) = crate::pretrain_progress::save(model_path, &progress) {
+                    eprintln!("  ✗ progress save failed: {e}");
+                }
             }
             Err(e) => eprintln!("  ✗ end-of-epoch save failed: {e}"),
         }
     }
+
+    // The run consumed all its epochs: drop the sidecar so the next invocation
+    // starts at the beginning of whatever corpus it is pointed at.
+    crate::pretrain_progress::clear(model_path);
+    println!("Run complete — progress file cleared; the next run starts a fresh pass.");
 }
 
 /// CPU supervised fine-tuning (Q-A / instruction tuning) of a hierarchical
@@ -625,6 +658,11 @@ pub struct TrainingState {
     tokens_since_log: usize,
     extra_cols: Vec<String>,
     extra_vals: Vec<(f32, usize)>,
+    /// Total decode NLL (nats) and the byte count it was measured over, since the
+    /// last save. Byte-weighted rather than a mean of per-window means, so windows
+    /// count by how much text they actually carry.
+    bpb_nats: f64,
+    bpb_bytes: usize,
 }
 
 impl TrainingState {
@@ -652,7 +690,35 @@ impl TrainingState {
             tokens_since_log: 0,
             extra_cols: Vec::new(),
             extra_vals: Vec::new(),
+            bpb_nats: 0.0,
+            bpb_bytes: 0,
         }
+    }
+
+    /// Accumulate one window's decode loss for the bits-per-byte metric. `loss` is
+    /// the mean NLL per decoder ROW, `rows` the count it was averaged over (chars
+    /// plus one `[W]` per word) and `bytes` the raw UTF-8 bytes those rows cover.
+    /// The `[W]` rows are part of the model's cost but not of the text, so the
+    /// total nats are charged against bytes only — that is what makes the number
+    /// comparable to a byte-level model that never emits a word marker.
+    pub fn log_bpb(&mut self, loss: f32, rows: usize, bytes: usize) {
+        if bytes == 0 || !loss.is_finite() {
+            return;
+        }
+        self.bpb_nats += loss as f64 * rows as f64;
+        self.bpb_bytes += bytes;
+    }
+
+    /// Mean bits per byte since the last `take_bpb`, or `None` if nothing was
+    /// accumulated.
+    pub fn take_bpb(&mut self) -> Option<f32> {
+        if self.bpb_bytes == 0 {
+            return None;
+        }
+        let bpb = self.bpb_nats / self.bpb_bytes as f64 / std::f64::consts::LN_2;
+        self.bpb_nats = 0.0;
+        self.bpb_bytes = 0;
+        Some(bpb as f32)
     }
 
     pub fn init_log(&mut self, model_path: &str, extra_cols: &[&str]) {
@@ -712,9 +778,11 @@ impl TrainingState {
         self.loss_steps += 1;
         self.steps_since_log += 1;
         if self.step.is_multiple_of(self.batch_size) {
-            let batch_num = self.step / self.batch_size;
-            self.warmup_lr = self.lr * (batch_num as f32 / WARMUP_STEPS as f32).min(1.0);
-            let t = (batch_num as f32 / DECAY_STEPS as f32).min(1.0);
+            // Schedule position is the number of windows seen, so the curve over
+            // the corpus is the same at any BATCH_SIZE.
+            let windows = self.step as f32;
+            self.warmup_lr = self.lr * (windows / WARMUP_WINDOWS as f32).min(1.0);
+            let t = (windows / DECAY_WINDOWS as f32).min(1.0);
             self.decay_lr = MIN_LR + 0.5 * (self.lr - MIN_LR) * (1.0 + (PI * t).cos());
             self.current_lr = self.warmup_lr.min(self.decay_lr);
             Some(self.current_lr)
@@ -797,5 +865,46 @@ impl TrainingState {
         if let Some(writer) = &mut self.log_writer {
             let _ = writer.flush();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A uniform distribution over 256 byte values costs exactly 8 bits per row.
+    /// With one `[W]` row per word those rows are extra cost spread over the same
+    /// bytes, so bpb must come out ABOVE 8 — the row mean alone would say 8.
+    #[test]
+    fn bpb_charges_marker_rows_against_bytes() {
+        let mut s = TrainingState::new();
+        let ln256 = 256f32.ln();
+        // 4 words x 4 bytes = 16 bytes, 20 rows (4 markers).
+        s.log_bpb(ln256, 20, 16);
+        let bpb = s.take_bpb().expect("accumulated");
+        assert!((bpb - 8.0 * 20.0 / 16.0).abs() < 1e-4, "got {bpb}");
+        assert!(s.take_bpb().is_none(), "take must reset the accumulator");
+    }
+
+    /// Windows are weighted by their byte count, not averaged as per-window means.
+    #[test]
+    fn bpb_is_byte_weighted_across_windows() {
+        let ln2 = std::f32::consts::LN_2;
+        let mut s = TrainingState::new();
+        s.log_bpb(ln2, 10, 10); // 1 bpb over 10 bytes
+        s.log_bpb(3.0 * ln2, 90, 90); // 3 bpb over 90 bytes
+        let bpb = s.take_bpb().expect("accumulated");
+        // Byte-weighted: (10*1 + 90*3)/100 = 2.8, not the naive mean of 2.
+        assert!((bpb - 2.8).abs() < 1e-4, "got {bpb}");
+    }
+
+    /// A window with no decoded bytes must not poison the average.
+    #[test]
+    fn bpb_ignores_empty_and_nonfinite_windows() {
+        let mut s = TrainingState::new();
+        s.log_bpb(1.0, 0, 0);
+        assert!(s.take_bpb().is_none());
+        s.log_bpb(f32::NAN, 5, 5);
+        assert!(s.take_bpb().is_none());
     }
 }

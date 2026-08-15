@@ -15,6 +15,7 @@ pub mod optimizers;
 pub mod parallel;
 pub mod parquet;
 pub mod prepare_set;
+pub mod pretrain_progress;
 pub mod sampling;
 pub mod saving;
 pub mod segment;

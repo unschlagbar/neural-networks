@@ -24,6 +24,7 @@ use crate::config::{
 use crate::gpu::Gpu;
 use crate::gpu::hierarchical::{HierCfg, Hierarchical};
 use crate::nn2::optim::AdamCfg;
+use crate::pretrain_progress;
 use crate::sft;
 use crate::sft_progress;
 use crate::tokenizer_utf8::Utf8Tokenizer;
@@ -106,25 +107,42 @@ pub fn train_hierarchical_gpu(model_path: &str) {
 
     let mut opt = AdamCfg::new(LR, crate::optimizers::WEIGHT_DECAY);
 
-    // Resume needs the total window count for the modulo — one cheap counting pass.
-    let resume_windows = if model.step_count > 0 {
-        let t0 = Instant::now();
-        let total = data.count_windows();
+    // Where the last run stopped, from the sidecar next to the checkpoint. The
+    // step count cannot answer this: it spans every corpus the weights have seen.
+    let mut progress =
+        pretrain_progress::resume_or_fresh(model_path, TRAIN_DATA, model.step_count, EPOCHS);
+    // Every run must stamp its window count into the sidecar, otherwise the
+    // resume it writes cannot be validated later. `windows == 0` marks a count
+    // that was never taken — unmeasured, not mismatched.
+    let t0 = Instant::now();
+    let total = data.count_windows();
+    println!(
+        "  {total} windows total (counting pass took {:.1?})",
+        t0.elapsed()
+    );
+    if !progress.is_fresh() && progress.windows != 0 && total != progress.windows {
+        // A resume offset is only meaningful against the window count it was
+        // measured with, so verify it before skipping anything.
         println!(
-            "  {total} windows total (counting pass took {:.1?})",
-            t0.elapsed()
+            "  corpus has {total} windows but the progress file recorded {} — \
+             starting a fresh pass.",
+            progress.windows
         );
-        model.step_count % total.max(1)
-    } else {
-        0
-    };
+        progress = pretrain_progress::PretrainProgress::fresh(TRAIN_DATA, model.step_count);
+    }
+    progress.windows = total;
+    let start_epoch = progress.epoch;
+    let start_done = progress.done;
 
-    for epoch in 1..=EPOCHS {
+    for epoch in start_epoch..=EPOCHS {
         println!("── Epoch {epoch} ───────────────────────────────────────");
-        let mut skip = if epoch == 1 { resume_windows } else { 0 };
+        // Only the resumed epoch skips; later epochs run whole.
+        let mut skip = if epoch == start_epoch { start_done } else { 0 };
         if skip > 0 {
             println!("  Resuming from window {skip} (step {})", model.step_count);
         }
+        progress.epoch = epoch;
+        progress.done = skip;
 
         let epoch_start = Instant::now();
         let mut tokens_since_print = 0usize;
@@ -137,6 +155,11 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                 continue;
             }
             for batch in chunk.iter().skip(skip) {
+                // Counts every window the iterator yields, including the ones
+                // skipped below — `done` must stay aligned with the position
+                // `chunk.iter().skip(done)` resumes at.
+                progress.done += 1;
+
                 // The dataset speaks u16 / Range; the model takes usize / (start, end).
                 let tokens: Vec<usize> = batch.tokens.iter().map(|&t| t as usize).collect();
                 let words = &batch.words;
@@ -149,6 +172,10 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                 tokens_since_print += tokens.len();
                 state.log_tokens(tokens.len());
                 state.log_metric("word_loss", model.last_word_loss());
+                // Bits per byte counts the decoded words' raw bytes only: the `[W]`
+                // rows are part of the model's cost but not of the text.
+                let dec_bytes: usize = words[1..].iter().map(|w| w.end - w.start).sum();
+                state.log_bpb(loss, model.last_rows(), dec_bytes);
 
                 // `state.step` returns Some(lr) only on a batch boundary, so grads
                 // accumulate over BATCH_SIZE windows before each optimizer step.
@@ -182,7 +209,16 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                             // past the checkpoint just written.
                             state.flush_log();
                             println!("saved -> {}", state.save_path());
+                            if let Some(bpb) = state.take_bpb() {
+                                println!("  bpb {bpb:.4} (mean since last save)");
+                            }
                             println!("  trained on: {}", model.seen.save_line());
+                            // Written after the weights, so the recorded position
+                            // never runs ahead of the checkpoint it describes.
+                            progress.step = state.step;
+                            if let Err(e) = pretrain_progress::save(state.save_path(), &progress) {
+                                eprintln!("progress save failed: {e}");
+                            }
                         }
                         Err(e) => eprintln!("save failed: {e}"),
                     }
@@ -191,16 +227,32 @@ pub fn train_hierarchical_gpu(model_path: &str) {
             skip = 0;
         }
         println!("Epoch {epoch} took {:.1?}", epoch_start.elapsed());
+        // The recorded position is the START of the next epoch, so a stop here
+        // resumes without redoing the epoch just finished.
+        progress.epoch = epoch + 1;
+        progress.done = 0;
+        progress.step = state.step;
+        if let Err(e) = pretrain_progress::save(state.save_path(), &progress) {
+            eprintln!("progress save failed: {e}");
+        }
     }
 
     match model.save(&gpu, state.save_path(), &[]) {
         Ok(()) => {
             state.flush_log();
             println!("final save -> {}", state.save_path());
+            if let Some(bpb) = state.take_bpb() {
+                println!("  bpb {bpb:.4} (mean since last save)");
+            }
             println!("  trained on: {}", model.seen.save_line());
         }
         Err(e) => eprintln!("final save failed: {e}"),
     }
+    // The run consumed all its epochs: drop the sidecar so the next invocation
+    // starts at the beginning of whatever corpus it is pointed at, instead of
+    // resuming at the end of this one.
+    pretrain_progress::clear(state.save_path());
+    println!("Run complete — progress file cleared; the next run starts a fresh pass.");
 }
 
 /// GPU supervised fine-tuning (Q-A instruction tuning) of a pretrained

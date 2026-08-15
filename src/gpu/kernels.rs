@@ -88,6 +88,7 @@ const NAMES: &[&str] = &[
     "mlstm_ds",
     "div_rows",
     "mul",
+    "ogate_fwd",
     "slice_t",
     "slice_t_batch",
     "unslice_t",

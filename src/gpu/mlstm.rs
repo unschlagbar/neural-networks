@@ -329,13 +329,21 @@ impl MLstm {
         gamma: &Tensor,
     ) -> Self {
         let dhv = d / heads;
+        // q·kᵀ wants k scaled by 1/√dqk. The factor is constant, so it is folded into
+        // wk/bk here and unfolded in `to_nn_cell`: the checkpoint keeps the unscaled
+        // weights, while the runtime never spends a pass rescaling k or dk.
+        let inv_sqrt_dqk = 1.0 / (dqk as f32).sqrt();
+        let scaled = |t: &Tensor| {
+            Tensor::new(&t.dims(), t.data.iter().map(|v| v * inv_sqrt_dqk).collect())
+        };
+        let (wk, bk) = (&scaled(wk), &scaled(bk));
         Self {
             input_size,
             d,
             heads,
             dqk,
             dhv,
-            inv_sqrt_dqk: 1.0 / (dqk as f32).sqrt(),
+            inv_sqrt_dqk,
             chunk: chunk_len(),
             lin_q: Linear::from_parts(gpu, wq, bq),
             lin_k: Linear::from_parts(gpu, wk, bk),
@@ -363,6 +371,16 @@ impl MLstm {
     /// `HIER` checkpoint from a GPU model.
     pub fn to_nn_cell(&self, gpu: &Gpu) -> crate::nn::mlstm::MLSTMLayer {
         use super::{dt_matrix, dt_vec};
+        // Undo the 1/√dqk `from_parts` folded into wk/bk, so the checkpoint holds the
+        // same weights the CPU cell does.
+        let unfold_m = |m: iron_oxide::collections::Matrix| {
+            let (r, c) = (m.rows(), m.cols());
+            let d = m.as_slice().iter().map(|v| v / self.inv_sqrt_dqk).collect();
+            iron_oxide::collections::Matrix::from_vec(d, r, c)
+        };
+        let unfold_v = |v: Box<[f32]>| -> Box<[f32]> {
+            v.iter().map(|x| x / self.inv_sqrt_dqk).collect()
+        };
         let w_out = crate::nn::linear::LinearLayer::from_loaded(
             self.d,
             self.d,
@@ -375,13 +393,13 @@ impl MLstm {
             self.heads,
             self.dqk,
             dt_matrix(gpu, &self.lin_q.w),
-            dt_matrix(gpu, &self.lin_k.w),
+            unfold_m(dt_matrix(gpu, &self.lin_k.w)),
             dt_matrix(gpu, &self.lin_v.w),
             dt_matrix(gpu, &self.lin_o.w),
             dt_matrix(gpu, &self.lin_i.w),
             dt_matrix(gpu, &self.lin_f.w),
             dt_vec(gpu, &self.lin_q.b),
-            dt_vec(gpu, &self.lin_k.b),
+            unfold_v(dt_vec(gpu, &self.lin_k.b)),
             dt_vec(gpu, &self.lin_v.b),
             dt_vec(gpu, &self.lin_o.b),
             dt_vec(gpu, &self.lin_i.b),
@@ -556,8 +574,8 @@ impl MLstm {
             self.lin_i.forward_staged(gpu, &xf, xf_b, &mut ig);
             self.lin_f.forward_staged(gpu, &xf, xf_b, &mut fg);
         });
-        ops::scale_(gpu, &mut k, self.inv_sqrt_dqk);
-        ops::sigmoid_(gpu, &mut o);
+        // k needs no rescale: 1/√dqk is folded into lin_k's weights. `o` is squashed
+        // later, fused into the product that consumes it.
 
         // The gate logits go head-major as fp32 on either path: the reference pins
         // vecI/vecB to fp32, and they are [BH, T] — a factor of `dqk` smaller than
@@ -610,7 +628,7 @@ impl MLstm {
             // back through `backward_with_x`: a chunked sweep would otherwise have the
             // next chunk's forward overwrite the private copy `forward_alloc` saves.
             let mut hconcat = DTensor::uninit(gpu, &[n, d]);
-            ops::mul_into(gpu, &o, &yhat, &mut hconcat);
+            ops::ogate_fwd(gpu, &mut o, &yhat, &mut hconcat);
             let mut out = DTensor::uninit(gpu, &[n, d]);
             self.lin_out.forward_shared(gpu, &hconcat, &mut out);
             self.saved.push(Cache::Fused(SavedFused {
@@ -747,7 +765,7 @@ impl MLstm {
         // `backward_with_x`: under a chunked sweep the private copy `forward_alloc`
         // saves would be overwritten by the next chunk's forward.
         let mut hconcat = DTensor::uninit(gpu, &[n, d]);
-        ops::mul_into(gpu, &o, &yhat, &mut hconcat); // o ⊙ ŷ  [N, d]
+        ops::ogate_fwd(gpu, &mut o, &yhat, &mut hconcat); // σ(o) ⊙ ŷ  [N, d]
         let mut out = DTensor::uninit(gpu, &[n, d]);
         self.lin_out.forward_shared(gpu, &hconcat, &mut out); // [N, d]
 
@@ -1027,8 +1045,8 @@ impl MLstm {
         }
 
         let dq = ops::head_scatter(gpu, &dqh, b, h, t, dqk); // [N, dqk·H]
-        let mut dk = ops::head_scatter(gpu, &dkh, b, h, t, dqk);
-        ops::scale_(gpu, &mut dk, self.inv_sqrt_dqk); // k = (·)·1/√dqk
+        // No 1/√dqk here: it lives in lin_k's weights, so dk is already in their scale.
+        let dk = ops::head_scatter(gpu, &dkh, b, h, t, dqk);
         let dv = ops::head_scatter(gpu, &dvh, b, h, t, dhv);
         let d_ig = ops::head_scatter(gpu, &digh.reshaped(&[bh, t, 1]), b, h, t, 1);
         let d_fg = ops::head_scatter(gpu, &dfgh.reshaped(&[bh, t, 1]), b, h, t, 1);
@@ -1268,8 +1286,8 @@ impl MLstm {
 
         // Scatter head-major grads back to position-major [N, ·].
         let dq = ops::head_scatter(gpu, &dqh, b, h, t, dqk); // [N, d_qk]
-        let mut dk = ops::head_scatter(gpu, &dkh, b, h, t, dqk);
-        ops::scale_(gpu, &mut dk, self.inv_sqrt_dqk); // k = (·)·1/√dqk
+        // No 1/√dqk here: it lives in lin_k's weights, so dk is already in their scale.
+        let dk = ops::head_scatter(gpu, &dkh, b, h, t, dqk);
         let dv = ops::head_scatter(gpu, &dvh, b, h, t, dhv); // [N, d]
         let d_ig = ops::head_scatter(gpu, &digh, b, h, t, 1); // [N, H]
         let d_fg = ops::head_scatter(gpu, &d_fgh3, b, h, t, 1);

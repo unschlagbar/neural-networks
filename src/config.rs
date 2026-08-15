@@ -23,16 +23,20 @@ pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 6;
 
 pub const LR: f32 = 1e-4;
 pub const MIN_LR: f32 = 1e-5;
-pub const WARMUP_STEPS: usize = 150;
-pub const DECAY_STEPS: usize = 150_000;
+// Warmup/decay horizons are counted in *windows* (data seen), not optimizer
+// steps, so changing BATCH_SIZE reshapes how often the LR is updated but not
+// the curve it follows over the corpus.
+//
+pub const WARMUP_WINDOWS: usize = 1_200;
+pub const DECAY_WINDOWS: usize = 1_500_000;
 // Windows whose gradients are accumulated before one optimizer step. Muon
 // (matrices) is scale-invariant via the Frobenius normalization and aux-Adam
 // (vectors) via its second moment, so summed grads need no manual rescaling.
-pub const BATCH_SIZE: usize = 8;
+pub const BATCH_SIZE: usize = 2;
 pub const EPOCHS: usize = 1;
 
 pub const SAVE_EVERY: usize = 1000;
-pub const LOG_EVERY: usize = 10;
+pub const LOG_EVERY: usize = 100;
 
 // Per-stack decoupled weight decay (λ), passed at optimizer-step time. `0.0`
 // makes a stack plain Adam; a positive λ makes it AdamW (decoupled decay on the
@@ -58,7 +62,7 @@ pub const TOP_P: f32 = 0.9;
 
 pub const CHAR_HIDDEN: usize = 256;
 pub const OUT_HIDDEN: usize = 256;
-pub const WORD_HIDDEN: usize = 768;
+pub const WORD_HIDDEN: usize = 1024;
 
 /// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).
 /// Bounds the logits and removes the cross-entropy incentive for unbounded
@@ -156,7 +160,7 @@ pub const PARQUET_LANGUAGE_COLUMN: &str = "language";
 /// Corpus path. A `.parquet` extension selects the parquet reader (one row per
 /// document, column `text` — override with `PARQUET_TEXT_COLUMN`); anything else
 /// is read as plain text with `<|endoftext|>` document separators.
-pub const TRAIN_DATA: &str = "../../training_data/000_00000.parquet";
+pub const TRAIN_DATA: &str = "../../training_data/000_00002.parquet";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
 // Post-training (SFT / instruction tuning)

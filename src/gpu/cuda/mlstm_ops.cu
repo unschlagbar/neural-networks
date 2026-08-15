@@ -259,6 +259,18 @@ extern "C" __global__ void mul(float* out, const float* a, const float* b, int n
     if (i < n) out[i] = a[i] * b[i];
 }
 
+// o-gate activation and its product with yhat in one pass: o holds the raw
+// projection on entry and the squashed gate on exit, because `ogate_bwd` needs
+// the post-sigmoid value to form o(1-o). Separately these were a full-width
+// read-modify-write followed by a second read of the same buffer.
+extern "C" __global__ void ogate_fwd(float* o, const float* yhat, float* hconcat, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = stable_sigmoid(o[i]);
+    o[i] = g;
+    hconcat[i] = g * yhat[i];
+}
+
 // mLSTM chunking (inter-chunk state carry; see gpu/mlstm.rs)
 // A chunk is a contiguous T-range [c0, c0+L) of a [BH, T, W] head-major tensor.
 // Within a group g the range is contiguous (g*T*W + c0*W, length L*W), so both

@@ -3562,6 +3562,22 @@ pub fn mul(gpu: &Gpu, a: &DTensor, b: &DTensor) -> DTensor {
 
 /// Elementwise `out = a * b` into a caller-owned buffer — the no-allocation form
 /// of [`mul`]. `out` may alias either operand.
+/// o-gate forward: `o ← σ(o)` and `hconcat = o ⊙ yhat` in one pass. `o` enters as
+/// the raw projection and leaves squashed, because `ogate_bwd` needs `σ(o)`.
+pub fn ogate_fwd(gpu: &Gpu, o: &mut DTensor, yhat: &DTensor, hconcat: &mut DTensor) {
+    let n = o.len();
+    assert_eq!(n, yhat.len(), "ogate_fwd: yhat length mismatch");
+    assert_eq!(n, hconcat.len(), "ogate_fwd: output length mismatch");
+    let n_i = n as i32;
+    let f = gpu.kernels.get("ogate_fwd");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut o.buf)
+        .arg(&yhat.buf)
+        .arg(&mut hconcat.buf)
+        .arg(&n_i);
+    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("ogate_fwd");
+}
+
 pub fn mul_into(gpu: &Gpu, a: &DTensor, b: &DTensor, out: &mut DTensor) {
     let n = a.len();
     assert_eq!(n, b.len(), "mul: length mismatch");
