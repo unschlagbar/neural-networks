@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use cudarc::cublas::CudaBlas;
+use cudarc::cublaslt::CudaBlasLT;
 use cudarc::cublas::sys::{cublasMath_t, cublasSetMathMode};
 use cudarc::driver::{CudaContext, CudaStream};
 
@@ -99,6 +100,10 @@ pub struct Gpu {
     pub context: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     pub blas: Arc<CudaBlas>,
+    /// cuBLASLt handle, for GEMMs that fold the bias into the epilogue instead of
+    /// seeding it with `broadcast_row` (see `Linear::forward_raw`). Shares `stream`
+    /// with `blas`, so the two stay in issue order.
+    pub blas_lt: Arc<CudaBlasLT>,
     pub kernels: Arc<Kernels>,
     /// Most shared memory a single block may opt into on this device, in bytes
     /// (`CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`). The fused mLSTM
@@ -152,6 +157,8 @@ impl Gpu {
         let blas =
             CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS init failed: {e:?}"))?;
         set_tf32(&blas)?;
+        let blas_lt = CudaBlasLT::new(stream.clone())
+            .map_err(|e| format!("cuBLASLt init failed: {e:?}"))?;
         let kernels = Kernels::load(&context)?;
         let max_shared_optin = context
             .attribute(
@@ -165,6 +172,7 @@ impl Gpu {
             context,
             stream,
             blas: Arc::new(blas),
+            blas_lt: Arc::new(blas_lt),
             kernels: Arc::new(kernels),
             max_shared_optin,
             sm_count,

@@ -71,10 +71,12 @@ impl Linear {
     /// `activations` is the saved forward input `x` plus the bf16 GEMM staging, both
     /// of which scale with the batch and are what a longer window grows.
     pub fn retained_bytes(&self) -> (usize, usize) {
-        let params = [&self.w, &self.b, &self.dw, &self.db, &self.mw, &self.vw, &self.mb, &self.vb]
-            .iter()
-            .map(|t| t.capacity() * 4)
-            .sum();
+        let params = [
+            &self.w, &self.b, &self.dw, &self.db, &self.mw, &self.vw, &self.mb, &self.vb,
+        ]
+        .iter()
+        .map(|t| t.capacity() * 4)
+        .sum();
         (params, self.x.capacity() * 4 + self.gemm.retained_bytes())
     }
 
@@ -105,6 +107,11 @@ impl Linear {
     #[inline]
     pub fn output_size(&self) -> usize {
         self.output
+    }
+    /// Whether this layer's GEMMs run in bf16 (see [`Self::pin_f32`]).
+    #[inline]
+    pub fn is_bf16(&self) -> bool {
+        self.bf16
     }
 
     /// `Y = X · W + b` into the caller's `y` `[B, out]`; `x` is `[B, in]`. Saves
@@ -213,7 +220,7 @@ impl Linear {
         gpu: &Gpu,
         x: &DTensor,
         x_b: &super::BTensor,
-        y: &mut DTensor,
+        out: &mut DTensor,
     ) {
         assert_eq!(
             x.cols(),
@@ -221,20 +228,45 @@ impl Linear {
             "Linear::forward_staged — input width mismatch"
         );
         assert_eq!(
-            y.dims(),
+            out.dims(),
             [x.rows(), self.output],
             "Linear::forward_staged — output shape"
         );
         if !self.x.is_empty() {
             self.x = DTensor::uninit(gpu, &[0, self.input]);
         }
-        ops::broadcast_row(gpu, y, &self.b);
+        ops::broadcast_row(gpu, out, &self.b);
         if self.bf16 {
             self.gemm
-                .run_staged_lhs(gpu, ops::MmForm::Nn, x_b, &self.w, y, 1.0);
+                .run_staged_lhs(gpu, ops::MmForm::Nn, x_b, &self.w, out, 1.0);
         } else {
-            ops::matmul_nn_into(gpu, x, &self.w, y, 1.0);
+            ops::matmul_nn_into(gpu, x, &self.w, out, 1.0);
         }
+    }
+
+    /// [`forward_staged`](Self::forward_staged) writing a **bf16** output with the
+    /// bias fused into the GEMM epilogue, for a consumer that reads bf16 anyway.
+    /// Saves the `broadcast_row` seed and the fp32 output's narrowing pass.
+    ///
+    /// Only valid on the bf16 path; an fp32-pinned layer has no bf16 GEMM to fuse
+    /// into and must go through [`forward_staged`](Self::forward_staged).
+    pub fn forward_staged_bf16(
+        &mut self,
+        gpu: &Gpu,
+        x_b: &super::BTensor,
+        out: &mut super::BTensor,
+    ) {
+        assert!(self.bf16, "Linear::forward_staged_bf16 — layer is fp32-pinned");
+        assert_eq!(
+            out.dims(),
+            [x_b.dims()[0], self.output],
+            "Linear::forward_staged_bf16 — output shape"
+        );
+        if !self.x.is_empty() {
+            self.x = DTensor::uninit(gpu, &[0, self.input]);
+        }
+        self.gemm
+            .run_staged_lhs_bias(gpu, x_b, &self.w, &self.b, out);
     }
 
     /// [`backward_with_x`](Self::backward_with_x) where the saved input is already
@@ -428,8 +460,24 @@ impl Linear {
     ) {
         self.gemm.invalidate_w();
         if let Some(q) = q {
-            q.push(gpu, &mut self.w, &self.dw, &mut self.mw, &mut self.vw, cfg, decay_w);
-            q.push(gpu, &mut self.b, &self.db, &mut self.mb, &mut self.vb, cfg, false);
+            q.push(
+                gpu,
+                &mut self.w,
+                &self.dw,
+                &mut self.mw,
+                &mut self.vw,
+                cfg,
+                decay_w,
+            );
+            q.push(
+                gpu,
+                &mut self.b,
+                &self.db,
+                &mut self.mb,
+                &mut self.vb,
+                cfg,
+                false,
+            );
             return;
         }
         ops::adamw(
@@ -473,7 +521,15 @@ impl Linear {
     ) {
         self.gemm.invalidate_w();
         if let Some(q) = q {
-            q.push(gpu, &mut self.w, &self.dw, &mut self.mw, &mut self.vw, cfg, decay_w);
+            q.push(
+                gpu,
+                &mut self.w,
+                &self.dw,
+                &mut self.mw,
+                &mut self.vw,
+                cfg,
+                decay_w,
+            );
             self.db.zero_(gpu);
             return;
         }
@@ -509,7 +565,11 @@ mod tests {
     /// the layer's *composition* (bias seeding, grad accumulation, the AdamW step),
     /// which the wider bound still pins.
     fn tol(gpu: &Gpu, base: f32) -> f32 {
-        if ops::gemm_bf16_enabled(gpu) { base * 20.0 } else { base }
+        if ops::gemm_bf16_enabled(gpu) {
+            base * 20.0
+        } else {
+            base
+        }
     }
 
     /// Tolerance for a parameter compared AFTER an Adam step.
@@ -521,7 +581,11 @@ mod tests {
     /// same factor is not enough — it leaves a bound that passes in isolation and
     /// fails on maybe one run in five, which is worse than no check at all.
     fn step_tol(gpu: &Gpu) -> f32 {
-        if ops::gemm_bf16_enabled(gpu) { 2e-3 } else { 1e-5 }
+        if ops::gemm_bf16_enabled(gpu) {
+            2e-3
+        } else {
+            1e-5
+        }
     }
 
     /// The bf16 weight cache must be dropped by every optimizer step.
@@ -644,13 +708,20 @@ mod tests {
         // difference is whether `x` was copied first — so the GEMM outputs compare by
         // exact equality, not a tolerance. `db` is the exception; see below.
         let eq = |got: &[f32], want: &[f32], what: &str| {
-            assert_eq!(got, want, "{what}: shared path diverged from the saving one");
+            assert_eq!(
+                got, want,
+                "{what}: shared path diverged from the saving one"
+            );
         };
 
         let y_saving = saving.forward_alloc(&gpu, &x);
         let mut y_shared = DTensor::uninit(&gpu, &[batch, output]);
         shared.forward_shared(&gpu, &x, &mut y_shared);
-        eq(&y_shared.to_host(&gpu).data, &y_saving.to_host(&gpu).data, "y");
+        eq(
+            &y_shared.to_host(&gpu).data,
+            &y_saving.to_host(&gpu).data,
+            "y",
+        );
 
         // The whole point: no retained input.
         assert!(shared.x.is_empty(), "forward_shared kept an [N, in] copy");
@@ -660,8 +731,16 @@ mod tests {
         let mut dx_shared = DTensor::uninit(&gpu, &[batch, input]);
         shared.backward_with_x(&gpu, &x, &dy, &mut dx_shared);
 
-        eq(&dx_shared.to_host(&gpu).data, &dx_saving.to_host(&gpu).data, "dx");
-        eq(&shared.dw.to_host(&gpu).data, &saving.dw.to_host(&gpu).data, "dw");
+        eq(
+            &dx_shared.to_host(&gpu).data,
+            &dx_saving.to_host(&gpu).data,
+            "dx",
+        );
+        eq(
+            &shared.dw.to_host(&gpu).data,
+            &saving.dw.to_host(&gpu).data,
+            "dw",
+        );
 
         // `db` is the one output that is not bit-reproducible: `add_col_sum` splits the
         // row axis over `blockIdx.y` and combines the slices with `atomicAdd`, so the
@@ -705,7 +784,10 @@ mod tests {
         let mut dx_blocked = Vec::with_capacity(batch * input);
         for r0 in (0..batch).step_by(blk) {
             let rows = blk.min(batch - r0);
-            let xb = Tensor::new(&[rows, input], x_h.data[r0 * input..(r0 + rows) * input].to_vec());
+            let xb = Tensor::new(
+                &[rows, input],
+                x_h.data[r0 * input..(r0 + rows) * input].to_vec(),
+            );
             let dyb = Tensor::new(
                 &[rows, output],
                 dy_h.data[r0 * output..(r0 + rows) * output].to_vec(),
@@ -719,7 +801,15 @@ mod tests {
         }
 
         assert_close(&dx_blocked, &dx_whole.to_host(&gpu).data, 1e-5);
-        assert_close(&blocked.dw.to_host(&gpu).data, &whole.dw.to_host(&gpu).data, 1e-4);
-        assert_close(&blocked.db.to_host(&gpu).data, &whole.db.to_host(&gpu).data, 1e-4);
+        assert_close(
+            &blocked.dw.to_host(&gpu).data,
+            &whole.dw.to_host(&gpu).data,
+            1e-4,
+        );
+        assert_close(
+            &blocked.db.to_host(&gpu).data,
+            &whole.db.to_host(&gpu).data,
+            1e-4,
+        );
     }
 }

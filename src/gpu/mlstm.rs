@@ -50,6 +50,13 @@ use crate::tensor::Tensor;
 
 /// Chunk length: `config::MLSTM_CHUNK`, overridable with `MLSTM_CHUNK=<L>` for A/B
 /// runs (0 = single-chunk). Resolved once — the env read must not sit in forward.
+/// Whether q/k/v come out of the projection already bf16 (`MLSTM_NO_BF16_QKV=1`
+/// forces the fp32 buffer + narrowing pass back on, for an A/B).
+fn bf16_qkv_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MLSTM_NO_BF16_QKV").as_deref() != Ok("1"))
+}
+
 fn chunk_len() -> usize {
     static L: OnceLock<usize> = OnceLock::new();
     *L.get_or_init(|| {
@@ -274,6 +281,12 @@ pub struct MLstm {
     lin_f: Linear,
     lin_out: Linear,
     headnorm: RmsNorm, // head-wise (group == dhv)
+    /// Whether q/k/v can be produced bf16 straight out of the projection, skipping
+    /// the fp32 buffer and the pass that narrows it. Everything but the per-call
+    /// fused-path check is fixed for the cell's lifetime, so it is resolved once
+    /// here: the env switch is a `OnceLock`, `slab_bf16` is decided at kernel load,
+    /// and only the logit head is ever pinned to fp32.
+    bf16_qkv: bool,
 
     /// Forward caches awaiting a backward, one per chunk in eviction order.
     ///
@@ -337,6 +350,17 @@ impl MLstm {
             Tensor::new(&t.dims(), t.data.iter().map(|v| v * inv_sqrt_dqk).collect())
         };
         let (wk, bk) = (&scaled(wk), &scaled(bk));
+        let (lin_q, lin_k, lin_v) = (
+            Linear::from_parts(gpu, wq, bq),
+            Linear::from_parts(gpu, wk, bk),
+            Linear::from_parts(gpu, wv, bv),
+        );
+        let bf16_qkv = bf16_qkv_enabled()
+            && !ops::mlstm_head_major()
+            && gpu.kernels.slab_bf16
+            && lin_q.is_bf16()
+            && lin_k.is_bf16()
+            && lin_v.is_bf16();
         Self {
             input_size,
             d,
@@ -344,10 +368,11 @@ impl MLstm {
             dqk,
             dhv,
             inv_sqrt_dqk,
+            bf16_qkv,
             chunk: chunk_len(),
-            lin_q: Linear::from_parts(gpu, wq, bq),
-            lin_k: Linear::from_parts(gpu, wk, bk),
-            lin_v: Linear::from_parts(gpu, wv, bv),
+            lin_q,
+            lin_k,
+            lin_v,
             lin_o: Linear::from_parts(gpu, wo, bo),
             lin_i: Linear::from_parts(gpu, wi, bi),
             lin_f: Linear::from_parts(gpu, wf, bf),
@@ -544,18 +569,43 @@ impl MLstm {
         // is not pooled (`assert_drained` in `backward_alloc` wants the pool whole).
         let mut xf = DTensor::uninit(gpu, &[rows, inp]);
         xf.copy_from(gpu, x);
+        let fused = self.fused_chunk(gpu, t);
+        // Only the fused path reads q/k/v as bf16; the op-at-a-time one below slices
+        // them for cuBLAS and needs them wide.
+        let bf16_qkv = self.bf16_qkv && fused.is_some();
+
         // Pooled buffers die at the reorg below; `o` is cached for backward, so it is
         // not. Widths differ per projection, so each is sized from its own layer.
-        let mut q = self.pool.take(gpu, &[rows, self.lin_q.output_size()]);
-        let mut k = self.pool.take(gpu, &[rows, self.lin_k.output_size()]);
-        let mut v = self.pool.take(gpu, &[rows, self.lin_v.output_size()]);
         let mut o = DTensor::uninit(gpu, &[rows, self.lin_o.output_size()]);
         let mut ig = self.pool.take(gpu, &[rows, self.lin_i.output_size()]); // [rows, H]
         let mut fg = self.pool.take(gpu, &[rows, self.lin_f.output_size()]); // [rows, H]
+        let mut qkv_w: Option<[DTensor; 3]> = None;
+        let mut qkv_b: Option<[super::BTensor; 3]> = None;
         ops::with_shared_lhs(gpu, &xf, |xf_b| {
-            self.lin_q.forward_staged(gpu, &xf, xf_b, &mut q);
-            self.lin_k.forward_staged(gpu, &xf, xf_b, &mut k);
-            self.lin_v.forward_staged(gpu, &xf, xf_b, &mut v);
+            if bf16_qkv {
+                let mk = |l: &mut Linear, w: usize| {
+                    let mut t = super::BTensor::uninit(gpu, &[rows, w]);
+                    l.forward_staged_bf16(gpu, xf_b, &mut t);
+                    t
+                };
+                let (wq, wk, wv) = (
+                    self.lin_q.output_size(),
+                    self.lin_k.output_size(),
+                    self.lin_v.output_size(),
+                );
+                let qb = mk(&mut self.lin_q, wq);
+                let kb = mk(&mut self.lin_k, wk);
+                let vb = mk(&mut self.lin_v, wv);
+                qkv_b = Some([qb, kb, vb]);
+            } else {
+                let mut q = self.pool.take(gpu, &[rows, self.lin_q.output_size()]);
+                let mut k = self.pool.take(gpu, &[rows, self.lin_k.output_size()]);
+                let mut v = self.pool.take(gpu, &[rows, self.lin_v.output_size()]);
+                self.lin_q.forward_staged(gpu, &xf, xf_b, &mut q);
+                self.lin_k.forward_staged(gpu, &xf, xf_b, &mut k);
+                self.lin_v.forward_staged(gpu, &xf, xf_b, &mut v);
+                qkv_w = Some([q, k, v]);
+            }
             self.lin_o.forward_staged(gpu, &xf, xf_b, &mut o);
             self.lin_i.forward_staged(gpu, &xf, xf_b, &mut ig);
             self.lin_f.forward_staged(gpu, &xf, xf_b, &mut fg);
@@ -566,33 +616,46 @@ impl MLstm {
         // Chosen before the q/k/v reorg: the fused kernels stride over the projection
         // output as it lies, while the path below slices q/k/v for cuBLAS, which needs
         // one fixed stride between matrices and so must gather.
-        if let Some(l) = self.fused_chunk(gpu, t) {
+        if let Some(l) = fused {
             // position-major skips the reorg and lets the kernels stride; head-major
             // pays a streaming pass for row locality, re-used once per chunk. Backward
             // must read them the same way, so the choice is recorded in the cache.
             // These buffers leave the pool for good — backward reads them.
             let head_major = ops::mlstm_head_major();
-            let (qh, kh, vh, igh, fgh) = if head_major {
-                let g = |src: &DTensor, w: usize| {
-                    ops::SlabBuf::from_f32(gpu, ops::head_gather(gpu, src, b, h, t, w))
-                };
-                let (qh, kh, vh) = (g(&q, dqk), g(&k, dqk), g(&v, dhv));
-                let igh = ops::head_gather(gpu, &ig, b, h, t, 1).reshaped(&[bh, t]);
-                let fgh = ops::head_gather(gpu, &fg, b, h, t, 1).reshaped(&[bh, t]);
-                self.pool.put_all([q, k, v, ig, fg]);
-                (qh, kh, vh, igh, fgh)
-            } else {
-                // `from_f32` narrows without permuting and consumes the fp32 tensor,
-                // so the wide buffer never outlives the narrow one. The gate logits
-                // stay fp32 — the reference pins vecI/vecB to fp32, and at [rows, H] they
-                // are a factor of `dqk` smaller than q/k/v, so narrowing buys nothing.
+            let (qh, kh, vh, igh, fgh) = if let Some([qb, kb, vb]) = qkv_b {
+                // Already bf16 out of the projection; nothing to narrow or permute.
                 (
-                    ops::SlabBuf::from_f32(gpu, self.pool.detach(q)),
-                    ops::SlabBuf::from_f32(gpu, self.pool.detach(k)),
-                    ops::SlabBuf::from_f32(gpu, self.pool.detach(v)),
+                    ops::SlabBuf::Bf16(qb),
+                    ops::SlabBuf::Bf16(kb),
+                    ops::SlabBuf::Bf16(vb),
                     self.pool.detach(ig),
                     self.pool.detach(fg),
                 )
+            } else {
+                let [q, k, v] = qkv_w.take().expect("fp32 q/k/v when not bf16_qkv");
+                if head_major {
+                    let g = |src: &DTensor, w: usize| {
+                        ops::SlabBuf::from_f32(gpu, ops::head_gather(gpu, src, b, h, t, w))
+                    };
+                    let (qh, kh, vh) = (g(&q, dqk), g(&k, dqk), g(&v, dhv));
+                    let igh = ops::head_gather(gpu, &ig, b, h, t, 1).reshaped(&[bh, t]);
+                    let fgh = ops::head_gather(gpu, &fg, b, h, t, 1).reshaped(&[bh, t]);
+                    self.pool.put_all([q, k, v, ig, fg]);
+                    (qh, kh, vh, igh, fgh)
+                } else {
+                    // `from_f32` narrows without permuting and consumes the fp32 tensor,
+                    // so the wide buffer never outlives the narrow one. The gate logits
+                    // stay fp32 — the reference pins vecI/vecB to fp32, and at [rows, H]
+                    // they are a factor of `dqk` smaller than q/k/v, so narrowing buys
+                    // nothing.
+                    (
+                        ops::SlabBuf::from_f32(gpu, self.pool.detach(q)),
+                        ops::SlabBuf::from_f32(gpu, self.pool.detach(k)),
+                        ops::SlabBuf::from_f32(gpu, self.pool.detach(v)),
+                        self.pool.detach(ig),
+                        self.pool.detach(fg),
+                    )
+                }
             };
             let st = if head_major {
                 ops::MlstmStrides::head_major(b, h, t, dqk, dhv)
@@ -651,7 +714,9 @@ impl MLstm {
 
         // Op-at-a-time path: q/k/v go head-major as fp32, because this path slices
         // them and hands the slices to cuBLAS, which needs one fixed stride between
-        // matrices and so cannot read the projection output where it lies.
+        // matrices and so cannot read the projection output where it lies. `bf16_qkv`
+        // requires the fused path, so the fp32 buffers are always the ones here.
+        let [q, k, v] = qkv_w.take().expect("op-at-a-time path needs fp32 q/k/v");
         let qh = ops::head_gather(gpu, &q, b, h, t, dqk); // [BH, T, dqk]
         let kh = ops::head_gather(gpu, &k, b, h, t, dqk);
         let vh = ops::head_gather(gpu, &v, b, h, t, dhv); // [BH, T, dhv]
@@ -903,6 +968,29 @@ impl MLstm {
     /// gradient from the right. Call before the rightmost chunk's backward.
     pub fn reset_bptt(&mut self, _gpu: &Gpu) {
         self.carry_dstate = None;
+    }
+
+    /// Drop the forward caches, leaving the pool and the weight staging alone —
+    /// for a caller that forwards repeatedly and never backwards.
+    pub fn drop_saved(&mut self) {
+        self.saved.clear();
+    }
+
+    /// Whether this cell produces q/k/v bf16 straight out of the projection.
+    pub fn uses_bf16_qkv(&self) -> bool {
+        self.bf16_qkv
+    }
+
+    /// Force the q/k/v path, so both can be exercised in one process. Turning it on
+    /// still requires the path to be supported; normal construction takes the same
+    /// decision from the environment.
+    pub fn set_bf16_qkv(&mut self, gpu: &Gpu, on: bool) {
+        self.bf16_qkv = on
+            && !ops::mlstm_head_major()
+            && gpu.kernels.slab_bf16
+            && self.lin_q.is_bf16()
+            && self.lin_k.is_bf16()
+            && self.lin_v.is_bf16();
     }
 
     /// Retained activation bytes split `(saved_cache, other)`.
@@ -1631,6 +1719,37 @@ mod tests {
             assert_close_rel(&wf, &wf0, 1e-3 * slab, &format!("wf (chunk {l})"));
             assert_close_rel(&wo, &wo0, 1e-3 * slab, &format!("w_out (chunk {l})"));
         }
+    }
+
+    /// Producing q/k/v bf16 out of the projection must match narrowing an fp32
+    /// buffer afterwards. Both round once, so this is exact-equality: the epilogue
+    /// bias and `broadcast_row` + `beta=1` feed the same accumulator, and the same
+    /// rounding lands on the same values.
+    #[test]
+    fn mlstm_bf16_qkv_matches_narrowed_fp32() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let (b, t, inp, d, heads, dqk) = (2, 128, 64, 256, 8, 32);
+        let proto = CpuMLstm::new(inp, d, heads, dqk);
+        let x = DTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, inp], 0.5, 0xB1));
+        let g = DTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, d], 1.0, 0xB2));
+
+        let run = |on: bool| {
+            let mut dev = MLstm::from_cpu(&gpu, &proto);
+            dev.set_bf16_qkv(&gpu, on);
+            assert_eq!(dev.uses_bf16_qkv(), on, "path not selected");
+            let y = dev.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let dx = dev.backward_alloc(&gpu, &g).to_host(&gpu).data;
+            let dwq = dev.lin_q.dw.to_host(&gpu).data;
+            (y, dx, dwq)
+        };
+
+        let (y_on, dx_on, dwq_on) = run(true);
+        let (y_off, dx_off, dwq_off) = run(false);
+        assert_eq!(y_on, y_off, "forward differs");
+        assert_eq!(dx_on, dx_off, "dx differs");
+        assert_eq!(dwq_on, dwq_off, "dW_q differs");
     }
 
     /// The fused kernels vs the op-at-a-time path at the **backbone's real shape**.

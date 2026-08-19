@@ -23,7 +23,7 @@ criterion = "0.8.2"
 # Optional CUDA backend. Off by default so the CPU build (the always-available
 # reference / FD-test oracle) keeps building on machines without a toolkit.
 # Enable with `cargo build --features cuda` on the box that has the RTX GPU.
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "dep:half"]
 default = ["cuda"]
 
 [dependencies]
@@ -32,6 +32,7 @@ rand = "0.10.0"
 rayon = "1.11"
 cpal = "0.18.1"
 hound = "3"
+half = { version = "2.7.1", optional = true }
 # NVRTC (runtime kernel compilation) + driver API + cuBLAS. `dynamic-loading`
 # dlopen's the libs at runtime so the build doesn't hard-link a fixed CUDA
 # version; the toolkit version is detected from the installed toolchain.
@@ -43,5 +44,7 @@ cudarc = { version = "0.19.8", default-features = false, features = [
     "driver",
     "nvrtc",
     "cublas",
+    "cublaslt",
+    "f16",
     "dynamic-loading",
 ], optional = true }

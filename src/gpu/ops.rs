@@ -356,6 +356,82 @@ pub fn matmul_bf16_into(
     .expect("cublas gemm_ex bf16");
 }
 
+/// `C = A·B + bias`, bf16 out, bias fused into the GEMM epilogue.
+///
+/// Saves the [`broadcast_row`] seed the legacy path needs (cuBLAS has no bias
+/// argument) and the `SlabBuf::from_f32` narrowing pass a fp32 output would need.
+/// Accumulation is still fp32, so the result is rounded once, at production.
+///
+/// `bias` is bf16 because cuBLASLt takes it in the operand type; the layer's fp32
+/// `b` stays the master. Only [`MmForm::Nn`]. Operand swap as in
+/// [`matmul_bf16_into`].
+pub fn matmul_bf16_bias_into(
+    gpu: &Gpu,
+    a: &super::BTensor,
+    b: &super::BTensor,
+    bias: &super::BTensor,
+    c: &mut super::BTensor,
+) {
+    use cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig};
+
+    let (m, ka) = (a.dims()[0], a.dims()[1]);
+    let (kb, n) = (b.dims()[0], b.dims()[1]);
+    assert_eq!(ka, kb, "matmul_bf16_bias: inner dims {ka} != {kb}");
+    assert_eq!(c.dims(), [m, n], "matmul_bf16_bias: C shape");
+    assert_eq!(bias.len(), n, "matmul_bf16_bias: bias width");
+
+    // Cᵀ = Bᵀ·Aᵀ, so `b` goes first and m/n swap. That puts the bias on the swapped
+    // form's leading dimension, which is what cuBLASLt's row-wise bias expects.
+    let cfg = MatmulConfig {
+        transa: false,
+        transb: false,
+        m: n as u64,
+        n: m as u64,
+        k: ka as u64,
+        alpha: 1.0,
+        lda: n as i64,
+        ldb: ka as i64,
+        beta: 0.0,
+        ldc: n as i64,
+        stride_a: None,
+        stride_b: None,
+        stride_c: None,
+        stride_bias: None,
+        batch_size: None,
+        transc: false,
+    };
+
+    // `BTensor` holds bf16 as `u16`; `Matmul<bf16>` wants `DevicePtr<bf16>`.
+    //
+    // SAFETY: both are plain 16-bit types with identical layout, and the slices are
+    // device allocations of the sizes the shape asserts above imply.
+    let (a_bf, b_bf, bias_bf) = unsafe {
+        (
+            a.buf.transmute::<half::bf16>(a.buf.len()).expect("bf16 view of a"),
+            b.buf.transmute::<half::bf16>(b.buf.len()).expect("bf16 view of b"),
+            bias.buf.transmute::<half::bf16>(bias.buf.len()).expect("bf16 view of bias"),
+        )
+    };
+    let mut c_bf = unsafe {
+        c.buf.transmute_mut::<half::bf16>(c.buf.len()).expect("bf16 view of c")
+    };
+
+    // SAFETY: shapes and leading dimensions are asserted above; the buffers are live
+    // allocations on `gpu.stream`, the stream the Lt handle was built on.
+    unsafe {
+        <CudaBlasLT as Matmul<half::bf16>>::matmul(
+            &gpu.blas_lt,
+            cfg,
+            &b_bf,
+            &a_bf,
+            &mut c_bf,
+            Some(&bias_bf),
+            None,
+        )
+    }
+    .expect("cublasLt matmul bf16 + bias");
+}
+
 /// One bf16 copy of an activation that several layers read.
 ///
 /// mLSTM hands the same `xf` to six projections, and the same `xf` again to their six
@@ -552,6 +628,9 @@ pub struct GemmBf16 {
     w: Option<super::BTensor>,
     /// Whether [`w`](Self::w) currently matches the fp32 weight.
     w_valid: bool,
+    /// Narrowed copy of the layer's bias, for the epilogue path. Invalidated with
+    /// `w` — an optimizer step writes both.
+    b: Option<super::BTensor>,
 }
 
 /// Whether the bf16 weight cache is on (`GPU_NO_WCACHE=1` turns it off).
@@ -572,6 +651,7 @@ impl GemmBf16 {
             rhs: None,
             w: None,
             w_valid: false,
+            b: None,
         }
     }
 
@@ -581,6 +661,7 @@ impl GemmBf16 {
     /// training silently not learning rather than as an error.
     pub fn invalidate_w(&mut self) {
         self.w_valid = false;
+        self.b = None;
     }
 
     /// Narrow `w` once and reuse it until invalidated. See [`w`](Self::w).
@@ -621,6 +702,31 @@ impl GemmBf16 {
         self.rhs = None;
         self.w = None;
         self.w_valid = false;
+        self.b = None;
+    }
+
+    /// `Y = X·W + b` with a bf16 `Y`, bias in the epilogue. `x_b` is the caller's
+    /// shared narrowed input; the weight and bias come from this cache.
+    pub fn run_staged_lhs_bias(
+        &mut self,
+        gpu: &Gpu,
+        x_b: &super::BTensor,
+        w: &DTensor,
+        b: &DTensor,
+        y: &mut super::BTensor,
+    ) {
+        let stale = self.b.as_ref().is_none_or(|t| t.dims() != b.dims());
+        if stale {
+            let mut nb = super::BTensor::uninit(gpu, b.dims());
+            nb.store(gpu, b);
+            self.b = Some(nb);
+        }
+        // Not through `stage_w`: that returns a borrow of `self`, which would still be
+        // live when the bias is read below.
+        self.stage_w(gpu, w);
+        let rhs = self.w.as_ref().expect("staged");
+        let bias = self.b.as_ref().expect("staged");
+        matmul_bf16_bias_into(gpu, x_b, rhs, bias, y);
     }
 
     /// Narrow `a` and `b` into the owned staging buffers and run the GEMM.
@@ -4851,6 +4957,49 @@ mod tests {
             assert!(
                 (d - 2.0 * s).abs() < 1e-4 * s.abs().max(1.0),
                 "beta=1 did not accumulate at {i}: {d} vs 2*{s}"
+            );
+        }
+    }
+
+    /// Tolerance is one bf16 rounding (~8 mantissa bits), not the fp32 path's.
+    #[test]
+    fn gemm_bf16_bias_matches_broadcast_plus_beta() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        if !gemm_bf16_enabled(&gpu) {
+            return;
+        }
+        let (m, k, n) = (16usize, 32usize, 8usize);
+        let x = Tensor::random(&[m, k], 1.0);
+        let w = Tensor::random(&[k, n], 1.0);
+        let bias = Tensor::random(&[n], 1.0);
+        let (dx, dw) = (DTensor::from_host(&gpu, &x), DTensor::from_host(&gpu, &w));
+        let dbias = DTensor::from_host(&gpu, &bias);
+
+        // Reference: seed the bias, accumulate the GEMM onto it in fp32.
+        let mut want = DTensor::uninit(&gpu, &[m, n]);
+        broadcast_row(&gpu, &mut want, &dbias);
+        GemmBf16::new().run(&gpu, MmForm::Nn, &dx, &dw, &mut want, 1.0);
+        let want = want.to_host(&gpu).data;
+
+        // Lt: same operands, bias in the epilogue, bf16 output.
+        let mut xb = super::super::BTensor::uninit(&gpu, &[m, k]);
+        xb.store(&gpu, &dx);
+        let mut wb = super::super::BTensor::uninit(&gpu, &[k, n]);
+        wb.store(&gpu, &dw);
+        let mut bb = super::super::BTensor::uninit(&gpu, &[n]);
+        bb.store(&gpu, &dbias);
+        let mut got_b = super::super::BTensor::uninit(&gpu, &[m, n]);
+        matmul_bf16_bias_into(&gpu, &xb, &wb, &bb, &mut got_b);
+        let mut wide = DTensor::uninit(&gpu, &[m, n]);
+        got_b.load(&gpu, &mut wide);
+        let got = wide.to_host(&gpu).data;
+
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() < 2e-2 * w.abs().max(1.0),
+                "Lt bias epilogue differs at {i}: {g} vs {w}"
             );
         }
     }
