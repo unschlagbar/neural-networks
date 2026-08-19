@@ -75,9 +75,9 @@ fn main() {
     let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
     let dy = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
 
+    let mut y = DTensor::uninit(&gpu, &[b, t, d]);
     let fwd = timed(&gpu, 2, 10, || {
-        let y = cell.forward_alloc(&gpu, &x);
-        drop(y);
+        cell.forward(&gpu, &x, &mut y);
         // backward must consume the cache the forward built, or it grows unboundedly
         let _ = cell.backward_alloc(&gpu, &dy);
     });
@@ -89,8 +89,7 @@ fn main() {
 
     // Forward alone, so the two halves can be separated.
     let f_only = timed(&gpu, 2, 10, || {
-        let y = cell.forward_alloc(&gpu, &x);
-        drop(y);
+        cell.forward(&gpu, &x, &mut y);
         let _ = cell.backward_alloc(&gpu, &dy);
     });
     let _ = f_only;

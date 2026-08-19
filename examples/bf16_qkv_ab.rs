@@ -52,10 +52,11 @@ fn main() {
 
     let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
 
-    let one = |cell: &mut MLstm, gpu: &Gpu, iters: usize| -> f64 {
+    let mut y = DTensor::uninit(&gpu, &[b, t, d]);
+    let mut one = |cell: &mut MLstm, gpu: &Gpu, iters: usize| -> f64 {
         let t0 = Instant::now();
         for _ in 0..iters {
-            let y = cell.forward_alloc(gpu, &x);
+            cell.forward(gpu, &x, &mut y);
             std::hint::black_box(&y);
             cell.drop_saved();
         }

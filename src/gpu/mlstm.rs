@@ -44,7 +44,7 @@
 use std::sync::OnceLock;
 
 use super::block::Cell;
-use super::{DTensor, Gpu, linear::Linear, ops, rms_norm::RmsNorm, Pool};
+use super::{DTensor, Gpu, Pool, linear::Linear, ops, rms_norm::RmsNorm};
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
 
@@ -113,7 +113,7 @@ struct Inter {
 struct Saved {
     b: usize,
     t: usize,
-    /// The flat `[N, in]` input, shared by all six projections (see `forward_alloc`).
+    /// The flat `[N, in]` input, shared by all six projections (see `forward`).
     /// Held here rather than six times inside the `Linear`s.
     xf: DTensor,
     qh: DTensor, // [BH, T, dqk]
@@ -145,7 +145,7 @@ struct SavedFused {
     /// non-offloaded run.
     ///
     /// The flat `[N, in]` input `xf` is shared by all six projections (see
-    /// `forward_alloc`) — held here rather than six times inside the `Linear`s.
+    /// `forward`) — held here rather than six times inside the `Linear`s.
     xf: Option<DTensor>,
     // bf16 storage, mirroring the reference's DTYPE tensors (matQ/matK/matV).
     qh: Option<ops::SlabBuf>,
@@ -177,7 +177,9 @@ impl SavedFused {
         self.o.as_ref().expect("mLSTM: o is parked on the host")
     }
     fn yhat(&self) -> &DTensor {
-        self.yhat.as_ref().expect("mLSTM: yhat is parked on the host")
+        self.yhat
+            .as_ref()
+            .expect("mLSTM: yhat is parked on the host")
     }
     fn hconcat(&self) -> &DTensor {
         self.hconcat
@@ -229,9 +231,9 @@ impl Saved {
             &self.yhat,
             &self.hconcat,
         ]
-            .iter()
-            .map(|t| t.capacity() * 4)
-            .sum();
+        .iter()
+        .map(|t| t.capacity() * 4)
+        .sum();
         let chunks: usize = self
             .chunks
             .iter()
@@ -346,9 +348,8 @@ impl MLstm {
         // wk/bk here and unfolded in `to_nn_cell`: the checkpoint keeps the unscaled
         // weights, while the runtime never spends a pass rescaling k or dk.
         let inv_sqrt_dqk = 1.0 / (dqk as f32).sqrt();
-        let scaled = |t: &Tensor| {
-            Tensor::new(&t.dims(), t.data.iter().map(|v| v * inv_sqrt_dqk).collect())
-        };
+        let scaled =
+            |t: &Tensor| Tensor::new(&t.dims(), t.data.iter().map(|v| v * inv_sqrt_dqk).collect());
         let (wk, bk) = (&scaled(wk), &scaled(bk));
         let (lin_q, lin_k, lin_v) = (
             Linear::from_parts(gpu, wq, bq),
@@ -403,9 +404,8 @@ impl MLstm {
             let d = m.as_slice().iter().map(|v| v / self.inv_sqrt_dqk).collect();
             iron_oxide::collections::Matrix::from_vec(d, r, c)
         };
-        let unfold_v = |v: Box<[f32]>| -> Box<[f32]> {
-            v.iter().map(|x| x / self.inv_sqrt_dqk).collect()
-        };
+        let unfold_v =
+            |v: Box<[f32]>| -> Box<[f32]> { v.iter().map(|x| x / self.inv_sqrt_dqk).collect() };
         let w_out = crate::nn::linear::LinearLayer::from_loaded(
             self.d,
             self.d,
@@ -540,14 +540,10 @@ impl MLstm {
     /// the parallel (attention) form over its own `[BH, L, L]` decay matrix, with
     /// the recurrent state `(C, n, m)` carried across chunk boundaries. One chunk
     /// covering the whole sequence reduces to the single-chunk form.
-    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
-        let out = self.forward_alloc(gpu, x);
-        y.copy_from(gpu, &out);
-    }
-
-    /// The chunkwise core, returning its own output buffer. `forward` copies that
-    /// into the caller's; the internals still allocate their per-chunk temporaries.
-    pub fn forward_alloc(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
+    ///
+    /// `out` is the caller's `[B, T, d]` buffer, written in place; the internals
+    /// still allocate their per-chunk temporaries.
+    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
         // Release the previous eviction before allocating anything here: freeing
         // returns memory to the CUDA allocator, which must not hand it back while a
         // copy is still reading it. Ordered on the compute stream, so it costs no host
@@ -562,6 +558,7 @@ impl MLstm {
             "MLstm::forward — input width mismatch"
         );
         let (d, h, dqk, dhv) = (self.d, self.heads, self.dqk, self.dhv);
+        assert_eq!(out.dims(), [b, t, d], "MLstm::forward — output shape");
         let rows = b * t; // flattened [B, T] positions
         let bh = b * h; // batch × head, the fused kernels' outer dim
 
@@ -673,7 +670,11 @@ impl MLstm {
                 &igh,
                 &fgh,
                 l,
-                if self.carry { self.carry_state.as_ref() } else { None },
+                if self.carry {
+                    self.carry_state.as_ref()
+                } else {
+                    None
+                },
                 st,
             );
             if self.carry {
@@ -689,11 +690,12 @@ impl MLstm {
             self.pool.put(h_tilde);
             // `hconcat` is kept in the cache rather than pooled, and `lin_out` takes it
             // back through `backward_with_x`: a chunked sweep would otherwise have the
-            // next chunk's forward overwrite the private copy `forward_alloc` saves.
+            // next chunk's forward overwrite the private copy `forward` saves.
             let mut hconcat = DTensor::uninit(gpu, &[rows, d]);
             ops::ogate_fwd(gpu, &mut o, &yhat, &mut hconcat);
-            let mut out = DTensor::uninit(gpu, &[rows, d]);
-            self.lin_out.forward_shared(gpu, &hconcat, &mut out);
+            out.reshape_to(&[rows, d]);
+            self.lin_out.forward_shared(gpu, &hconcat, out);
+            out.reshape_to(&[b, t, d]);
             self.saved.push(Cache::Fused(SavedFused {
                 b,
                 t,
@@ -709,7 +711,7 @@ impl MLstm {
                 hconcat: Some(hconcat),
             }));
             self.evict_saved(gpu);
-            return out.reshaped(&[b, t, d]);
+            return;
         }
 
         // Op-at-a-time path: q/k/v go head-major as fp32, because this path slices
@@ -830,12 +832,13 @@ impl MLstm {
         self.headnorm.forward(gpu, &h_tilde, &mut yhat);
         self.pool.put(h_tilde);
         // `hconcat` is cached rather than pooled, and `lin_out` takes it back through
-        // `backward_with_x`: under a chunked sweep the private copy `forward_alloc`
+        // `backward_with_x`: under a chunked sweep the private copy `forward`
         // saves would be overwritten by the next chunk's forward.
         let mut hconcat = DTensor::uninit(gpu, &[rows, d]);
         ops::ogate_fwd(gpu, &mut o, &yhat, &mut hconcat); // σ(o) ⊙ ŷ  [rows, d]
-        let mut out = DTensor::uninit(gpu, &[rows, d]);
-        self.lin_out.forward_shared(gpu, &hconcat, &mut out); // [rows, d]
+        out.reshape_to(&[rows, d]);
+        self.lin_out.forward_shared(gpu, &hconcat, out); // [rows, d]
+        out.reshape_to(&[b, t, d]);
 
         // `o`/`yhat` are unused after `mul`, so move (not dup) them into the cache.
         self.saved.push(Cache::Legacy(Saved {
@@ -851,7 +854,6 @@ impl MLstm {
             yhat,
             hconcat,
         }));
-        out.reshaped(&[b, t, d])
     }
 
     /// Park this cell's saved activations on the host, if offload is enabled.
@@ -1059,8 +1061,7 @@ impl MLstm {
     /// Backward into a freshly allocated `dx` `[B, T, in]` — the by-value
     /// companion to [`backward`](Self::backward).
     pub fn backward_alloc_dx(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
-        let mut dx =
-            DTensor::uninit(gpu, &[dy.shape[0], dy.shape[1], self.input_size]);
+        let mut dx = DTensor::uninit(gpu, &[dy.shape[0], dy.shape[1], self.input_size]);
         self.backward(gpu, dy, &mut dx);
         dx
     }
@@ -1083,11 +1084,7 @@ impl MLstm {
         // `take`, not `as_ref`: the cache holds a window's activations, and dropping
         // them at the end of this call (rather than when the next forward overwrites
         // the field) keeps them from staying resident across the optimizer step.
-        match self
-            .saved
-            .pop()
-            .expect("MLstm::backward before forward")
-        {
+        match self.saved.pop().expect("MLstm::backward before forward") {
             Cache::Fused(sv) => self.backward_fused(gpu, dy, sv),
             Cache::Legacy(sv) => self.backward_legacy(gpu, dy, sv),
         }
@@ -1130,7 +1127,11 @@ impl MLstm {
             &sv.igh,
             &sv.fgh,
             &d_ytil,
-            if self.carry { self.carry_dstate.as_ref() } else { None },
+            if self.carry {
+                self.carry_dstate.as_ref()
+            } else {
+                None
+            },
             ops::MlstmStrides::position_major(b, h, t, dqk, dhv),
         );
         self.pool.put(d_ytil);
@@ -1146,7 +1147,7 @@ impl MLstm {
         // dx is the sum of the six projection backwards, accumulated into one
         // buffer with one pooled scratch — not a fresh [N, in] per term.
         //
-        // All six read the one shared `sv.xf` (see `forward_alloc`), so they take
+        // All six read the one shared `sv.xf` (see `forward`), so they take
         // `backward_with_x` rather than each consulting a private saved copy.
         // `sv.xf` is narrowed once for all six, as in forward.
         let mut acc = DTensor::uninit(gpu, &[n, inp]);
@@ -1590,13 +1591,14 @@ mod tests {
     fn assert_close_rel(got: &[f32], want: &[f32], tol: f32, what: &str) {
         assert_eq!(got.len(), want.len(), "{what}: length mismatch");
         let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let (worst, at) = got.iter().zip(want).enumerate().fold(
-            (0.0f32, 0usize),
-            |(m, at), (i, (&a, &b))| {
-                let d = (a - b).abs();
-                if d > m { (d, i) } else { (m, at) }
-            },
-        );
+        let (worst, at) =
+            got.iter()
+                .zip(want)
+                .enumerate()
+                .fold((0.0f32, 0usize), |(m, at), (i, (&a, &b))| {
+                    let d = (a - b).abs();
+                    if d > m { (d, i) } else { (m, at) }
+                });
         assert!(
             worst / scale.max(f32::MIN_POSITIVE) < tol,
             "{what}: worst |a-b| {worst:.3e} at [{at}] on scale {scale:.3e} \
@@ -1626,7 +1628,8 @@ mod tests {
 
         // Forward
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
+        let mut y_dev = DTensor::uninit(&gpu, &[b, t, d]);
+        dev.forward(&gpu, &DTensor::from_host(&gpu, &x), &mut y_dev);
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, "y");
 
         // Backward
@@ -1691,7 +1694,9 @@ mod tests {
         let run = |chunk: usize| {
             let mut dev = MLstm::from_cpu(&gpu, &proto);
             dev.set_chunk(chunk);
-            let y = dev.forward_alloc(&gpu, &dx).to_host(&gpu).data;
+            let mut yt = DTensor::uninit(&gpu, &[b, t, d]);
+            dev.forward(&gpu, &dx, &mut yt);
+            let y = yt.to_host(&gpu).data;
             let dxo = dev.backward_alloc(&gpu, &dg).to_host(&gpu).data;
             let mut cfg = AdamCfg::new(1e-3, 0.01);
             cfg.t = 1;
@@ -1739,7 +1744,9 @@ mod tests {
             let mut dev = MLstm::from_cpu(&gpu, &proto);
             dev.set_bf16_qkv(&gpu, on);
             assert_eq!(dev.uses_bf16_qkv(), on, "path not selected");
-            let y = dev.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let mut yt = DTensor::uninit(&gpu, &[b, t, d]);
+            dev.forward(&gpu, &x, &mut yt);
+            let y = yt.to_host(&gpu).data;
             let dx = dev.backward_alloc(&gpu, &g).to_host(&gpu).data;
             let dwq = dev.lin_q.dw.to_host(&gpu).data;
             (y, dx, dwq)
@@ -1786,7 +1793,9 @@ mod tests {
         let run = |chunk: usize| {
             let mut dev = MLstm::from_cpu(&gpu, &proto);
             dev.set_chunk(chunk);
-            let y = dev.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let mut yt = DTensor::uninit(&gpu, &[b, t, d]);
+            dev.forward(&gpu, &x, &mut yt);
+            let y = yt.to_host(&gpu).data;
             let dx = dev.backward_alloc(&gpu, &g).to_host(&gpu).data;
             let mut cfg = AdamCfg::new(1e-3, 0.01);
             cfg.t = 1;
@@ -1893,7 +1902,9 @@ mod tests {
             let _guard = with_mma(mma);
             let mut dev = MLstm::from_cpu(&gpu, &proto);
             dev.set_chunk(32);
-            let y = dev.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let mut yt = DTensor::uninit(&gpu, &[b, t, d]);
+            dev.forward(&gpu, &x, &mut yt);
+            let y = yt.to_host(&gpu).data;
             let dx = dev.backward_alloc(&gpu, &g).to_host(&gpu).data;
             (y, dx)
         };
@@ -1944,7 +1955,8 @@ mod tests {
         let g = Tensor::random(&[b, t, d], 1.0);
 
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
+        let mut y_dev = DTensor::uninit(&gpu, &[b, t, d]);
+        dev.forward(&gpu, &DTensor::from_host(&gpu, &x), &mut y_dev);
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, "y");
 
         let dx_cpu = cpu.backward(&g);
@@ -1986,7 +1998,11 @@ mod tests {
         let mk = |dims: &[usize], seed: u64| {
             DTensor::from_host(&gpu, &Tensor::random_seeded(dims, 0.5, seed))
         };
-        let (q, k, v) = (mk(&[bh, t, dqk], 0x1), mk(&[bh, t, dqk], 0x2), mk(&[bh, t, dhv], 0x3));
+        let (q, k, v) = (
+            mk(&[bh, t, dqk], 0x1),
+            mk(&[bh, t, dqk], 0x2),
+            mk(&[bh, t, dhv], 0x3),
+        );
         let (ig, fg) = (mk(&[bh, t], 0x4), mk(&[bh, t], 0x5));
 
         // [B*H, T, W] -> [N, H*W] with N = B*T: the layout the projections emit.
@@ -2153,8 +2169,6 @@ mod tests {
         assert_close(&got, &want, 3e-2, "chunked ytil vs whole");
     }
 
-
-
     /// The chunked **backward** must reproduce the whole-sequence one.
     ///
     /// `mlstm_chunked_carry_matches_whole` only compares the forward, and that gap hid
@@ -2199,7 +2213,8 @@ mod tests {
         // 6-step call is a single internal chunk, `is_last` is true for it either way,
         // and the CARRY path under test is never reached.
         let mut whole = MLstm::from_cpu(&gpu, &proto);
-        let _ = whole.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
+        let mut y_whole = DTensor::uninit(&gpu, &[b, t, d]);
+        whole.forward(&gpu, &DTensor::from_host(&gpu, &x), &mut y_whole);
         let want = whole
             .backward_alloc(&gpu, &DTensor::from_host(&gpu, &g))
             .to_host(&gpu)
@@ -2227,7 +2242,8 @@ mod tests {
             part.set_carry(true);
             part.reset_state(&gpu);
             for &(c0, len) in &parts {
-                let _ = part.forward_alloc(&gpu, &cut(&x, c0, len, inp));
+                let mut y_part = DTensor::uninit(&gpu, &[b, len, d]);
+                part.forward(&gpu, &cut(&x, c0, len, inp), &mut y_part);
             }
             // Backward unwinds right to left, starting with no gradient from the right.
             part.reset_bptt(&gpu);

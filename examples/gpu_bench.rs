@@ -275,8 +275,9 @@ fn main() {
         );
         let dx_in = DTensor::from_host(&gpu, &x);
         let ddy = DTensor::from_host(&gpu, &dy);
+        let mut y_dev = DTensor::uninit(&gpu, &[b, t, d]);
         let gpu_s = gpu_time(&gpu, GPU_WARMUP, GPU_ITERS, || {
-            let _y = dev.forward_alloc(&gpu, &dx_in);
+            dev.forward(&gpu, &dx_in, &mut y_dev);
             let _dx = dev.backward_alloc(&gpu, &ddy);
             dev.step(&gpu, &cfg);
         });

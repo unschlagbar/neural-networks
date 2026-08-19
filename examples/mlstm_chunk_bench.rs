@@ -67,21 +67,23 @@ fn main() {
 
         // Peak: memory live between forward and backward (decay matrices resident).
         let before = mem_used();
-        let y = dev.forward_alloc(&gpu, &x);
+        let mut y = DTensor::uninit(&gpu, &[b, t, d]);
+        dev.forward(&gpu, &x, &mut y);
         gpu.stream.synchronize().unwrap();
         let peak = mem_used();
         drop(y);
         let _ = dev.backward_alloc(&gpu, &g);
         gpu.stream.synchronize().unwrap();
 
+        let mut y = DTensor::uninit(&gpu, &[b, t, d]);
         for _ in 0..warmup {
-            let _ = dev.forward_alloc(&gpu, &x);
+            dev.forward(&gpu, &x, &mut y);
             let _ = dev.backward_alloc(&gpu, &g);
         }
         gpu.stream.synchronize().unwrap();
         let t0 = Instant::now();
         for _ in 0..iters {
-            let _ = dev.forward_alloc(&gpu, &x);
+            dev.forward(&gpu, &x, &mut y);
             let _ = dev.backward_alloc(&gpu, &g);
         }
         gpu.stream.synchronize().unwrap();
