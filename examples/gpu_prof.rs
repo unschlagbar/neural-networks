@@ -47,9 +47,9 @@ fn main() {
     // The real training step: one full hierarchical forward+backward window at
     // config.rs shapes (2048 words, ~5 chars each).
     {
-        use neural_networks::gpu::hierarchical::{HierCfg, Hierarchical};
+        use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
         let words_n = 2048usize;
-        let cfg = HierCfg {
+        let cfg = ModelCfg {
             vocab: 100,
             hc: 256,
             wh: 512,
@@ -61,7 +61,7 @@ fn main() {
             w_token: 99,
             cap: 30.0,
         };
-        let mut model = Hierarchical::new(&gpu, &cfg);
+        let mut model = Hierarchical::new(&gpu, cfg);
         let mut tokens = Vec::new();
         let mut words: Vec<std::range::Range<usize>> = Vec::new();
         for w in 0..words_n {

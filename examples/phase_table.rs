@@ -20,7 +20,7 @@ fn main() {
     use neural_networks::config::{WORD_BLOCKS, WORD_HIDDEN};
     use neural_networks::gpu::Gpu;
     use neural_networks::gpu::block::phase::{self, Bucket};
-    use neural_networks::gpu::hierarchical::{HierCfg, Hierarchical};
+    use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
     use neural_networks::nn2::optim::AdamCfg;
 
     if !phase::enabled() {
@@ -29,7 +29,7 @@ fn main() {
     }
     let gpu = Gpu::new().expect("gpu");
 
-    let cfg = HierCfg {
+    let cfg = ModelCfg {
         vocab: 260,
         hc: 256,
         wh: WORD_HIDDEN,
@@ -41,7 +41,7 @@ fn main() {
         w_token: 256,
         cap: 30.0,
     };
-    let mut model = Hierarchical::new(&gpu, &cfg);
+    let mut model = Hierarchical::new(&gpu, cfg);
     let mut opt = AdamCfg::new(3e-4, 0.01);
 
     let n_words = 1024;

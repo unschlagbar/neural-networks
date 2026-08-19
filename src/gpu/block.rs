@@ -235,6 +235,12 @@ impl Cell for SLstm {
     fn drop_saved_act(&mut self) {
         SLstm::drop_saved_act(self)
     }
+    fn enable_offload(&mut self, gpu: &Gpu, in_flight: offload::SharedInFlight) {
+        SLstm::enable_offload(self, gpu, in_flight)
+    }
+    fn prefetch_act(&mut self, gpu: &Gpu) {
+        SLstm::prefetch_saved(self, gpu)
+    }
     fn retained_bytes(&self) -> (usize, usize) {
         SLstm::retained_bytes(self)
     }
@@ -651,7 +657,13 @@ impl<C: Cell> Block<C> {
             .iter()
             .map(|l| l.retained_bytes().1)
             .sum();
-        [ffn, a.pool.retained_bytes(), norms, proj, self.cell.retained_bytes().1]
+        [
+            ffn,
+            a.pool.retained_bytes(),
+            norms,
+            proj,
+            self.cell.retained_bytes().1,
+        ]
     }
 
     /// This block's pool free-list shape `(distinct sizes, buffers)`. Diagnostic.
@@ -1544,5 +1556,54 @@ mod tests {
                 "step {step}: weights diverged after the optimizer step"
             );
         }
+    }
+
+    /// A **chunked** sLSTM sweep must be bit-exact under offload.
+    ///
+    /// The unchunked tests above never reach the cell's park: it only holds the caches
+    /// a chunked sweep sets aside (`SLstm::chunk_saved`), because the live buffers stay
+    /// resident to keep the captured graphs' device pointers valid. So this is the test
+    /// that actually covers `SLstm::enable_offload` — several chunks forwarded before
+    /// any is unwound, then unwound right to left, which is the backbone's shape.
+    #[test]
+    fn slstm_chunked_offload_matches_resident_exactly() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let (h, u, b, t) = (8, 12, 1, 6);
+        let cpu = CpuSLstmBlock::new_slstm(h, u);
+        let mut resident = Block::<SLstm>::from_cpu(&gpu, &cpu);
+        let mut parked = Block::<SLstm>::from_cpu(&gpu, &cpu);
+        resident.disable_offload();
+        parked.enable_offload(&gpu, offload::InFlight::shared());
+
+        // Three chunks of one sequence: carry on, all forwards, then all backwards.
+        let xs: Vec<Tensor> = (0..3).map(|_| Tensor::random(&[b, t, h], 0.5)).collect();
+        let gs: Vec<Tensor> = (0..3).map(|_| Tensor::random(&[b, t, h], 1.0)).collect();
+
+        let run = |dev: &mut Block<SLstm>| {
+            dev.set_carry(false);
+            dev.reset_state(&gpu);
+            dev.set_carry(true);
+            let mut ys = Vec::new();
+            for x in &xs {
+                let dx = DTensor::from_host(&gpu, x);
+                ys.push(dev.forward_alloc(&gpu, &dx).to_host(&gpu).data);
+            }
+            // Unwind right to left; the rightmost chunk starts with no incoming grad.
+            dev.reset_bptt(&gpu);
+            let mut dxs = Vec::new();
+            for g in gs.iter().rev() {
+                let dg = DTensor::from_host(&gpu, g);
+                dxs.push(dev.backward_alloc(&gpu, &dg).to_host(&gpu).data);
+            }
+            (ys, dxs, dev.lin_down.dw.to_host(&gpu).data)
+        };
+
+        let r = run(&mut resident);
+        let p = run(&mut parked);
+        assert_eq!(p.0, r.0, "chunked sLSTM: y differs under offload");
+        assert_eq!(p.1, r.1, "chunked sLSTM: dx differs under offload");
+        assert_eq!(p.2, r.2, "chunked sLSTM: lin_down.dw differs under offload");
     }
 }

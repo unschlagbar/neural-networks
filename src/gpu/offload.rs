@@ -763,6 +763,25 @@ impl HostPark {
         self.in_flight.borrow_mut().release_blocking();
     }
 
+    /// Drop every live generation without restoring it, for a sweep abandoned before
+    /// its backward consumed the chunks.
+    ///
+    /// Blocks first: a generation may still have its D2H in flight, and the device
+    /// sources are owned by the in-flight slot until that copy lands. The pinned slots
+    /// go back to `spare` rather than being freed — they are the expensive part, and
+    /// the next sweep reuses them at the same capacities.
+    pub fn discard_all(&mut self) {
+        if self.live == 0 && self.prefetched.is_none() {
+            return;
+        }
+        self.sync_parked();
+        self.prefetched = None;
+        for g in self.gens.drain(..self.live) {
+            self.spare.extend(g.slots);
+        }
+        self.live = 0;
+    }
+
     /// Start this park's uploads without waiting for them.
     ///
     /// Call one block *ahead* of the consumer: the H2D then runs underneath that

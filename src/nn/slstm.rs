@@ -289,15 +289,19 @@ impl SLSTMLayer {
             // n starts at 1 — otherwise i' can underflow to 0 and h = c/n is 0/0.
             let fm = log_f + cache.m_prev[j];
             let np = cache.n_prev[j];
-            let m = if np == 0.0 {
+            let first = np == 0.0;
+            let m = if first {
                 cache.it_pre[j]
             } else {
                 fm.max(cache.it_pre[j])
             };
 
-            // Stabilized exponential gates
+            // Stabilized exponential gates. On the first step the carry is empty
+            // (n_prev = c_prev = 0), so f' only ever multiplies zeros; forcing it
+            // to 0 avoids exp(fm − ĩ) overflowing to inf for a strongly negative
+            // ĩ, which would turn inf·0 into NaN.
             let i_prime = (cache.it_pre[j] - m).exp();
-            let f_prime = (fm - m).exp();
+            let f_prime = if first { 0.0 } else { (fm - m).exp() };
 
             let c = f_prime * cache.c_prev[j] + i_prime * zt;
             let n = f_prime * np + i_prime;

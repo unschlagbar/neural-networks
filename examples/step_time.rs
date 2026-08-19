@@ -19,7 +19,7 @@ fn main() {
 fn main() {
     use neural_networks::config::{WORD_BLOCKS, WORD_HIDDEN, WORDS_PER_SEQ};
     use neural_networks::gpu::Gpu;
-    use neural_networks::gpu::hierarchical::{HierCfg, Hierarchical};
+    use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
     use neural_networks::nn2::optim::AdamCfg;
 
     let words: usize = std::env::var("WORDS")
@@ -32,7 +32,7 @@ fn main() {
         .unwrap_or(10);
 
     let gpu = Gpu::new().expect("gpu");
-    let cfg = HierCfg {
+    let cfg = ModelCfg {
         vocab: 260,
         hc: 256,
         wh: WORD_HIDDEN,
@@ -44,7 +44,7 @@ fn main() {
         w_token: 256,
         cap: 30.0,
     };
-    let mut model = Hierarchical::new(&gpu, &cfg);
+    let mut model = Hierarchical::new(&gpu, cfg);
     let mut opt = AdamCfg::new(3e-4, 0.01);
 
     let mut tokens = Vec::new();

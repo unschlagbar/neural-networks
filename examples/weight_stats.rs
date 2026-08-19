@@ -129,13 +129,21 @@ fn mlstm_rows(i: usize, cell: &MLSTMLayer) {
     row(i, "mLSTM", "head_norm.gamma", &cell.head_norm.gamma);
 }
 
-/// Prints mean, RMS and max-abs of one tensor.
+/// Prints mean, RMS and max-abs of one tensor, plus any non-finite count.
 fn row(i: usize, layer: &str, tensor: &str, data: &[f32]) {
-    let n = data.len().max(1) as f32;
-    let mean: f32 = data.iter().sum::<f32>() / n;
-    let rms = (data.iter().map(|x| x * x).sum::<f32>() / n).sqrt();
-    let max = data.iter().fold(0.0, |a: f32, &x| a.max(x.abs()));
+    let nan = data.iter().filter(|x| x.is_nan()).count();
+    let inf = data.iter().filter(|x| x.is_infinite()).count();
+    let finite: Vec<f32> = data.iter().copied().filter(|x| x.is_finite()).collect();
+    let n = finite.len().max(1) as f32;
+    let mean: f32 = finite.iter().sum::<f32>() / n;
+    let rms = (finite.iter().map(|x| x * x).sum::<f32>() / n).sqrt();
+    let max = finite.iter().fold(0.0, |a: f32, &x| a.max(x.abs()));
+    let flag = if nan + inf > 0 {
+        format!("  <-- nan {nan} inf {inf}")
+    } else {
+        String::new()
+    };
     println!(
-        "  [{i:>2}] {layer:<12} {tensor:<22} mean {mean:>9.4}  rms {rms:>9.4}  max|x| {max:>9.4}"
+        "  [{i:>2}] {layer:<12} {tensor:<22} mean {mean:>9.4}  rms {rms:>9.4}  max|x| {max:>9.4}{flag}"
     );
 }

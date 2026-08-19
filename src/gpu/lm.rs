@@ -17,8 +17,8 @@
 //! The blocks are held as `Vec<Box<dyn BlockLike>>` because `Block<SLstm>` and
 //! `Block<MLstm>` are different concrete types.
 
-use super::block::BlockLike;
 use super::{DTensor, Gpu, linear::Linear, ops, rms_norm::RmsNorm};
+use crate::gpu::block::BlockLike;
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
 

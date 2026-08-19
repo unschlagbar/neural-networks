@@ -17,7 +17,7 @@ pub const MAX_WORD_BYTES: usize = 16;
 /// is meant to bind first — this only guards against a pathological run with no
 /// boundary token. Caches are sized to the *actual* longest window
 /// (`WordChunk::max_window_tokens`), never to this cap, so raising it is free.
-pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 6;
+pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 7;
 
 // Training-Schedule
 
@@ -55,14 +55,14 @@ pub const FLAT_WEIGHT_DECAY: f32 = 0.0;
 // Sampling
 
 pub const MAX_LEN: usize = 2000;
-pub const TEMPERATURE: f32 = 0.4;
+pub const TEMPERATURE: f32 = 0.5;
 pub const TOP_P: f32 = 0.9;
 
 // Modell-Dimensions
 
 pub const CHAR_HIDDEN: usize = 256;
 pub const OUT_HIDDEN: usize = 256;
-pub const WORD_HIDDEN: usize = 1024;
+pub const WORD_HIDDEN: usize = 768;
 
 /// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).
 /// Bounds the logits and removes the cross-entropy incentive for unbounded

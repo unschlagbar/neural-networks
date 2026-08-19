@@ -49,7 +49,7 @@ use cudarc::driver::CudaGraph;
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 
 use super::block::phase;
-use super::ops::{self, SlstmSlabs};
+use super::ops::{self, SlabBuf, SlstmSlabs};
 use super::rms_norm::RmsNorm;
 use super::{DTensor, Gpu};
 use crate::nn2::optim::AdamCfg;
@@ -218,6 +218,12 @@ pub struct SLstm {
     ///
     /// Empty on the unchunked path, where the reuse above is untouched.
     chunk_saved: Vec<SlstmChunk>,
+    /// Host staging for the chunk caches above, when the surrounding block opted in.
+    ///
+    /// Only the *set-aside* chunks ride. The live `g`/`slabs`/`x_saved` slots stay on
+    /// the device: their addresses are what the captured graphs were built against
+    /// (see `take_uninit`), so moving them would invalidate replay.
+    park: Option<super::offload::HostPark>,
     /// Backward's incoming `dy`, copied into a stable buffer: the caller hands us a
     /// fresh `DTensor` every time, whose pointer a graph cannot depend on.
     dy_buf: Option<DTensor>,
@@ -245,10 +251,72 @@ pub struct SLstm {
 
 /// One chunk's forward cache, set aside so a later chunk's forward can take fresh
 /// buffers without destroying it. See [`SLstm::chunk_saved`].
-struct SlstmChunk {
-    g: DTensor,
-    slabs: SlstmSlabs,
-    x_saved: DTensor,
+///
+/// `Resident` holds the device buffers directly. `Parked` means the same set has been
+/// handed to the [`HostPark`](super::offload::HostPark) and lives in host memory; the
+/// park's generation stack is popped in the same right-to-left order backward unwinds
+/// the chunks, so the two stay in step without storing an index here.
+enum SlstmChunk {
+    Resident {
+        g: DTensor,
+        slabs: SlstmSlabs,
+        x_saved: DTensor,
+    },
+    Parked,
+}
+
+/// The eleven buffers of one chunk cache, in the fixed order `evict`/`restore` share.
+///
+/// Written out rather than derived so the two directions cannot drift: a mismatch here
+/// is a silent shape/width swap, not a compile error.
+fn park_order(g: DTensor, slabs: SlstmSlabs, x_saved: DTensor) -> Vec<super::offload::Parked> {
+    use super::offload::Parked;
+    vec![
+        Parked::from(g),
+        Parked::from(x_saved),
+        Parked::from(slabs.c_prev),
+        Parked::from(slabs.n_prev),
+        Parked::from(slabs.i_prime),
+        Parked::from(slabs.f_prime),
+        Parked::from(slabs.c),
+        Parked::from(slabs.n),
+        Parked::from(slabs.zt),
+        Parked::from(slabs.ot),
+        Parked::from(slabs.h_prev),
+    ]
+}
+
+/// Rebuild a chunk cache from `park_order`'s output, in the same order.
+fn park_unorder(p: Vec<super::offload::Parked>) -> (DTensor, SlstmSlabs, DTensor) {
+    use super::offload::Parked;
+    assert_eq!(p.len(), 11, "slstm park: restored buffer count");
+    let mut it = p.into_iter();
+    // The stabilizer group is fp32 by construction (`gpu::bf16`), so a bf16 buffer
+    // arriving here is a park/restore order mismatch, not a precision choice.
+    fn wide(it: &mut std::vec::IntoIter<super::offload::Parked>, what: &str) -> DTensor {
+        match it.next().expect("slstm park: short restore") {
+            Parked::F32(t) => t,
+            Parked::Bf16(_) => panic!("slstm park: {what} came back bf16"),
+        }
+    }
+    let g = wide(&mut it, "g");
+    let x_saved = wide(&mut it, "x_saved");
+    let (c_prev, n_prev) = (wide(&mut it, "c_prev"), wide(&mut it, "n_prev"));
+    let (i_prime, f_prime) = (wide(&mut it, "i_prime"), wide(&mut it, "f_prime"));
+    let (c, n) = (wide(&mut it, "c"), wide(&mut it, "n"));
+    let mut slab = || SlabBuf::from(it.next().expect("slstm park: short restore"));
+    let slabs = SlstmSlabs {
+        c_prev,
+        n_prev,
+        i_prime,
+        f_prime,
+        c,
+        n,
+        zt: slab(),
+        ot: slab(),
+        h_prev: slab(),
+    };
+    (g, slabs, x_saved)
 }
 
 /// Keep `slot`'s buffer when it already has the wanted shape, else allocate a
@@ -371,6 +439,7 @@ impl SLstm {
             h_prev_f32: None,
             buf_shape: None,
             chunk_saved: Vec::new(),
+            park: None,
             fwd_graph: None,
             bwd_graph: None,
             batch: 0,
@@ -532,6 +601,13 @@ impl SLstm {
     /// Forward over a whole `[B, T, in]` sequence into `y` `[B, T, H]`. State
     /// resets to zero at t=0 and stays device-resident across the T-loop.
     pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
+        // Release the previous eviction before allocating anything here: freeing
+        // returns memory to the CUDA allocator, which must not hand it back while a
+        // copy is still reading it. Ordered on the compute stream, so it costs no host
+        // time. See `Block::forward` for the failure this prevents.
+        if let Some(park) = &self.park {
+            park.release_previous(gpu);
+        }
         assert_eq!(x.rank, 3, "SLstm::forward expects [B, T, in]");
         let (b, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);
         assert_eq!(inp, self.input, "SLstm::forward — input width mismatch");
@@ -597,7 +673,17 @@ impl SLstm {
             if let (Some(g), Some(slabs), Some(x_saved)) =
                 (self.g.take(), self.slabs.take(), self.x_saved.take())
             {
-                self.chunk_saved.push(SlstmChunk { g, slabs, x_saved });
+                // With offload on, this chunk's cache goes to the host instead of
+                // staying resident. The device tensors are handed to the park, which
+                // holds them until its D2H has landed — the next chunk's eviction
+                // releases them, so the copy overlaps that chunk's compute.
+                match &mut self.park {
+                    Some(park) => {
+                        park.evict(gpu, park_order(g, slabs, x_saved));
+                        self.chunk_saved.push(SlstmChunk::Parked);
+                    }
+                    None => self.chunk_saved.push(SlstmChunk::Resident { g, slabs, x_saved }),
+                }
             }
         }
 
@@ -912,10 +998,22 @@ impl SLstm {
         // just handed back releases this chunk's activations now rather than at the
         // next forward, which is what keeps only the chunks still owed a backward
         // resident.
-        if let Some(prev) = self.chunk_saved.pop() {
-            self.g = Some(prev.g);
-            self.slabs = Some(prev.slabs);
-            self.x_saved = Some(prev.x_saved);
+        match self.chunk_saved.pop() {
+            Some(SlstmChunk::Resident { g, slabs, x_saved }) => {
+                self.g = Some(g);
+                self.slabs = Some(slabs);
+                self.x_saved = Some(x_saved);
+            }
+            // The park's generations pop in the same right-to-left order, so this
+            // restores the chunk to the left — exactly the one that unwinds next.
+            Some(SlstmChunk::Parked) => {
+                let park = self.park.as_mut().expect("parked chunk without a park");
+                let (g, slabs, x_saved) = park_unorder(park.restore(gpu));
+                self.g = Some(g);
+                self.slabs = Some(slabs);
+                self.x_saved = Some(x_saved);
+            }
+            None => {}
         }
 
         dx.reshape_to(&[b, t, inp]);
@@ -1055,6 +1153,7 @@ impl SLstm {
         self.slabs = None;
         self.x_saved = None;
         self.chunk_saved.clear();
+        self.discard_parked();
         // The GEMM staging deliberately stays: `drop_saved_act` runs between the chunks
         // of a sweep, and dropping the cached bf16 `Wx` there costs a re-narrow per
         // chunk. It is bounded by the window, not the corpus, and `clear` on the layer
@@ -1100,6 +1199,34 @@ impl SLstm {
         // A sweep that ended early (a caller that forwarded chunks and never unwound
         // them) would otherwise leave its caches to accumulate across steps.
         self.chunk_saved.clear();
+        self.discard_parked();
+    }
+
+    /// Drop any host generations left over from a sweep that was abandoned before its
+    /// backward consumed them, so they do not accumulate across steps.
+    fn discard_parked(&mut self) {
+        if let Some(park) = &mut self.park {
+            park.discard_all();
+        }
+    }
+
+    /// Park this cell's set-aside chunk caches on the host between forward and
+    /// backward.
+    ///
+    /// Opted into by the surrounding [`Block`](super::block::Block), and subject to the
+    /// same constraint: only for a stack whose whole forward precedes its backward.
+    /// See `Block::enable_offload`.
+    pub fn enable_offload(&mut self, gpu: &Gpu, in_flight: super::offload::SharedInFlight) {
+        self.park =
+            Some(super::offload::HostPark::new(gpu, in_flight).expect("offload: host park"));
+    }
+
+    /// Start the parked chunk on its way back, without waiting. Called one block ahead
+    /// of this cell's backward so the upload overlaps compute.
+    pub fn prefetch_saved(&mut self, gpu: &Gpu) {
+        if let Some(park) = &mut self.park {
+            park.prefetch(gpu);
+        }
     }
 
     /// Zero the carried **BPTT** channels, so the next `backward` starts with no
@@ -1128,10 +1255,12 @@ impl SLstm {
             + self
                 .chunk_saved
                 .iter()
-                .map(|c| {
-                    c.slabs.retained_bytes()
-                        + c.x_saved.capacity() * 4
-                        + c.g.capacity() * 4
+                .map(|c| match c {
+                    SlstmChunk::Resident { g, slabs, x_saved } => {
+                        slabs.retained_bytes() + x_saved.capacity() * 4 + g.capacity() * 4
+                    }
+                    // On the host, so it holds no device bytes — which is the point.
+                    SlstmChunk::Parked => 0,
                 })
                 .sum::<usize>();
         let (_, all) = self.retained_bytes();
@@ -1850,6 +1979,60 @@ mod tests {
         for gi in 0..4 {
             assert_close(&part.gate_dw(&gpu, gi), &whole.gate_dw(&gpu, gi), 1e-3);
             assert_close(&part.gate_db(&gpu, gi), &whole.gate_db(&gpu, gi), 1e-3);
+        }
+    }
+
+    /// The GPU cell (`hg` training) against `nn::slstm` (`hs` inference) — the two
+    /// implementations a checkpoint actually round-trips through. The other parity
+    /// tests compare the GPU to `nn2`, which inference never runs, so this is the
+    /// pair that has to agree. State is reset per word in the encoder/decoder, so
+    /// the sequence start (`n_prev == 0`) is exercised on every call.
+    #[test]
+    fn gpu_matches_nn_slstm_inference_cell() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        use crate::nn::slstm::SLSTMLayer as InferSLstm;
+        use crate::nn_layer::NnLayer;
+
+        let (t, inp, h) = (64, 4, 6);
+        let mut cpu = InferSLstm::new(inp, h);
+
+        // `from_nn_cell` is the same converter the real GPU stack uses to load an
+        // `nn::slstm` checkpoint, so the weights land exactly as training saw them.
+        let mut dev = SLstm::from_nn_cell(&gpu, &cpu, None);
+        dev.set_carry(true);
+        dev.reset_state(&gpu);
+        cpu.reset_state();
+
+        let x = Tensor::random(&[1, t, inp], 0.5);
+        let y_dev = dev
+            .forward_alloc(&gpu, &DTensor::from_host(&gpu, &x))
+            .to_host(&gpu)
+            .data;
+
+        // Drive the scalar CPU cell one step at a time over the same input, then
+        // apply the post-cell norm the GPU cell owns internally (γ = 1, since
+        // from_parts got None) so both sides end at the same point.
+        let mut cache = cpu.alloc_cache();
+        let mut norm = crate::nn2::rms_norm::RmsNorm::new(h);
+        let mut y_cpu = Vec::with_capacity(t * h);
+        for step in 0..t {
+            let xt = &x.data[step * inp..(step + 1) * inp];
+            cpu.forward(xt, &mut cache);
+            let mut row = Tensor::zeros(&[1, h]);
+            row.data.copy_from_slice(&cache.h);
+            y_cpu.extend_from_slice(&norm.forward(&row).data);
+        }
+
+        assert_eq!(y_dev.len(), y_cpu.len());
+        for (i, (g, c)) in y_dev.iter().zip(&y_cpu).enumerate() {
+            assert!(
+                (g - c).abs() < tol(&gpu, 8e-3),
+                "step {}/unit {}: gpu {g} vs cpu {c}",
+                i / h,
+                i % h
+            );
         }
     }
 }

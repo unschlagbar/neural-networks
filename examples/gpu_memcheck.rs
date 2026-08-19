@@ -9,11 +9,11 @@ fn main() {
 #[cfg(feature = "cuda")]
 fn main() {
     use neural_networks::gpu::Gpu;
-    use neural_networks::gpu::hierarchical::{HierCfg, Hierarchical};
+    use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
     use neural_networks::nn2::optim::AdamCfg;
 
     let gpu = Gpu::new().expect("gpu");
-    let cfg = HierCfg {
+    let cfg = ModelCfg {
         vocab: 100,
         hc: 256,
         wh: 512,
@@ -25,7 +25,7 @@ fn main() {
         w_token: 99,
         cap: 30.0,
     };
-    let mut model = Hierarchical::new(&gpu, &cfg);
+    let mut model = Hierarchical::new(&gpu, cfg);
     let mut opt = AdamCfg::new(3e-4, 0.01);
 
     let free_mb = || cudarc::driver::result::mem_get_info().unwrap().0 / (1024 * 1024);

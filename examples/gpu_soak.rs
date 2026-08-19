@@ -28,7 +28,7 @@ fn main() {
     use neural_networks::batches::ChunkedWordDataSet;
     use neural_networks::config::*;
     use neural_networks::gpu::Gpu;
-    use neural_networks::gpu::hierarchical::{HierCfg, Hierarchical};
+    use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
     use neural_networks::nn2::optim::AdamCfg;
     use neural_networks::tokenizer_utf8::Utf8Tokenizer;
 
@@ -44,7 +44,7 @@ fn main() {
     let vocab = tok.vocab_size();
     let w_token = tok.w_token() as usize;
     let heads = 8;
-    let cfg = HierCfg {
+    let cfg = ModelCfg {
         vocab,
         hc: CHAR_HIDDEN,
         wh: WORD_HIDDEN,
@@ -56,7 +56,7 @@ fn main() {
         w_token,
         cap: LOGIT_SOFTCAP,
     };
-    let mut model = Hierarchical::new(&gpu, &cfg);
+    let mut model = Hierarchical::new(&gpu, cfg);
     let mut opt = AdamCfg::new(LR, neural_networks::optimizers::WEIGHT_DECAY);
 
     let mut data = ChunkedWordDataSet::open(

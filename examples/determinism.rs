@@ -18,7 +18,7 @@ fn main() {
         CHAR_HIDDEN, MAX_WINDOW_TOKENS, OUT_HIDDEN, WORD_BLOCKS, WORD_HIDDEN,
     };
     use neural_networks::gpu::Gpu;
-    use neural_networks::gpu::hierarchical::{HierCfg, Hierarchical};
+    use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
     use neural_networks::tokenizer_utf8::Utf8Tokenizer;
 
     let mut args = std::env::args().skip(1);
@@ -27,7 +27,7 @@ fn main() {
 
     let gpu = Gpu::new().expect("gpu");
     let tok = Utf8Tokenizer::new();
-    let cfg = HierCfg {
+    let cfg = ModelCfg {
         vocab: tok.vocab_size(),
         hc: CHAR_HIDDEN,
         wh: WORD_HIDDEN,
@@ -39,7 +39,10 @@ fn main() {
         w_token: neural_networks::tokenizer_utf8::W_TOKEN as usize,
         cap: 30.0,
     };
-    assert_eq!(CHAR_HIDDEN, OUT_HIDDEN, "decoder ties the encoder char table");
+    assert_eq!(
+        CHAR_HIDDEN, OUT_HIDDEN,
+        "decoder ties the encoder char table"
+    );
 
     let mut tokens = Vec::with_capacity(words * 6);
     let mut spans: Vec<std::range::Range<usize>> = Vec::with_capacity(words);
@@ -64,7 +67,7 @@ fn main() {
 
     // One model, never stepped: every repetition sees identical weights, so any
     // spread in the loss is the forward/backward itself being nondeterministic.
-    let mut model = Hierarchical::new(&gpu, &cfg);
+    let mut model = Hierarchical::new(&gpu, cfg);
 
     let mut losses = Vec::with_capacity(reps);
     for i in 0..reps {

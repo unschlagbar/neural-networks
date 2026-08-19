@@ -5,7 +5,7 @@ use neural_networks::{
     config::*,
     gpu::{
         Gpu,
-        hierarchical::{HierCfg, Hierarchical},
+        hierarchical::{Hierarchical, ModelCfg},
     },
     nn2::optim::AdamCfg,
     tokenizer_utf8::Utf8Tokenizer,
@@ -50,7 +50,7 @@ fn main() {
 
     let gpu = Gpu::new().expect("no GPU");
     let heads = 8;
-    let cfg = HierCfg {
+    let cfg = ModelCfg {
         vocab: tok.vocab_size(),
         hc: CHAR_HIDDEN,
         wh: WORD_HIDDEN,
@@ -63,7 +63,7 @@ fn main() {
         cap: LOGIT_SOFTCAP,
     };
     let base0 = used_mb();
-    let mut model = Hierarchical::new(&gpu, &cfg);
+    let mut model = Hierarchical::new(&gpu, cfg);
     println!("ctx {base0:.0} MB -> after model init {:.0} MB", used_mb());
     let mut opt = AdamCfg::new(LR, neural_networks::optimizers::WEIGHT_DECAY);
     let tokens: Vec<usize> = worst.tokens.iter().map(|&t| t as usize).collect();

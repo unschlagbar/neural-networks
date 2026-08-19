@@ -15,7 +15,7 @@ fn main() {
 fn main() {
     use neural_networks::config::{BACKBONE_CHUNK, GROUP_MAX_ROWS, WORD_BLOCKS, WORD_HIDDEN};
     use neural_networks::gpu::Gpu;
-    use neural_networks::gpu::hierarchical::{HierCfg, Hierarchical};
+    use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
     use neural_networks::nn2::optim::AdamCfg;
 
     let n_words: usize = std::env::args()
@@ -24,7 +24,7 @@ fn main() {
         .unwrap_or(1024);
 
     let gpu = Gpu::new().expect("gpu");
-    let cfg = HierCfg {
+    let cfg = ModelCfg {
         vocab: 260,
         hc: 256,
         wh: WORD_HIDDEN,
@@ -47,7 +47,10 @@ fn main() {
         words.push((start..tokens.len()).into());
     }
 
-    println!("{n_words} words, {} tokens, WH={WORD_HIDDEN}, {WORD_BLOCKS} blocks", tokens.len());
+    println!(
+        "{n_words} words, {} tokens, WH={WORD_HIDDEN}, {WORD_BLOCKS} blocks",
+        tokens.len()
+    );
     println!("{:>16}  {:>10}  {:>10}", "config", "ms/step", "vs old");
 
     let mut base = 0.0f64;
@@ -63,7 +66,7 @@ fn main() {
         ("chunk only", BACKBONE_CHUNK, 0),
         ("both (current)", BACKBONE_CHUNK, GROUP_MAX_ROWS),
     ] {
-        let mut model = Hierarchical::new(&gpu, &cfg);
+        let mut model = Hierarchical::new(&gpu, cfg);
         model.set_bb_chunk(Some(chunk));
         model.set_group_cap(Some(cap));
         let mut opt = AdamCfg::new(3e-4, 0.01);

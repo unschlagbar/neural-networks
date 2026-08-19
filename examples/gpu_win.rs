@@ -14,7 +14,7 @@ fn main() {
 
     use neural_networks::config::{CHAR_HIDDEN, WORD_BLOCKS, WORD_HIDDEN};
     use neural_networks::gpu::Gpu;
-    use neural_networks::gpu::hierarchical::{HierCfg, Hierarchical};
+    use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
 
     let words_n: usize = std::env::args()
         .nth(1)
@@ -29,7 +29,7 @@ fn main() {
         }
     };
 
-    let cfg = HierCfg {
+    let cfg = ModelCfg {
         vocab: 100,
         hc: CHAR_HIDDEN,
         wh: WORD_HIDDEN,
@@ -41,7 +41,7 @@ fn main() {
         w_token: 99,
         cap: 30.0,
     };
-    let mut model = Hierarchical::new(&gpu, &cfg);
+    let mut model = Hierarchical::new(&gpu, cfg);
 
     // Synthetic window: `words_n` words of 3..8 chars, like the real corpus.
     let mut tokens: Vec<usize> = Vec::new();

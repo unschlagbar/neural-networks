@@ -22,7 +22,7 @@ use crate::config::{
     WORD_HIDDEN, WORDS_PER_SEQ,
 };
 use crate::gpu::Gpu;
-use crate::gpu::hierarchical::{HierCfg, Hierarchical};
+use crate::gpu::hierarchical::{Hierarchical, ModelCfg};
 use crate::nn2::optim::AdamCfg;
 use crate::pretrain_progress;
 use crate::sft;
@@ -32,15 +32,15 @@ use crate::training::TrainingState;
 
 /// Architecture, taken from `config.rs` so the GPU model matches the CPU one.
 /// `heads`/`dqk` mirror `model.rs::build_hierarchical_model`.
-fn cfg_from_config(vocab: usize, w_token: usize) -> HierCfg {
+fn cfg_from_config(vocab: usize, w_token: usize) -> ModelCfg {
     let heads = 8;
-    HierCfg {
+    ModelCfg {
         vocab,
         hc: CHAR_HIDDEN,
         wh: WORD_HIDDEN,
-        enc_blocks: 4,
+        enc_blocks: 5,
         bb_blocks: WORD_BLOCKS,
-        dec_blocks: 4,
+        dec_blocks: 5,
         heads,
         dqk: WORD_HIDDEN / heads,
         w_token,
@@ -74,7 +74,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         }
         Err(e) => {
             println!("Could not load '{model_path}' ({e}) — creating new GPU model.");
-            Hierarchical::new(&gpu, &cfg)
+            Hierarchical::new(&gpu, cfg)
         }
     };
     if model.cfg != cfg {

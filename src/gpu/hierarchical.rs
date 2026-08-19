@@ -31,9 +31,10 @@ use std::collections::BTreeMap;
 use std::io;
 use std::range::Range;
 
-use super::block::{Block, BlockLike};
+use super::block::Block;
 use super::{DTensor, Gpu, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm};
 use crate::format::{Meta, ModelKind, Seen, Writer};
+use crate::gpu::block::BlockLike;
 use crate::gpu::{dt_matrix, dt_vec, tensor_from_matrix, tensor_from_slice};
 use crate::nn::embedding::EmbeddingLayer;
 use crate::nn::linear::LinearLayer;
@@ -49,7 +50,7 @@ use crate::tensor::Tensor;
 
 /// Config for the hierarchical stack (mirrors `nn2::HierCfg`).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HierCfg {
+pub struct ModelCfg {
     pub vocab: usize,
     pub hc: usize, // char/context hidden (tied embedding + decoder width)
     pub wh: usize, // backbone width
@@ -82,7 +83,7 @@ impl WordEncoder {
         Self {
             blocks: (0..n)
                 .map(|i| {
-                    if i == 0 {
+                    if i.is_multiple_of(2) {
                         Box::new(Block::from_cell(
                             gpu,
                             hc,
@@ -440,7 +441,7 @@ fn enc_group_rows(
     w_token: usize,
     out: &mut EncGroup,
 ) {
-    let tmax = grp.iter().map(|&w| enc_lens[w] + 1).max().unwrap();
+    let tmax = grp.iter().map(|&w| enc_lens[w]).max().unwrap() + 1;
     out.tmax = tmax;
     out.ids.clear();
     out.ids.resize(grp.len() * tmax, 0);
@@ -457,7 +458,7 @@ fn enc_group_rows(
 }
 
 pub struct Hierarchical {
-    pub cfg: HierCfg,
+    pub cfg: ModelCfg,
 
     // Tied char table (encoder input + decoder char slots) + grad/moments.
     pub table: DTensor,
@@ -571,10 +572,10 @@ impl Flags {
 }
 
 impl Hierarchical {
-    pub fn new(gpu: &Gpu, cfg: &HierCfg) -> Self {
+    pub fn new(gpu: &Gpu, cfg: ModelCfg) -> Self {
         let bb_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.bb_blocks)
             .map(|i| {
-                if i.is_multiple_of(4) {
+                if i.is_multiple_of(8) {
                     Box::new(Block::from_cell(
                         gpu,
                         cfg.wh,
@@ -593,7 +594,7 @@ impl Hierarchical {
             .collect();
         let dec_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.dec_blocks)
             .map(|i| {
-                if i != 1 {
+                if i.is_multiple_of(2) {
                     Box::new(Block::from_cell(
                         gpu,
                         cfg.hc,
@@ -611,7 +612,7 @@ impl Hierarchical {
             })
             .collect();
         let mut model = Self {
-            cfg: *cfg,
+            cfg,
             table: DTensor::from_host(gpu, &Tensor::random(&[cfg.vocab, cfg.hc], 0.02)),
             dtable: DTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
             m_tbl: DTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
@@ -1497,6 +1498,34 @@ impl Hierarchical {
         rows
     }
 
+    /// Learnable parameter counts as `(encoder, backbone, decoder, other)`.
+    ///
+    /// Counts the same tensors a checkpoint stores, so the total times 4 bytes is
+    /// directly comparable to a saved file's size. `other` is the tied char table plus
+    /// the backbone's front/back projections, the decoder norm and the logit head.
+    pub fn param_counts(&mut self) -> (usize, usize, usize, usize) {
+        fn blocks(bs: &mut [Box<dyn BlockLike>]) -> usize {
+            bs.iter_mut()
+                .flat_map(|b| b.params_mut())
+                .map(|t| t.len())
+                .sum()
+        }
+        let enc = blocks(&mut self.encoder.blocks);
+        let bb = blocks(&mut self.bb_blocks);
+        let dec = blocks(&mut self.dec_blocks);
+        let other = self.table.len()
+            + self
+                .bb_front
+                .params_mut()
+                .into_iter()
+                .chain(self.bb_back.params_mut())
+                .chain(self.dec_head.params_mut())
+                .chain(self.dec_norm.params_mut())
+                .map(|t| t.len())
+                .sum::<usize>();
+        (enc, bb, dec, other)
+    }
+
     /// Per-stage retained activations broken out by owner, for the memory audit.
     ///
     /// Columns: `ffn_bufs, pool, norms, projections, cell_saved, cell_other`. The
@@ -1848,7 +1877,7 @@ impl Hierarchical {
             .map(|s| s.cap)
             .unwrap_or(crate::config::LOGIT_SOFTCAP);
 
-        let cfg = HierCfg {
+        let cfg = ModelCfg {
             vocab,
             hc,
             wh,
@@ -1863,7 +1892,7 @@ impl Hierarchical {
 
         // Build a fresh model (for the zeroed grads/moments), then swap in the
         // loaded weight-bearing parts.
-        let mut model = Hierarchical::new(gpu, &cfg);
+        let mut model = Hierarchical::new(gpu, cfg);
         model.step_count = stacks.step;
         model.seen = stacks.seen;
         model.table = table;
@@ -1904,7 +1933,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        let cfg = HierCfg {
+        let cfg = ModelCfg {
             vocab: 9,
             hc: 16,
             wh: 24,
@@ -1916,7 +1945,7 @@ mod tests {
             w_token: 8,
             cap: 30.0,
         };
-        let mut model = Hierarchical::new(&gpu, &cfg);
+        let mut model = Hierarchical::new(&gpu, cfg);
 
         let tokens = vec![1usize, 2, 3, 4, 5, 6, 7, 1, 2, 3];
         let words = vec![
@@ -1979,7 +2008,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        let cfg = HierCfg {
+        let cfg = ModelCfg {
             vocab: 12,
             hc: 256,
             wh: 768,
@@ -2009,7 +2038,7 @@ mod tests {
 
         // One model, never stepped: identical weights every rep, so any spread is
         // the forward/backward itself.
-        let mut model = Hierarchical::new(&gpu, &cfg);
+        let mut model = Hierarchical::new(&gpu, cfg);
         let first = model.forward_backward(&gpu, &tokens, &words);
         for rep in 1..4 {
             let got = model.forward_backward(&gpu, &tokens, &words);
@@ -2030,7 +2059,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        let cfg = HierCfg {
+        let cfg = ModelCfg {
             vocab: 12,
             hc: 32,
             wh: 48,
@@ -2058,7 +2087,7 @@ mod tests {
             });
         }
 
-        let mut model = Hierarchical::new(&gpu, &cfg);
+        let mut model = Hierarchical::new(&gpu, cfg);
         let char_loss = model.forward_backward(&gpu, &tokens, &words);
         let word_loss = model.last_word_loss();
 
@@ -2085,7 +2114,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        let cfg = HierCfg {
+        let cfg = ModelCfg {
             vocab: 12,
             hc: 16,
             wh: 24,
@@ -2116,7 +2145,7 @@ mod tests {
             } else {
                 unsafe { std::env::set_var("GPU_NO_GROUP", "1") };
             }
-            let mut model = Hierarchical::new(&gpu, &cfg);
+            let mut model = Hierarchical::new(&gpu, cfg);
             // Same starting weights for both runs.
             let seed = std::env::temp_dir().join("gpu_group_seed.hier");
             let seed = seed.to_str().unwrap();
@@ -2175,7 +2204,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        let cfg = HierCfg {
+        let cfg = ModelCfg {
             vocab: 12,
             hc: 16,
             wh: 24,
@@ -2198,7 +2227,7 @@ mod tests {
             .collect();
 
         let run = |chunk: usize| -> (f32, Vec<f32>, Vec<f32>) {
-            let mut model = Hierarchical::new(&gpu, &cfg);
+            let mut model = Hierarchical::new(&gpu, cfg);
             // Same starting weights for both legs.
             let seed = std::env::temp_dir().join("gpu_chunk_seed.hier");
             let seed = seed.to_str().unwrap();
@@ -2279,7 +2308,7 @@ mod tests {
         // Wide enough that a chunk's buffers are a real allocation: at a toy width the
         // pool hands every chunk the same address back and the stale-pointer replay is
         // accidentally harmless, so the bug does not reproduce.
-        let cfg = HierCfg {
+        let cfg = ModelCfg {
             vocab: 64,
             hc: 256,
             wh: 768,
@@ -2303,7 +2332,7 @@ mod tests {
             .collect();
 
         let run = |chunk: usize| -> (f32, Vec<f32>, Vec<f32>) {
-            let mut model = Hierarchical::new(&gpu, &cfg);
+            let mut model = Hierarchical::new(&gpu, cfg);
             let seed = std::env::temp_dir().join("gpu_three_chunk_seed.hier");
             let seed = seed.to_str().unwrap();
             if chunk != usize::MAX {
@@ -2368,7 +2397,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        let cfg = HierCfg {
+        let cfg = ModelCfg {
             vocab: 12,
             hc: 16,
             wh: 24,
@@ -2391,7 +2420,7 @@ mod tests {
             .collect();
 
         let run = |cap: usize| -> (f32, Vec<f32>) {
-            let mut model = Hierarchical::new(&gpu, &cfg);
+            let mut model = Hierarchical::new(&gpu, cfg);
             let seed = std::env::temp_dir().join("gpu_groupcap_seed.hier");
             let seed = seed.to_str().unwrap();
             if cap == 0 {
