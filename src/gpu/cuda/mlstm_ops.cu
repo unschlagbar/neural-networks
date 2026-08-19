@@ -64,24 +64,6 @@ extern "C" __global__ void head_gather(const float* x, float* out, int B, int H,
     out[idx] = x[(b * T + t) * (H * W) + h * W + c];
 }
 
-// `head_gather` writing a bf16 destination, for the mLSTM's saved q/k/v.
-//
-// This must narrow AT THE GATHER, not afterwards. Producing the fp32 tensor first
-// and converting it costs the full-width allocation anyway — and because cudarc
-// frees through an async memory pool that retains blocks, that fp32 buffer stays
-// resident, so the pair costs MORE than fp32 alone. Measured: doing it the naive
-// way made a step 32 MB larger, not smaller. Writing narrow from the start is what
-// actually removes the wide buffer.
-extern "C" __global__ void head_gather_slab(const float* x, slab_t* out, int B, int H, int T, int W) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * H * T * W) return;
-    int c = idx % W;
-    int t = (idx / W) % T;
-    int h = (idx / (W * T)) % H;
-    int b = idx / (W * T * H);
-    slab_st(out, idx, x[(b * T + t) * (H * W) + h * W + c]);
-}
-
 // Inverse of head_gather: head-major [B*H, T, W] → position-major [N, H*W].
 // Plain write (each destination element hit once).
 extern "C" __global__ void head_scatter(const float* in, float* x, int B, int H, int T, int W) {
@@ -94,20 +76,6 @@ extern "C" __global__ void head_scatter(const float* in, float* x, int B, int H,
     x[(b * T + t) * (H * W) + h * W + c] = in[idx];
 }
 
-// `head_scatter` reading a bf16 source. The mLSTM's `ytil` is stored narrow, and
-// this is the one consumer that reads it outside the fused kernels; widening it
-// into a temporary first would allocate exactly the fp32 buffer the narrow storage
-// exists to avoid, so the conversion happens here, on the fly. The destination is
-// fp32 either way — it feeds the head norm.
-extern "C" __global__ void head_scatter_slab(const slab_t* in, float* x, int B, int H, int T, int W) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * H * T * W) return;
-    int c = idx % W;
-    int t = (idx / W) % T;
-    int h = (idx / (W * T)) % H;
-    int b = idx / (W * T * H);
-    x[(b * T + t) * (H * W) + h * W + c] = slab_ld(in, idx);
-}
 
 // Inclusive cumulative sum of logσ(f) along T, per row g of [BH, T]. One thread
 // per row (the scan is serial but each row is independent; T is small).

@@ -537,35 +537,21 @@ impl MLstm {
             "MLstm::forward — input width mismatch"
         );
         let (d, h, dqk, dhv) = (self.d, self.heads, self.dqk, self.dhv);
-        let (n, bh) = (b * t, b * h);
+        let rows = b * t; // flattened [B, T] positions
+        let bh = b * h; // batch × head, the fused kernels' outer dim
 
-        // Projections on the flat [N, in] view. Every one of these is consumed by
-        // the head-major reorg below and then dead, so they come from the pool and
-        // go straight back — the cell holds one set of them, not one per call.
-        // Widths differ per projection — q/k are `heads·dqk`, v/o are `heads·dhv`
-        // (== d), i/f are one logit per head — so each buffer is sized from its own
-        // layer rather than assuming `d`.
-        //
-        // All six projections read the SAME `xf`, so it is saved once here and handed
-        // to `forward_shared`, which copies nothing. `Linear::forward` would instead
-        // deep-copy it into each layer's own `self.x` — five identical [N, in] copies,
-        // 21 MB per cell at H=1024 and 252 MB across the backbone, for one tensor.
-        // Backward pairs this with `backward_with_x(&sv.xf, …)`.
-        //
-        // `xf` therefore outlives the call and is NOT pooled: it must survive to
-        // backward, and the pool has to get back everything it lends
-        // (`assert_drained` at the top of `backward_alloc`).
-        let mut xf = DTensor::uninit(gpu, &[n, inp]);
+        // Backward needs this for every projection's dW, so it outlives the call and
+        // is not pooled (`assert_drained` in `backward_alloc` wants the pool whole).
+        let mut xf = DTensor::uninit(gpu, &[rows, inp]);
         xf.copy_from(gpu, x);
-        // All six read `xf`: narrow it once into the shared scratch instead of once per
-        // projection. `o` is kept in the cache for backward, so it is NOT pooled: the
-        // pool must get back everything it lends, and this one never comes back.
-        let mut q = self.pool.take(gpu, &[n, self.lin_q.output_size()]);
-        let mut k = self.pool.take(gpu, &[n, self.lin_k.output_size()]);
-        let mut v = self.pool.take(gpu, &[n, self.lin_v.output_size()]);
-        let mut o = DTensor::uninit(gpu, &[n, self.lin_o.output_size()]);
-        let mut ig = self.pool.take(gpu, &[n, self.lin_i.output_size()]); // [N, H]
-        let mut fg = self.pool.take(gpu, &[n, self.lin_f.output_size()]); // [N, H]
+        // Pooled buffers die at the reorg below; `o` is cached for backward, so it is
+        // not. Widths differ per projection, so each is sized from its own layer.
+        let mut q = self.pool.take(gpu, &[rows, self.lin_q.output_size()]);
+        let mut k = self.pool.take(gpu, &[rows, self.lin_k.output_size()]);
+        let mut v = self.pool.take(gpu, &[rows, self.lin_v.output_size()]);
+        let mut o = DTensor::uninit(gpu, &[rows, self.lin_o.output_size()]);
+        let mut ig = self.pool.take(gpu, &[rows, self.lin_i.output_size()]); // [rows, H]
+        let mut fg = self.pool.take(gpu, &[rows, self.lin_f.output_size()]); // [rows, H]
         ops::with_shared_lhs(gpu, &xf, |xf_b| {
             self.lin_q.forward_staged(gpu, &xf, xf_b, &mut q);
             self.lin_k.forward_staged(gpu, &xf, xf_b, &mut k);
@@ -577,29 +563,42 @@ impl MLstm {
         // k needs no rescale: 1/√dqk is folded into lin_k's weights. `o` is squashed
         // later, fused into the product that consumes it.
 
-        // The gate logits go head-major as fp32 on either path: the reference pins
-        // vecI/vecB to fp32, and they are [BH, T] — a factor of `dqk` smaller than
-        // q/k/v, so there is nothing to win by narrowing them anyway.
-        let igh = ops::head_gather(gpu, &ig, b, h, t, 1).reshaped(&[bh, t]); // [BH, T]
-        let fgh = ops::head_gather(gpu, &fg, b, h, t, 1).reshaped(&[bh, t]);
-
-        // The fused kernels do the whole chunkwise core — states and all chunks — in
-        // three launches. Everything before and after (projections, head norm, the
-        // o-gate, the output projection) is shared with the path below.
-        //
-        // The path is chosen BEFORE the q/k/v reorg, because the two want different
-        // destinations: the fused path gathers straight into bf16 slabs, while the
-        // op-at-a-time path below slices q/k/v for cuBLAS and needs them fp32.
-        // Gathering fp32 first and narrowing afterwards would allocate the wide
-        // buffer regardless — see `ops::head_gather_slab` for why that costs rather
-        // than saves.
+        // Chosen before the q/k/v reorg: the fused kernels stride over the projection
+        // output as it lies, while the path below slices q/k/v for cuBLAS, which needs
+        // one fixed stride between matrices and so must gather.
         if let Some(l) = self.fused_chunk(gpu, t) {
-            // Head-major reorg straight into slab storage. These outlive the call
-            // (backward reads them), so they are NOT pooled.
-            let qh = ops::head_gather_slab(gpu, &q, b, h, t, dqk); // [BH, T, dqk]
-            let kh = ops::head_gather_slab(gpu, &k, b, h, t, dqk);
-            let vh = ops::head_gather_slab(gpu, &v, b, h, t, dhv); // [BH, T, dhv]
-            self.pool.put_all([q, k, v, ig, fg]);
+            // position-major skips the reorg and lets the kernels stride; head-major
+            // pays a streaming pass for row locality, re-used once per chunk. Backward
+            // must read them the same way, so the choice is recorded in the cache.
+            // These buffers leave the pool for good — backward reads them.
+            let head_major = ops::mlstm_head_major();
+            let (qh, kh, vh, igh, fgh) = if head_major {
+                let g = |src: &DTensor, w: usize| {
+                    ops::SlabBuf::from_f32(gpu, ops::head_gather(gpu, src, b, h, t, w))
+                };
+                let (qh, kh, vh) = (g(&q, dqk), g(&k, dqk), g(&v, dhv));
+                let igh = ops::head_gather(gpu, &ig, b, h, t, 1).reshaped(&[bh, t]);
+                let fgh = ops::head_gather(gpu, &fg, b, h, t, 1).reshaped(&[bh, t]);
+                self.pool.put_all([q, k, v, ig, fg]);
+                (qh, kh, vh, igh, fgh)
+            } else {
+                // `from_f32` narrows without permuting and consumes the fp32 tensor,
+                // so the wide buffer never outlives the narrow one. The gate logits
+                // stay fp32 — the reference pins vecI/vecB to fp32, and at [rows, H] they
+                // are a factor of `dqk` smaller than q/k/v, so narrowing buys nothing.
+                (
+                    ops::SlabBuf::from_f32(gpu, self.pool.detach(q)),
+                    ops::SlabBuf::from_f32(gpu, self.pool.detach(k)),
+                    ops::SlabBuf::from_f32(gpu, self.pool.detach(v)),
+                    self.pool.detach(ig),
+                    self.pool.detach(fg),
+                )
+            };
+            let st = if head_major {
+                ops::MlstmStrides::head_major(b, h, t, dqk, dhv)
+            } else {
+                ops::MlstmStrides::position_major(b, h, t, dqk, dhv)
+            };
             // Carry the recurrent state in from the previous chunk when the surrounding
             // sweep is chunked; `None` (the unchunked case) starts it at zero inside
             // the kernel. The outgoing state is taken below, after the cache is built.
@@ -612,24 +611,25 @@ impl MLstm {
                 &fgh,
                 l,
                 if self.carry { self.carry_state.as_ref() } else { None },
+                st,
             );
             if self.carry {
                 let bh = b * h;
                 self.carry_state = Some(fused.final_state(gpu, bh, dhv, dqk));
             }
-            // `h_tilde` and `hconcat` die inside this block; `yhat` is cached for
-            // backward, so only the first two are pooled.
-            let mut h_tilde = self.pool.take(gpu, &[n, d]); // [N, d]
-            ops::head_scatter_slab_into(gpu, &fused.ytil, b, h, t, dhv, &mut h_tilde);
-            let mut yhat = DTensor::uninit(gpu, &[n, d]);
-            self.headnorm.forward(gpu, &h_tilde, &mut yhat);
+            // The head norm wants [rows, d]: position-major `ytil` already is, and only
+            // needs widening to fp32; head-major has to be scattered.
+            let mut h_tilde = self.pool.take(gpu, &[rows, d]);
+            let yt = fused.ytil.as_f32(gpu, &mut h_tilde);
+            let mut yhat = DTensor::uninit(gpu, &[rows, d]);
+            self.headnorm.forward(gpu, yt, &mut yhat);
             self.pool.put(h_tilde);
             // `hconcat` is kept in the cache rather than pooled, and `lin_out` takes it
             // back through `backward_with_x`: a chunked sweep would otherwise have the
             // next chunk's forward overwrite the private copy `forward_alloc` saves.
-            let mut hconcat = DTensor::uninit(gpu, &[n, d]);
+            let mut hconcat = DTensor::uninit(gpu, &[rows, d]);
             ops::ogate_fwd(gpu, &mut o, &yhat, &mut hconcat);
-            let mut out = DTensor::uninit(gpu, &[n, d]);
+            let mut out = DTensor::uninit(gpu, &[rows, d]);
             self.lin_out.forward_shared(gpu, &hconcat, &mut out);
             self.saved.push(Cache::Fused(SavedFused {
                 b,
@@ -650,10 +650,13 @@ impl MLstm {
         }
 
         // Op-at-a-time path: q/k/v go head-major as fp32, because this path slices
-        // them and hands the slices to cuBLAS, which has no bf16 operand here.
+        // them and hands the slices to cuBLAS, which needs one fixed stride between
+        // matrices and so cannot read the projection output where it lies.
         let qh = ops::head_gather(gpu, &q, b, h, t, dqk); // [BH, T, dqk]
         let kh = ops::head_gather(gpu, &k, b, h, t, dqk);
         let vh = ops::head_gather(gpu, &v, b, h, t, dhv); // [BH, T, dhv]
+        let igh = ops::head_gather(gpu, &ig, b, h, t, 1).reshaped(&[bh, t]); // [BH, T]
+        let fgh = ops::head_gather(gpu, &fg, b, h, t, 1).reshaped(&[bh, t]);
         self.pool.put_all([q, k, v, ig, fg]);
 
         // Recurrent state carried across chunks (stabilized, as on the CPU).
@@ -756,18 +759,18 @@ impl MLstm {
 
         // Back to position-major, head-norm, o-gate, output projection. `h_tilde`
         // and `hconcat` die here; `yhat` is cached for backward.
-        let mut h_tilde = self.pool.take(gpu, &[n, d]); // [N, d]
+        let mut h_tilde = self.pool.take(gpu, &[rows, d]); // [rows, d]
         ops::head_scatter_into(gpu, &ytil, b, h, t, dhv, &mut h_tilde);
-        let mut yhat = DTensor::uninit(gpu, &[n, d]);
+        let mut yhat = DTensor::uninit(gpu, &[rows, d]);
         self.headnorm.forward(gpu, &h_tilde, &mut yhat);
         self.pool.put(h_tilde);
         // `hconcat` is cached rather than pooled, and `lin_out` takes it back through
         // `backward_with_x`: under a chunked sweep the private copy `forward_alloc`
         // saves would be overwritten by the next chunk's forward.
-        let mut hconcat = DTensor::uninit(gpu, &[n, d]);
-        ops::ogate_fwd(gpu, &mut o, &yhat, &mut hconcat); // σ(o) ⊙ ŷ  [N, d]
-        let mut out = DTensor::uninit(gpu, &[n, d]);
-        self.lin_out.forward_shared(gpu, &hconcat, &mut out); // [N, d]
+        let mut hconcat = DTensor::uninit(gpu, &[rows, d]);
+        ops::ogate_fwd(gpu, &mut o, &yhat, &mut hconcat); // σ(o) ⊙ ŷ  [rows, d]
+        let mut out = DTensor::uninit(gpu, &[rows, d]);
+        self.lin_out.forward_shared(gpu, &hconcat, &mut out); // [rows, d]
 
         // `o`/`yhat` are unused after `mul`, so move (not dup) them into the cache.
         self.saved.push(Cache::Legacy(Saved {
@@ -1007,7 +1010,7 @@ impl MLstm {
     fn backward_fused(&mut self, gpu: &Gpu, dy: &DTensor, sv: SavedFused) -> DTensor {
         let (d, h, dqk, dhv, inp) = (self.d, self.heads, self.dqk, self.dhv, self.input_size);
         let (b, t) = (sv.b, sv.t);
-        let (n, bh) = (b * t, b * h);
+        let n = b * t;
 
         // The whole shell is temporaries: each value below dies as soon as the next
         // op has read it, so all of them come from the pool and go back.
@@ -1019,12 +1022,13 @@ impl MLstm {
         self.pool.put(dy_flat);
         let (do_pre, d_yhat) = ops::ogate_bwd(gpu, &d_hconcat, sv.o(), sv.yhat());
         self.pool.put(d_hconcat);
-        let mut d_h_tilde = self.pool.take(gpu, &[n, d]);
-        self.headnorm.backward(gpu, &d_yhat, &mut d_h_tilde);
-        let d_ytil = ops::head_gather(gpu, &d_h_tilde, b, h, t, dhv); // [BH, T, dhv]
-        // `d_h_tilde` is the pool's; `d_yhat` came from `ogate_bwd`, so it is only
-        // dropped — see the note at the end of this function.
-        self.pool.put(d_h_tilde);
+        // No gather: the kernels read `d_ytil` through the same position-major strides
+        // they wrote `ytil` with, and the head norm's output is already in that layout.
+        // It leaves the pool for the duration of the call and is returned below.
+        let mut d_ytil = self.pool.take(gpu, &[n, d]);
+        self.headnorm.backward(gpu, &d_yhat, &mut d_ytil);
+        // `d_yhat` came from `ogate_bwd`, so it is only dropped — see the note at the
+        // end of this function.
         drop(d_yhat);
 
         // Backward unwinds chunks right to left, so the carried BPTT state comes from
@@ -1039,17 +1043,17 @@ impl MLstm {
             &sv.fgh,
             &d_ytil,
             if self.carry { self.carry_dstate.as_ref() } else { None },
+            ops::MlstmStrides::position_major(b, h, t, dqk, dhv),
         );
+        self.pool.put(d_ytil);
         if self.carry {
             self.carry_dstate = Some(dstate);
         }
 
-        let dq = ops::head_scatter(gpu, &dqh, b, h, t, dqk); // [N, dqk·H]
-        // No 1/√dqk here: it lives in lin_k's weights, so dk is already in their scale.
-        let dk = ops::head_scatter(gpu, &dkh, b, h, t, dqk);
-        let dv = ops::head_scatter(gpu, &dvh, b, h, t, dhv);
-        let d_ig = ops::head_scatter(gpu, &digh.reshaped(&[bh, t, 1]), b, h, t, 1);
-        let d_fg = ops::head_scatter(gpu, &dfgh.reshaped(&[bh, t, 1]), b, h, t, 1);
+        // No scatter: the kernel wrote these through position-major strides, so they
+        // already have the [N, H·W] shape the projection backwards want. `dk` needs no
+        // 1/√dqk either — it lives in lin_k's weights, so dk is already in their scale.
+        let (dq, dk, dv, d_ig, d_fg) = (dqh, dkh, dvh, digh, dfgh);
 
         // dx is the sum of the six projection backwards, accumulated into one
         // buffer with one pooled scratch — not a fresh [N, in] per term.
@@ -1842,6 +1846,96 @@ mod tests {
         );
     }
 
+    /// The same q/k/v, handed in position-major with matching strides, must give the
+    /// same result as the head-major reorg.
+    ///
+    /// This is the property that lets a caller skip `head_gather` entirely: the
+    /// kernels address through `MlstmStrides`, so the layout is an argument rather
+    /// than a packing. Run at `b > 1`, where the row index is `b*T + t` and the batch
+    /// and head strides are not proportional — the case a single fused `bh` stride
+    /// could not express. The two runs must agree bit for bit: same arithmetic, same
+    /// order, only the addressing differs.
+    #[test]
+    fn mlstm_fused_position_major_matches_head_major() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let _mma = with_mma(false);
+        let (b, h, t, dqk, dhv, l) = (3usize, 4usize, 96usize, 64usize, 64usize, 32usize);
+        let bh = b * h;
+
+        let mk = |dims: &[usize], seed: u64| {
+            DTensor::from_host(&gpu, &Tensor::random_seeded(dims, 0.5, seed))
+        };
+        let (q, k, v) = (mk(&[bh, t, dqk], 0x1), mk(&[bh, t, dqk], 0x2), mk(&[bh, t, dhv], 0x3));
+        let (ig, fg) = (mk(&[bh, t], 0x4), mk(&[bh, t], 0x5));
+
+        // [B*H, T, W] -> [N, H*W] with N = B*T: the layout the projections emit.
+        let to_pos = |src: &DTensor, w: usize| {
+            let hst = src.to_host(&gpu);
+            let mut out = vec![0.0; b * t * h * w];
+            for bb in 0..b {
+                for hh in 0..h {
+                    for tt in 0..t {
+                        for c in 0..w {
+                            out[(bb * t + tt) * (h * w) + hh * w + c] =
+                                hst.data[((bb * h + hh) * t + tt) * w + c];
+                        }
+                    }
+                }
+            }
+            DTensor::from_host(&gpu, &Tensor::new(&[b * t, h * w], out))
+        };
+
+        let ytil_host = |f: &ops::MlstmFused| {
+            let mut s = DTensor::uninit(&gpu, &[bh * t * dhv]);
+            f.ytil.as_f32(&gpu, &mut s).to_host(&gpu).data
+        };
+        let slab = |src: &DTensor| ops::SlabBuf::from_f32(&gpu, src.dup(&gpu));
+
+        let hm = ops::mlstm_fused_fw(
+            &gpu,
+            &slab(&q),
+            &slab(&k),
+            &slab(&v),
+            &ig,
+            &fg,
+            l,
+            None,
+            ops::MlstmStrides::head_major(b, h, t, dqk, dhv),
+        );
+        let pm = ops::mlstm_fused_fw(
+            &gpu,
+            &slab(&to_pos(&q, dqk)),
+            &slab(&to_pos(&k, dqk)),
+            &slab(&to_pos(&v, dhv)),
+            &to_pos(&ig, 1).reshaped(&[b * t, h]),
+            &to_pos(&fg, 1).reshaped(&[b * t, h]),
+            l,
+            None,
+            ops::MlstmStrides::position_major(b, h, t, dqk, dhv),
+        );
+
+        // The two runs write `ytil` in their OWN layouts, so compare through the
+        // index rather than element by element.
+        let (hm_y, pm_y) = (ytil_host(&hm), ytil_host(&pm));
+        assert_eq!(hm_y.len(), pm_y.len());
+        for bb in 0..b {
+            for hh in 0..h {
+                for tt in 0..t {
+                    for c in 0..dhv {
+                        let i_hm = ((bb * h + hh) * t + tt) * dhv + c;
+                        let i_pm = (bb * t + tt) * (h * dhv) + hh * dhv + c;
+                        assert_eq!(
+                            hm_y[i_hm], pm_y[i_pm],
+                            "ytil differs at (b{bb} h{hh} t{tt} c{c})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// The fused forward, run in chunks with the state carried, must reproduce the
     /// single whole-sequence call.
     ///
@@ -1886,6 +1980,7 @@ mod tests {
             &fg,
             l,
             None,
+            ops::MlstmStrides::head_major(bh, 1, t, dqk, dhv),
         );
         let want = ytil_host(&whole, bh * t * dhv);
 
@@ -1915,6 +2010,7 @@ mod tests {
                 &fgc.reshaped(&[bh, c]),
                 l,
                 state.as_ref(),
+                ops::MlstmStrides::head_major(bh, 1, c, dqk, dhv),
             );
             per_chunk.push(ytil_host(&f, bh * c * dhv));
             state = Some(f.final_state(&gpu, bh, dhv, dqk));

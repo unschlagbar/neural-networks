@@ -1410,6 +1410,18 @@ pub fn no_adamw_batch() -> bool {
     *OFF.get_or_init(|| std::env::var("GPU_NO_ADAMW_BATCH").is_ok_and(|v| v != "0"))
 }
 
+/// `MLSTM_HEAD_MAJOR=1` gathers q/k/v head-major before the fused kernels instead of
+/// striding over the projection output where it lies.
+///
+/// The gather is a streaming pass the stride path does not need, but it buys the
+/// kernels row locality: head-major puts a timestep `W` from the next, position-major
+/// `H*W`, and the fused kernels re-read q/k/v once per chunk. Which wins is a
+/// measurement — see `examples/mlstm_layout_ab.rs`.
+pub fn mlstm_head_major() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MLSTM_HEAD_MAJOR").is_ok_and(|v| v != "0"))
+}
+
 /// Collects AdamW updates and issues them a batch at a time.
 ///
 /// One `adamw` launch per parameter tensor is ~11 us of mostly launch overhead for
@@ -2646,62 +2658,6 @@ pub fn head_scatter_into(
         .arg(&wi);
     unsafe { lb.launch(LaunchConfig::for_num_elems((b * h * t * w) as u32)) }
         .expect("head_scatter");
-}
-
-/// [`head_gather`] writing straight into a [`SlabBuf`], narrowing as it goes.
-///
-/// The conversion has to happen *here* rather than on the result of a normal
-/// `head_gather`. Materializing the fp32 tensor first and then narrowing it pays
-/// for the wide allocation regardless — and cudarc frees through an async pool that
-/// retains blocks, so the fp32 buffer stays resident afterwards and the pair costs
-/// **more** than fp32 alone. That was measured: the naive ordering made a training
-/// step 32 MB larger rather than smaller. Writing narrow from the start is what
-/// removes the wide buffer from the working set.
-pub fn head_gather_slab(gpu: &Gpu, x: &DTensor, b: usize, h: usize, t: usize, w: usize) -> SlabBuf {
-    let mut out = SlabBuf::new(gpu, &[b * h, t, w]);
-    let (bi, hi, ti, wi) = (b as i32, h as i32, t as i32, w as i32);
-    let name = match out {
-        SlabBuf::F32(_) => "head_gather",
-        SlabBuf::Bf16(_) => "head_gather_slab",
-    };
-    let f = gpu.kernels.get(name);
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&x.buf);
-    push_slab!(lb, out);
-    lb.arg(&bi).arg(&hi).arg(&ti).arg(&wi);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((b * h * t * w) as u32)) }
-        .expect("head_gather_slab");
-    out
-}
-
-/// [`head_scatter_into`] reading a [`SlabBuf`] source, converting on the fly.
-///
-/// The mLSTM's `ytil` is stored bf16; widening it into a temporary before the
-/// scatter would allocate the very fp32 buffer the narrow storage exists to avoid,
-/// so the kernel reads it narrow instead. Output is fp32 either way.
-pub fn head_scatter_slab_into(
-    gpu: &Gpu,
-    x: &SlabBuf,
-    b: usize,
-    h: usize,
-    t: usize,
-    w: usize,
-    out: &mut DTensor,
-) {
-    assert_eq!(out.len(), b * t * h * w, "head_scatter_slab: output size");
-    let (bi, hi, ti, wi) = (b as i32, h as i32, t as i32, w as i32);
-    // The fp32 variant is the same kernel without the convert; dispatch on the
-    // slab's own width so this works on both paths.
-    let name = match x {
-        SlabBuf::F32(_) => "head_scatter",
-        SlabBuf::Bf16(_) => "head_scatter_slab",
-    };
-    let f = gpu.kernels.get(name);
-    let mut lb = gpu.stream.launch_builder(&f);
-    push_slab_ref!(lb, *x);
-    lb.arg(&mut out.buf).arg(&bi).arg(&hi).arg(&ti).arg(&wi);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((b * h * t * w) as u32)) }
-        .expect("head_scatter_slab");
 }
 
 /// Inclusive cumsum of logσ along T, per row of `f` `[BH, T]` → `fc` `[BH, T]`.
@@ -3978,6 +3934,95 @@ fn seed_state_slot0(
     state_slot_copy(gpu, src, dst, bh, slots, 0, stride, false);
 }
 
+/// How the fused kernels address q/k/v and the gates: the distance to the next
+/// batch, head and timestep, per tensor group. The innermost stride is 1 on every
+/// layout used here, so it is implicit.
+///
+/// The kernels take these instead of assuming a packing, after the reference
+/// (`mlstm_kernels` passes `str_matQK_B_NH`/`_S`/`_DHQK` and reads them off the
+/// tensor). That makes the head-major reorg a choice of arguments rather than a
+/// pass over memory.
+///
+/// Batch and head are strided separately rather than as one fused `bh`: under
+/// position-major the row index is `b*T + t`, so the batch step is `T*H*W` while
+/// the head step is only `W` — not proportional, as a single stride would require.
+/// Which of the two layouts a [`MlstmStrides`] describes. The strides alone are
+/// enough for the kernels, but the backward launcher also has to *allocate* the
+/// gradients, and those must come out in the same layout the kernel writes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MlstmLayout {
+    /// `[B*H, T, W]` — each `(b,h)` owns a contiguous `T×W` block.
+    HeadMajor,
+    /// `[B*T, H*W]` — what the projections produce.
+    PositionMajor,
+}
+
+#[derive(Clone, Copy)]
+pub struct MlstmStrides {
+    pub layout: MlstmLayout,
+    /// Logical shape of the run, which the strides no longer imply.
+    pub b: usize,
+    pub h: usize,
+    pub t: usize,
+    pub dqk: usize,
+    pub dhv: usize,
+    pub qk_b: i64,
+    pub qk_h: i64,
+    pub qk_s: i64,
+    pub hv_b: i64,
+    pub hv_h: i64,
+    pub hv_s: i64,
+    pub g_b: i64,
+    pub g_h: i64,
+    pub g_s: i64,
+}
+
+impl MlstmStrides {
+    /// Head-major `[B*H, T, W]` — each `(b,h)` owns a contiguous `T×W` block.
+    pub fn head_major(b: usize, h: usize, t: usize, dqk: usize, dhv: usize) -> Self {
+        Self {
+            layout: MlstmLayout::HeadMajor,
+            b,
+            h,
+            t,
+            dqk,
+            dhv,
+            qk_b: (h * t * dqk) as i64,
+            qk_h: (t * dqk) as i64,
+            qk_s: dqk as i64,
+            hv_b: (h * t * dhv) as i64,
+            hv_h: (t * dhv) as i64,
+            hv_s: dhv as i64,
+            g_b: (h * t) as i64,
+            g_h: t as i64,
+            g_s: 1,
+        }
+    }
+
+    /// Position-major `[N, H*W]` with `N = B*T` — what the projections produce.
+    /// Head `h` is the column slice at `h*W`, the next timestep a full row away,
+    /// and the next batch `T` rows on.
+    pub fn position_major(b: usize, h: usize, t: usize, dqk: usize, dhv: usize) -> Self {
+        Self {
+            layout: MlstmLayout::PositionMajor,
+            b,
+            h,
+            t,
+            dqk,
+            dhv,
+            qk_b: (t * h * dqk) as i64,
+            qk_h: dqk as i64,
+            qk_s: (h * dqk) as i64,
+            hv_b: (t * h * dhv) as i64,
+            hv_h: dhv as i64,
+            hv_s: (h * dhv) as i64,
+            g_b: (t * h) as i64,
+            g_h: 1,
+            g_s: h as i64,
+        }
+    }
+}
+
 pub fn mlstm_fused_fw(
     gpu: &Gpu,
     qh: &SlabBuf,  // [BH, T, dqk]   bf16 storage (reference: matQ at DTYPE)
@@ -3988,15 +4033,16 @@ pub fn mlstm_fused_fw(
     l: usize,
     // State this call continues from, or `None` to start the recurrence at zero.
     carry_in: Option<&MlstmState>,
+    st: MlstmStrides,
 ) -> MlstmFused {
-    let (bh, t, dqk) = (qh.dims()[0], qh.dims()[1], qh.dims()[2]);
-    let dhv = vh.dims()[2];
+    let (bh, t, dqk, dhv) = (st.b * st.h, st.t, st.dqk, st.dhv);
     let l = l.min(t);
     assert!(
         mlstm_fused_supported(l, dqk, dhv),
         "fused mLSTM: unsupported shape"
     );
     let nc = t.div_ceil(l);
+    let h_i = st.h as i32;
     let (t_i, l_i, nc_i, dqk_i, dhv_i, bh_i) = (
         t as i32, l as i32, nc as i32, dqk as i32, dhv as i32, bh as i32,
     );
@@ -4017,7 +4063,13 @@ pub fn mlstm_fused_fw(
     let carry_i = carry_in.is_some() as i32;
     // ytil is the kernel's output h (reference stores matHout at DTYPE); the
     // stabilizer/normalizer triple stays fp32, as does the chunk state.
-    let mut ytil = SlabBuf::new(gpu, &[bh, t, dhv]);
+    // Allocated in the layout the kernel writes it in, so a position-major run needs
+    // no scatter to reach the head norm. Same element count either way.
+    let ytil_dims: Vec<usize> = match st.layout {
+        MlstmLayout::HeadMajor => vec![bh, t, dhv],
+        MlstmLayout::PositionMajor => vec![st.b * t, st.h * dhv],
+    };
+    let mut ytil = SlabBuf::new(gpu, &ytil_dims);
     let mut msv = DTensor::uninit(gpu, &[bh, t]);
     let mut psiv = DTensor::uninit(gpu, &[bh, t]);
     let mut qnv = DTensor::uninit(gpu, &[bh, t]);
@@ -4029,7 +4081,11 @@ pub fn mlstm_fused_fw(
         .arg(&t_i)
         .arg(&l_i)
         .arg(&nc_i)
-        .arg(&bh_i);
+        .arg(&bh_i)
+        .arg(&h_i)
+        .arg(&st.g_b)
+        .arg(&st.g_h)
+        .arg(&st.g_s);
     unsafe { lb.launch(LaunchConfig::for_num_elems((bh * nc) as u32)) }.expect("mlstm_fw_gates");
 
     let tv = fused_tv(dhv);
@@ -4051,7 +4107,17 @@ pub fn mlstm_fused_fw(
         .arg(&dqk_i)
         .arg(&dhv_i)
         .arg(&tv_i)
-        .arg(&carry_i);
+        .arg(&carry_i)
+        .arg(&h_i)
+        .arg(&st.qk_b)
+        .arg(&st.qk_h)
+        .arg(&st.qk_s)
+        .arg(&st.hv_b)
+        .arg(&st.hv_h)
+        .arg(&st.hv_s)
+        .arg(&st.g_b)
+        .arg(&st.g_h)
+        .arg(&st.g_s);
     unsafe { lb.launch(fused_cfg((ntv, bh as u32, 1), FUSED_THREADS_REC, smem)) }
         .expect("mlstm_fw_C");
 
@@ -4074,7 +4140,17 @@ pub fn mlstm_fused_fw(
         .arg(&l_i)
         .arg(&nc_i)
         .arg(&dqk_i)
-        .arg(&dhv_i);
+        .arg(&dhv_i)
+        .arg(&h_i)
+        .arg(&st.qk_b)
+        .arg(&st.qk_h)
+        .arg(&st.qk_s)
+        .arg(&st.hv_b)
+        .arg(&st.hv_h)
+        .arg(&st.hv_s)
+        .arg(&st.g_b)
+        .arg(&st.g_h)
+        .arg(&st.g_s);
     unsafe {
         lb.launch(fused_cfg(
             (nc as u32, bh as u32, 1),
@@ -4117,10 +4193,11 @@ pub fn mlstm_fused_bw(
     // BPTT state flowing in from the chunk to the RIGHT, or `None` for the rightmost
     // chunk (and for an unchunked call), where it is zero.
     carry_in: Option<&MlstmDState>,
+    st: MlstmStrides,
 ) -> (DTensor, DTensor, DTensor, DTensor, DTensor, MlstmDState) {
-    let (bh, t, dqk) = (qh.dims()[0], qh.dims()[1], qh.dims()[2]);
-    let dhv = vh.dims()[2];
+    let (bh, t, dqk, dhv) = (st.b * st.h, st.t, st.dqk, st.dhv);
     let (l, nc) = (sv.l, sv.nc);
+    let h_i = st.h as i32;
     let (t_i, l_i, nc_i, dqk_i, dhv_i) = (t as i32, l as i32, nc as i32, dqk as i32, dhv as i32);
 
     // Zeroed, not `uninit`: under CARRY `mlstm_bw_parallel` reads slot NC for every
@@ -4160,15 +4237,46 @@ pub fn mlstm_fused_bw(
         .arg(&dqk_i)
         .arg(&dhv_i)
         .arg(&tv_i)
-        .arg(&carry_i);
+        .arg(&carry_i)
+        .arg(&h_i)
+        .arg(&st.qk_b)
+        .arg(&st.qk_h)
+        .arg(&st.qk_s)
+        .arg(&st.hv_b)
+        .arg(&st.hv_h)
+        .arg(&st.hv_s);
     unsafe { lb.launch(fused_cfg((ntv, bh as u32, 1), FUSED_THREADS_REC, smem)) }
         .expect("mlstm_bw_dC");
 
-    let mut dq = DTensor::uninit(gpu, &[bh, t, dqk]);
-    let mut dk = DTensor::uninit(gpu, &[bh, t, dqk]);
-    let mut dv = DTensor::uninit(gpu, &[bh, t, dhv]);
-    let mut dig = DTensor::uninit(gpu, &[bh, t]);
-    let mut dfg = DTensor::uninit(gpu, &[bh, t]);
+    // Shaped to match the stride layout the kernel writes through: head-major keeps
+    // the `[BH, T, W]` blocks, position-major lays them out as the projections do so
+    // the caller needs no scatter. Same element count either way — only the view
+    // differs, and `st` is what the kernel actually indexes with.
+    let pos = st.layout == MlstmLayout::PositionMajor;
+    let (dq_dims, dk_dims, dv_dims): (Vec<usize>, Vec<usize>, Vec<usize>) = if pos {
+        let n = st.b * t;
+        (
+            vec![n, st.h * dqk],
+            vec![n, st.h * dqk],
+            vec![n, st.h * dhv],
+        )
+    } else {
+        (
+            vec![bh, t, dqk],
+            vec![bh, t, dqk],
+            vec![bh, t, dhv],
+        )
+    };
+    let g_dims: Vec<usize> = if pos {
+        vec![st.b * t, st.h]
+    } else {
+        vec![bh, t]
+    };
+    let mut dq = DTensor::uninit(gpu, &dq_dims);
+    let mut dk = DTensor::uninit(gpu, &dk_dims);
+    let mut dv = DTensor::uninit(gpu, &dv_dims);
+    let mut dig = DTensor::uninit(gpu, &g_dims);
+    let mut dfg = DTensor::uninit(gpu, &g_dims);
 
     let (name, kind) = bw_parallel_kernel(gpu);
     let (f, smem) = fused_kernel(gpu, name, fused_smem(kind, l, dqk, dhv));
@@ -4199,7 +4307,17 @@ pub fn mlstm_fused_bw(
         .arg(&nc_i)
         .arg(&dqk_i)
         .arg(&dhv_i)
-        .arg(&carry_i);
+        .arg(&carry_i)
+        .arg(&h_i)
+        .arg(&st.qk_b)
+        .arg(&st.qk_h)
+        .arg(&st.qk_s)
+        .arg(&st.hv_b)
+        .arg(&st.hv_h)
+        .arg(&st.hv_s)
+        .arg(&st.g_b)
+        .arg(&st.g_h)
+        .arg(&st.g_s);
     unsafe {
         lb.launch(fused_cfg(
             (nc as u32, bh as u32, 1),

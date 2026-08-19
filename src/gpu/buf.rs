@@ -462,6 +462,22 @@ impl Pool {
         );
     }
 
+    /// Take a borrowed buffer permanently out of the pool's accounting.
+    ///
+    /// For a value that was pooled scratch but is now being moved somewhere that
+    /// outlives the pass — a forward cache backward reads. Without this the loan
+    /// counter never comes back down and [`assert_drained`](Self::assert_drained)
+    /// fires on what is actually a deliberate hand-off. The buffer is simply
+    /// returned to the caller, who now owns it.
+    pub fn detach(&mut self, t: DTensor) -> DTensor {
+        debug_assert!(
+            self.lent > 0,
+            "Pool::detach of a buffer this pool never lent"
+        );
+        self.lent = self.lent.saturating_sub(1);
+        t
+    }
+
     /// Return several buffers at once.
     pub fn put_all<I: IntoIterator<Item = DTensor>>(&mut self, ts: I) {
         for t in ts {
