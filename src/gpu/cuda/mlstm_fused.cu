@@ -19,15 +19,17 @@
 // which is exactly the (fc, m, bvec, avec) the op-at-a-time path builds, so the
 // two agree elementwise — `mlstm_fused_matches_legacy` pins them together.
 //
-// The only sequential axis is the CHUNK STATE (C, n, m), and it is small. So the
-// work splits into a serial-over-chunks kernel that carries a [dhv, dqk] state
-// and does no per-timestep launch, and a parallel-over-chunks kernel that holds
-// all the FLOPs and is embarrassingly parallel:
-//   mlstm_fw_gates    -> fc, per chunk, independent
-//   mlstm_fw_C        -> the chunk states, looping chunks INSIDE the kernel
-//   mlstm_fw_parallel -> every chunk independently, one block each
-// Backward mirrors it (mlstm_bw_dC walks chunks in reverse, mlstm_bw_parallel is
-// per-chunk). The last chunk may be short and is masked by `len` everywhere.
+// The only sequential axis is the CHUNK STATE (C, n, m), and it decomposes: each
+// chunk's own contribution to it depends on nothing to its left, so the state is a
+// per-chunk product computed all at once plus a first-order scan over the results.
+// Nothing in either direction loops chunks inside a kernel:
+//   mlstm_fw_gates    -> fc / a / g / the stabilizer scan, one block per (b, h)
+//   mlstm_fw_dC       -> every chunk's ΔC, one block each
+//   mlstm_state_scan  -> the chunk recurrence, elementwise over the state
+//   mlstm_fw_parallel -> the intra-chunk attention, one block per chunk
+// Backward mirrors it exactly — `mlstm_bw_dqn`, `mlstm_bw_dC`, the same
+// `mlstm_state_scan` run in reverse, `mlstm_bw_parallel`. The last chunk may be
+// short and is masked by `len` everywhere.
 //
 // LAYOUT: q/k/v and the gate logits are POSITION-MAJOR `[B*T, H*W]` — the layout the
 // projections write — so element (b, h, t, c) sits at `((b*T + t)*H + h)*W + c`, and
@@ -52,6 +54,15 @@ __device__ __forceinline__ long bhBase(int bh, int H, long sB, long sH) {
     return (long)(bh / H) * sB + (long)(bh % H) * sH;
 }
 
+// Sum across a warp, every lane left holding the total. The order is the shuffle
+// tree's, which the shape alone decides — unlike an atomic, whose order is the
+// scheduler's and so is not reproducible run to run.
+__device__ __forceinline__ float warp_sum(float v) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+}
+
 // SHAPE CONSTANTS. Built with -DMLSTM_SPEC the shape parameters are literals from
 // NVRTC, matching how the reference passes them as `tl.constexpr`; the kernels then
 // fold their padded dims, give every strided loop a static trip count, and drop the
@@ -64,27 +75,15 @@ __device__ __forceinline__ long bhBase(int bh, int H, long sB, long sH) {
 // needs no second argument list — a specialized kernel is simply passed values it
 // then ignores.
 //
-// `TV` and the block width matter as much as the head dims here: the two recurrent
-// kernels stride `tv * dqk` elements over `nthreads`, and with both constant that
-// becomes a fixed unrolled trip count instead of a loop with a runtime bound.
+// The block width matters as much as the head dims: every staging loop strides
+// `nthreads` over its tile, and with the width constant that becomes a fixed
+// unrolled trip count instead of a loop with a runtime bound.
 #if MLSTM_SPEC
 #define MLSTM_SHAPE_ARGS \
-    int T, int arg_L, int NC, int arg_dqk, int arg_dhv, int arg_H
-#define MLSTM_SHAPE_ARGS_BW \
     int T, int arg_L, int NC, int arg_dqk, int arg_dhv, int CARRY, int arg_H
 #define MLSTM_SHAPE_BIND                                                       \
     (void)arg_L; (void)arg_dqk; (void)arg_dhv; (void)arg_H;                    \
     const int L = MLSTM_L, dqk = MLSTM_DQK, dhv = MLSTM_DHV, H = MLSTM_H;      \
-    MLSTM_STRIDES
-// The recurrent pair additionally takes TV; `nthreads` is blockDim.x, which the
-// launch pins to MLSTM_THREADS.
-#define MLSTM_SHAPE_ARGS_REC                                                   \
-    int T, int arg_L, int NC, int arg_dqk, int arg_dhv, int arg_TV,            \
-    int CARRY, int arg_H
-#define MLSTM_SHAPE_BIND_REC                                                   \
-    (void)arg_L; (void)arg_dqk; (void)arg_dhv; (void)arg_TV; (void)arg_H;      \
-    const int L = MLSTM_L, dqk = MLSTM_DQK, dhv = MLSTM_DHV, H = MLSTM_H;      \
-    const int TV = MLSTM_TV;                                                   \
     MLSTM_STRIDES
 #define MLSTM_NTHREADS MLSTM_THREADS
 // `sRed` is a static array, so it must be sized at compile time; specialized it is
@@ -92,13 +91,8 @@ __device__ __forceinline__ long bhBase(int bh, int H, long sB, long sH) {
 #define MLSTM_NTHREADS_MAX MLSTM_THREADS
 #else
 #define MLSTM_SHAPE_ARGS \
-    int T, int L, int NC, int dqk, int dhv, int H
-#define MLSTM_SHAPE_ARGS_BW \
     int T, int L, int NC, int dqk, int dhv, int CARRY, int H
-#define MLSTM_SHAPE_ARGS_REC \
-    int T, int L, int NC, int dqk, int dhv, int TV, int CARRY, int H
 #define MLSTM_SHAPE_BIND MLSTM_STRIDES
-#define MLSTM_SHAPE_BIND_REC MLSTM_STRIDES
 #define MLSTM_NTHREADS blockDim.x
 #define MLSTM_NTHREADS_MAX 1024
 #endif
@@ -112,10 +106,11 @@ __device__ __forceinline__ long bhBase(int bh, int H, long sB, long sH) {
 #define MLSTM_KT 32
 #endif
 
-// The `dhv` twin of MLSTM_KT (the reference's `siz_b_DHHV`). Slicing the value
-// dimension partitions the OUTPUT columns of the parallel kernels rather than a
-// contraction, so unlike `MLSTM_KT` no slice needs accumulating across iterations.
-// Must be a multiple of the mma N (8). `MLSTM_VT=<n>` overrides for a sweep.
+// The `dhv` twin of MLSTM_KT (the reference's `siz_b_DHHV`). In the FORWARD this
+// slices the output columns rather than a contraction, so no slice needs
+// accumulating across iterations; in the backward `dhv` IS a contraction (phases 4
+// and 5), which is why this must be a multiple of 16 and not just of the mma's N.
+// `MLSTM_VT=<n>` overrides for a sweep.
 #ifndef MLSTM_VT
 #define MLSTM_VT 64
 #endif
@@ -204,9 +199,16 @@ extern "C" __global__ void mlstm_fw_gates(
     }
 }
 
-// The chunk-state recurrence, and all that is left of it: fold the chunk-local
-// contributions `mlstm_fw_dC` wrote into the running state.
-//   C_{k+1} = g_k·C_k + ΔC_k ,   n_{k+1} = g_k·n_k + Δn_k
+// The chunk-state recurrence, and all that is left of it: fold the per-chunk
+// contributions `mlstm_fw_dC` / `mlstm_bw_dC` wrote into the running state.
+//
+//   REV = 0  C_{k+1} = g_k·C_k + ΔC_k          slot k+1 holds ΔC_k, slot 0 the seed
+//   REV = 1  dC_k    = g_k·dC_{k+1} + ΔdC_k    slot k holds ΔdC_k, slot NC the seed
+//
+// One recurrence, walked in either direction: forward carries the state left to
+// right over `cst`/`nst`, backward carries its gradient right to left over
+// `dcst`/`dnst`, and both decay by the same per-chunk `g`.
+//
 // In place, one thread per state element walking the chunks in a register. Every
 // element of the state is independent, so what used to pin the grid at BH blocks
 // (one per sequence, each carrying a whole [dhv, dqk] state through a serial chunk
@@ -214,9 +216,14 @@ extern "C" __global__ void mlstm_fw_gates(
 //
 // Elements past the [dhv, dqk] state are the `n` vector, which decays by the same
 // `g`, so one loop covers both.
-extern "C" __global__ void mlstm_fw_scan(
+//
+// The seed slot already holds the state the sweep starts from — the caller staged it
+// when carrying, the ΔC kernel zeroed it when not — so this reads it rather than
+// deciding what it should be. With a single chunk and no incoming state there is
+// nothing to fold and the caller skips the launch.
+extern "C" __global__ void mlstm_state_scan(
     float* cst, float* nst, const float* gvec,
-    int NC, int dqk, int dhv, int CARRY) {
+    int NC, int dqk, int dhv, int REV) {
     const int bh = blockIdx.y;
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     const int cn = dhv * dqk;
@@ -233,108 +240,83 @@ extern "C" __global__ void mlstm_fw_scan(
     }
 
     const float* g = gvec + (long)bh * NC;
-    float acc = CARRY ? p[0] : 0.0f;
-    if (!CARRY) p[0] = 0.0f;
-    // One slot read ahead, so the multiply-add of chunk k overlaps the load of k+1
-    // instead of waiting on it.
-    float nxt = p[stride];
-    for (int k = 0; k < NC; ++k) {
-        const float cur = nxt;
-        p += stride;
-        if (k + 1 < NC) nxt = p[stride];
-        acc = g[k] * acc + cur;
-        *p = acc;
+    const int dir = REV ? -1 : 1;
+    float acc = p[(long)(REV ? NC : 0) * stride];
+    // The slot this step writes, and the chunk whose `g` decays into it.
+    float* d = p + (long)(REV ? NC - 1 : 1) * stride;
+    int k = REV ? NC - 1 : 0;
+    for (int i = 0; i < NC; ++i) {
+        acc = g[k] * acc + *d;
+        *d = acc;
+        k += dir;
+        d += (long)dir * stride;
+    }
+}
+
+// dψ, for every timestep, once. Both backward kernels need it and the reduction it
+// costs is over the whole `dhv` row, so it is a launch of its own rather than the
+// same sum computed twice.
+//
+//   red[t] = Σ_v dỹ[t][v]·ỹ[t][v]
+//   dqn[t] = sign(qn[t])·(−red[t]/ψ[t])   where |qn| — not the exp(−m) floor — won
+//                                          the max in ψ, else 0
+//
+// `num` is not saved: num = ỹ·ψ, so Σ_v dỹ·num = ψ·Σ_v dỹ·ỹ and the ψ² cancels down
+// to the one division above. One WARP per row, lanes splitting the `dhv` it reduces.
+//
+// A warp's index IS its row of the position-major `[B*T, H*dhv]` layout, so
+// consecutive warps read consecutive memory. Indexing by `(bh, t)` instead — the
+// order the `[BH, T]` scalars beside it are in — put a whole `H*dhv` stride between
+// neighbouring warps and read the tensor at half bandwidth.
+extern "C" __global__ void mlstm_bw_dqn(
+    const float* dytil, const slab_t* ytil, const float* psiv,
+    const float* qnv, const float* msv, float* dqnv,
+    int N, int T, int dhv, int H) {
+    // Warp-uniform, so the bounds check diverges nothing and the shuffle below is
+    // over a whole warp.
+    const int w = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    if (w >= N) return;
+    const int lane = threadIdx.x & 31;
+    const long gy = (long)w * dhv;
+
+    float red = 0.0f;
+    for (int v = lane; v < dhv; v += 32) red += dytil[gy + v] * slab_ld(ytil, gy + v);
+    red = warp_sum(red);
+    if (lane == 0) {
+        // The scalars are `[BH, T]`, so the (b, t, h) this warp owns has to be rebuilt.
+        const int h = w % H, bt = w / H, t = bt % T;
+        const long gt = (long)((bt / T) * H + h) * T + t;
+        const float qn = qnv[gt];
+        const float dpsi = -red / psiv[gt];
+        dqnv[gt] = (fabsf(qn) > expf(-msv[gt])) ? ((qn > 0.0f ? 1.0f : -1.0f) * dpsi) : 0.0f;
     }
 }
 
 // Tensor-core dots (sm_80+)
 //
-// Every contraction in the reference (nx-ai/mlstm_kernels) is a `tl.dot`. Below is
-// that same `dot`, written out as the PTX Triton would emit, in the two widths the
-// kernels need — fp32 operands (TF32) and bf16 operands. Everything the forward
-// contracts is bf16 in memory or is narrowed on the way into shared memory, so the
-// forward uses `mma_bf16`; the backward still carries fp32 intermediates into its
-// dots and uses the TF32 unit.
+// Every contraction in the reference (nx-ai/mlstm_kernels) is a `tl.dot` on DTYPE =
+// bf16 tensors. Below is that same `dot`, written out as the PTX Triton would emit:
+// `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`, where a whole WARP
+// cooperates to compute D(16x8) += A(16x16)·B(16x8) with bf16 operands and a full
+// fp32 accumulator.
 //
-// The TF32 unit is `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`: a whole
-// WARP cooperates to compute D(16x8) += A(16x8)·B(8x8), with the operands rounded
-// to TF32 (fp32's 8 exponent bits, 10 mantissa bits) and the product accumulated in
-// full fp32. Precision-wise it sits exactly where cuBLAS's TF32 math mode does,
-// and where the reference already is.
+// bf16 rather than the TF32 unit (m16n8k8) these kernels used to contract on: q, k,
+// v and ỹ are bf16 in memory already, so rounding them to TF32 is a no-op that costs
+// a `cvt` per element and half the contraction depth, and every fp32 intermediate
+// either feeds a dot whose other operand is bf16 anyway or is a gradient, where the
+// mantissa the accumulator keeps is what matters. Halving the operand width also
+// halves the staging tiles, which is what buys the occupancy back.
 //
 // A warp's 32 lanes each hold a fixed slice of every fragment. With
 //   g = lane / 4   (the "group")      c = lane % 4   (the index within it)
 // the layouts the instruction requires are:
-//   A (16x8, row): a0=(g, c)   a1=(g+8, c)   a2=(g, c+4)   a3=(g+8, c+4)
-//   B (8x8, col):  b0=(c, g)   b1=(c+4, g)                  [(row=k, col=n)]
-//   D (16x8):      d0=(g, 2c)  d1=(g, 2c+1)  d2=(g+8, 2c)  d3=(g+8, 2c+1)
-// The `ld_*` helpers below are just those tables, applied to a shared-memory tile.
+//   A (16x16, row): register i holds the PAIR (g[+8], 2c[+8]) and its k+1 neighbour
+//   B (16x8, col):  b0 = (2c, g)   b1 = (2c+8, g)          [(row=k, col=n)]
+//   D (16x8):       d0=(g, 2c)  d1=(g, 2c+1)  d2=(g+8, 2c)  d3=(g+8, 2c+1)
+// The `ldb_*` helpers below are just those tables, applied to a shared-memory tile.
 // Nothing here is allowed to diverge inside a warp — `mma.sync` is warp-wide.
 #if MMA_TF32
 
-__device__ __forceinline__ unsigned tf32_of(float x) {
-    unsigned r;
-    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
-    return r;
-}
-
-// D += A·B for one warp. Accumulates in place, so a K-loop just calls it again.
-__device__ __forceinline__ void mma_16x8x8(float* d, const unsigned* a, const unsigned* b) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
-
-// A from a row-major [M, K] tile: A[m][k] = s[m*ld + k].
-__device__ __forceinline__ void ld_a_mk(unsigned* a, const float* s, int ld, int m0, int k0) {
-    int lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
-    a[0] = tf32_of(s[(m0 + g)     * ld + k0 + c]);
-    a[1] = tf32_of(s[(m0 + g + 8) * ld + k0 + c]);
-    a[2] = tf32_of(s[(m0 + g)     * ld + k0 + c + 4]);
-    a[3] = tf32_of(s[(m0 + g + 8) * ld + k0 + c + 4]);
-}
-
-// A from a row-major [K, M] tile, i.e. Aᵀ is what is in memory: A[m][k] = s[k*ld + m].
-// This is how `dS` is contracted over `t` for dK without ever transposing it.
-__device__ __forceinline__ void ld_a_km(unsigned* a, const float* s, int ld, int m0, int k0) {
-    int lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
-    a[0] = tf32_of(s[(k0 + c)     * ld + m0 + g]);
-    a[1] = tf32_of(s[(k0 + c)     * ld + m0 + g + 8]);
-    a[2] = tf32_of(s[(k0 + c + 4) * ld + m0 + g]);
-    a[3] = tf32_of(s[(k0 + c + 4) * ld + m0 + g + 8]);
-}
-
-// B from a row-major [N, K] tile: B[k][n] = s[n*ld + k]. (`Q·Kᵀ`: K is stored
-// [j, q] and is wanted as [q, j].)
-__device__ __forceinline__ void ld_b_nk(unsigned* b, const float* s, int ld, int k0, int n0) {
-    int lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
-    b[0] = tf32_of(s[(n0 + g) * ld + k0 + c]);
-    b[1] = tf32_of(s[(n0 + g) * ld + k0 + c + 4]);
-}
-
-// B from a row-major [K, N] tile: B[k][n] = s[k*ld + n]. (`(D̄⊙S)·V`.)
-__device__ __forceinline__ void ld_b_kn(unsigned* b, const float* s, int ld, int k0, int n0) {
-    int lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
-    b[0] = tf32_of(s[(k0 + c)     * ld + n0 + g]);
-    b[1] = tf32_of(s[(k0 + c + 4) * ld + n0 + g]);
-}
-
-// bf16 operands (mma.m16n8k16, sm_80+)
-//
-// The forward's operands are already bf16 where they came out of a projection, so
-// rounding them to TF32 for the unit above is a no-op that costs a `cvt` per element
-// and half the contraction depth. `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`
-// takes them as they are: a warp computes D(16x8) += A(16x16)·B(16x8) in one
-// instruction where the TF32 unit needs two, and the staging tiles are half the
-// shared memory — which is what lets a block hold the whole chunk without slicing.
-// This is where the reference is too (`tl.dot` on DTYPE = bf16 tensors).
-//
-// The fragment register layout is the same table as above with the contraction
-// twice as deep, so each register holds a PAIR of adjacent k: register a0 is
-// A[g][2c] in its low half and A[g][2c+1] in its high half, with g = lane/4 and
-// c = lane%4.
 typedef unsigned short bf16s_t;
 
 // Round-to-nearest-even into bf16. Written out rather than taken from
@@ -414,7 +396,7 @@ __device__ __forceinline__ int mma_col(int i) { return (((threadIdx.x & 31) & 3)
 // The chunk-LOCAL contribution to the state, one block per (chunk, bh):
 //   ΔC_k = Σ_j a_k[j]·V_k[j] ⊗ K_k[j]      [dhv, dqk]
 //   Δn_k = Σ_j a_k[j]·K_k[j]               [dqk]
-// written into slot k+1 of `cst`/`nst`, where `mlstm_fw_scan` folds them into the
+// written into slot k+1 of `cst`/`nst`, where `mlstm_state_scan` folds them into the
 // running state. The split is exact rather than an approximation: `a` already
 // carries the stabilizer (see `mlstm_fw_gates`), so nothing here depends on the
 // state to its left and EVERY chunk runs at once.
@@ -423,7 +405,7 @@ __device__ __forceinline__ int mma_col(int i) { return (((threadIdx.x & 31) & 3)
 // one block per (b, h) walking the chunks — which is right when `B·NH` alone fills
 // the machine. At the backbone's shape it is 8 blocks, so the state update was 43%
 // of the forward: a grid of BH doing a [dhv, dqk] update per chunk in sequence.
-// Here the grid is NC·BH and the only serial axis left is `mlstm_fw_scan`'s
+// Here the grid is NC·BH and the only serial axis left is `mlstm_state_scan`'s
 // elementwise fold.
 //
 // ΔC is Vᵀ·K contracted over the chunk's timesteps, so it is one accumulator per
@@ -469,6 +451,18 @@ extern "C" __global__ void mlstm_fw_dC(
             ? slab_ld(kk, qkB + (long)(c0 + j) * sQK_S + q) : 0.0f);
     }
     __syncthreads();
+
+    // Slot 0 is the state the sequence starts from, and chunk 0's block is the one
+    // that can write it without a race. Under CARRY the caller already staged it
+    // there. `mlstm_fw_parallel` skips reading it, but `mlstm_state_scan` folds it in and
+    // `mlstm_bw_parallel` reads it unconditionally, so it is materialised here rather
+    // than left to whatever the allocator handed back.
+    if (k == 0 && !CARRY) {
+        float* c0out = cst + (long)bh * (NC + 1) * dhv * dqk;
+        for (int e = tid; e < dhv * dqk; e += nthreads) c0out[e] = 0.0f;
+        float* n0out = nst + (long)bh * (NC + 1) * dqk;
+        for (int e = tid; e < dqk; e += nthreads) n0out[e] = 0.0f;
+    }
 
     // sV is [L, dhv] and sK is [L, dqk], so the A loader consumes V transposed and
     // neither operand is ever materialised the other way round.
@@ -528,6 +522,11 @@ extern "C" __global__ void mlstm_fw_parallel(
     int warp = tid >> 5, nwarps = nthreads >> 5;
     int c0 = k * L;
     int len = min(L, T - c0);
+    // The state entering chunk 0 is zero unless the caller carried one in, so the
+    // whole inter-chunk half — a [dhv, dqk] read per block and a dot over dqk —
+    // contributes nothing and is skipped. Uniform across the block, so no divergence;
+    // at the encoder and decoder, where a word is a single chunk, it is every block.
+    const int has_state = (k > 0) || CARRY;
 
     // `const int` of a literal folds exactly like an enum under -DMLSTM_SPEC, and
     // stays an ordinary runtime value without it.
@@ -601,7 +600,7 @@ extern "C" __global__ void mlstm_fw_parallel(
         }
         for (int e = tid; e < KT; e += nthreads) {
             int q = q0 + e;
-            sN[e] = (q < dqk) ? nst[((long)bh * (NC + 1) + k) * dqk + q] : 0.0f;
+            sN[e] = (has_state && q < dqk) ? nst[((long)bh * (NC + 1) + k) * dqk + q] : 0.0f;
         }
         __syncthreads();
 
@@ -684,7 +683,7 @@ extern "C" __global__ void mlstm_fw_parallel(
 
         // Q·C_prevᵀ contracts dqk, so it needs its own slice loop over the same
         // output tile; the partial sums live in sAcc between the two.
-        for (int kt = 0; kt < NKT; ++kt) {
+        for (int kt = 0; has_state && kt < NKT; ++kt) {
             int q0 = kt * KT;
             __syncthreads();
             for (int e = tid; e < LP * KT; e += nthreads) {
@@ -723,151 +722,118 @@ extern "C" __global__ void mlstm_fw_parallel(
     }
 }
 
-#endif // MMA_TF32
-
-// Backward over the chunk states: the mirror of `mlstm_fw_C`, walking chunks in
-// reverse with the chunk loop inside the kernel. `dcst[k]` is the gradient wrt the
-// state ENTERING chunk k (so it lines up index-for-index with `cst`):
-//   dcst[k] = g_k · dcst[k+1] + Σ_t b_k[t]·d_num_k[t]⊗Q_k[t]
-// dcst[NC] is zero — the state the last chunk produces is never read.
+// The chunk-LOCAL contribution to the BPTT state, one block per (chunk, bh) — the
+// exact mirror of `mlstm_fw_dC`:
+//   ΔdC_k[v][q] = Σ_t b_k[t]·d_num_k[t][v]·Q_k[t][q]      [dhv, dqk]
+//   Δdn_k[q]    = Σ_t b_k[t]·d_qn_k[t]·Q_k[t][q]          [dqk]
+// written into slot k of `dcst`/`dnst`, where `mlstm_state_scan` (REV) folds them
+// into the running gradient `dcst[k] = g_k·dcst[k+1] + ΔdC_k`.
+//
+// `dcst[k]` is the gradient wrt the state ENTERING chunk k, so it lines up
+// index-for-index with `cst`. Slot NC is the gradient flowing in from the chunk to
+// the RIGHT: zero for the rightmost, or whatever the caller staged there under
+// CARRY. Chunk 0's block materialises it in the zero case, so every reader finds a
+// real value and `mlstm_bw_parallel` needs no "is this the last chunk" branch.
+//
+// This kernel used to decide the whole backward: it walked the chunks in reverse
+// INSIDE one block, carrying a [dhv, dqk] state, so its grid was BH times a `dhv`
+// split invented purely to keep the SMs busy. The state recurrence decomposes the
+// same way in both directions — `a` and `b` both already carry the stabilizer, so a
+// chunk's own contribution depends on nothing outside it — and there is no reason
+// for the two directions to have different shapes.
+//
+// d_num = dỹ/ψ, with `b` folded in while staging, which leaves Q exactly the bf16 it
+// already is in memory — as `mlstm_fw_dC` folds `a` into V and leaves K alone.
 extern "C" __global__ void mlstm_bw_dC(
-    const slab_t* qq, const float* dytil, const slab_t* ytil,
-    const float* psiv, const float* qnv, const float* msv,
-    const float* fcb, const float* mst,
+    const slab_t* qq, const float* dytil, const float* psiv, const float* dqnv,
+    const float* fcb, const float* mst, const float* msv,
     float* dcst, float* dnst,
-    MLSTM_SHAPE_ARGS_REC) {
-    MLSTM_SHAPE_BIND_REC
-    int v0 = blockIdx.x * TV, bh = blockIdx.y;
-    int tv = min(TV, dhv - v0);
-    int tid = threadIdx.x;
-    const int nthreads = MLSTM_NTHREADS;
-    const int LQ = dqk + 1, LV = tv + 1;
-    int lead = (blockIdx.x == 0); // the tile that also owns `dn`
+    MLSTM_SHAPE_ARGS) {
+    MLSTM_SHAPE_BIND
+    const int k = blockIdx.x, bh = blockIdx.y;
+    const int tid = threadIdx.x, nthreads = MLSTM_NTHREADS;
+    const int warp = tid >> 5, nwarps = nthreads >> 5;
+    const int c0 = k * L, len = min(L, T - c0);
+    // Padded to the mma tile — rows to M=16, the contraction to K=16, columns to
+    // N=8 — and zero-filled, so a short last chunk and an odd head dim need no
+    // special case: a zero row contributes nothing to a dot.
+    const int LP = (L + 15) & ~15;
+    const int VP = (dhv + 15) & ~15;
+    const int KP = (dqk + 7) & ~7;
+    const int LV = BF16_LD(VP), LQ = BF16_LD(KP);
 
     extern __shared__ float sh[];
-    float* sQ   = sh;                 // [L, LQ]
-    float* sDN  = sQ + L * LQ;        // [L, LV]   d_num, the v-slice only
-    float* sdC  = sDN + L * LV;       // [tv, LQ]
-    float* sdN  = sdC + tv * LQ;      // [dqk]
-    float* sB   = sdN + dqk;          // [L]
-    float* sDQn = sB + L;             // [L]
+    float* sB = sh;                                  // [L]  b[t]/ψ[t]
+    float* sBD = sB + L;                             // [L]  b[t]·d_qn[t]
+    bf16s_t* sDN = (bf16s_t*)(sBD + L);              // [LP, LV]  d_num, `b` folded in
+    bf16s_t* sQ = sDN + (long)LP * LV;               // [LP, LQ]
 
-    // Incoming BPTT state. Normally zero — the state the last chunk produces is never
-    // read. Under CARRY the caller has staged the gradient flowing back from the chunk
-    // to the RIGHT into slot NC (the slot this kernel would otherwise publish first),
-    // so a chunked backward matches the unchunked one. Mirrors `mlstm_fw_C`'s CARRY.
-    const float* dcin = dcst + ((long)bh * (NC + 1) + NC) * dhv * dqk;
-    const float* dnin = dnst + ((long)bh * (NC + 1) + NC) * dqk;
-    for (int e = tid; e < tv * dqk; e += nthreads) {
-        int v = e / dqk, q = e - v * dqk;
-        sdC[v * LQ + q] = CARRY ? dcin[(long)(v0 + v) * dqk + q] : 0.0f;
+    const long qkB = bhBase(bh, H, sQK_B, sQK_H);
+    const long hvB = bhBase(bh, H, sHV_B, sHV_H);
+    const float m_prev = mst[(long)bh * (NC + 1) + k];
+    for (int t = tid; t < len; t += nthreads) {
+        const long gt = (long)bh * T + c0 + t;
+        const float b = expf(fcb[((long)bh * NC + k) * L + t] + m_prev - msv[gt]);
+        sB[t] = b / psiv[gt];
+        sBD[t] = b * dqnv[gt];
     }
-    for (int e = tid; e < dqk; e += nthreads) sdN[e] = CARRY ? dnin[e] : 0.0f;
+
+    // The gradient flowing in from the right, when there is none to flow in. Chunk
+    // 0's block owns it — every other slot is written by the block that produced it.
+    if (k == 0 && !CARRY) {
+        float* dcin = dcst + ((long)bh * (NC + 1) + NC) * dhv * dqk;
+        for (int e = tid; e < dhv * dqk; e += nthreads) dcin[e] = 0.0f;
+        float* dnin = dnst + ((long)bh * (NC + 1) + NC) * dqk;
+        for (int e = tid; e < dqk; e += nthreads) dnin[e] = 0.0f;
+    }
+    for (int e = tid; e < LP * KP; e += nthreads) {
+        const int t = e / KP, q = e - t * KP;
+        sQ[t * LQ + q] = to_bf16((t < len && q < dqk)
+            ? slab_ld(qq, qkB + (long)(c0 + t) * sQK_S + q) : 0.0f);
+    }
     __syncthreads();
 
-    for (int k = NC - 1; k >= 0; --k) {
-        int c0 = k * L;
-        int len = min(L, T - c0);
-
-        // What is in sdC right now is the gradient wrt C_k — i.e. wrt the state
-        // entering chunk k+1. Publish it there before folding chunk k in.
-        float* dcout = dcst + ((long)bh * (NC + 1) + (k + 1)) * dhv * dqk;
-        for (int e = tid; e < tv * dqk; e += nthreads) {
-            int v = e / dqk, q = e - v * dqk;
-            dcout[(long)(v0 + v) * dqk + q] = sdC[v * LQ + q];
-        }
-        if (lead) {
-            float* dnout = dnst + ((long)bh * (NC + 1) + (k + 1)) * dqk;
-            for (int e = tid; e < dqk; e += nthreads) dnout[e] = sdN[e];
-        }
-
-        float m_prev = mst[(long)bh * (NC + 1) + k];
-        float fc_last = fcb[((long)bh * NC + k) * L + (len - 1)];
-        float m_last = msv[(long)bh * T + c0 + len - 1];
-        float gk = expf(fc_last + m_prev - m_last);
-
-        for (int e = tid; e < len * dqk; e += nthreads) {
-            int t = e / dqk, q = e - t * dqk;
-            sQ[t * LQ + q] = slab_ld(qq, bhBase(bh, H, sQK_B, sQK_H) + (long)(c0 + t) * sQK_S + q);
-        }
-
-        // d_num = d_ytil/ψ and d_qn — the backward of ỹ = num/ψ, ψ = max(|qn|,1).
-        // num is not saved: num = ỹ·ψ, so Σ_v d_ytil·num = ψ·Σ_v d_ytil·ỹ and the
-        // ψ² cancels down to one division. d_qn contracts over ALL of dhv, so every
-        // tile computes it (each reading the full d_ytil row) — only the v-slice of
-        // d_num goes to shared memory.
-        // One WARP per timestep rather than one thread: `len` is at most L (<= 32), so
-        // a thread-per-t left all but `len` of the 256 threads idle while each of the
-        // few active ones ran the whole `dhv` reduction alone. Splitting `red` across
-        // the warp's lanes uses 32x more of the block and shortens the serial chain to
-        // dhv/32 + a shuffle tree.
-        {
-            const int lane = tid & 31;
-            const int warp = tid >> 5;
-            const int nwarps = nthreads >> 5;
-            for (int t = warp; t < len; t += nwarps) {
-                long gt = (long)bh * T + c0 + t;
-                long gy = bhBase(bh, H, sHV_B, sHV_H) + (long)(c0 + t) * sHV_S;
-                float inv = 1.0f / psiv[gt];
-                float red = 0.0f;
-                for (int v = lane; v < dhv; v += 32)
-                    red += dytil[gy + v] * slab_ld(ytil, gy + v);
-                #pragma unroll
-                for (int off = 16; off > 0; off >>= 1)
-                    red += __shfl_down_sync(0xffffffffu, red, off);
-                red = __shfl_sync(0xffffffffu, red, 0);
-                for (int v = lane; v < tv; v += 32)
-                    sDN[t * LV + v] = dytil[gy + v0 + v] * inv;
-                if (lane == 0) {
-                    float dpsi = -red * inv;
-                    float qn = qnv[gt];
-                    // Grad flows through qn only where it, not the exp(-m) floor, won
-                    // the max.
-                    sDQn[t] = (fabsf(qn) > expf(-msv[gt]))
-                                  ? ((qn > 0.0f ? 1.0f : -1.0f) * dpsi)
-                                  : 0.0f;
-                    sB[t] = expf(fcb[((long)bh * NC + k) * L + t] + m_prev - msv[gt]);
-                }
-            }
-        }
-        __syncthreads();
-
-        for (int e = tid; e < tv * dqk; e += nthreads) {
-            int v = e / dqk, q = e - v * dqk;
-            float acc = 0.0f;
-            for (int t = 0; t < len; ++t) acc += sB[t] * sDN[t * LV + v] * sQ[t * LQ + q];
-            sdC[v * LQ + q] = gk * sdC[v * LQ + q] + acc;
-        }
-        if (lead) {
-            for (int q = tid; q < dqk; q += nthreads) {
-                float acc = 0.0f;
-                for (int t = 0; t < len; ++t) acc += sB[t] * sDQn[t] * sQ[t * LQ + q];
-                sdN[q] = gk * sdN[q] + acc;
-            }
-        }
-        __syncthreads();
+    for (int e = tid; e < LP * VP; e += nthreads) {
+        const int t = e / VP, v = e - t * VP;
+        sDN[t * LV + v] = to_bf16((t < len && v < dhv)
+            ? sB[t] * dytil[hvB + (long)(c0 + t) * sHV_S + v] : 0.0f);
     }
+    __syncthreads();
 
-    float* dcout = dcst + (long)bh * (NC + 1) * dhv * dqk;
-    for (int e = tid; e < tv * dqk; e += nthreads) {
-        int v = e / dqk, q = e - v * dqk;
-        dcout[(long)(v0 + v) * dqk + q] = sdC[v * LQ + q];
+    // sDN is [L, dhv] and sQ is [L, dqk], so the A loader consumes d_num transposed
+    // and neither operand is ever materialised the other way round.
+    float* dcout = dcst + ((long)bh * (NC + 1) + k) * dhv * dqk;
+    const int ntile = KP >> 3;
+    for (int tile = warp; tile < (VP >> 4) * ntile; tile += nwarps) {
+        const int m0 = (tile / ntile) << 4, n0 = (tile % ntile) << 3;
+        float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        unsigned a[4], b[2];
+        for (int k0 = 0; k0 < LP; k0 += 16) {
+            ldb_a_km(a, sDN, LV, m0, k0);
+            ldb_b_kn(b, sQ, LQ, k0, n0);
+            mma_bf16(d, a, b);
+        }
+        for (int i = 0; i < 4; ++i) {
+            const int v = m0 + mma_row(i), q = n0 + mma_col(i);
+            if (v < dhv && q < dqk) dcout[(long)v * dqk + q] = d[i];
+        }
     }
-    if (lead) {
-        float* dnout = dnst + (long)bh * (NC + 1) * dqk;
-        for (int e = tid; e < dqk; e += nthreads) dnout[e] = sdN[e];
+    // Δdn is a matrix-VECTOR product, so there is no dot for the tensor cores here.
+    float* dnout = dnst + ((long)bh * (NC + 1) + k) * dqk;
+    for (int q = tid; q < dqk; q += nthreads) {
+        float acc = 0.0f;
+        for (int t = 0; t < len; ++t) acc += sBD[t] * from_bf16(sQ[t * LQ + q]);
+        dnout[q] = acc;
     }
 }
 
-#if MMA_TF32
-
-// The tensor-core twin of `mlstm_bw_parallel`. Every contraction in the backward
-// is a dot, so every one of them goes to the tensor cores:
+// The intra-chunk backward, one block per (chunk, bh) — the twin of
+// `mlstm_fw_parallel`. Every contraction in it is a dot, so every one of them goes
+// to the tensor cores:
 //
 //   phase 1   S     = Q·Kᵀ         over dqk   -> masked+decayed into sDS (as fwd)
-//   phase 2   dVnum = DSᵀ·dN       over t     |
-//             st    = K·dCᵀ        over dqk   |- all three land on [L, dhv], so one
-//             pre   = Q·Cᵀ         over dqk   |  warp pass computes all three
+//   phase 2   dVnum = DSᵀ·dN       over t     |- both land on [L, dhv], so one warp
+//             st    = K·dCᵀ        over dqk   |  pass computes both
 //   phase 4   dds   = dN·Vᵀ        over dhv   -> [L, L], epilogue makes dS in place
 //   phase 5   dQint = dS·K         over j     |
 //             dQinx = dN·C         over dhv   |- all four land on [L, dqk], so again
@@ -878,79 +844,85 @@ extern "C" __global__ void mlstm_bw_dC(
 // whole K-loop, so two dots that write the same tile cost one tile's worth of
 // epilogue and one set of shared-memory reads for the shared operand.
 //
-// `da`/`db` still reduce with shared atomics — they contract the SAME products the
-// tiles already hold (`st` over v, `pre` over v), so they ride along in the epilogue
-// instead of getting a pass of their own, exactly as in the scalar kernel.
+// Every mma operand is staged bf16 — q/k/v are that in memory already, and the fp32
+// intermediates (the states, d_num, DS/dS) feed dots whose other operand is bf16
+// regardless. What is summed, compared or exponentiated stays fp32, so `sDS` exists
+// twice: the fp32 copy the mask epilogues work on and `sDSb`, the narrowed operand
+// the two dots that contract it read.
+//
+// `da`/`db` reduce in a fixed order rather than with atomics — they contract the
+// SAME products the tiles already hold (`st` over v, `dqx` over q), but several
+// warps own rows of the same tile, and float addition is not associative.
 //
 // Everything else — the dg reduction, the a/b/g -> (dfc, dig) fold, the reverse
-// cumsum tail — is elementwise or a scan, has no dot in it, and is unchanged.
+// cumsum tail — is elementwise or a scan and has no dot in it.
 extern "C" __global__ void mlstm_bw_parallel(
     const slab_t* qq, const slab_t* kk, const slab_t* vv,
     const float* ig, const float* fg, const float* fcb,
     const float* cst, const float* nst, const float* mst,
     const float* dcst, const float* dnst,
-    const slab_t* ytil, const float* dytil, const float* psiv,
-    const float* qnv, const float* msv,
+    const float* dytil, const float* psiv, const float* dqnv, const float* msv,
     float* dq, float* dk, float* dv, float* dig, float* dfg,
-    MLSTM_SHAPE_ARGS_BW) {
+    MLSTM_SHAPE_ARGS) {
     MLSTM_SHAPE_BIND
-    int k = blockIdx.x, bh = blockIdx.y;
-    int tid = threadIdx.x, nthreads = blockDim.x;
-    int warp = tid >> 5, nwarps = nthreads >> 5;
-    int c0 = k * L;
-    int len = min(L, T - c0);
-    // See `mlstm_bw_parallel`: under CARRY the last chunk's outgoing gradient is the
-    // one staged in slot NC, not zero.
-    int is_last = (k == NC - 1) && !CARRY;
+    (void)CARRY;
+    const int k = blockIdx.x, bh = blockIdx.y;
+    const int tid = threadIdx.x, nthreads = MLSTM_NTHREADS;
+    const int warp = tid >> 5, nwarps = nthreads >> 5, lane = tid & 31;
+    const int c0 = k * L;
+    const int len = min(L, T - c0);
 
+    // Every axis a dot contracts is padded to the bf16 mma's K = 16 and zero-filled,
+    // which is what lets one code path serve a short last chunk and an odd head dim
+    // alike: a zero row contributes nothing. `dhv` is a contraction here (phases 4
+    // and 5) where the forward only ever has it as an output index, so it pads to 16
+    // too rather than to the mma's N = 8.
     const int LP = (L + 15) & ~15;
-    const int KP = (dqk + 7) & ~7;
-    const int VP = (dhv + 7) & ~7;
+    const int KP = (dqk + 15) & ~15;
+    const int VP = (dhv + 15) & ~15;
     // The `dqk` axis is staged one KT-wide slice at a time rather than whole. Every
-    // buffer that spans it — Q, K, and the two `[dhv, dqk]` states, which alone are
-    // 57% of the untiled footprint — is sized to the slice, so shared memory stops
-    // scaling with the head dim: the block loops `NKT` slices instead of holding
-    // them. This is the reference's `siz_b_DHQK` (nx-ai/mlstm_kernels caps it with
-    // `get_head_dim_block_size`, min(64, ..), so a wider head raises the trip count
-    // and never the footprint). KT >= dqk degenerates to one full-width pass, i.e.
-    // exactly the untiled kernel.
-    const int KT = (MLSTM_KT < dqk) ? MLSTM_KT : KP;
-    const int NKT = (dqk + KT - 1) / KT;
+    // buffer that spans it — Q, K, and the two `[dhv, dqk]` states — is sized to the
+    // slice, so shared memory stops scaling with the head dim: the block loops `NKT`
+    // slices instead of holding them. This is the reference's `siz_b_DHQK`
+    // (nx-ai/mlstm_kernels caps it with `get_head_dim_block_size`, min(64, ..), so a
+    // wider head raises the trip count and never the footprint).
+    const int KT = (MLSTM_KT < KP) ? MLSTM_KT : KP;
+    const int NKT = (KP + KT - 1) / KT;
     // The `dhv` twin of KT. Unlike `dqk`, this axis is a CONTRACTION in phases 4/5
     // and an OUTPUT index in phase 2, so the two need opposite treatment: phase 2's
     // slice owns its columns outright, while phases 4 and 5 accumulate across slices.
-    const int VT = (MLSTM_VT < dhv) ? MLSTM_VT : VP;
-    const int NVT = (dhv + VT - 1) / VT;
-    const int LQ = KT + 1, LV = VT + 1, LS = LP + 1;
-    const int LK = KT + 1;
+    const int VT = (MLSTM_VT < VP) ? MLSTM_VT : VP;
+    const int NVT = (VP + VT - 1) / VT;
+    const int LS = LP + 1, LV = VT + 1, LK = KT + 1;      // +1: fp32 bank pad
+    const int LQb = BF16_LD(KT), LVb = BF16_LD(VT), LDb = BF16_LD(LP);
 
     extern __shared__ float sh[];
-    float* sQ   = sh;                  // [LP, LQ]   one dqk slice
-    float* sK   = sQ + LP * LQ;        // [LP, LQ]   one dqk slice
-    float* sV   = sK + LP * LQ;        // [LP, LV]   one dhv slice
-    float* sDN  = sV + LP * LV;        // [LP, LV]   d_num,   one dhv slice
-    float* sDS  = sDN + LP * LV;       // [LP, LS]   DS, then dS
-    float* sC   = sDS + LP * LS;       // [VT, LQ]   C_{k-1}, one (dhv, dqk) tile
-    float* sdC  = sC + VT * LQ;        // [VT, LQ]   dC_k,    one (dhv, dqk) tile
-    float* sSt  = sdC + VT * LQ;       // [LP, LV]   Σ_q dC·K, summed over dqk slices
-    float* sPre = sSt + LP * LV;       // [LP, LV]   Σ_q Q·C,  summed over dqk slices
-    float* sN   = sPre + LP * LV;      // [KT]
+    float* sDS  = sh;                  // [LP, LS]   DS, then dS
+    float* sDds = sDS + LP * LS;       // [LP, LS]   phase 4's dhv contraction
+    float* sSt  = sDds + LP * LS;      // [LP, LV]   Σ_q dC·K, summed over dqk slices
+    float* sDqi = sSt + LP * LV;       // [LP, LK]   phase 5's dQ tile
+    float* sDki = sDqi + LP * LK;      // [LP, LK]   phase 5's dK tile
+    float* sDqx = sDki + LP * LK;      // [LP, LK]   Σ_v dN·C, summed over dhv slices
+    float* sN   = sDqx + LP * LK;      // [KT]
     float* sdN  = sN + KT;             // [KT]
     float* sFc  = sdN + KT;            // [LP]
     float* sIg  = sFc + LP;            // [LP]
     float* sM   = sIg + LP;            // [LP]
     float* sB   = sM + LP;             // [LP]
     float* sA   = sB + LP;             // [LP]
-    float* sQn  = sA + LP;             // [LP]
-    float* sDQn = sQn + LP;            // [LP]
+    float* sDQn = sA + LP;             // [LP]
     float* sDfc = sDQn + LP;           // [LP]
     float* sDig = sDfc + LP;           // [LP]
     float* sDa  = sDig + LP;           // [LP]
     float* sDb  = sDa + LP;            // [LP]
-    float* sDds = sDb + LP;            // [LP, LS]  phase 4's dhv contraction
-    float* sDqi = sDds + LP * LS;      // [LP, LK]  phase 5's dQ tile
-    float* sDki = sDqi + LP * LK;      // [LP, LK]  phase 5's dK tile
-    __shared__ float sRed[512]; // must cover FUSED_THREADS_PAR
+    bf16s_t* sQ   = (bf16s_t*)(sDb + LP);   // [LP, LQb]  one dqk slice
+    bf16s_t* sK   = sQ + (long)LP * LQb;    // [LP, LQb]  one dqk slice
+    bf16s_t* sV   = sK + (long)LP * LQb;    // [LP, LVb]  one dhv slice
+    bf16s_t* sDN  = sV + (long)LP * LVb;    // [LP, LVb]  d_num, one dhv slice
+    bf16s_t* sC   = sDN + (long)LP * LVb;   // [VT, LQb]  C_{k-1}, one (dhv, dqk) tile
+    bf16s_t* sdC  = sC + (long)VT * LQb;    // [VT, LQb]  dC_k,    one (dhv, dqk) tile
+    bf16s_t* sDSb = sdC + (long)VT * LQb;   // [LP, LDb]  the narrowed DS / dS
+    __shared__ float sRed[MLSTM_NTHREADS_MAX];
 
     // Stage the `q0`-based dqk slice of Q/K and of the two states. Called once per
     // tile by every phase that walks the dqk axis; each is followed by the barrier
@@ -960,46 +932,46 @@ extern "C" __global__ void mlstm_bw_parallel(
             int t = e / KT, q = e - t * KT;                                           \
             int ok = (t < len) && ((q0) + q < dqk);                                   \
             long base = bhBase(bh, H, sQK_B, sQK_H) + (long)(c0 + t) * sQK_S + (q0) + q; \
-            sQ[t * LQ + q] = ok ? slab_ld(qq, base) : 0.0f;                           \
-            sK[t * LQ + q] = ok ? slab_ld(kk, base) : 0.0f;                           \
+            sQ[t * LQb + q] = to_bf16(ok ? slab_ld(qq, base) : 0.0f);                 \
+            sK[t * LQb + q] = to_bf16(ok ? slab_ld(kk, base) : 0.0f);                 \
         }
-    // The (v0, q0) tile of the two `[dhv, dqk]` states. `n`/`dn` span dqk only, so
-    // they are staged by the v0 == 0 pass and left alone by the others.
-    #define STAGE_STATE(v0, q0)                                                       \
+    // The (v0, q0) tile of one `[dhv, dqk]` state, narrowed. `slot` is k for the
+    // forward state and k+1 for its gradient — which always exists, because
+    // `mlstm_bw_dC` materialises slot NC, so there is no rightmost-chunk case here.
+    // Named per buffer rather than staging both at once: phase 2 reads only `dC` and
+    // phase 1 neither, and each of those tiles is a `[VT, KT]` trip through HBM.
+    #define STAGE_STATE(dst, src, slot, v0, q0)                                       \
         for (int e = tid; e < VT * KT; e += nthreads) {                               \
             int vs = e / KT, q = e - vs * KT;                                         \
             int ok = ((v0) + vs < dhv) && ((q0) + q < dqk);                           \
             long off = (long)((v0) + vs) * dqk + (q0) + q;                            \
-            sC[vs * LQ + q] =                                                         \
-                ok ? cst[((long)bh * (NC + 1) + k) * dhv * dqk + off] : 0.0f;          \
-            sdC[vs * LQ + q] = (ok && !is_last)                                       \
-                ? dcst[((long)bh * (NC + 1) + (k + 1)) * dhv * dqk + off] : 0.0f;      \
-        }                                                                             \
+            dst[vs * LQb + q] = to_bf16(                                              \
+                ok ? src[((long)bh * (NC + 1) + (slot)) * dhv * dqk + off] : 0.0f);    \
+        }
+    // `n`/`dn` span dqk only, so they need no `v0` and stay fp32 — nothing contracts
+    // them on the tensor cores.
+    #define STAGE_N(q0)                                                               \
         for (int e = tid; e < KT; e += nthreads) {                                    \
             int ok = (q0) + e < dqk;                                                  \
             sN[e] = ok ? nst[((long)bh * (NC + 1) + k) * dqk + (q0) + e] : 0.0f;       \
-            sdN[e] = (ok && !is_last)                                                 \
-                ? dnst[((long)bh * (NC + 1) + (k + 1)) * dqk + (q0) + e] : 0.0f;       \
+            sdN[e] = ok ? dnst[((long)bh * (NC + 1) + (k + 1)) * dqk + (q0) + e] : 0.0f; \
         }
 
-    // The `v0` slice of V and of d_num. d_num needs `psi`/`ytil` reductions that run
-    // over the WHOLE dhv row, so the reduction they feed (`sDQn`) is done once up
-    // front and only the staging is per slice.
+    // The `v0` slice of V and of d_num.
     #define STAGE_V(v0)                                                               \
         for (int e = tid; e < LP * VT; e += nthreads) {                               \
             int t = e / VT, vs = e - t * VT, v = (v0) + vs;                           \
             int ok = (t < len) && (v < dhv);                                          \
-            sV[t * LV + vs] = ok                                                      \
-                ? slab_ld(vv, bhBase(bh, H, sHV_B, sHV_H) + (long)(c0 + t) * sHV_S + v) : 0.0f; \
-            sDN[t * LV + vs] = ok                                                     \
-                ? dytil[bhBase(bh, H, sHV_B, sHV_H) + (long)(c0 + t) * sHV_S + v]     \
-                    * (1.0f / psiv[(long)bh * T + c0 + t]) : 0.0f;                    \
+            long gy = bhBase(bh, H, sHV_B, sHV_H) + (long)(c0 + t) * sHV_S + v;       \
+            sV[t * LVb + vs] = to_bf16(ok ? slab_ld(vv, gy) : 0.0f);                  \
+            sDN[t * LVb + vs] = to_bf16(                                              \
+                ok ? dytil[gy] / psiv[(long)bh * T + c0 + t] : 0.0f);                 \
         }
 
     for (int j = tid; j < LP; j += nthreads) {
         sFc[j] = (j < L)   ? fcb[((long)bh * NC + k) * L + j] : 0.0f;
         sIg[j] = (j < len) ? ig[bhBase(bh, H, sG_B, sG_H) + (long)(c0 + j) * sG_S]        : 0.0f;
-        sM[j] = 0.0f; sB[j] = 0.0f; sA[j] = 0.0f; sQn[j] = 0.0f; sDQn[j] = 0.0f;
+        sM[j] = 0.0f; sB[j] = 0.0f; sA[j] = 0.0f; sDQn[j] = 0.0f;
         sDfc[j] = 0.0f; sDig[j] = 0.0f; sDa[j] = 0.0f; sDb[j] = 0.0f;
     }
     float m_prev = mst[(long)bh * (NC + 1) + k];
@@ -1011,21 +983,10 @@ extern "C" __global__ void mlstm_bw_parallel(
 
     for (int t = tid; t < len; t += nthreads) {
         long gt = (long)bh * T + c0 + t;
-        long gy = bhBase(bh, H, sHV_B, sHV_H) + (long)(c0 + t) * sHV_S;
         sM[t] = msv[gt];
         sB[t] = expf(sFc[t] + m_prev - sM[t]);
         sA[t] = expf(fc_last - sFc[t] + sIg[t] - m_last);
-        sQn[t] = qnv[gt];
-
-        float inv = 1.0f / psiv[gt];
-        // Contracts the whole dhv row, so it cannot be confined to a dhv slice;
-        // sDN itself is staged per slice by STAGE_V.
-        float red = 0.0f;
-        for (int v = 0; v < dhv; ++v) red += dytil[gy + v] * slab_ld(ytil, gy + v);
-        float dpsi = -red * inv;
-        float qn = sQn[t];
-        // Grad flows through qn only where it, not the exp(−m) floor, won the max.
-        sDQn[t] = (fabsf(qn) > expf(-sM[t])) ? ((qn > 0.0f ? 1.0f : -1.0f) * dpsi) : 0.0f;
+        sDQn[t] = dqnv[gt];
     }
     __syncthreads();
 
@@ -1039,7 +1000,6 @@ extern "C" __global__ void mlstm_bw_parallel(
     //
     //   DS   = Q·Kᵀ            -> sDS   (phase 1)
     //   st   = K·dCᵀ           -> sSt   (phase 2)
-    //   pre  = Q·Cᵀ            -> sPre  (phase 2)
     //   da/db n-side           -> sDa/sDb
     //   dg   = ΣdC⊙C + ΣdN⊙N   -> `dgloc`, reduced after the loop
     //
@@ -1057,10 +1017,10 @@ extern "C" __global__ void mlstm_bw_parallel(
             int m0 = (tile / ltile) << 4, n0 = (tile % ltile) << 3;
             float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             unsigned a[4], b[2];
-            for (int k0 = 0; k0 < KT; k0 += 8) {
-                ld_a_mk(a, sQ, LQ, m0, k0);
-                ld_b_nk(b, sK, LQ, k0, n0);
-                mma_16x8x8(d, a, b);
+            for (int k0 = 0; k0 < KT; k0 += 16) {
+                ldb_a_mk(a, sQ, LQb, m0, k0);
+                ldb_b_nk(b, sK, LQb, k0, n0);
+                mma_bf16(d, a, b);
             }
             for (int i = 0; i < 4; ++i) {
                 int t = m0 + mma_row(i), j = n0 + mma_col(i);
@@ -1069,41 +1029,44 @@ extern "C" __global__ void mlstm_bw_parallel(
         }
 
         // The n-side of da/db: a matrix-vector product, so no dot for the tensor
-        // cores and `len` threads is enough. `n`/`dn` span dqk only, so the v0 == 0
-        // staging of STAGE_STATE is all this needs.
-        STAGE_STATE(0, kt * KT);
+        // cores and `len` threads is enough. Nothing here reads the `[dhv, dqk]`
+        // states, only the vectors beside them.
+        STAGE_N(kt * KT);
         __syncthreads();
-        {
-            int qlim = min(KT, dqk - kt * KT);
-            for (int j = tid; j < len; j += nthreads) {
-                float acc = 0.0f, pre_qn = 0.0f;
-                for (int q = 0; q < qlim; ++q) {
-                    acc += sdN[q] * sK[j * LQ + q];
-                    pre_qn += sQ[j * LQ + q] * sN[q];
-                }
+        for (int j = warp; j < len; j += nwarps) {
+            float acc = 0.0f, pre_qn = 0.0f;
+            for (int q = lane; q < KT; q += 32) {
+                acc += sdN[q] * from_bf16(sK[j * LQb + q]);
+                pre_qn += from_bf16(sQ[j * LQb + q]) * sN[q];
+            }
+            acc = warp_sum(acc);
+            pre_qn = warp_sum(pre_qn);
+            if (lane == 0) {
                 sDa[j] += acc;
                 sDb[j] += sDQn[j] * pre_qn;
             }
-            for (int e = tid; e < KT; e += nthreads) dgloc += sdN[e] * sN[e];
         }
+        for (int e = tid; e < KT; e += nthreads) dgloc += sdN[e] * sN[e];
     }
     __syncthreads();
-    // The D̄ epilogue phase 1 owed, applied once the whole contraction is in.
+    // The D̄ epilogue phase 1 owed, applied once the whole contraction is in. The
+    // narrowed copy is what phase 2's dV dot contracts.
     for (int e = tid; e < LP * LS; e += nthreads) {
         int t = e / LS, j = e - t * LS;
         float val = 0.0f;
         if (t < len && j <= t) val = expf(sFc[t] - sFc[j] + sIg[j] - sM[t]) * sDS[e];
         sDS[e] = val;
+        sDSb[t * LDb + j] = to_bf16(val);
     }
     __syncthreads();
 
-    // Phase 2: dV, plus the `st` and `pre` products that `da`/`db` reduce over v,
-    // and phase 4's dhv contraction, which shares the same V/dN staging.
+    // Phase 2: dV, plus the `st` product that `da` reduces over v, and phase 4's dhv
+    // contraction, which shares the same V/dN staging.
     //
     // `v` is an OUTPUT index for dV, so a dhv slice owns its columns outright. But
-    // `st`/`pre` contract dqk INSIDE that slice, so this is a nested loop: the outer
-    // pass stages a dhv slice, the inner one sweeps dqk into `sSt`/`sPre`, which are
-    // therefore only [LP, VT] and are re-zeroed per outer pass.
+    // `st` contracts dqk INSIDE that slice, so this is a nested loop: the outer pass
+    // stages a dhv slice, the inner one sweeps dqk into `sSt`, which is therefore
+    // only [LP, VT] and is re-zeroed per outer pass.
     //
     // `dds` (phase 4) contracts dhv, so it cannot finish inside one slice — it
     // accumulates into sDds across the outer loop and its epilogue runs after.
@@ -1113,38 +1076,27 @@ extern "C" __global__ void mlstm_bw_parallel(
         int v0 = vt * VT;
         __syncthreads();
         STAGE_V(v0);
-        for (int e = tid; e < LP * LV; e += nthreads) { sSt[e] = 0.0f; sPre[e] = 0.0f; }
+        for (int e = tid; e < LP * LV; e += nthreads) sSt[e] = 0.0f;
         __syncthreads();
 
         for (int kt = 0; kt < NKT; ++kt) {
             __syncthreads();
             STAGE_QK(kt * KT);
-            STAGE_STATE(v0, kt * KT);
+            STAGE_STATE(sdC, dcst, k + 1, v0, kt * KT);
             __syncthreads();
             for (int tile = warp; tile < mtile * vtile; tile += nwarps) {
                 int m0 = (tile / vtile) << 4, n0 = (tile % vtile) << 3;
-                float dst[4]  = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_q dC[v][q]·K[j][q]
-                float dpre[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_q Q[t][q]·C[v][q]
+                float dst[4] = {0.0f, 0.0f, 0.0f, 0.0f};   // Σ_q dC[v][q]·K[j][q]
                 unsigned a[4], b[2];
-                for (int k0 = 0; k0 < KT; k0 += 8) {
-                    ld_a_mk(a, sK, LQ, m0, k0);
-                    ld_b_nk(b, sdC, LQ, k0, n0);
-                    mma_16x8x8(dst, a, b);
-                    ld_a_mk(a, sQ, LQ, m0, k0);
-                    ld_b_nk(b, sC, LQ, k0, n0);
-                    mma_16x8x8(dpre, a, b);
+                for (int k0 = 0; k0 < KT; k0 += 16) {
+                    ldb_a_mk(a, sK, LQb, m0, k0);
+                    ldb_b_nk(b, sdC, LQb, k0, n0);
+                    mma_bf16(dst, a, b);
                 }
                 for (int i = 0; i < 4; ++i) {
                     int r = m0 + mma_row(i), vs = n0 + mma_col(i);
                     sSt[r * LV + vs] += dst[i];
-                    sPre[r * LV + vs] += dpre[i];
                 }
-            }
-            // dg's C-term: this (v0, q0) tile of dC⊙C. The pad is zero in both
-            // operands, so it contributes nothing and needs no masking.
-            for (int e = tid; e < VT * KT; e += nthreads) {
-                int vs = e / KT, q = e - vs * KT;
-                dgloc += sdC[vs * LQ + q] * sC[vs * LQ + q];
             }
         }
         __syncthreads();
@@ -1155,10 +1107,10 @@ extern "C" __global__ void mlstm_bw_parallel(
             float dnum[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_t DS[t][j]·dN[t][v]
             unsigned a[4], b[2];
             // DS[t][j] is zero for j > t, so contracting over ALL t is the same as t >= j.
-            for (int k0 = 0; k0 < LP; k0 += 8) {
-                ld_a_km(a, sDS, LS, m0, k0);   // Aᵀ in memory: DS is [t, j], we want [j, t]
-                ld_b_kn(b, sDN, LV, k0, n0);
-                mma_16x8x8(dnum, a, b);
+            for (int k0 = 0; k0 < LP; k0 += 16) {
+                ldb_a_km(a, sDSb, LDb, m0, k0);  // Aᵀ in memory: DS is [t, j], we want [j, t]
+                ldb_b_kn(b, sDN, LVb, k0, n0);
+                mma_bf16(dnum, a, b);
             }
             for (int i = 0; i < 4; ++i) {
                 int r = m0 + mma_row(i), vs = n0 + mma_col(i);
@@ -1166,10 +1118,23 @@ extern "C" __global__ void mlstm_bw_parallel(
                 if (r < len && v < dhv) {
                     float st = sSt[r * LV + vs];
                     dv[bhBase(bh, H, sHV_B, sHV_H) + (long)(c0 + r) * sHV_S + v] = dnum[i] + sA[r] * st;
-                    atomicAdd(&sDa[r], sV[r * LV + vs] * st);
-                    atomicAdd(&sDb[r], sDN[r * LV + vs] * sPre[r * LV + vs]);
                 }
             }
+        }
+
+        // da's v-side, as a fixed-order pass rather than an atomic in the epilogue
+        // above. Several warps own (r, vs) pairs of the SAME row there, so an atomic
+        // makes the summation order a scheduling artefact — and float addition is not
+        // associative, so the last bits of every gate gradient became a property of
+        // how the blocks happened to be scheduled. One thread per row, `vs` ascending,
+        // is the same sum in an order the shape alone decides. The operands are all
+        // final for this dhv slice, so no extra barrier is needed.
+        for (int r = warp; r < len; r += nwarps) {
+            float da = 0.0f;
+            for (int vs = lane; vs < VT; vs += 32)
+                da += from_bf16(sV[r * LVb + vs]) * sSt[r * LV + vs];
+            da = warp_sum(da);
+            if (lane == 0) sDa[r] += da;
         }
 
         // Phase 4's dhv contraction, accumulated across the slices.
@@ -1177,10 +1142,10 @@ extern "C" __global__ void mlstm_bw_parallel(
             int m0 = (tile / ltile) << 4, n0 = (tile % ltile) << 3;
             float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};   // Σ_v dN[t][v]·V[j][v]
             unsigned a[4], b[2];
-            for (int k0 = 0; k0 < VT; k0 += 8) {
-                ld_a_mk(a, sDN, LV, m0, k0);
-                ld_b_nk(b, sV, LV, k0, n0);
-                mma_16x8x8(d, a, b);
+            for (int k0 = 0; k0 < VT; k0 += 16) {
+                ldb_a_mk(a, sDN, LVb, m0, k0);
+                ldb_b_nk(b, sV, LVb, k0, n0);
+                mma_bf16(d, a, b);
             }
             for (int i = 0; i < 4; ++i) {
                 int t = m0 + mma_row(i), j = n0 + mma_col(i);
@@ -1197,16 +1162,31 @@ extern "C" __global__ void mlstm_bw_parallel(
         int m0 = (tile / ltile) << 4, n0 = (tile % ltile) << 3;
         for (int i = 0; i < 4; ++i) {
             int t = m0 + mma_row(i), j = n0 + mma_col(i);
-            float out = 0.0f;
+            float out = 0.0f, p = 0.0f;
             if (t < len && j <= t) {
                 float dds = sDds[t * LS + j] + sDQn[t];
-                float p = dds * sDS[t * LS + j];
-                atomicAdd(&sDfc[t], p);
-                atomicAdd(&sDfc[j], -p);
-                atomicAdd(&sDig[j], p);
+                p = dds * sDS[t * LS + j];
                 out = dds * expf(sFc[t] - sFc[j] + sIg[j] - sM[t]);
             }
-            sDS[t * LS + j] = out;
+            // `p` lands where its own `dds` came from: that element of sDds is dead
+            // once `dds` is formed, and the reduction below wants the whole block.
+            sDds[t * LS + j] = p;
+            sDSb[t * LDb + j] = to_bf16(out);
+        }
+    }
+    __syncthreads();
+    // `p` folds into dfc/dig by row and by column: dfc[r] += Σ_j p[r][j] − Σ_t p[t][r]
+    // and dig[r] += Σ_t p[t][r]. One thread owns row r AND column r, so every slot is
+    // written exactly once and the order is the shape's, not the scheduler's.
+    for (int r = warp; r < len; r += nwarps) {
+        float row = 0.0f, col = 0.0f;
+        for (int j = lane; j <= r; j += 32) row += sDds[r * LS + j];
+        for (int t = r + lane; t < len; t += 32) col += sDds[t * LS + r];
+        row = warp_sum(row);
+        col = warp_sum(col);
+        if (lane == 0) {
+            sDfc[r] += row - col;
+            sDig[r] += col;
         }
     }
     __syncthreads();
@@ -1217,24 +1197,32 @@ extern "C" __global__ void mlstm_bw_parallel(
     // dQ/dK outright, so the loop needs no cross-slice accumulation — each pass
     // stages its slice and writes the columns it owns.
     // The two dS dots contract `j`/`t` and are done once per dqk slice; `dqx`/`dks`
-    // contract dhv, so they need the dhv slices nested inside — the accumulator sits
-    // in registers across that inner loop and only the epilogue is per (t, q).
+    // contract dhv, so they need the dhv slices nested inside.
+    //
+    // `dqx` gets its own accumulator rather than folding straight into dQ, because
+    // `db` is the same contraction seen from the other side:
+    //   db[t] = Σ_v dN[t][v]·(Σ_q Q[t][q]·C[v][q]) = Σ_q Q[t][q]·dqx[t][q]
+    // Phase 2 used to compute that inner product a second time as a `[L, dhv]` dot of
+    // its own — a sixth of every mma this kernel issued, for a number already on its
+    // way through here.
     for (int kt = 0; kt < NKT; ++kt) {
         __syncthreads();
         STAGE_QK(kt * KT);
+        STAGE_N(kt * KT);
+        for (int e = tid; e < LP * LK; e += nthreads) sDqx[e] = 0.0f;
         __syncthreads();
         for (int tile = warp; tile < mtile * ktile; tile += nwarps) {
             int m0 = (tile / ktile) << 4, n0 = (tile % ktile) << 3;
             float dqi[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_j dS[t][j]·K[j][q]
             float dki[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_t dS[t][j]·Q[t][q]
             unsigned a[4], b[2];
-            for (int k0 = 0; k0 < LP; k0 += 8) {
-                ld_a_mk(a, sDS, LS, m0, k0);   // dS as [t, j], contracting j
-                ld_b_kn(b, sK, LQ, k0, n0);
-                mma_16x8x8(dqi, a, b);
-                ld_a_km(a, sDS, LS, m0, k0);   // dSᵀ, contracting t
-                ld_b_kn(b, sQ, LQ, k0, n0);
-                mma_16x8x8(dki, a, b);
+            for (int k0 = 0; k0 < LP; k0 += 16) {
+                ldb_a_mk(a, sDSb, LDb, m0, k0);   // dS as [t, j], contracting j
+                ldb_b_kn(b, sK, LQb, k0, n0);
+                mma_bf16(dqi, a, b);
+                ldb_a_km(a, sDSb, LDb, m0, k0);   // dSᵀ, contracting t
+                ldb_b_kn(b, sQ, LQb, k0, n0);
+                mma_bf16(dki, a, b);
             }
             for (int i = 0; i < 4; ++i) {
                 int r = m0 + mma_row(i), qs = n0 + mma_col(i);
@@ -1246,35 +1234,53 @@ extern "C" __global__ void mlstm_bw_parallel(
             int v0 = vt * VT;
             __syncthreads();
             STAGE_V(v0);
-            STAGE_STATE(v0, kt * KT);
+            STAGE_STATE(sC, cst, k, v0, kt * KT);
+            STAGE_STATE(sdC, dcst, k + 1, v0, kt * KT);
             __syncthreads();
             for (int tile = warp; tile < mtile * ktile; tile += nwarps) {
                 int m0 = (tile / ktile) << 4, n0 = (tile % ktile) << 3;
                 float dqx[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_v dN[t][v]·C[v][q]
                 float dks[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Σ_v V[j][v]·dC[v][q]
                 unsigned a[4], b[2];
-                for (int k0 = 0; k0 < VT; k0 += 8) {
-                    ld_a_mk(a, sDN, LV, m0, k0);
-                    ld_b_kn(b, sC, LQ, k0, n0);
-                    mma_16x8x8(dqx, a, b);
-                    ld_a_mk(a, sV, LV, m0, k0);
-                    ld_b_kn(b, sdC, LQ, k0, n0);
-                    mma_16x8x8(dks, a, b);
+                for (int k0 = 0; k0 < VT; k0 += 16) {
+                    ldb_a_mk(a, sDN, LVb, m0, k0);
+                    ldb_b_kn(b, sC, LQb, k0, n0);
+                    mma_bf16(dqx, a, b);
+                    ldb_a_mk(a, sV, LVb, m0, k0);
+                    ldb_b_kn(b, sdC, LQb, k0, n0);
+                    mma_bf16(dks, a, b);
                 }
                 for (int i = 0; i < 4; ++i) {
                     int r = m0 + mma_row(i), qs = n0 + mma_col(i);
-                    sDqi[r * LK + qs] += sB[r] * dqx[i];
+                    sDqx[r * LK + qs] += dqx[i];
                     sDki[r * LK + qs] += sA[r] * dks[i];
                 }
             }
+            // dg's C-term: this (v0, q0) tile of dC⊙C. Phase 2 needs only dC, so
+            // this rides along with the one pass that stages BOTH states — reading
+            // `cst` twice per block was a whole [dhv, dqk] trip through HBM for a
+            // scalar. The pad is zero in both operands, so it needs no masking.
+            for (int e = tid; e < VT * KT; e += nthreads) {
+                int vs = e / KT, q = e - vs * KT;
+                dgloc += from_bf16(sdC[vs * LQb + q]) * from_bf16(sC[vs * LQb + q]);
+            }
         }
         __syncthreads();
-        // `n`/`dn` span dqk only, so the last STAGE_STATE left them correct.
+        // db's share of this dqk slice, one thread per row so the order is the
+        // shape's. `q` is a contraction here, so it runs over the whole slice: the
+        // pad columns of sQ and of sDqx are both zero.
+        for (int r = warp; r < len; r += nwarps) {
+            float db = 0.0f;
+            for (int qs = lane; qs < KT; qs += 32)
+                db += from_bf16(sQ[r * LQb + qs]) * sDqx[r * LK + qs];
+            db = warp_sum(db);
+            if (lane == 0) sDb[r] += db;
+        }
         for (int e = tid; e < LP * KT; e += nthreads) {
             int r = e / KT, qs = e - r * KT, q = kt * KT + qs;
             if (r < len && q < dqk) {
                 dq[bhBase(bh, H, sQK_B, sQK_H) + (long)(c0 + r) * sQK_S + q] =
-                    sDqi[r * LK + qs] + sB[r] * sDQn[r] * sN[qs];
+                    sDqi[r * LK + qs] + sB[r] * (sDqx[r * LK + qs] + sDQn[r] * sN[qs]);
                 dk[bhBase(bh, H, sQK_B, sQK_H) + (long)(c0 + r) * sQK_S + q] =
                     sDki[r * LK + qs] + sA[r] * sdN[qs];
             }
@@ -1290,32 +1296,45 @@ extern "C" __global__ void mlstm_bw_parallel(
         if (tid < s) sRed[tid] += sRed[tid + s];
         __syncthreads();
     }
-    float dg = sRed[0];
 
     // a/b/g -> (dfc, dig), accumulating onto the intra-chunk D̄ contribution
     // (m held constant, as everywhere).
     for (int j = tid; j < len; j += nthreads) {
         float pa = sDa[j] * sA[j];
-        atomicAdd(&sDig[j], pa);
-        atomicAdd(&sDfc[j], sDb[j] * sB[j] - pa);
-    }
-    __syncthreads();
-    if (tid == 0) {
-        float acc = dg * gsca;
-        for (int j = 0; j < len; ++j) acc += sDa[j] * sA[j];
-        sDfc[len - 1] += acc;
+        sDig[j] += pa;
+        sDfc[j] += sDb[j] * sB[j] - pa;
     }
     __syncthreads();
 
-    if (tid == 0) {
-        float acc = 0.0f;
-        for (int j = len - 1; j >= 0; --j) {
-            acc += sDfc[j];
-            long gg = bhBase(bh, H, sG_B, sG_H) + (long)(c0 + j) * sG_S;
+    // The tail: fold Σ_j da·a (plus g's own term) into the last row of dfc, then walk
+    // dfc back through the cumulative log-forget it came from. Both are reductions
+    // over `len <= L <= 32`, so ONE warp does them with shuffles — a thread-0 loop
+    // left the block's other warps waiting on a serial chain the length of the chunk.
+    if (warp == 0) {
+        const int lane = tid;
+        const float dfc = (lane < len) ? sDfc[lane] : 0.0f;
+        float da_a = (lane < len) ? sDa[lane] * sA[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            da_a += __shfl_xor_sync(0xffffffffu, da_a, off);
+        // Reverse inclusive scan: lane j ends with Σ_{j' >= j} dfc[j'], which is what
+        // the cumulative log-forget `fc` propagates back to gate j. Lanes past `len`
+        // hold zero, so they add nothing.
+        float acc = dfc + ((lane == len - 1) ? (da_a + sRed[0] * gsca) : 0.0f);
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const float v = __shfl_down_sync(0xffffffffu, acc, off);
+            if (lane + off < 32) acc += v;
+        }
+        if (lane < len) {
+            long gg = bhBase(bh, H, sG_B, sG_H) + (long)(c0 + lane) * sG_S;
             dfg[gg] = acc * (1.0f - stable_sigmoid(fg[gg]));
-            dig[gg] = sDig[j];
+            dig[gg] = sDig[lane];
         }
     }
+    #undef STAGE_QK
+    #undef STAGE_STATE
+    #undef STAGE_V
 }
 
 #endif // MMA_TF32

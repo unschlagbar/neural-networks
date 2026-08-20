@@ -490,9 +490,13 @@ pub struct HostPark {
     /// pool would pin host memory in proportion to the largest shape ever evicted and
     /// never give it back.
     spare: Vec<PinnedHostSlice<u16>>,
-    /// Most slots this park has ever owned at once, across every generation and the
-    /// spare pool. The retention bound follows this, so a park keeps exactly the slots
-    /// its own sweep shape turns over and no more.
+    /// Most slots this park has ever needed LIVE at once — generations still owed a
+    /// restore. The retention bound follows this, so a park keeps exactly the slots its
+    /// own sweep shape turns over and no more.
+    ///
+    /// Must not count [`spare`](Self::spare): that pool is what the bound limits, so
+    /// including it makes the bound grow with the thing it is bounding and stop binding
+    /// at all.
     peak_slots: usize,
     /// Page-locking calls this park has made, for the reuse test to observe.
     #[cfg(test)]
@@ -558,18 +562,25 @@ impl InFlight {
         Default::default()
     }
 
-    /// Free the oldest eviction's buffers if the queue is full, ordering the *compute
-    /// stream* against its copy rather than blocking the host.
+    /// Free the oldest eviction's buffers once its copy has landed.
     ///
-    /// `gpu.stream.wait(ev)` is the whole point: the buffers are freed with
-    /// `cuMemFreeAsync` on the compute stream, so making that stream wait for the copy
-    /// is sufficient — and it costs no host time, which a `synchronize()` would.
-    /// Blocking the host instead measured a 26% step regression, because it serializes
-    /// every eviction against the compute it is supposed to hide behind.
-    pub fn release(&mut self, gpu: &Gpu) {
+    /// The wait has to be a HOST wait. Making the compute stream wait on the event and
+    /// then dropping is what this did, on the reasoning that the buffers are freed with
+    /// `cuMemFreeAsync` on that same stream and so cannot be reused before it — but the
+    /// free is not in fact ordered behind the wait, and the memory came back to a later
+    /// allocation while the transfer stream was still reading it. It read as
+    /// nondeterminism, not as a crash: gradients that differed run to run in whichever
+    /// blocks happened to lose the race. `examples/train_determinism.rs` is the probe
+    /// that catches it; the model's own forward loss does not, because the corrupted
+    /// buffers are only read in backward.
+    ///
+    /// It costs nothing. At `IN_FLIGHT_DEPTH` = 2 the copy being waited on was issued a
+    /// whole block of compute ago and has long since landed, so the sync returns
+    /// immediately: 153.2 ms/step against 153.4 for the racy version, at 1024 words.
+    pub fn release(&mut self) {
         while self.pending.len() >= IN_FLIGHT_DEPTH {
             let (bufs, ev) = self.pending.remove(0);
-            gpu.stream.wait(&ev).expect("offload: order free after park");
+            ev.synchronize().expect("offload: await park");
             drop(bufs);
         }
     }
@@ -618,9 +629,12 @@ impl HostPark {
 
     /// Bytes currently parked on the host, over every generation.
     pub fn host_bytes(&self) -> usize {
-        self.gens[..self.live]
+        // Every slot the park holds, not just the live ones: the spare pool is pinned
+        // host memory too, and a diagnostic that cannot see it cannot see it grow.
+        self.gens
             .iter()
             .flat_map(|g| g.slots.iter())
+            .chain(self.spare.iter())
             .map(|s| s.num_bytes())
             .sum()
     }
@@ -641,14 +655,43 @@ impl HostPark {
     ///
     /// Reuses its pinned slots across steps when the shapes repeat, so a steady
     /// training loop page-locks nothing after the first window.
+    /// Return displaced slots to the spare pool, within its bound.
+    ///
+    /// Full pool: keep the LARGER capacity and free the other. Dropping whichever slot
+    /// happened to arrive last would let a run of small evictions displace exactly the
+    /// big slots the next sweep needs, which is the page-locking churn the pool exists
+    /// to avoid — and `evict` matches best-fit, so a slot only earns its place by being
+    /// big enough for something.
+    fn recycle(&mut self, slots: Vec<PinnedHostSlice<u16>>) {
+        let spare_max = self.peak_slots + SPARE_SLACK;
+        for s in slots {
+            if self.spare.len() < spare_max {
+                self.spare.push(s);
+                continue;
+            }
+            let smallest = self
+                .spare
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, x)| x.len())
+                .map(|(i, _)| i);
+            if let Some(i) = smallest
+                && self.spare[i].len() < s.len()
+            {
+                self.spare[i] = s;
+            }
+        }
+    }
+
     pub fn evict(&mut self, gpu: &Gpu, bufs: Vec<Parked>) {
         // Make room for this eviction. `Block::forward` and `MLstm::forward_alloc`
         // release before allocating, which is what keeps the wait off the hot path, but
         // a block releases twice and then evicts twice — so the second eviction can
         // still arrive with the queue full. Draining here bounds the queue at the
         // depth regardless of how the callers interleave.
-        let mut in_flight = self.in_flight.borrow_mut();
-        in_flight.release(gpu);
+        // Scoped: `recycle` below needs `&mut self`, and the shared slot is re-borrowed
+        // at the end to hand it this eviction's sources.
+        self.in_flight.borrow_mut().release();
 
         let produced = gpu
             .stream
@@ -672,27 +715,21 @@ impl HostPark {
         // the slot's own length is never read back. Reusing a larger slot wastes only
         // the tail.
 
-        // Peak slots this park circulates: everything it currently owns — live
-        // generations, restored-but-not-yet-displaced ones, and the spares between them
-        // — plus what this eviction takes. The spares must be counted: with capacity
-        // matching a smaller slot can sit unused while a larger request misses, and a
-        // bound that ignored them would discard exactly the slots the next sweep needs.
-        let owned: usize =
-            self.gens.iter().map(|g| g.slots.len()).sum::<usize>() + self.spare.len();
-        self.peak_slots = self.peak_slots.max(owned + bufs.len());
-        let spare_max = self.peak_slots + SPARE_SLACK;
+        // Peak slots this park must hold LIVE at once: the generations still owed a
+        // restore, plus what this eviction takes. Deliberately not "everything the park
+        // owns" — the spare pool is what the bound below limits, so counting it here
+        // makes the bound track its own growth and it can never bind. The pool then
+        // never releases a slot, and every capacity miss page-locks one more for good.
+        let live_slots: usize =
+            self.gens[..depth].iter().map(|g| g.slots.len()).sum::<usize>() + bufs.len();
+        self.peak_slots = self.peak_slots.max(live_slots);
 
         // Reclaim the generations this eviction displaces *first*, so their slots are
         // available to it. Reclaiming afterwards would make every re-eviction at a
         // depth allocate before the slot it is about to replace comes back.
         if self.gens.len() > depth {
-            for g in self.gens.drain(depth..) {
-                for s in g.slots {
-                    if self.spare.len() < spare_max {
-                        self.spare.push(s);
-                    }
-                }
-            }
+            let displaced: Vec<_> = self.gens.drain(depth..).flat_map(|g| g.slots).collect();
+            self.recycle(displaced);
         }
 
         let mut slots = Vec::with_capacity(bufs.len());
@@ -746,16 +783,16 @@ impl HostPark {
         // eviction, and `InFlight::release` has synchronized on the copy long before
         // then — the host data is complete by construction.
         let done = self.xfer.record_event(None).expect("offload: record park");
-        in_flight.push(bufs, done);
+        self.in_flight.borrow_mut().push(bufs, done);
     }
 
     /// Free the previous eviction's buffers, ordered on the compute stream.
     ///
     /// Call at the *start* of the next block's forward, before it allocates: freeing
     /// returns memory to the allocator, and the allocator must not hand it back while
-    /// a copy is still reading it.
-    pub fn release_previous(&self, gpu: &Gpu) {
-        self.in_flight.borrow_mut().release(gpu);
+    /// a copy is still reading it. See [`InFlight::release`].
+    pub fn release_previous(&self) {
+        self.in_flight.borrow_mut().release();
     }
 
     /// Block the host until any in-flight eviction has landed. Teardown and tests.
@@ -776,9 +813,8 @@ impl HostPark {
         }
         self.sync_parked();
         self.prefetched = None;
-        for g in self.gens.drain(..self.live) {
-            self.spare.extend(g.slots);
-        }
+        let dropped: Vec<_> = self.gens.drain(..self.live).flat_map(|g| g.slots).collect();
+        self.recycle(dropped);
         self.live = 0;
     }
 
@@ -1085,6 +1121,49 @@ mod tests {
         }
     }
 
+    /// The spare pool must stay bounded when the shapes keep changing.
+    ///
+    /// This is the other half of `park_reuses_pinned_slots_across_steps`, and the half
+    /// that was missing: every test here checked that re-evicting does not page-lock,
+    /// none checked that the pool ever gives a slot back. It did not. The retention
+    /// bound was `peak_slots + SPARE_SLACK` where `peak_slots` was a high-water mark of
+    /// everything the park owned *including the spare pool* — so `spare.len() <
+    /// peak_slots + SLACK` held by construction, the reclaim never dropped a slot, and
+    /// every capacity miss pinned one more host buffer for the life of the process.
+    ///
+    /// Real windows never repeat a shape, so a training run missed constantly: ~4 GB of
+    /// pinned host memory per window, and the OOM killer within a couple of minutes.
+    #[test]
+    fn park_pool_stays_bounded_as_shapes_change() {
+        let Some(gpu) = crate::gpu::test_gpu() else {
+            return;
+        };
+        let mut park = HostPark::new(&gpu, InFlight::shared()).expect("park");
+        // Ever-larger shapes, which is what defeats best-fit reuse: each one misses and
+        // allocates, so nothing here is reused and only the bound can stop the growth.
+        for i in 0..40 {
+            if i > 0 {
+                let _ = park.restore(&gpu);
+            }
+            let t = Tensor::random(&[16 + i, 32], 1.0);
+            park.evict(&gpu, vec![DTensor::from_host(&gpu, &t).into()]);
+            park.sync_parked();
+        }
+        // One live generation of one slot, so the pool may hold SPARE_SLACK more.
+        let held = park.gens.iter().map(|g| g.slots.len()).sum::<usize>() + park.spare.len();
+        assert!(
+            held <= 1 + SPARE_SLACK + 1,
+            "spare pool grew to {held} slots over 40 shapes; the retention bound never bound"
+        );
+        // And the bytes with it: 40 growing shapes summed would be ~10x the largest.
+        let largest = (16 + 39) * 32 * 4;
+        assert!(
+            park.host_bytes() <= largest * (1 + SPARE_SLACK + 1),
+            "park holds {} pinned bytes, largest slot is {largest}",
+            park.host_bytes()
+        );
+    }
+
     /// Re-evicting the same shapes must not re-allocate pinned memory: page-locking is
     /// expensive, and a training loop parks the same shapes every window.
     #[test]
@@ -1140,12 +1219,16 @@ mod tests {
             "alternating shapes page-locked {grew} times, expected at most 1"
         );
 
-        // A larger shape legitimately reallocates: no spare is big enough.
+        // A larger shape legitimately reallocates: no spare is big enough. `host_bytes`
+        // counts the spare pool too, so the check is on the GROWTH — the smaller slots
+        // from above are still held, and are supposed to be.
         let _ = park.restore(&gpu);
+        let (before, allocs) = (park.host_bytes(), park.allocs);
         let b = Tensor::random(&[16, 64], 1.0);
         park.evict(&gpu, vec![DTensor::from_host(&gpu, &b).into()]);
         park.sync_parked();
-        assert_eq!(park.host_bytes(), 16 * 64 * 4);
+        assert_eq!(park.allocs, allocs + 1, "a larger shape must page-lock a new slot");
+        assert_eq!(park.host_bytes() - before, 16 * 64 * 4, "and only that slot");
     }
 
     /// A chunked sweep holds one generation per chunk, so a park's peak slot demand

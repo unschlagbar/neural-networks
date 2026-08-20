@@ -1,14 +1,15 @@
-//! mLSTM forward at the shapes the model actually runs, timed on its own.
+//! mLSTM forward and backward at the shapes the model actually runs.
 //!
-//!   cargo run --release --features cuda --example mlstm_fw_bench
+//!   cargo run --release --features cuda --example mlstm_bw_bench
 //!
-//! The backbone is the only place an mLSTM cell appears (B=1, T=BACKBONE_CHUNK,
-//! WORD_HIDDEN wide, 8 heads), so that row is the one that decides a step. The
-//! others bracket it.
+//! Backward is not timed on its own — it needs a forward's cache — so each row is
+//! measured twice: a forward-only loop and a forward+backward loop, with the
+//! backward reported as the difference. The `bwd` column is what this benchmark
+//! exists for.
 //!
-//! SM clock swings by more than 2x under load, so every row prints the clock it
-//! was measured at and the whole table is repeated — compare rows across repeats,
-//! not a single pair.
+//! SM clock swings by more than 2x under load, so every row prints the clock it was
+//! measured at and the whole table is repeated — compare rows across repeats, not a
+//! single pair.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -40,11 +41,10 @@ fn main() {
             .unwrap_or_else(|| "?".into())
     };
 
-    // (B, T, heads, dqk). Row 0 is the backbone cell as the trainer builds it: one
-    // sequence, BACKBONE_CHUNK long, WORD_HIDDEN wide. Rows 2-4 are the encoder's and
+    // (B, T, heads, dqk). Row 0/1 are the backbone cell as the trainer builds it: one
+    // sequence, BACKBONE_CHUNK long, WORD_HIDDEN wide. The rest are the encoder's and
     // decoder's cell — CHAR_HIDDEN wide at 16 heads, so dqk = 16, over a batch of
-    // words whose length is the sequence axis. The two regimes could hardly be
-    // further apart: `bh` is 8 at the backbone and thousands here.
+    // words whose length is the sequence axis.
     let shapes: &[(usize, usize, usize, usize)] = &[
         (1, 512, 8, 96),
         (1, 1024, 8, 96),
@@ -52,14 +52,14 @@ fn main() {
         (256, 8, 16, 16),
         (128, 16, 16, 16),
     ];
-    // `MLSTM_BENCH_ONLY=<row>` narrows the table to one shape, which is what a
-    // profiler run wants — otherwise every kernel statistic mixes all four.
-    let only: Option<usize> = std::env::var("MLSTM_BENCH_ONLY").ok().and_then(|v| v.parse().ok());
+    let only: Option<usize> = std::env::var("MLSTM_BENCH_ONLY")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let shapes: Vec<(usize, usize, usize, usize)> = match only {
         Some(i) => vec![shapes[i]],
         None => shapes.to_vec(),
     };
-    let iters = 50;
+    let iters = 30;
     let repeats = 3;
 
     let mut cells: Vec<_> = shapes
@@ -67,24 +67,27 @@ fn main() {
         .map(|&(b, t, h, dqk)| {
             let d = h * dqk;
             let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
+            let g = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
             let cell = MLstm::new_rand(&gpu, d, d, h, dqk);
             let y = DTensor::uninit(&gpu, &[b, t, d]);
-            (x, cell, y)
+            (x, g, cell, y)
         })
         .collect();
 
-    for (i, (x, cell, y)) in cells.iter_mut().enumerate() {
-        let _ = i;
+    for (x, g, cell, y) in cells.iter_mut() {
         for _ in 0..10 {
             cell.forward(&gpu, x, y);
-            cell.drop_saved();
+            let _ = cell.backward_alloc(&gpu, g);
         }
     }
     gpu.stream.synchronize().unwrap();
 
-    println!("{:>3} {:>5} {:>4} {:>4} {:>10} {:>9}", "B", "T", "H", "dqk", "ms/fwd", "clocks");
+    println!(
+        "{:>3} {:>5} {:>4} {:>4} {:>9} {:>9} {:>9}",
+        "B", "T", "H", "dqk", "ms/fwd", "ms/bwd", "clocks"
+    );
     for _ in 0..repeats {
-        for (&(b, t, h, dqk), (x, cell, y)) in shapes.iter().zip(cells.iter_mut()) {
+        for (&(b, t, h, dqk), (x, g, cell, y)) in shapes.iter().zip(cells.iter_mut()) {
             gpu.stream.synchronize().unwrap();
             let t0 = Instant::now();
             for _ in 0..iters {
@@ -92,8 +95,21 @@ fn main() {
                 cell.drop_saved();
             }
             gpu.stream.synchronize().unwrap();
-            let ms = t0.elapsed().as_secs_f64() / iters as f64 * 1e3;
-            println!("{b:>3} {t:>5} {h:>4} {dqk:>4} {ms:>10.4} {:>9}", clock());
+            let fwd = t0.elapsed().as_secs_f64() / iters as f64 * 1e3;
+
+            gpu.stream.synchronize().unwrap();
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                cell.forward(&gpu, x, y);
+                let _ = cell.backward_alloc(&gpu, g);
+            }
+            gpu.stream.synchronize().unwrap();
+            let both = t0.elapsed().as_secs_f64() / iters as f64 * 1e3;
+            println!(
+                "{b:>3} {t:>5} {h:>4} {dqk:>4} {fwd:>9.4} {:>9.4} {:>9}",
+                both - fwd,
+                clock()
+            );
         }
     }
 }

@@ -28,7 +28,7 @@ fn main() {
     for hidden in [512usize, 768, 1024, 2048, 4096] {
         let heads = 8;
         let dqk = hidden / heads;
-        let (fw, bw) = ops::mlstm_fused_smem_parts(ops::FUSED_MAX_L, dqk, dqk, heads);
+        let (fw, bw) = ops::mlstm_fused_smem_parts(ops::FUSED_MAX_L, dqk, dqk);
         let bytes = fw.max(bw);
         println!(
             "{:>12} {:>6} {:>11.1} KB {:>11.1} KB {:>10}",

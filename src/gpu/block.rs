@@ -832,7 +832,7 @@ impl<C: Cell> Block<C> {
         // itself stream-ordered, so ordering the stream suffices and the transfer
         // still overlaps this block's compute.
         if let Some(park) = &self.act.park {
-            park.release_previous(gpu);
+            park.release_previous();
         }
         let a = &mut self.act;
         a.pool.assert_drained("Block::forward");

@@ -41,14 +41,24 @@
 //! backward (`mlstm_chunking_matches_single_chunk`). Backward sweeps chunks in
 //! reverse, carrying `dC`/`dn` — BPTT over chunks, parallel form within each.
 //!
-//! The forward is four launches, and only one of them is serial in anything:
-//! `mlstm_fw_gates` (the gate scan, one block per `(b, h)`), `mlstm_fw_dC` (every
-//! chunk's own `ΔC`, all at once), `mlstm_fw_scan` (the one place the chunk
-//! recurrence is actually walked — elementwise, so it parallelises over the whole
-//! state) and `mlstm_fw_parallel` (the intra-chunk attention, one block per chunk).
+//! Each direction is four launches, in mirror-image shapes, and only one of them is
+//! serial in anything:
+//!
+//! | | forward | backward |
+//! |---|---|---|
+//! | per-timestep scalars | `mlstm_fw_gates` (gate scan, one block per `(b, h)`) | `mlstm_bw_dqn` (dψ, one warp per step) |
+//! | per-chunk state product | `mlstm_fw_dC` (every chunk's `ΔC`, all at once) | `mlstm_bw_dC` (every chunk's `ΔdC`) |
+//! | the chunk recurrence | `mlstm_state_scan` | the same kernel, reversed |
+//! | intra-chunk attention | `mlstm_fw_parallel` | `mlstm_bw_parallel` |
+//!
+//! The scan is the one place the chunk recurrence is actually walked, and it is
+//! elementwise, so it parallelises over the whole state either way. Nothing loops
+//! chunks inside a kernel: a chunk's own contribution to the state depends on
+//! nothing outside it, because `a` and `b` already carry the stabilizer.
 //!
 //! A sequence already shorter than `L` (the encoder/decoder, where T is a word
-//! length) takes the single-chunk path with no inter-chunk work at all.
+//! length) takes the single-chunk path with no inter-chunk work at all — both scans
+//! are skipped outright.
 
 use std::sync::OnceLock;
 
@@ -378,10 +388,10 @@ impl MLstm {
     /// clamped into what the kernels support rather than dispatched on: longer than
     /// `FUSED_MAX_L` clamps down (the decay matrix must fit in shared memory), and
     /// `chunk == 0` clamps UP to 1, a step-by-step recurrence.
-    fn fused_chunk(&self, gpu: &Gpu, t: usize, bh: usize) -> usize {
+    fn fused_chunk(&self, gpu: &Gpu, t: usize) -> usize {
         let l = self.chunk.min(ops::FUSED_MAX_L).min(t).max(1);
         debug_assert!(
-            ops::mlstm_fused_smem_bytes(l, self.dqk, self.dhv, bh) <= gpu.max_shared_optin,
+            ops::mlstm_fused_smem_bytes(l, self.dqk, self.dhv) <= gpu.max_shared_optin,
             "fused mLSTM shared memory exceeds this device's opt-in limit",
         );
         l
@@ -398,10 +408,9 @@ impl MLstm {
     pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
         // Release the previous eviction before allocating anything here: freeing
         // returns memory to the CUDA allocator, which must not hand it back while a
-        // copy is still reading it. Ordered on the compute stream, so it costs no host
-        // time. See `Block::forward` for the failure this prevents.
+        // copy is still reading it. See `InFlight::release`.
         if let Some(park) = &self.park {
-            park.release_previous(gpu);
+            park.release_previous();
         }
         assert_eq!(x.rank, 3, "MLstm::forward expects [B, T, in]");
         let (b, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);
@@ -418,7 +427,7 @@ impl MLstm {
         // is not pooled (`assert_drained` in `backward_alloc` wants the pool whole).
         let mut xf = DTensor::uninit(gpu, &[rows, inp]);
         xf.copy_from(gpu, x);
-        let l = self.fused_chunk(gpu, t, shape.bh());
+        let l = self.fused_chunk(gpu, t);
 
         // The six projections, all off the same narrowed `xf`. q/k/v land in slabs at
         // the kernels' own width and stay exactly where the projection wrote them —
@@ -1321,8 +1330,7 @@ mod tests {
     ///
     /// This is the load-bearing property of the chunked sweep, tested at the kernel
     /// level so a failure points at the `CARRY` seeding in `mlstm_fw_gates` /
-    /// `mlstm_fw_scan` rather than at
-    /// anything layered above it. `m` is the stabilizer: seeding it wrong does not
+    /// `mlstm_state_scan` rather than at anything layered above it. `m` is the stabilizer: seeding it wrong does not
     /// crash and produces no NaN, it silently rescales every value in the chunk — so
     /// comparing `ytil` (the kernel's output) across the split is the only thing that
     /// actually catches it.

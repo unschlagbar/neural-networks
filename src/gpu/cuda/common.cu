@@ -41,23 +41,43 @@ extern "C" __global__ void broadcast_row_resid(
     }
 }
 
-// db[o] += sum over rows of dy[r*n + o].
+// db[o] += sum over rows of dy[r*n + o], and of dy[r*n + o]*mul[r*n + o] under
+// `use_mul` (`dgamma` for RMSNorm, which is the same reduction over an elementwise
+// product). `mul` is a live pointer either way — the caller passes `dy` again when it
+// has no second operand, which costs nothing and keeps the argument non-null.
 //
-// A thread owns one column and a *slice* of the rows; `blockIdx.y` splits the row axis
-// so the reduction has more than `n` threads of parallelism. One thread per column
-// (the whole column in a serial loop) left a 768-wide layer running on 3 warps while
-// each thread strode 768 floats per step — the kernel was 13% of GPU time at 19 us a
-// call. Threads of a warp still hold adjacent `o`, so each row read stays coalesced.
+// The row axis is split across `threadIdx.y` and folded by a fixed-order tree — NOT
+// by an atomicAdd across blocks. Float addition is not associative, so an atomic made
+// the last bits of every bias gradient depend on the order the blocks happened to be
+// scheduled in; one training step later that is a different model. Here ONE block
+// owns a column tile and every row of it, so the summation order is a property of the
+// shape alone and two runs of the same shape agree bit for bit.
 //
-// Partial sums land with atomicAdd: `db` is an accumulator (`+=`) across the y-slices
-// and across calls, and the caller zeroes it between steps.
-extern "C" __global__ void add_col_sum(float* db, const float* dy, int rows, int n) {
-    int o = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= n) return;
+// A thread still owns one column and a slice of the rows, so the parallelism the
+// atomic bought is kept: it moved from `blockIdx.y` into `threadIdx.y`. Threads of a
+// warp hold adjacent `o`, so each row read stays coalesced.
+//
+// `db` is an accumulator (`+=`) across calls; the caller zeroes it between steps.
+extern "C" __global__ void add_col_sum(float* db, const float* dy, const float* mul,
+                                       int use_mul, int rows, int n) {
+    extern __shared__ float shcs[];
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
     float s = 0.0f;
-    for (int r = blockIdx.y; r < rows; r += gridDim.y) s += dy[(long)r * n + o];
-    if (gridDim.y == 1) db[o] += s;
-    else atomicAdd(&db[o], s);
+    if (o < n) {
+        for (int r = threadIdx.y; r < rows; r += blockDim.y) {
+            long i = (long)r * n + o;
+            s += use_mul ? dy[i] * mul[i] : dy[i];
+        }
+    }
+    shcs[tid] = s;
+    __syncthreads();
+    // blockDim.y is a power of two (the launcher picks it), so the tree is exact.
+    for (int half = blockDim.y >> 1; half > 0; half >>= 1) {
+        if (threadIdx.y < half) shcs[tid] += shcs[tid + half * blockDim.x];
+        __syncthreads();
+    }
+    if (threadIdx.y == 0 && o < n) db[o] += shcs[tid];
 }
 
 // out[r, :] = table[ids[r], :]. One thread per output element.
@@ -70,14 +90,38 @@ extern "C" __global__ void embedding_gather(const float* table, const unsigned* 
     }
 }
 
-// dtable[ids[r], :] += dy[r, :]. Ids may repeat -> atomicAdd.
-extern "C" __global__ void embedding_scatter_add(float* dtable, const unsigned* ids,
-                                                 const float* dy, int dim, int rows) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < rows * dim) {
-        int r = i / dim, c = i % dim;
-        atomicAdd(&dtable[ids[r] * dim + c], dy[i]);
-    }
+// dtable[ids[r], :] += dy[r, :], where ids REPEAT — the whole difficulty. An
+// atomicAdd per element is the obvious answer and is not reproducible: a token that
+// occurs 3000 times in a window has its 3000 contributions summed in whatever order
+// the blocks were scheduled in, and float addition does not associate.
+//
+// Instead the row axis is cut into `slices`, and one thread owns one (slice, column)
+// for the whole slice: it walks its rows in ASCENDING order into its slice's private
+// table, so no two threads ever touch the same slot. `embedding_scatter_merge` then
+// folds the slices in slice order. Both orders are properties of the shape.
+//
+// With one slice the "private table" is `dtable` itself and no merge is needed.
+extern "C" __global__ void embedding_scatter_add(float* part, const unsigned* ids,
+                                                 const float* dy, int dim, int rows,
+                                                 int vocab, int slices) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= dim) return;
+    const int s = blockIdx.y;
+    float* p = part + (long)s * vocab * dim + c;
+    // Balanced to the last row: `rows` need not divide `slices`.
+    const int lo = (int)((long)rows * s / slices);
+    const int hi = (int)((long)rows * (s + 1) / slices);
+    for (int r = lo; r < hi; ++r) p[(long)ids[r] * dim] += dy[(long)r * dim + c];
+}
+
+// Fold `embedding_scatter_add`'s per-slice tables into `dtable`, slices ascending.
+extern "C" __global__ void embedding_scatter_merge(float* dtable, const float* part,
+                                                   int n, int slices) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float s = 0.0f;
+    for (int k = 0; k < slices; ++k) s += part[(long)k * n + i];
+    dtable[i] += s;
 }
 
 
@@ -148,15 +192,13 @@ extern "C" __global__ void rms_norm_forward(const float* x, const float* gamma, 
     }
 }
 
-// Backward twin. Besides the reduction, this fixes the other half of the problem:
-// the thread-per-group version did an `atomicAdd` to `dgamma` for EVERY element,
-// so at ungrouped width every row's thread contended on the same 1024 slots. Here
-// each thread accumulates its strided slice into a register and issues one atomic
-// per element it owns — same total atomics, but spread across blocks rather than
-// serialized behind one thread per row, and the `s` reduction is a tree.
+// Backward twin — `dx` only. `dgamma` is a sum over ROWS of `dy ⊙ x_hat`, which
+// every block of this grid would have to contribute to; that is `add_col_sum`'s
+// reduction, and doing it here needed an atomicAdd per element, which is not
+// reproducible. The caller runs `add_col_sum(dgamma, dy, x_hat, ..)` instead.
 extern "C" __global__ void rms_norm_backward(const float* dy, const float* x_hat,
                                                  const float* inv_rms, const float* gamma,
-                                                 float* dgamma, float* dx,
+                                                 float* dx,
                                                  int groups_per_row, int group,
                                                  int total_groups) {
     int gi = blockIdx.x;
@@ -169,11 +211,8 @@ extern "C" __global__ void rms_norm_backward(const float* dy, const float* x_hat
     float inv = inv_rms[gi];
 
     float s = 0.0f;
-    for (int i = threadIdx.x; i < group; i += blockDim.x) {
-        float dyxh = dy[off + i] * x_hat[off + i];
-        atomicAdd(&dgamma[g_off + i], dyxh);
-        s += gamma[g_off + i] * dyxh;
-    }
+    for (int i = threadIdx.x; i < group; i += blockDim.x)
+        s += gamma[g_off + i] * dy[off + i] * x_hat[off + i];
     s = rmsn_block_sum(s, sh);
     float s_over_g = s / (float)group;
 

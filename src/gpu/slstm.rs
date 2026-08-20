@@ -603,10 +603,9 @@ impl SLstm {
     pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
         // Release the previous eviction before allocating anything here: freeing
         // returns memory to the CUDA allocator, which must not hand it back while a
-        // copy is still reading it. Ordered on the compute stream, so it costs no host
-        // time. See `Block::forward` for the failure this prevents.
+        // copy is still reading it. See `InFlight::release`.
         if let Some(park) = &self.park {
-            park.release_previous(gpu);
+            park.release_previous();
         }
         assert_eq!(x.rank, 3, "SLstm::forward expects [B, T, in]");
         let (b, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);

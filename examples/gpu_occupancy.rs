@@ -66,7 +66,7 @@ fn main() {
     );
 
     for (name, f, smem, grid) in ops::mlstm_fused_kernels(&gpu, l, dqk, dhv, bh, t) {
-        let threads = ops::fused_threads(name, bh, dqk);
+        let threads = ops::fused_threads(name, l, dqk, dhv);
         let fa = |a: FA| f.get_attribute(a).unwrap_or(-1);
         let regs = fa(FA::CU_FUNC_ATTRIBUTE_NUM_REGS);
         // Local memory per thread: nonzero means the kernel SPILLED registers to

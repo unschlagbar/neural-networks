@@ -1412,6 +1412,43 @@ impl Hierarchical {
         self.group_cap = cap;
     }
 
+    /// A bit-hash of every accumulated gradient, named by owner.
+    ///
+    /// Diagnostic for reproducibility: two runs of the same window against the same
+    /// weights must produce the same list, and when they do not, this says which
+    /// tensor moved. One host round-trip per tensor, so it belongs in a probe.
+    pub fn grad_signature(&self, gpu: &Gpu) -> Vec<(String, u64)> {
+        fn hash(v: &[f32]) -> u64 {
+            v.iter().fold(0xcbf29ce484222325u64, |h, x| {
+                (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3)
+            })
+        }
+        let mut out = Vec::new();
+        let mut push = |name: String, g: &DTensor| out.push((name, hash(&g.to_host(gpu).data)));
+        push("table".into(), &self.dtable);
+        for (stage, blocks) in [
+            ("enc", &self.encoder.blocks),
+            ("bb", &self.bb_blocks),
+            ("dec", &self.dec_blocks),
+        ] {
+            for (i, b) in blocks.iter().enumerate() {
+                for (j, g) in b.grads().iter().enumerate() {
+                    push(format!("{stage}{i}.g{j}"), g);
+                }
+            }
+        }
+        for (name, l) in [
+            ("bb_front", &self.bb_front),
+            ("bb_back", &self.bb_back),
+            ("dec_head", &self.dec_head),
+        ] {
+            push(format!("{name}.dw"), &l.dw);
+            push(format!("{name}.db"), &l.db);
+        }
+        push("dec_norm.dgamma".into(), &self.dec_norm.dgamma);
+        out
+    }
+
     /// L2 norm of each block's accumulated gradient, for one stage ("encoder",
     /// "backbone", "decoder"). Diagnostic — one host round-trip per tensor, so this
     /// belongs in a probe, not a training loop.
@@ -2203,8 +2240,26 @@ mod tests {
     /// activations and produce a *plausible but wrong* gradient rather than crashing.
     /// So the comparison runs through a full optimizer step and checks the tied table
     /// (fed by all three stages) and the backbone's own projections.
+    /// Backbone chunks of four words: shorter than the mLSTM's own chunk length, so
+    /// each cell call runs a single internal chunk.
     #[test]
     fn backbone_chunked_matches_unchunked() {
+        chunked_vs_unchunked(12, 4);
+    }
+
+    /// The same comparison with each backbone chunk *longer* than the mLSTM's `L`, so
+    /// a cell call runs several internal chunks and the state crossing the call border
+    /// is a scanned one rather than a single chunk's own. Cross-call carry on top of a
+    /// multi-chunk scan is a third path, reachable from neither alone, and it is the
+    /// one the real config takes: 512-word chunks against `L` = 32 is 16 internal
+    /// chunks, where the four-word case above is one.
+    #[test]
+    fn backbone_chunked_matches_unchunked_multi_mlstm_chunk() {
+        let chunk = crate::gpu::ops::FUSED_MAX_L * 3 / 2;
+        chunked_vs_unchunked(chunk * 3, chunk);
+    }
+
+    fn chunked_vs_unchunked(nwords: usize, chunk: usize) {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
@@ -2220,10 +2275,10 @@ mod tests {
             w_token: 11,
             cap: 30.0,
         };
-        // 12 words, so a chunk of 4 gives three chunks — two interior borders, which
-        // is what a single-border test would miss.
-        let tokens: Vec<usize> = (0..24).map(|i| 1 + i % 9).collect();
-        let words: Vec<Range<usize>> = (0..12)
+        // Callers pass three chunks' worth, so there are two interior borders — a
+        // single-border test misses a state that only goes wrong from the second on.
+        let tokens: Vec<usize> = (0..nwords * 2).map(|i| 1 + i % 9).collect();
+        let words: Vec<Range<usize>> = (0..nwords)
             .map(|w| Range {
                 start: w * 2,
                 end: w * 2 + 2,
@@ -2232,8 +2287,9 @@ mod tests {
 
         let run = |chunk: usize| -> (f32, Vec<f32>, Vec<f32>) {
             let mut model = Hierarchical::new(&gpu, cfg);
-            // Same starting weights for both legs.
-            let seed = std::env::temp_dir().join("gpu_chunk_seed.hier");
+            // Same starting weights for both legs. Named per word count so the two
+            // callers cannot hand each other the wrong seed.
+            let seed = std::env::temp_dir().join(format!("gpu_chunk_seed_{nwords}.hier"));
             let seed = seed.to_str().unwrap();
             if chunk != usize::MAX {
                 model.save(&gpu, seed, &[]).expect("save seed");
@@ -2249,11 +2305,20 @@ mod tests {
             // full-size weight difference and post-step weights cannot distinguish
             // that from a real error.
             let table: Vec<f32> = model.dtable.to_host(&gpu).data.to_vec();
-            let front: Vec<f32> = model.bb_front.dw.to_host(&gpu).data.to_vec();
-            (loss, table, front)
+            // The backbone's own gradients, not just what leaks out through
+            // `bb_front`: a state that crosses a chunk border wrong lands on the cells
+            // that carry it, and is diluted by the time it reaches the stages on
+            // either side.
+            let mut bb: Vec<f32> = Vec::new();
+            for blk in model.bb_blocks.iter() {
+                for g in blk.grads() {
+                    bb.extend_from_slice(&g.to_host(&gpu).data);
+                }
+            }
+            (loss, table, bb)
         };
 
-        let (loss_c, table_c, front_c) = run(4);
+        let (loss_c, table_c, front_c) = run(chunk);
         let (loss_u, table_u, front_u) = run(usize::MAX);
 
         // A tolerance test, not an equality one, for the reason
@@ -2292,7 +2357,7 @@ mod tests {
             );
         };
         check(&table_c, &table_u, "tied table");
-        check(&front_c, &front_u, "bb_front");
+        check(&front_c, &front_u, "backbone blocks");
     }
 
     /// A backbone sweep of three or more chunks must give the same gradients as one.

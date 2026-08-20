@@ -52,6 +52,7 @@ const NAMES: &[&str] = &[
     "add_col_sum",
     "embedding_gather",
     "embedding_scatter_add",
+    "embedding_scatter_merge",
     "rms_norm_forward",
     "rms_norm_backward",
     "softmax_ce",
@@ -95,8 +96,8 @@ const NAMES: &[&str] = &[
     "revcumsum_dlogsig",
     "revcumsum_dlogsig_block",
     "mlstm_fw_gates",
-    "mlstm_fw_scan",
-    "mlstm_bw_dC",
+    "mlstm_state_scan",
+    "mlstm_bw_dqn",
     "scatter_rows",
     "masked_softmax_ce",
     "masked_softmax_ce_block",
@@ -104,7 +105,8 @@ const NAMES: &[&str] = &[
 
 /// Kernels compiled with `MMA_TF32` against the real device arch — the ones that
 /// issue `mma.sync`, which does not exist at NVRTC's default target.
-const MMA_NAMES: &[&str] = &["mlstm_fw_dC", "mlstm_fw_parallel", "mlstm_bw_parallel"];
+const MMA_NAMES: &[&str] =
+    &["mlstm_fw_dC", "mlstm_fw_parallel", "mlstm_bw_dC", "mlstm_bw_parallel"];
 
 
 /// Cooperative-launch kernels; need `<cooperative_groups.h>`, so they share the
@@ -213,17 +215,15 @@ pub struct Kernels {
     mlstm_spec: std::sync::Mutex<HashMap<MlstmSpecKey, Option<CudaFunction>>>,
 }
 
-/// The shape constants a fused mLSTM kernel is built at. `tv` and `threads` are
-/// only meaningful for the two recurrent kernels — they are the strided loop bound
-/// and the block width those two are dominated by — and are passed as 0 for the
-/// parallel pair so the two never share a cache slot.
+/// The shape constants a fused mLSTM kernel is built at. `kt`/`vt` are the head-dim
+/// slice widths and are 0 for the two kernels that do not tile them, so a ΔC build
+/// and a parallel build never share a cache slot.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct MlstmSpec {
     pub l: usize,
     pub dqk: usize,
     pub dhv: usize,
     pub h: usize,
-    pub tv: usize,
     pub threads: u32,
     /// `dqk` slice width; 0 for the kernels that do not tile it.
     pub kt: usize,
@@ -439,7 +439,7 @@ impl Kernels {
             return hit.clone();
         }
         let (major, minor) = self.arch;
-        let MlstmSpec { l, dqk, dhv, h, tv, threads, kt, vt } = spec;
+        let MlstmSpec { l, dqk, dhv, h, threads, kt, vt } = spec;
         let mut options = vec![
             format!("--gpu-architecture=compute_{major}{minor}"),
             "-DMMA_TF32=1".to_string(),
@@ -448,7 +448,6 @@ impl Kernels {
             format!("-DMLSTM_DQK={dqk}"),
             format!("-DMLSTM_DHV={dhv}"),
             format!("-DMLSTM_H={h}"),
-            format!("-DMLSTM_TV={}", tv.max(1)),
             format!("-DMLSTM_THREADS={}", threads.max(1)),
         ];
         if kt > 0 {
