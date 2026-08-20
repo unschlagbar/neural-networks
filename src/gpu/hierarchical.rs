@@ -968,11 +968,15 @@ impl Hierarchical {
         let spans = self.backbone_spans(dw);
         let rows_max = spans.iter().map(|&(_, len)| len).max().unwrap_or(0);
 
-        if spans.len() > 1 {
-            for blk in self.bb_blocks.iter_mut() {
-                blk.set_carry(true);
-                blk.reset_state(gpu);
-            }
+        // Unconditional, not `if spans.len() > 1`: a window that fits in one chunk is an
+        // unchunked sweep and must be set up as one. Skipping it leaves `carry` true from
+        // whatever the previous window was, and that window's final state and BPTT
+        // gradient still loaded — so a short window resumes the recurrence of the
+        // document before it.
+        let carry = spans.len() > 1;
+        for blk in self.bb_blocks.iter_mut() {
+            blk.set_carry(carry);
+            blk.reset_state(gpu);
         }
         // `bb_back`'s input per chunk. `Linear::forward` saves its input for `dW`, and a
         // later chunk's forward would overwrite it — so each chunk's is kept here and
