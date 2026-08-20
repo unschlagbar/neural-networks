@@ -2718,54 +2718,6 @@ pub fn swiglu_backward_into(
 
 // mLSTM parallel/chunkwise core (see gpu/mlstm.rs).
 
-/// Position-major `[N, H*W]` (N=B·T) → head-major `[B*H, T, W]`.
-pub fn head_gather(gpu: &Gpu, x: &DTensor, b: usize, h: usize, t: usize, w: usize) -> DTensor {
-    let mut out = DTensor::uninit(gpu, &[b * h, t, w]);
-    let (bi, hi, ti, wi) = (b as i32, h as i32, t as i32, w as i32);
-    let f = gpu.kernels.get("head_gather");
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&x.buf)
-        .arg(&mut out.buf)
-        .arg(&bi)
-        .arg(&hi)
-        .arg(&ti)
-        .arg(&wi);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((b * h * t * w) as u32)) }.expect("head_gather");
-    out
-}
-
-/// Head-major `[B*H, T, W]` → position-major `[N, H*W]` (inverse of `head_gather`).
-pub fn head_scatter(gpu: &Gpu, x: &DTensor, b: usize, h: usize, t: usize, w: usize) -> DTensor {
-    let mut out = DTensor::uninit(gpu, &[b * t, h * w]);
-    head_scatter_into(gpu, x, b, h, t, w, &mut out);
-    out
-}
-
-/// Head-major `[B*H, T, W]` → position-major `[N, H*W]` into a caller-owned
-/// buffer — the no-allocation form of [`head_scatter`].
-pub fn head_scatter_into(
-    gpu: &Gpu,
-    x: &DTensor,
-    b: usize,
-    h: usize,
-    t: usize,
-    w: usize,
-    out: &mut DTensor,
-) {
-    assert_eq!(out.len(), b * t * h * w, "head_scatter: output size");
-    let (bi, hi, ti, wi) = (b as i32, h as i32, t as i32, w as i32);
-    let f = gpu.kernels.get("head_scatter");
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&x.buf)
-        .arg(&mut out.buf)
-        .arg(&bi)
-        .arg(&hi)
-        .arg(&ti)
-        .arg(&wi);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((b * h * t * w) as u32)) }
-        .expect("head_scatter");
-}
-
 /// Inclusive cumsum of logσ along T, per row of `f` `[BH, T]` → `fc` `[BH, T]`.
 pub fn cumsum_logsig(gpu: &Gpu, f: &DTensor) -> DTensor {
     let (bh, t) = (f.rows(), f.cols());
@@ -2803,54 +2755,6 @@ fn no_block_scan() -> bool {
 /// 1024. A row shorter than the block leaves the tail lanes idle but still coalesced.
 fn scan_block_dim(t: usize) -> u32 {
     t.div_ceil(32).clamp(1, 32) as u32 * 32
-}
-
-/// Per-row stabilizer `m` `[BH, T]` = `max(max_{j≤t}(fc_t−fc_j+ig_j), fc_t+m_prev)`.
-pub fn mlstm_rowmax_m(gpu: &Gpu, fc: &DTensor, ig: &DTensor, m_prev: &DTensor) -> DTensor {
-    let (bh, t) = (fc.rows(), fc.cols());
-    let mut m = DTensor::uninit(gpu, &[bh, t]);
-    let (ti, bht) = (t as i32, (bh * t) as i32);
-    let f = gpu.kernels.get("mlstm_rowmax_m");
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&fc.buf)
-        .arg(&ig.buf)
-        .arg(&m_prev.buf)
-        .arg(&mut m.buf)
-        .arg(&ti)
-        .arg(&bht);
-    unsafe { lb.launch(row_block_cfg(bh * t, t)) }.expect("mlstm_rowmax_m");
-    m
-}
-
-/// `DS = D̄ ⊙ S` plus the decay weights `D̄`, row normalizer `qn` and `ψ`. `s` is
-/// `[BH, T, T]`; returns `(Dbar, DS, qn, psi)`. `D̄` is retained for the backward.
-pub fn mlstm_ds(
-    gpu: &Gpu,
-    s: &DTensor,
-    fc: &DTensor,
-    ig: &DTensor,
-    m: &DTensor,
-) -> (DTensor, DTensor, DTensor, DTensor) {
-    let (bh, t) = (fc.rows(), fc.cols());
-    let mut dbar = DTensor::uninit(gpu, &[bh, t, t]);
-    let mut ds = DTensor::uninit(gpu, &[bh, t, t]);
-    let mut qn = DTensor::uninit(gpu, &[bh, t]);
-    let mut psi = DTensor::uninit(gpu, &[bh, t]);
-    let (ti, bht) = (t as i32, (bh * t) as i32);
-    let f = gpu.kernels.get("mlstm_ds");
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&s.buf)
-        .arg(&fc.buf)
-        .arg(&ig.buf)
-        .arg(&m.buf)
-        .arg(&mut dbar.buf)
-        .arg(&mut ds.buf)
-        .arg(&mut qn.buf)
-        .arg(&mut psi.buf)
-        .arg(&ti)
-        .arg(&bht);
-    unsafe { lb.launch(row_block_cfg(bh * t, t)) }.expect("mlstm_ds");
-    (dbar, ds, qn, psi)
 }
 
 // mLSTM chunking (inter-chunk state carry; see gpu/mlstm.rs).
@@ -3139,85 +3043,6 @@ fn unslice_t_inner(
     unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("unslice_t");
 }
 
-/// The chunk's two inter-chunk decay weight vectors, both `[BH, L]`:
-/// `b_t = exp(fc_t + m_prev − m_t)` (carried state → row t) and
-/// `a_j = exp(fc_last − fc_j + ig_j − m_last)` (row j → outgoing state).
-pub fn mlstm_chunk_ab(
-    gpu: &Gpu,
-    fc: &DTensor,
-    ig: &DTensor,
-    m: &DTensor,
-    m_prev: &DTensor,
-) -> (DTensor, DTensor) {
-    let (bh, l) = (fc.rows(), fc.cols());
-    let mut b = DTensor::uninit(gpu, &[bh, l]);
-    let mut a = DTensor::uninit(gpu, &[bh, l]);
-    let (li, bhl) = (l as i32, (bh * l) as i32);
-    let f = gpu.kernels.get("mlstm_chunk_ab");
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&fc.buf)
-        .arg(&ig.buf)
-        .arg(&m.buf)
-        .arg(&m_prev.buf)
-        .arg(&mut b.buf)
-        .arg(&mut a.buf)
-        .arg(&li)
-        .arg(&bhl);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((bh * l) as u32)) }.expect("mlstm_chunk_ab");
-    (b, a)
-}
-
-/// `out = s ⊙ x` broadcast over the trailing width `w`: `out[i] = s[i/w]·x[i]`.
-pub fn mul_rows(gpu: &Gpu, x: &DTensor, s: &DTensor, w: usize) -> DTensor {
-    let total = x.len();
-    assert_eq!(total, s.len() * w, "mul_rows: {total} != {} · {w}", s.len());
-    let mut out = DTensor::uninit(gpu, x.dims());
-    let (wi, total_i) = (w as i32, total as i32);
-    let f = gpu.kernels.get("mul_rows");
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&mut out.buf)
-        .arg(&x.buf)
-        .arg(&s.buf)
-        .arg(&wi)
-        .arg(&total_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("mul_rows");
-    out
-}
-
-/// `out += s ⊙ x` broadcast over the trailing width `w`. Doubles as the per-head
-/// state decay (`C += g[head]·C_prev`, with `w` = the head's element count).
-pub fn mul_rows_add(gpu: &Gpu, out: &mut DTensor, x: &DTensor, s: &DTensor, w: usize) {
-    let total = x.len();
-    assert_eq!(total, out.len(), "mul_rows_add: out/x length mismatch");
-    assert_eq!(
-        total,
-        s.len() * w,
-        "mul_rows_add: {total} != {} · {w}",
-        s.len()
-    );
-    let (wi, total_i) = (w as i32, total as i32);
-    let f = gpu.kernels.get("mul_rows_add");
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&mut out.buf)
-        .arg(&x.buf)
-        .arg(&s.buf)
-        .arg(&wi)
-        .arg(&total_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("mul_rows_add");
-}
-
-/// `ψ = max(|qn|, 1)` — needed once the inter-chunk term has been folded into `qn`.
-pub fn psi_from_qn(gpu: &Gpu, qn: &DTensor, m: &DTensor) -> DTensor {
-    let n = qn.len();
-    let n_i = n as i32;
-    let mut psi = DTensor::uninit(gpu, qn.dims());
-    let f = gpu.kernels.get("psi_from_qn");
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&qn.buf).arg(&m.buf).arg(&mut psi.buf).arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("psi_from_qn");
-    psi
-}
-
 /// `out[r] += Σ_w x[r,w]·y[r,w]` for `[R, W]` operands (`out` is `[R]`).
 pub fn row_dot_add(gpu: &Gpu, out: &mut DTensor, x: &DTensor, y: &DTensor, w: usize) {
     let r = out.len();
@@ -3493,63 +3318,6 @@ pub fn ogate_bwd(
     (do_pre, d_yhat)
 }
 
-/// Backward of `ytil = num/ψ` → `(d_num, d_qn)`. `num` `[BH,T,dhv]`, `psi`/`qn` `[BH,T]`.
-pub fn div_rows_bwd(
-    gpu: &Gpu,
-    d_ytil: &DTensor,
-    num: &DTensor,
-    psi: &DTensor,
-    qn: &DTensor,
-    m: &DTensor,
-    dhv: usize,
-) -> (DTensor, DTensor) {
-    let (bh, t) = (psi.rows(), psi.cols());
-    let mut d_num = DTensor::uninit(gpu, num.dims());
-    let mut d_qn = DTensor::uninit(gpu, &[bh, t]);
-    let (dhv_i, bht) = (dhv as i32, (bh * t) as i32);
-    let f = gpu.kernels.get("div_rows_bwd");
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&d_ytil.buf)
-        .arg(&num.buf)
-        .arg(&psi.buf)
-        .arg(&qn.buf)
-        .arg(&m.buf)
-        .arg(&mut d_num.buf)
-        .arg(&mut d_qn.buf)
-        .arg(&dhv_i)
-        .arg(&bht);
-    unsafe { lb.launch(row_block_cfg(bh * t, dhv)) }.expect("div_rows_bwd");
-    (d_num, d_qn)
-}
-
-/// Backward of `DS = D̄⊙S` + qn-sum → `(dS, P)`. `dds_num = d_num·Vᵀ` (num path),
-/// `d_qn` the qn path; `dbar`/`ds` the saved forward weights.
-pub fn mlstm_ds_bwd(
-    gpu: &Gpu,
-    dds_num: &DTensor,
-    d_qn: &DTensor,
-    dbar: &DTensor,
-    ds: &DTensor,
-) -> (DTensor, DTensor) {
-    let (bh, t, _) = (dds_num.shape[0], dds_num.shape[1], dds_num.shape[2]);
-    let total = bh * t * t;
-    let mut d_s = DTensor::uninit(gpu, &[bh, t, t]);
-    let mut p = DTensor::uninit(gpu, &[bh, t, t]);
-    let (ti, total_i) = (t as i32, total as i32);
-    let f = gpu.kernels.get("mlstm_ds_bwd");
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&dds_num.buf)
-        .arg(&d_qn.buf)
-        .arg(&dbar.buf)
-        .arg(&ds.buf)
-        .arg(&mut d_s.buf)
-        .arg(&mut p.buf)
-        .arg(&ti)
-        .arg(&total_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("mlstm_ds_bwd");
-    (d_s, p)
-}
-
 /// Reduce `P` `[BH,T,T]` into `(dfc, dig)` `[BH,T]` (see kernel).
 pub fn mlstm_dfc_dig(gpu: &Gpu, p: &DTensor) -> (DTensor, DTensor) {
     let (bh, t) = (p.shape[0], p.shape[1]);
@@ -3599,22 +3367,6 @@ pub fn revcumsum_dlogsig(gpu: &Gpu, dfc: &DTensor, f: &DTensor) -> DTensor {
     df
 }
 
-/// Row-normalize `num` `[BH, T, dhv]` by `psi` `[BH, T]` → `ytil` `[BH, T, dhv]`.
-pub fn div_rows(gpu: &Gpu, num: &DTensor, psi: &DTensor, dhv: usize) -> DTensor {
-    let total = num.len();
-    let mut ytil = DTensor::uninit(gpu, num.dims());
-    let (dhv_i, total_i) = (dhv as i32, total as i32);
-    let f = gpu.kernels.get("div_rows");
-    let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&num.buf)
-        .arg(&psi.buf)
-        .arg(&mut ytil.buf)
-        .arg(&dhv_i)
-        .arg(&total_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("div_rows");
-    ytil
-}
-
 /// Elementwise product `out = a ⊙ b` (fresh allocation).
 pub fn mul(gpu: &Gpu, a: &DTensor, b: &DTensor) -> DTensor {
     let mut out = DTensor::uninit(gpu, a.dims());
@@ -3653,16 +3405,60 @@ pub fn mul_into(gpu: &Gpu, a: &DTensor, b: &DTensor, out: &mut DTensor) {
 
 // Fused chunkwise mLSTM (TFLA). See the kernel block in `gpu/kernels.rs`.
 //
-// Three launches forward, two backward, for a whole sequence — against ~25 per
-// chunk on the op-at-a-time path. The [L, L] decay matrix stays in shared memory,
-// so none of the per-chunk intermediates the old path allocated exist at all.
+// Four launches forward, two backward, for a whole sequence. The [L, L] decay
+// matrix stays in shared memory and never reaches HBM.
 
-/// Threads per block for the two RECURRENT kernels (`fw_C`, `bw_dC`). They are
-/// small and shared-memory-cheap; their problem is grid size, not warp count.
+/// Threads per block for `mlstm_bw_dC`, the one kernel still shaped as a serial
+/// walk over chunks carrying a `[dhv, dqk]` state.
 ///
-/// Must stay a power of two, and must not exceed the `__shared__ float sRed[256]`
-/// that `fw_C`'s max-reduction indexes.
-pub const FUSED_THREADS_REC: u32 = 256;
+/// It is latency-bound, not throughput-bound: the state dependency is an axis that
+/// cannot be parallelized, so what matters is how fast one chunk iteration retires,
+/// and wide blocks shorten both the per-timestep reduction and the `[tv, dqk]`
+/// accumulation.
+///
+/// 512 measured best at dqk=dhv ∈ {32, 64}, B=1, T=4096: 2.91 ms/iter against 3.57
+/// at 256, i.e. −18%. 1024 is worse again (3.57) — past 512 the block stops fitting
+/// well enough to keep several resident per SM.
+///
+/// Must stay a power of two and must not exceed the kernel's `sRed[1024]`.
+/// `MLSTM_THREADS_REC=<n>` overrides for a sweep.
+pub const FUSED_THREADS_REC: u32 = 512;
+
+/// [`FUSED_THREADS_REC`], chosen against the same regime split as [`fused_tv`].
+///
+/// A wide block shortens one serial chunk iteration, which is what the backbone is
+/// bound by (−18% there). But it only pays while blocks are scarce: once `bh` alone
+/// oversubscribes the machine, 512-thread blocks cut how many stay resident per SM
+/// and the encoder/decoder loses 8–17% against 256.
+///
+/// The width also depends on `dqk`, and not monotonically: the block strides a
+/// `tv*dqk` accumulation, so a head dim that is not a power of two leaves partial
+/// warps idle in the reduction and prefers a narrower block. Measured at bh=8,
+/// 4 interleaved repeats (median ms/iter):
+///
+/// | dqk | 256 | 512 |
+/// |-----|-----|-----|
+/// | 64  | 3.15 | **2.74** |
+/// | 96  | **4.33** | 4.75 |
+///
+/// Bounded by `bw_dC`'s `sRed[1024]`, which its max-reduction indexes by tid.
+/// `MLSTM_THREADS_REC=<n>` pins it for a sweep.
+fn fused_threads_rec(bh: usize, dqk: usize) -> u32 {
+    static N: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let pinned = *N.get_or_init(|| {
+        std::env::var("MLSTM_THREADS_REC")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n: &u32| n > 0 && n <= 1024 && n.is_power_of_two())
+    });
+    if let Some(n) = pinned {
+        return n;
+    }
+    if bh >= 84 {
+        return 256;
+    }
+    if dqk.is_power_of_two() { FUSED_THREADS_REC } else { 256 }
+}
 
 /// Threads per block for the two PARALLEL kernels (`fw_parallel`, `bw_parallel`).
 ///
@@ -3677,6 +3473,15 @@ pub const FUSED_THREADS_REC: u32 = 256;
 /// Must stay a power of two and not exceed `bw_parallel`'s `sRed[512]`.
 pub const FUSED_THREADS_PAR: u32 = 512;
 
+/// Threads per block for `mlstm_fw_gates`. A block owns one `(b, h)` and gives one
+/// WARP to each chunk, so this caps how many chunks it works on at a time; the
+/// serial scan that follows them runs on a single thread either way.
+pub const GATES_THREADS: u32 = 256;
+
+/// Threads per block for `mlstm_fw_scan`. Pure streaming over state elements — the
+/// block width only sets how the grid is cut.
+pub const SCAN_THREADS: u32 = 256;
+
 /// Longest chunk the fused kernels support. `L` bounds the shared-memory
 /// footprint — the backward stages `[L, dqk]`, `[L, dhv]` and `[L, L]` blocks plus
 /// two `[dhv, dqk]` states, which at L=32, dqk=dhv=64 is ~70 KB, inside the 99 KB
@@ -3684,6 +3489,63 @@ pub const FUSED_THREADS_PAR: u32 = 512;
 /// (`mlstm_chunking_matches_single_chunk` pins every L to the same numbers), so
 /// capping it costs accuracy nothing.
 pub const FUSED_MAX_L: usize = 32;
+
+/// Head-dim slice width the two parallel kernels walk the `dqk` axis in.
+///
+/// Must match `MLSTM_KT` in `mlstm_fused.cu` — the host sizes the dynamic shared
+/// memory the kernel then indexes, so a disagreement is an out-of-bounds walk rather
+/// than a compile error. A fixed cap, not a divisor of any head dim: widening `dqk`
+/// raises the kernel's trip count and leaves the footprint alone. A multiple of 16,
+/// the bf16 mma's contraction depth.
+pub const MLSTM_KT: usize = 32;
+
+/// [`MLSTM_KT`], with `MLSTM_KT=<n>` honoured as a pin for a sweep. Rounded to the
+/// mma contraction pad so the value the host sizes for is the value the kernel tiles
+/// to.
+pub fn mlstm_vt() -> usize {
+    static PIN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let pinned = *PIN.get_or_init(|| {
+        std::env::var("MLSTM_VT").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 8)
+    });
+    // 32 everywhere by default. A wide head measures slightly better on the dhv axis
+    // at 64 (dhv=128: 5.89 vs 6.34), but `mlstm_kt` already widens at that width and
+    // the two together put `bw_parallel` at 107.6 KB — over the 99 KB opt-in and
+    // straight back onto the op-at-a-time path. Widening dqk is the better half of
+    // that trade: KT=64/VT=32 measures 5.76 and fits in 75.4 KB.
+    mma_pad(pinned.unwrap_or(32), 8)
+}
+
+/// `dhv` slice width, the `dhv` twin of [`MLSTM_KT`]. Slices OUTPUT columns rather
+/// than a contraction, so no slice needs accumulating across iterations.
+pub const MLSTM_VT: usize = 64;
+
+/// Widest head dim the fused kernels are efficient at.
+///
+/// Not a capability limit — both head dims are tiled, so they FIT at any width (flat
+/// 75.4 KB). It is where they stop being the fast choice: a block walks `NKT·NVT`
+/// slice passes, so its work grows quadratically in the head dim. Measured at B=1
+/// T=4096 H=8 against the op-at-a-time path that used to serve as the fallback
+/// (median ms/iter, fused vs that path): dqk=128 5.94/6.24, dqk=192 13.7/10.0,
+/// dqk=256 17.6/13.7, dqk=512 71/40.
+///
+/// **Nothing enforces this any more.** The op-at-a-time path was removed once every
+/// shape the model builds (dqk 96/24/16) sat below this line, so a wider head runs
+/// the fused kernels regardless and pays the ratio above. Every current config is
+/// well inside it; a future `WORD_HIDDEN >= 1536` (dqk 192 at 8 heads) is where it
+/// starts to matter, and that is the point to revisit the L-axis blocking rather
+/// than reinstate a second code path.
+pub const FUSED_MAX_HEAD: usize = 128;
+
+pub fn mlstm_kt(dqk: usize) -> usize {
+    static PIN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let pinned = *PIN.get_or_init(|| {
+        std::env::var("MLSTM_KT").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 8)
+    });
+    // The forward's parallel kernel contracts 16 at a time (the bf16 mma's K), so
+    // every slice width is a multiple of 16; the backward's contracts 8 and is happy
+    // with any multiple of 16 too.
+    mma_pad(pinned.unwrap_or(if dqk >= 128 { 64 } else { MLSTM_KT }), 16)
+}
 
 /// What forward hands to backward. Everything here is `[BH, …]` head-major.
 ///
@@ -3741,29 +3603,55 @@ impl MlstmFused {
 ///
 /// The `+ 1`s are the bank-conflict pad: every 2D shared array is stored with its
 /// row stride one float longer than its row, so that warps walking `row` at fixed
-/// `col` spread across banks instead of piling onto one. See `mlstm_fw_C`.
-fn fused_smem(kind: &str, l: usize, dqk: usize, dhv: usize) -> usize {
-    let (lq, lv, ls) = (dqk + 1, dhv + 1, l + 1);
-    let tv = fused_tv(dhv);
+/// `col` spread across banks instead of piling onto one. Tiles that feed an mma are
+/// bf16 and pad by `bf16_ld` instead, which spreads the 32-bit PAIR loads a fragment
+/// makes.
+fn fused_smem(kind: &str, l: usize, dqk: usize, dhv: usize, bh: usize) -> usize {
+    let lq = dqk + 1;
+    let tv = fused_tv(dhv, bh);
     let lvt = tv + 1; // the two recurrent kernels stage only a `tv`-wide slice of v
     match kind {
-        "fw_C" => l * lq + l * lvt + tv * lq + dqk + 3 * l,
-        "fw_parallel" => 2 * l * lq + l * lv + dhv * lq + l * ls + dqk + 5 * l,
         "bw_dC" => l * lq + l * lvt + tv * lq + dqk + 2 * l,
-        "bw_parallel" => 2 * l * lq + 2 * l * lv + l * ls + 2 * dhv * lq + 2 * dqk + 11 * l,
-        // The mma kernels pad every dim up to the tensor-core tile (rows to the
+        // `mlstm_fw_dC` stages the chunk's V (with `a` folded in) and K, both padded
+        // up to the mma tile. No `[L, L]` extent and no state tile: the output goes
+        // straight from the accumulators to HBM.
+        "fw_dC" => {
+            let (lp, vp, kp) = (mma_pad(l, 16), mma_pad(dhv, 16), mma_pad(dqk, 8));
+            // The two tiles are bf16, so they count half a float per element.
+            l + (lp * bf16_ld(vp) + lp * bf16_ld(kp)).div_ceil(2)
+        }
+        // The parallel kernels pad every dim up to the tensor-core tile (rows to the
         // mma M=16, the contraction to K=8, the columns to N=8) and zero-fill the
         // pad, which is what lets one code path serve a short last chunk and an odd
         // dqk/dhv alike. Must match the `LP`/`KP`/`VP` the kernel recomputes.
-        "fw_parallel_mma" => {
-            let (lp, kp, vp) = (mma_pad(l, 16), mma_pad(dqk, 8), mma_pad(dhv, 8));
-            let (lq, lv, ls) = (kp + 1, vp + 1, lp + 1);
-            2 * lp * lq + lp * lv + vp * lq + lp * ls + kp + 5 * lp
+        // Both head dims are sliced (`MLSTM_KT` / `MLSTM_VT`), so every buffer
+        // spanning one is sized to the slice and the footprint is flat in dqk/dhv.
+        // `sAcc` stages the output tile between the two dots that write it, which
+        // no longer share a warp once the dqk contraction has its own slice loop.
+        "fw_parallel" => {
+            let (lp, kp, vp) = (mma_pad(l, 16), mma_pad(dqk, 16), mma_pad(dhv, 8));
+            let kt = mma_pad(mlstm_kt(dqk).min(kp), 16);
+            let vt = mma_pad(mlstm_vt().min(vp), 8);
+            let (ls, la) = (lp + 1, vt + 1);
+            let (lq, lv, ld) = (bf16_ld(kt), bf16_ld(vt), bf16_ld(lp));
+            // fp32: the decay matrix, the per-row scalars and the output tile.
+            let f32s = lp * ls + kt + 6 * lp + lp * la;
+            // bf16: every mma operand, at half a float per element.
+            let bf16s = 2 * lp * lq + lp * lv + vt * lq + lp * ld;
+            f32s + bf16s.div_ceil(2)
         }
-        "bw_parallel_mma" => {
+        // The dqk axis is sliced `MLSTM_KT` wide (see `mlstm_bw_parallel`), so
+        // every buffer spanning it is sized to the slice, not the head dim. `sSt`
+        // and `sPre` stage the two dqk-contracted products across slices.
+        "bw_parallel" => {
             let (lp, kp, vp) = (mma_pad(l, 16), mma_pad(dqk, 8), mma_pad(dhv, 8));
-            let (lq, lv, ls) = (kp + 1, vp + 1, lp + 1);
-            2 * lp * lq + 2 * lp * lv + lp * ls + 2 * vp * lq + 2 * kp + 11 * lp
+            let kt = mma_pad(mlstm_kt(dqk).min(kp), 8);
+            let vt = mma_pad(mlstm_vt().min(vp), 8);
+            let (lq, lv, ls, lk) = (kt + 1, vt + 1, lp + 1, kt + 1);
+            // sDds stages phase 4's dhv contraction across slices; sDqi/sDki do the
+            // same for phase 5's two dhv-contracting dots.
+            2 * lp * lq + 4 * lp * lv + 2 * lp * ls + 2 * vt * lq + 2 * lp * lk
+                + 2 * kt + 11 * lp
         }
         _ => unreachable!(),
     }
@@ -3774,65 +3662,61 @@ fn mma_pad(n: usize, to: usize) -> usize {
     n.div_ceil(to) * to
 }
 
-/// Whether the tensor-core kernels are *selected* (as opposed to merely compiled).
-///
-/// `MLSTM_NO_MMA=1` forces the scalar path: the A/B baseline for benchmarking, the
-/// exact-fp32 oracle `mlstm_fused_mma_matches_scalar` pins the tensor-core path
-/// against, and the escape hatch if a tensor-core kernel ever misbehaves.
-static MMA_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-static MMA_INIT: std::sync::Once = std::sync::Once::new();
-
-/// Public read of [`mma_enabled`] for the fused-vs-legacy dispatch, which must know
-/// which path's shared-memory footprint to compare against the device limit.
-pub fn mma_enabled_pub() -> bool {
-    mma_enabled()
+/// Row stride of a bf16 shared tile, in elements. Must match `BF16_LD` in
+/// `mlstm_fused.cu` — the host sizes the dynamic shared memory the kernel indexes.
+fn bf16_ld(w: usize) -> usize {
+    mma_pad(w, 16) + 8
 }
 
-fn mma_enabled() -> bool {
-    MMA_INIT.call_once(|| {
-        let on = std::env::var("MLSTM_NO_MMA").is_err();
-        MMA_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+/// Value-dimension tile for `mlstm_bw_dC`. Its grid is otherwise BH alone — 8 blocks
+/// at the backbone's shape — so `v` is split to fill the machine: the grid is
+/// `(ceil(dhv/tv), BH)`, and a smaller tile means MORE blocks.
+///
+/// This is what decides the backward, because it is the one kernel that cannot be
+/// parallelized over chunks. (The forward's twin, `mlstm_fw_C`, was replaced by
+/// `mlstm_fw_dC` + `mlstm_fw_scan`, which need no `v` split at all.)
+///
+/// The right tile depends on whether `bh` alone already fills the machine, and the
+/// two cells in this model sit on opposite sides of that line:
+///
+/// | shape | bh | tv=4 | tv=16 |
+/// |---|---|---|---|
+/// | backbone   B=1,   T=4096, H=8  |  8 | **2.87** | 3.77 |
+/// | enc/dec    B=64,  T=16,   H=16 | 1024 | 0.54 | **0.42** |
+/// | enc/dec    B=256, T=16,   H=16 | 4096 | 2.05 | **1.52** |
+///
+/// At `bh = 8` the `v` split is the only source of blocks, so a small tile wins by
+/// 24%. At `bh >= 1024` the grid is already oversubscribed and splitting `v` only
+/// shrinks the `[tv, dqk]` accumulation below one element per thread — a fixed
+/// `tv = 4` costs the encoder/decoder 28–35%. So the tile is chosen against the
+/// grid rather than pinned: split `v` only while `bh` leaves SMs idle.
+///
+/// `MLSTM_TV=<n>` pins it for a sweep.
+fn fused_tv(dhv: usize, bh: usize) -> usize {
+    static TV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let pinned = *TV.get_or_init(|| {
+        std::env::var("MLSTM_TV")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&v: &usize| v > 0)
     });
-    MMA_ON.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Flip the tensor-core path on/off at runtime. Only for the A/B tests, which run
-/// the same input down both paths in one process; production reads the env once.
-#[cfg(test)]
-pub fn set_mma_enabled(on: bool) {
-    mma_enabled(); // run the Once first, so it cannot clobber us afterwards
-    MMA_ON.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The parallel forward kernel to run: the tensor-core one where the device has
-/// tensor cores, else the scalar one.
-///
-/// They compute the same thing; only the three contractions differ, and only in
-/// that the tensor-core path rounds their inputs to TF32 — as the reference
-/// `mlstm_kernels` does, Triton's `tl.dot` being TF32 on fp32 inputs by default.
-fn fw_parallel_kernel(gpu: &Gpu) -> (&'static str, &'static str) {
-    if gpu.kernels.has_mma && mma_enabled() {
-        ("mlstm_fw_parallel_mma", "fw_parallel_mma")
+    // 84 SMs on this part; the exact count only decides where the regimes meet, and
+    // a batched cell clears any plausible value by more than an order of magnitude.
+    const SMS: usize = 84;
+    // Grid is `ceil(dhv/tv) * bh`. At bh < SMS the `v` split is the only source of
+    // blocks, and the measured optimum sits well above the SM count — 192 blocks at
+    // dhv=96 (tv=4), 128 at dhv=128 (tv=8) — so "enough to fill the machine" does
+    // NOT predict it and a formula fitted to those two points would be an invention.
+    // What both have in common is a block width of ~512 v-elements of work; the
+    // ladder below is the measurement, not a model.
+    let tv = pinned.unwrap_or(if bh >= SMS {
+        16
+    } else if dhv >= 128 {
+        8
     } else {
-        ("mlstm_fw_parallel", "fw_parallel")
-    }
-}
-
-/// The parallel backward kernel to run. See [`fw_parallel_kernel`].
-fn bw_parallel_kernel(gpu: &Gpu) -> (&'static str, &'static str) {
-    if gpu.kernels.has_mma && mma_enabled() {
-        ("mlstm_bw_parallel_mma", "bw_parallel_mma")
-    } else {
-        ("mlstm_bw_parallel", "bw_parallel")
-    }
-}
-
-/// Value-dimension tile for the two recurrent kernels. Their grid is otherwise BH
-/// alone — 8 blocks at the backbone's shape, on a 48-SM card — so `v` is split to
-/// fill the machine. 16 gives 4 tiles at dhv = 64, i.e. 32 blocks, each with a
-/// small enough state to keep several resident per SM.
-fn fused_tv(dhv: usize) -> usize {
-    dhv.min(16)
+        4
+    });
+    dhv.min(tv)
 }
 
 /// Fetch a fused kernel and opt it into the shared memory it needs.
@@ -3855,6 +3739,37 @@ fn fused_kernel(gpu: &Gpu, name: &str, smem_floats: usize) -> (cudarc::driver::C
     (f, bytes)
 }
 
+/// [`fused_kernel`], but preferring a build with the shape baked in as compile-time
+/// constants — the reference's `tl.constexpr` shape parameters.
+///
+/// All four heavy kernels go through here. The parallel pair folds its padded tile
+/// dims; the recurrent pair additionally folds `tv` and the block width, which are
+/// the bound and the stride of every loop they run. A shape that fails to compile
+/// falls back to the generic kernel, which is always present and always correct.
+fn fused_kernel_spec(
+    gpu: &Gpu,
+    name: &'static str,
+    smem_floats: usize,
+    spec: super::kernels::MlstmSpec,
+) -> (cudarc::driver::CudaFunction, u32) {
+    let bytes = (smem_floats * std::mem::size_of::<f32>()) as u32;
+    match gpu.kernels.mlstm_specialized(&gpu.context, name, spec) {
+        Some(f) => {
+            if bytes > 48 * 1024 {
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    bytes as i32,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("{name}: cannot opt into {bytes} B of shared memory: {e:?}")
+                });
+            }
+            (f, bytes)
+        }
+        None => fused_kernel(gpu, name, smem_floats),
+    }
+}
+
 fn fused_cfg(grid: (u32, u32, u32), threads: u32, smem: u32) -> LaunchConfig {
     LaunchConfig {
         grid_dim: grid,
@@ -3865,40 +3780,42 @@ fn fused_cfg(grid: (u32, u32, u32), threads: u32, smem: u32) -> LaunchConfig {
 
 /// Threads a fused kernel launches with — recurrent kernels and parallel kernels
 /// have different needs. See the two constants above.
-pub fn fused_threads(name: &str) -> u32 {
+pub fn fused_threads(name: &str, bh: usize, dqk: usize) -> u32 {
     match name {
-        "mlstm_fw_C" | "mlstm_bw_dC" => FUSED_THREADS_REC,
+        "mlstm_bw_dC" => fused_threads_rec(bh, dqk),
+        "mlstm_fw_gates" => GATES_THREADS,
+        "mlstm_fw_scan" => SCAN_THREADS,
         _ => FUSED_THREADS_PAR,
     }
 }
 
-/// Whether the fused kernels can run this shape. The op-at-a-time path stays as
-/// the fallback (and as the A/B baseline for `mlstm_fused_bench`).
+/// Whether the fused kernels can run this shape. Diagnostic — there is no longer a
+/// second path to fall back to, so a shape outside this is a bug, not a dispatch.
 pub fn mlstm_fused_supported(l: usize, dqk: usize, dhv: usize) -> bool {
     l >= 1 && l <= FUSED_MAX_L && dqk >= 1 && dhv >= 1
 }
 
-/// Peak per-block shared memory (bytes) any fused kernel needs at this blocking,
-/// on the given path (`mma` = the tensor-core kernels are selected).
+/// Peak per-block shared memory (bytes) any fused kernel needs at this blocking.
 ///
 /// The kernels keep their whole `[L, L]` decay matrix — and, in the backward, two
 /// `[dhv, dqk]` state-staging tiles — resident in shared memory, so at large head
-/// dims (`dqk = dhv = 96` on the backbone) this crosses what a 100 KB-shared card
-/// can opt a single block into. `MLstm::fused_chunk` compares it against
-/// `Gpu::max_shared_optin` and drops to the op-at-a-time path when it does not fit;
-/// the scalar and mma paths carry the same footprint, so `MLSTM_NO_MMA` is not an
-/// escape from it.
-pub fn mlstm_fused_smem_bytes(l: usize, dqk: usize, dhv: usize, mma: bool) -> usize {
-    let kinds: &[&str] = if mma {
-        &["fw_C", "fw_parallel_mma", "bw_dC", "bw_parallel_mma"]
-    } else {
-        &["fw_C", "fw_parallel", "bw_dC", "bw_parallel"]
-    };
-    kinds
+/// dims this used to cross what a 100 KB-shared card can opt a single block into.
+/// Both head dims are now tiled, so it is flat in `dqk`/`dhv` (37.8 KB forward,
+/// 75.4 KB backward at any width) and `MLstm::fused_chunk` only debug-asserts it.
+pub fn mlstm_fused_smem_bytes(l: usize, dqk: usize, dhv: usize, bh: usize) -> usize {
+    ["fw_dC", "fw_parallel", "bw_dC", "bw_parallel"]
         .iter()
-        .map(|k| fused_smem(k, l, dqk, dhv) * std::mem::size_of::<f32>())
+        .map(|k| fused_smem(k, l, dqk, dhv, bh) * std::mem::size_of::<f32>())
         .max()
         .unwrap()
+}
+
+/// The forward and backward parallel kernels' shared memory, separately. Both are
+/// flat in the head dims once tiled, so a width that regresses points at exactly one
+/// of them. Diagnostic; the gate uses [`mlstm_fused_smem_bytes`].
+pub fn mlstm_fused_smem_parts(l: usize, dqk: usize, dhv: usize, bh: usize) -> (usize, usize) {
+    let f = |k: &str| fused_smem(k, l, dqk, dhv, bh) * std::mem::size_of::<f32>();
+    (f("fw_parallel"), f("bw_parallel"))
 }
 
 /// The four heavy fused kernels at a given blocking, each already opted into the
@@ -3916,28 +3833,25 @@ pub fn mlstm_fused_kernels(
     t: usize,
 ) -> Vec<(&'static str, cudarc::driver::CudaFunction, u32, (u32, u32))> {
     let nc = t.div_ceil(l) as u32;
-    let ntv = dhv.div_ceil(fused_tv(dhv)) as u32;
+    let ntv = dhv.div_ceil(fused_tv(dhv, bh)) as u32;
+    let bh_n = bh;
     let bh = bh as u32;
-    // The two parallel kernels are reported as whichever variant would actually be
-    // launched — asking the driver about the scalar one while the tensor-core one
-    // runs would be reporting the wrong kernel's registers and shared memory.
-    let (fw_par, fw_kind) = fw_parallel_kernel(gpu);
-    let (bw_par, bw_kind) = bw_parallel_kernel(gpu);
     [
-        ("fw_C", "mlstm_fw_C", (ntv, bh)),
-        (fw_kind, fw_par, (nc, bh)),
+        ("fw_dC", "mlstm_fw_dC", (nc, bh)),
+        ("fw_parallel", "mlstm_fw_parallel", (nc, bh)),
         ("bw_dC", "mlstm_bw_dC", (ntv, bh)),
-        (bw_kind, bw_par, (nc, bh)),
+        ("bw_parallel", "mlstm_bw_parallel", (nc, bh)),
     ]
     .into_iter()
     .map(|(kind, name, grid)| {
-        let (f, smem) = fused_kernel(gpu, name, fused_smem(kind, l, dqk, dhv));
+        let (f, smem) = fused_kernel(gpu, name, fused_smem(kind, l, dqk, dhv, bh_n));
         (name, f, smem, grid)
     })
     .collect()
 }
 
-/// Chunkwise forward: `mlstm_fw_gates` → `mlstm_fw_C` → `mlstm_fw_parallel`.
+/// Chunkwise forward: `mlstm_fw_gates` → `mlstm_fw_dC` → `mlstm_fw_scan` →
+/// `mlstm_fw_parallel`.
 #[allow(clippy::too_many_arguments)]
 /// The recurrent state entering a chunked mLSTM call: `C`, `n`, `m` for every
 /// `(batch, head)`, laid out exactly as one slice of `MlstmFused`'s `cst`/`nst`/`mst`.
@@ -4040,106 +3954,41 @@ fn seed_state_slot0(
     state_slot_copy(gpu, src, dst, bh, slots, 0, stride, false);
 }
 
-/// How the fused kernels address q/k/v and the gates: the distance to the next
-/// batch, head and timestep, per tensor group. The innermost stride is 1 on every
-/// layout used here, so it is implicit.
+/// The logical shape of one fused mLSTM call.
 ///
-/// The kernels take these instead of assuming a packing, after the reference
-/// (`mlstm_kernels` passes `str_matQK_B_NH`/`_S`/`_DHQK` and reads them off the
-/// tensor). That makes the head-major reorg a choice of arguments rather than a
-/// pass over memory.
-///
-/// Batch and head are strided separately rather than as one fused `bh`: under
-/// position-major the row index is `b*T + t`, so the batch step is `T*H*W` while
-/// the head step is only `W` — not proportional, as a single stride would require.
-/// Which of the two layouts a [`MlstmStrides`] describes. The strides alone are
-/// enough for the kernels, but the backward launcher also has to *allocate* the
-/// gradients, and those must come out in the same layout the kernel writes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum MlstmLayout {
-    /// `[B*H, T, W]` — each `(b,h)` owns a contiguous `T×W` block.
-    HeadMajor,
-    /// `[B*T, H*W]` — what the projections produce.
-    PositionMajor,
-}
-
+/// It is all the kernels need to address their inputs: q/k/v and the gate logits are
+/// position-major `[B*T, H*W]` — the layout the projections write — so element
+/// `(b, h, t, c)` sits at `((b*T + t)*H + h)*W + c`, with `W` the group's width. The
+/// reference (`mlstm_kernels`) passes explicit strides because PyTorch hands it
+/// whatever the caller had; here one producer feeds one consumer, so the kernels
+/// derive them (see `MLSTM_STRIDES` in `mlstm_fused.cu`).
 #[derive(Clone, Copy)]
-pub struct MlstmStrides {
-    pub layout: MlstmLayout,
-    /// Logical shape of the run, which the strides no longer imply.
+pub struct MlstmShape {
     pub b: usize,
     pub h: usize,
     pub t: usize,
     pub dqk: usize,
     pub dhv: usize,
-    pub qk_b: i64,
-    pub qk_h: i64,
-    pub qk_s: i64,
-    pub hv_b: i64,
-    pub hv_h: i64,
-    pub hv_s: i64,
-    pub g_b: i64,
-    pub g_h: i64,
-    pub g_s: i64,
 }
 
-impl MlstmStrides {
-    /// Head-major `[B*H, T, W]` — each `(b,h)` owns a contiguous `T×W` block.
-    pub fn head_major(b: usize, h: usize, t: usize, dqk: usize, dhv: usize) -> Self {
-        Self {
-            layout: MlstmLayout::HeadMajor,
-            b,
-            h,
-            t,
-            dqk,
-            dhv,
-            qk_b: (h * t * dqk) as i64,
-            qk_h: (t * dqk) as i64,
-            qk_s: dqk as i64,
-            hv_b: (h * t * dhv) as i64,
-            hv_h: (t * dhv) as i64,
-            hv_s: dhv as i64,
-            g_b: (h * t) as i64,
-            g_h: t as i64,
-            g_s: 1,
-        }
-    }
-
-    /// Position-major `[N, H*W]` with `N = B*T` — what the projections produce.
-    /// Head `h` is the column slice at `h*W`, the next timestep a full row away,
-    /// and the next batch `T` rows on.
-    pub fn position_major(b: usize, h: usize, t: usize, dqk: usize, dhv: usize) -> Self {
-        Self {
-            layout: MlstmLayout::PositionMajor,
-            b,
-            h,
-            t,
-            dqk,
-            dhv,
-            qk_b: (t * h * dqk) as i64,
-            qk_h: dqk as i64,
-            qk_s: (h * dqk) as i64,
-            hv_b: (t * h * dhv) as i64,
-            hv_h: dhv as i64,
-            hv_s: (h * dhv) as i64,
-            g_b: (t * h) as i64,
-            g_h: 1,
-            g_s: h as i64,
-        }
+impl MlstmShape {
+    /// `B*H` — the outer dimension every fused kernel's grid is keyed on.
+    pub fn bh(&self) -> usize {
+        self.b * self.h
     }
 }
 
 pub fn mlstm_fused_fw(
     gpu: &Gpu,
-    qh: &SlabBuf,  // [BH, T, dqk]   bf16 storage (reference: matQ at DTYPE)
-    kh: &SlabBuf,  // [BH, T, dqk]   bf16, already scaled by 1/√dqk
-    vh: &SlabBuf,  // [BH, T, dhv]   bf16 (matV)
-    igh: &DTensor, // [BH, T]        fp32: gate logit (reference pins vecI)
-    fgh: &DTensor, // [BH, T]        fp32: gate logit (vecB is fp32 too)
+    qh: &SlabBuf,  // [B*T, H*dqk]  bf16 storage (reference: matQ at DTYPE)
+    kh: &SlabBuf,  // [B*T, H*dqk]  bf16, already scaled by 1/√dqk
+    vh: &SlabBuf,  // [B*T, H*dhv]  bf16 (matV)
+    igh: &DTensor, // [B*T, H]      fp32: gate logit (reference pins vecI)
+    fgh: &DTensor, // [B*T, H]      fp32: gate logit (vecB is fp32 too)
     l: usize,
     // State this call continues from, or `None` to start the recurrence at zero.
     carry_in: Option<&MlstmState>,
-    st: MlstmStrides,
+    st: MlstmShape,
 ) -> MlstmFused {
     let (bh, t, dqk, dhv) = (st.b * st.h, st.t, st.dqk, st.dhv);
     let l = l.min(t);
@@ -4149,18 +3998,17 @@ pub fn mlstm_fused_fw(
     );
     let nc = t.div_ceil(l);
     let h_i = st.h as i32;
-    let (t_i, l_i, nc_i, dqk_i, dhv_i, bh_i) = (
-        t as i32, l as i32, nc as i32, dqk as i32, dhv as i32, bh as i32,
-    );
+    let (t_i, l_i, nc_i, dqk_i, dhv_i) =
+        (t as i32, l as i32, nc as i32, dqk as i32, dhv as i32);
 
     let mut fcb = DTensor::uninit(gpu, &[bh, nc, l]);
     let mut cst = DTensor::uninit(gpu, &[bh, nc + 1, dhv, dqk]);
     let mut nst = DTensor::uninit(gpu, &[bh, nc + 1, dqk]);
     let mut mst = DTensor::uninit(gpu, &[bh, nc + 1]);
-    // Carrying: stage the incoming state into slot 0 of each array, which is exactly
-    // where `mlstm_fw_C` reads it from under `CARRY` (and where it would otherwise
-    // publish the zero initial state). Copying rather than aliasing keeps the kernel's
-    // "state entering chunk k lives at index k" invariant intact for backward.
+    // Carrying: stage the incoming state into slot 0 of each array, which is where
+    // `mlstm_fw_scan` (and `mlstm_fw_gates`, for `m`) picks it up under `CARRY`.
+    // Copying rather than aliasing keeps the "state entering chunk k lives at index k"
+    // invariant intact for backward.
     if let Some(st) = carry_in {
         seed_state_slot0(gpu, &st.c, &mut cst, bh, nc + 1, dhv * dqk);
         seed_state_slot0(gpu, &st.n, &mut nst, bh, nc + 1, dqk);
@@ -4168,67 +4016,89 @@ pub fn mlstm_fused_fw(
     }
     let carry_i = carry_in.is_some() as i32;
     // ytil is the kernel's output h (reference stores matHout at DTYPE); the
-    // stabilizer/normalizer triple stays fp32, as does the chunk state.
-    // Allocated in the layout the kernel writes it in, so a position-major run needs
-    // no scatter to reach the head norm. Same element count either way.
-    let ytil_dims: Vec<usize> = match st.layout {
-        MlstmLayout::HeadMajor => vec![bh, t, dhv],
-        MlstmLayout::PositionMajor => vec![st.b * t, st.h * dhv],
-    };
-    let mut ytil = SlabBuf::new(gpu, &ytil_dims);
+    // stabilizer/normalizer triple stays fp32, as does the chunk state. Written
+    // position-major like q/k/v, so it reaches the head norm without a scatter.
+    let mut ytil = SlabBuf::new(gpu, &[st.b * t, st.h * dhv]);
     let mut msv = DTensor::uninit(gpu, &[bh, t]);
     let mut psiv = DTensor::uninit(gpu, &[bh, t]);
     let mut qnv = DTensor::uninit(gpu, &[bh, t]);
 
+    // Gates: `fcb` plus the per-chunk `a`/`g` and the stabilizer scan. One block per
+    // (b, h) — the scan over chunks is serial, and it is the only thing left in the
+    // forward that is. `avec`/`gvec` are consumed by the next two launches and by
+    // nothing else, so they do not join the saved cache.
+    let mut avec = DTensor::uninit(gpu, &[bh, nc, l]);
+    let mut gvec = DTensor::uninit(gpu, &[bh, nc]);
     let f = gpu.kernels.get("mlstm_fw_gates");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&fgh.buf)
+        .arg(&igh.buf)
         .arg(&mut fcb.buf)
+        .arg(&mut avec.buf)
+        .arg(&mut gvec.buf)
+        .arg(&mut mst.buf)
         .arg(&t_i)
         .arg(&l_i)
         .arg(&nc_i)
-        .arg(&bh_i)
-        .arg(&h_i)
-        .arg(&st.g_b)
-        .arg(&st.g_h)
-        .arg(&st.g_s);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((bh * nc) as u32)) }.expect("mlstm_fw_gates");
+        .arg(&carry_i)
+        .arg(&h_i);
+    unsafe {
+        lb.launch(fused_cfg(
+            (bh as u32, 1, 1),
+            GATES_THREADS,
+            (2 * nc * std::mem::size_of::<f32>()) as u32,
+        ))
+    }
+    .expect("mlstm_fw_gates");
 
-    let tv = fused_tv(dhv);
-    let tv_i = tv as i32;
-    let ntv = dhv.div_ceil(tv) as u32;
-
-    let (f, smem) = fused_kernel(gpu, "mlstm_fw_C", fused_smem("fw_C", l, dqk, dhv));
+    // Every chunk's own contribution to the state, all at once.
+    let (f, smem) = fused_kernel_spec(
+        gpu,
+        "mlstm_fw_dC",
+        fused_smem("fw_dC", l, dqk, dhv, bh),
+        super::kernels::MlstmSpec { l, dqk, dhv, h: st.h, tv: 0, threads: 0, kt: 0, vt: 0 },
+    );
     let mut lb = gpu.stream.launch_builder(&f);
     push_slab_ref!(lb, *kh);
     push_slab_ref!(lb, *vh);
-    lb.arg(&igh.buf)
-        .arg(&fcb.buf)
+    lb.arg(&avec.buf)
         .arg(&mut cst.buf)
         .arg(&mut nst.buf)
-        .arg(&mut mst.buf)
         .arg(&t_i)
         .arg(&l_i)
         .arg(&nc_i)
         .arg(&dqk_i)
         .arg(&dhv_i)
-        .arg(&tv_i)
-        .arg(&carry_i)
-        .arg(&h_i)
-        .arg(&st.qk_b)
-        .arg(&st.qk_h)
-        .arg(&st.qk_s)
-        .arg(&st.hv_b)
-        .arg(&st.hv_h)
-        .arg(&st.hv_s)
-        .arg(&st.g_b)
-        .arg(&st.g_h)
-        .arg(&st.g_s);
-    unsafe { lb.launch(fused_cfg((ntv, bh as u32, 1), FUSED_THREADS_REC, smem)) }
-        .expect("mlstm_fw_C");
+        .arg(&h_i);
+    unsafe { lb.launch(fused_cfg((nc as u32, bh as u32, 1), FUSED_THREADS_PAR, smem)) }
+        .expect("mlstm_fw_dC");
 
-    let (name, kind) = fw_parallel_kernel(gpu);
-    let (f, smem) = fused_kernel(gpu, name, fused_smem(kind, l, dqk, dhv));
+    // ... folded into the running state, one thread per state element.
+    let elems = dhv * dqk + dqk;
+    let f = gpu.kernels.get("mlstm_fw_scan");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut cst.buf)
+        .arg(&mut nst.buf)
+        .arg(&gvec.buf)
+        .arg(&nc_i)
+        .arg(&dqk_i)
+        .arg(&dhv_i)
+        .arg(&carry_i);
+    unsafe {
+        lb.launch(fused_cfg(
+            (elems.div_ceil(SCAN_THREADS as usize) as u32, bh as u32, 1),
+            SCAN_THREADS,
+            0,
+        ))
+    }
+    .expect("mlstm_fw_scan");
+
+    let (f, smem) = fused_kernel_spec(
+        gpu,
+        "mlstm_fw_parallel",
+        fused_smem("fw_parallel", l, dqk, dhv, bh),
+        super::kernels::MlstmSpec { l, dqk, dhv, h: st.h, tv: 0, threads: 0, kt: mlstm_kt(dqk), vt: mlstm_vt() },
+    );
     let mut lb = gpu.stream.launch_builder(&f);
     push_slab_ref!(lb, *qh);
     push_slab_ref!(lb, *kh);
@@ -4247,16 +4117,7 @@ pub fn mlstm_fused_fw(
         .arg(&nc_i)
         .arg(&dqk_i)
         .arg(&dhv_i)
-        .arg(&h_i)
-        .arg(&st.qk_b)
-        .arg(&st.qk_h)
-        .arg(&st.qk_s)
-        .arg(&st.hv_b)
-        .arg(&st.hv_h)
-        .arg(&st.hv_s)
-        .arg(&st.g_b)
-        .arg(&st.g_h)
-        .arg(&st.g_s);
+        .arg(&h_i);
     unsafe {
         lb.launch(fused_cfg(
             (nc as u32, bh as u32, 1),
@@ -4299,7 +4160,7 @@ pub fn mlstm_fused_bw(
     // BPTT state flowing in from the chunk to the RIGHT, or `None` for the rightmost
     // chunk (and for an unchunked call), where it is zero.
     carry_in: Option<&MlstmDState>,
-    st: MlstmStrides,
+    st: MlstmShape,
 ) -> (DTensor, DTensor, DTensor, DTensor, DTensor, MlstmDState) {
     let (bh, t, dqk, dhv) = (st.b * st.h, st.t, st.dqk, st.dhv);
     let (l, nc) = (sv.l, sv.nc);
@@ -4321,11 +4182,17 @@ pub fn mlstm_fused_bw(
     }
     let carry_i = carry_in.is_some() as i32;
 
-    let tv = fused_tv(dhv);
+    let tv = fused_tv(dhv, bh);
+    let rec_threads = fused_threads_rec(bh, dqk);
     let tv_i = tv as i32;
     let ntv = dhv.div_ceil(tv) as u32;
 
-    let (f, smem) = fused_kernel(gpu, "mlstm_bw_dC", fused_smem("bw_dC", l, dqk, dhv));
+    let (f, smem) = fused_kernel_spec(
+        gpu,
+        "mlstm_bw_dC",
+        fused_smem("bw_dC", l, dqk, dhv, bh),
+        super::kernels::MlstmSpec { l, dqk, dhv, h: st.h, tv, threads: rec_threads, kt: 0, vt: 0 },
+    );
     let mut lb = gpu.stream.launch_builder(&f);
     push_slab_ref!(lb, *qh);
     lb.arg(&d_ytil.buf);
@@ -4344,48 +4211,29 @@ pub fn mlstm_fused_bw(
         .arg(&dhv_i)
         .arg(&tv_i)
         .arg(&carry_i)
-        .arg(&h_i)
-        .arg(&st.qk_b)
-        .arg(&st.qk_h)
-        .arg(&st.qk_s)
-        .arg(&st.hv_b)
-        .arg(&st.hv_h)
-        .arg(&st.hv_s);
-    unsafe { lb.launch(fused_cfg((ntv, bh as u32, 1), FUSED_THREADS_REC, smem)) }
+        .arg(&h_i);
+    unsafe { lb.launch(fused_cfg((ntv, bh as u32, 1), rec_threads, smem)) }
         .expect("mlstm_bw_dC");
 
     // Shaped to match the stride layout the kernel writes through: head-major keeps
     // the `[BH, T, W]` blocks, position-major lays them out as the projections do so
     // the caller needs no scatter. Same element count either way — only the view
     // differs, and `st` is what the kernel actually indexes with.
-    let pos = st.layout == MlstmLayout::PositionMajor;
-    let (dq_dims, dk_dims, dv_dims): (Vec<usize>, Vec<usize>, Vec<usize>) = if pos {
-        let n = st.b * t;
-        (
-            vec![n, st.h * dqk],
-            vec![n, st.h * dqk],
-            vec![n, st.h * dhv],
-        )
-    } else {
-        (
-            vec![bh, t, dqk],
-            vec![bh, t, dqk],
-            vec![bh, t, dhv],
-        )
-    };
-    let g_dims: Vec<usize> = if pos {
-        vec![st.b * t, st.h]
-    } else {
-        vec![bh, t]
-    };
-    let mut dq = DTensor::uninit(gpu, &dq_dims);
-    let mut dk = DTensor::uninit(gpu, &dk_dims);
-    let mut dv = DTensor::uninit(gpu, &dv_dims);
-    let mut dig = DTensor::uninit(gpu, &g_dims);
-    let mut dfg = DTensor::uninit(gpu, &g_dims);
+    // Shaped as the kernel writes them — position-major, exactly as the projections
+    // laid out q/k/v — so the caller needs no scatter pass.
+    let n = st.b * t;
+    let mut dq = DTensor::uninit(gpu, &[n, st.h * dqk]);
+    let mut dk = DTensor::uninit(gpu, &[n, st.h * dqk]);
+    let mut dv = DTensor::uninit(gpu, &[n, st.h * dhv]);
+    let mut dig = DTensor::uninit(gpu, &[n, st.h]);
+    let mut dfg = DTensor::uninit(gpu, &[n, st.h]);
 
-    let (name, kind) = bw_parallel_kernel(gpu);
-    let (f, smem) = fused_kernel(gpu, name, fused_smem(kind, l, dqk, dhv));
+    let (f, smem) = fused_kernel_spec(
+        gpu,
+        "mlstm_bw_parallel",
+        fused_smem("bw_parallel", l, dqk, dhv, bh),
+        super::kernels::MlstmSpec { l, dqk, dhv, h: st.h, tv: 0, threads: 0, kt: mlstm_kt(dqk), vt: mlstm_vt() },
+    );
     let mut lb = gpu.stream.launch_builder(&f);
     push_slab_ref!(lb, *qh);
     push_slab_ref!(lb, *kh);
@@ -4414,16 +4262,7 @@ pub fn mlstm_fused_bw(
         .arg(&dqk_i)
         .arg(&dhv_i)
         .arg(&carry_i)
-        .arg(&h_i)
-        .arg(&st.qk_b)
-        .arg(&st.qk_h)
-        .arg(&st.qk_s)
-        .arg(&st.hv_b)
-        .arg(&st.hv_h)
-        .arg(&st.hv_s)
-        .arg(&st.g_b)
-        .arg(&st.g_h)
-        .arg(&st.g_s);
+        .arg(&h_i);
     unsafe {
         lb.launch(fused_cfg(
             (nc as u32, bh as u32, 1),

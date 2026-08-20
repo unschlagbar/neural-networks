@@ -78,46 +78,33 @@ const NAMES: &[&str] = &[
     "swiglu_backward",
     "scale_inplace",
     "sigmoid_inplace",
-    "head_gather",
-    "head_scatter",
     "cumsum_logsig",
     "cumsum_logsig_block",
-    "mlstm_rowmax_m",
-    "mlstm_ds",
-    "div_rows",
     "mul",
     "ogate_fwd",
     "slice_t",
     "slice_t_batch",
     "unslice_t",
     "unslice_t_batch",
-    "mlstm_chunk_ab",
-    "mul_rows",
-    "mul_rows_add",
-    "psi_from_qn",
     "row_dot_add",
     "group_dot_add",
     "mlstm_chunk_ab_bwd",
     "mlstm_chunk_ab_bwd_block",
     "ogate_bwd",
-    "div_rows_bwd",
-    "mlstm_ds_bwd",
     "mlstm_dfc_dig",
     "revcumsum_dlogsig",
     "revcumsum_dlogsig_block",
     "mlstm_fw_gates",
-    "mlstm_fw_C",
-    "mlstm_fw_parallel",
+    "mlstm_fw_scan",
     "mlstm_bw_dC",
-    "mlstm_bw_parallel",
     "scatter_rows",
     "masked_softmax_ce",
     "masked_softmax_ce_block",
 ];
 
-/// Kernels that exist only when the device has tensor cores (`MMA_TF32`, sm_80+).
-/// Each is a drop-in twin of the same-named kernel without the suffix.
-const MMA_NAMES: &[&str] = &["mlstm_fw_parallel_mma", "mlstm_bw_parallel_mma"];
+/// Kernels compiled with `MMA_TF32` against the real device arch — the ones that
+/// issue `mma.sync`, which does not exist at NVRTC's default target.
+const MMA_NAMES: &[&str] = &["mlstm_fw_dC", "mlstm_fw_parallel", "mlstm_bw_parallel"];
 
 
 /// Cooperative-launch kernels; need `<cooperative_groups.h>`, so they share the
@@ -188,8 +175,6 @@ fn extra_include_dirs(main: &str) -> Vec<String> {
 /// `Arc`-backed handle) and cheap to look up.
 pub struct Kernels {
     funcs: std::collections::HashMap<&'static str, CudaFunction>,
-    /// Whether [`MMA_NAMES`] were compiled — i.e. the device is sm_80 or later.
-    pub has_mma: bool,
     /// Whether [`COOP_NAMES`] were compiled (same include-path requirement as bf16).
     pub has_coop: bool,
     /// Whether [`BF16_NAMES`] were compiled, i.e. whether `<cuda_bf16.h>` was found.
@@ -218,7 +203,36 @@ pub struct Kernels {
     ///
     /// `Mutex` because `Kernels` lives behind an `Arc` and this fills in lazily.
     specialized: std::sync::Mutex<HashMap<(&'static str, usize, usize, bool), Option<CudaFunction>>>,
+    /// Shape-specialized fused mLSTM kernels, keyed by `(name, L, dqk, dhv, H)`.
+    ///
+    /// The reference (`nx-ai/mlstm_kernels`) passes every one of these as a Triton
+    /// `tl.constexpr`, so the tile arithmetic folds at compile time; here they arrive
+    /// as runtime `int`s and each shared-memory index costs a multiply. With them
+    /// fixed, `LP`/`KP`/`VP` become literals, the tile loops get static trip counts,
+    /// and the pad branches resolve away.
+    mlstm_spec: std::sync::Mutex<HashMap<MlstmSpecKey, Option<CudaFunction>>>,
 }
+
+/// The shape constants a fused mLSTM kernel is built at. `tv` and `threads` are
+/// only meaningful for the two recurrent kernels — they are the strided loop bound
+/// and the block width those two are dominated by — and are passed as 0 for the
+/// parallel pair so the two never share a cache slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct MlstmSpec {
+    pub l: usize,
+    pub dqk: usize,
+    pub dhv: usize,
+    pub h: usize,
+    pub tv: usize,
+    pub threads: u32,
+    /// `dqk` slice width; 0 for the kernels that do not tile it.
+    pub kt: usize,
+    /// `dhv` slice width; 0 for the kernels that do not tile it.
+    pub vt: usize,
+}
+
+/// `(name, shape)` — what a specialized build is cached under.
+pub type MlstmSpecKey = (&'static str, MlstmSpec);
 
 impl Kernels {
     /// Compile [`SRC`] with NVRTC and load every kernel in [`NAMES`], plus — on a
@@ -244,7 +258,14 @@ impl Kernels {
         let (major, minor) = ctx
             .compute_capability()
             .map_err(|e| format!("compute capability query failed: {e:?}"))?;
-        let has_mma = major >= 8;
+        // The mLSTM core is tensor-core only: every contraction in the parallel pair
+        // is an `mma.sync`, which needs sm_80. There is no scalar twin to fall back
+        // to, so this is a hard requirement rather than a dispatch.
+        if major < 8 {
+            return Err(format!(
+                "GPU training needs tensor cores (sm_80 or later); this device is sm_{major}{minor}"
+            ));
+        }
 
         // Slab storage dtype has to be decided BEFORE the base module is compiled:
         // `slab_t` appears in the signature of `slstm_cell_step` and friends, which
@@ -293,7 +314,7 @@ impl Kernels {
             funcs.insert(name, f);
         }
 
-        if has_mma {
+        {
             let mut options = vec![
                 format!("--gpu-architecture=compute_{major}{minor}"),
                 "-DMMA_TF32=1".to_string(),
@@ -384,14 +405,82 @@ impl Kernels {
 
         Ok(Self {
             funcs,
-            has_mma,
             has_bf16,
             slab_bf16,
             has_coop,
             coop_includes,
             arch: (major, minor),
             specialized: std::sync::Mutex::new(HashMap::new()),
+            mlstm_spec: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// A fused mLSTM kernel with `(L, dqk, dhv, H)` baked in as compile-time
+    /// constants, or `None` to fall back to the generic one.
+    ///
+    /// Mirrors [`Kernels::specialized`]: one NVRTC compile per distinct shape, cached
+    /// (failures included). The backbone runs a single shape, so this is paid once at
+    /// startup. `MLSTM_NO_SPECIALIZE=1` forces the generic path for an A/B.
+    ///
+    /// Every specialized build is compiled for the device arch, which the `mma.sync`
+    /// in the parallel pair needs anyway.
+    pub fn mlstm_specialized(
+        &self,
+        ctx: &Arc<CudaContext>,
+        name: &'static str,
+        spec: MlstmSpec,
+    ) -> Option<CudaFunction> {
+        if std::env::var("MLSTM_NO_SPECIALIZE").is_ok() {
+            return None;
+        }
+        let mut cache = self.mlstm_spec.lock().ok()?;
+        let key = (name, spec);
+        if let Some(hit) = cache.get(&key) {
+            return hit.clone();
+        }
+        let (major, minor) = self.arch;
+        let MlstmSpec { l, dqk, dhv, h, tv, threads, kt, vt } = spec;
+        let mut options = vec![
+            format!("--gpu-architecture=compute_{major}{minor}"),
+            "-DMMA_TF32=1".to_string(),
+            "-DMLSTM_SPEC=1".to_string(),
+            format!("-DMLSTM_L={l}"),
+            format!("-DMLSTM_DQK={dqk}"),
+            format!("-DMLSTM_DHV={dhv}"),
+            format!("-DMLSTM_H={h}"),
+            format!("-DMLSTM_TV={}", tv.max(1)),
+            format!("-DMLSTM_THREADS={}", threads.max(1)),
+        ];
+        if kt > 0 {
+            options.push(format!("-DMLSTM_KT={kt}"));
+        }
+        if vt > 0 {
+            options.push(format!("-DMLSTM_VT={vt}"));
+        }
+        // Same slab width as every other module — see `load`.
+        if self.slab_bf16 {
+            options.push("-DSLAB_BF16=1".to_string());
+            if let Some(inc) = cuda_include_dir() {
+                options.push(format!("-I{inc}"));
+                options.extend(extra_include_dirs(&inc).iter().map(|d| format!("-I{d}")));
+            }
+        }
+        let built = compile_ptx_with_opts(SRC, CompileOptions {
+            options,
+            ..Default::default()
+        })
+        .map_err(|e| format!("{e:?}"))
+        .and_then(|ptx| ctx.load_module(ptx).map_err(|e| format!("{e:?}")))
+        .and_then(|m| m.load_function(name).map_err(|e| format!("{e:?}")));
+        let f = match built {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("mlstm specialized {name} ({spec:?}) unavailable: {e}");
+                None
+            }
+        };
+        cache.insert(key, f.clone());
+        f
     }
 
     /// A cooperative kernel specialized to `(h, b)`, or `None` to use the generic

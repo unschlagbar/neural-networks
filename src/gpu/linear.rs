@@ -269,6 +269,25 @@ impl Linear {
             .run_staged_lhs_bias(gpu, x_b, &self.w, &self.b, out);
     }
 
+    /// [`forward_staged`](Self::forward_staged) into a slab, at whatever width the
+    /// kernels were built for: a bf16 slab is written straight out of the GEMM
+    /// epilogue, an fp32 one goes through the ordinary staged path.
+    ///
+    /// This is what lets a consumer that reads slabs ask for its projection without
+    /// knowing which width it got.
+    pub fn forward_staged_slab(
+        &mut self,
+        gpu: &Gpu,
+        x: &DTensor,
+        x_b: &super::BTensor,
+        out: &mut ops::SlabBuf,
+    ) {
+        match out {
+            ops::SlabBuf::Bf16(o) => self.forward_staged_bf16(gpu, x_b, o),
+            ops::SlabBuf::F32(o) => self.forward_staged(gpu, x, x_b, o),
+        }
+    }
+
     /// [`backward_with_x`](Self::backward_with_x) where the saved input is already
     /// narrowed into a [`ops::SharedLhs`].
     pub fn backward_staged_x(

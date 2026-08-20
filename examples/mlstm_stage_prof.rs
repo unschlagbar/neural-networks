@@ -147,7 +147,7 @@ fn main() {
     let igh = DTensor::from_host(&gpu, &Tensor::random(&[bh, t], 0.5));
     let fgh = DTensor::from_host(&gpu, &Tensor::random(&[bh, t], 0.5));
     let dyt = DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dhv], 1.0));
-    let stf = ops::MlstmStrides::head_major(bh, 1, t, dqk, dhv);
+    let stf = ops::MlstmShape { b: bh, h: 1, t, dqk, dhv };
 
     let f_fw = timed(&gpu, 3, 20, || {
         let _ = ops::mlstm_fused_fw(&gpu, &qh, &kh, &vh, &igh, &fgh, lf, None, stf);

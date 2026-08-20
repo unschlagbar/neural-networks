@@ -846,7 +846,11 @@ impl Hierarchical {
     }
 
     fn group_cap(&self) -> usize {
-        self.group_cap.unwrap_or(crate::config::GROUP_MAX_ROWS)
+        static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let env = *ENV.get_or_init(|| {
+            std::env::var("GPU_GROUP_CAP").ok().and_then(|v| v.parse::<usize>().ok())
+        });
+        self.group_cap.or(env).unwrap_or(crate::config::GROUP_MAX_ROWS)
     }
 
     /// Run one encoder group's rectangle through the block stack, leaving the result

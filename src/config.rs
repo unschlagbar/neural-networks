@@ -85,6 +85,14 @@ pub const WORD_BLOCKS: usize = 32;
 /// Sized above the sLSTM's `GRAPH_MIN_T` (32) so every chunk still takes the captured-
 /// graph path — the backbone is launch-bound at batch 1, and dropping to the per-step
 /// loop would cost far more than the memory is worth.
+///
+/// It also sets how many times each backbone cell is invoked per step
+/// (`words / BACKBONE_CHUNK` per layer per window), and a shorter chunk runs those
+/// cells at a shorter `T`, where the fused mLSTM kernels are further from their
+/// tuned shape. Measured at 4096 words, 3 interleaved repeats (ms/step, peak MiB of
+/// 16303): 512 -> 566 / 9469, 1024 -> 536 / 11549, 2048 -> 531 / 14939, 4096 OOMs.
+///
+/// `GPU_BACKBONE_CHUNK` overrides it for an A/B.
 pub const BACKBONE_CHUNK: usize = 512;
 
 /// Largest encoder/decoder group, in rows (`words_in_group × tmax`). `0` disables the
@@ -122,7 +130,9 @@ pub const GROUP_MAX_ROWS: usize = 2048;
 /// (`mlstm_chunking_matches_single_chunk` pins this). A cell whose T is already
 /// ≤ L takes the single-chunk path unchanged.
 ///
-/// Override at runtime with `MLSTM_CHUNK=<L>` (0 = single-chunk) for A/B runs.
+/// Override at runtime with `MLSTM_CHUNK=<L>` for A/B runs. The fused kernels cap
+/// the effective L at `ops::FUSED_MAX_L`, so values above that are clamped, and 0 —
+/// once "one chunk over the whole sequence" — now means L = 1.
 ///
 /// 256 measured fastest on the RTX 4050 at the backbone shape (B=1, d=512, 16
 /// heads): at T=2048 it is 18.9 ms/iter against 63.5 for single-chunk, and the

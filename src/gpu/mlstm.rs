@@ -18,7 +18,10 @@
 //! approximation, same as the CPU / the sLSTM cell).
 //!
 //! The six projections and `W_out` are `gpu::Linear`; only the attention core is
-//! bespoke kernels + strided-batched GEMM, on the head-major `[B*H, T, ·]` layout.
+//! bespoke kernels. Those read q/k/v where the projections left them —
+//! position-major `[B*T, H*W]` — so the cell has no reorg pass at all, and every
+//! contraction in them runs on the tensor cores with bf16 operands, which is what
+//! the projections already produced.
 //!
 //! # Chunking (`config::MLSTM_CHUNK`)
 //!
@@ -38,6 +41,12 @@
 //! backward (`mlstm_chunking_matches_single_chunk`). Backward sweeps chunks in
 //! reverse, carrying `dC`/`dn` — BPTT over chunks, parallel form within each.
 //!
+//! The forward is four launches, and only one of them is serial in anything:
+//! `mlstm_fw_gates` (the gate scan, one block per `(b, h)`), `mlstm_fw_dC` (every
+//! chunk's own `ΔC`, all at once), `mlstm_fw_scan` (the one place the chunk
+//! recurrence is actually walked — elementwise, so it parallelises over the whole
+//! state) and `mlstm_fw_parallel` (the intra-chunk attention, one block per chunk).
+//!
 //! A sequence already shorter than `L` (the encoder/decoder, where T is a word
 //! length) takes the single-chunk path with no inter-chunk work at all.
 
@@ -49,14 +58,7 @@ use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
 
 /// Chunk length: `config::MLSTM_CHUNK`, overridable with `MLSTM_CHUNK=<L>` for A/B
-/// runs (0 = single-chunk). Resolved once — the env read must not sit in forward.
-/// Whether q/k/v come out of the projection already bf16 (`MLSTM_NO_BF16_QKV=1`
-/// forces the fp32 buffer + narrowing pass back on, for an A/B).
-fn bf16_qkv_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MLSTM_NO_BF16_QKV").as_deref() != Ok("1"))
-}
-
+/// runs. Resolved once — the env read must not sit in forward.
 fn chunk_len() -> usize {
     static L: OnceLock<usize> = OnceLock::new();
     *L.get_or_init(|| {
@@ -65,70 +67,6 @@ fn chunk_len() -> usize {
             .and_then(|s| s.parse().ok())
             .unwrap_or(crate::config::MLSTM_CHUNK)
     })
-}
-
-/// Per-chunk forward intermediates.
-///
-/// The two [BH, L, L] decay matrices (D̄ and DS) are the largest tensors here, and
-/// they are simply kept. Before chunking they were [BH, T, T] — 134 MB *each, per
-/// block* at 2048 words — which is why they used to be recomputed in backward
-/// instead; chunking makes them small enough (2·BH·L² floats per chunk) that
-/// caching costs ~64 MB across the whole backbone and saves the rebuild GEMM.
-///
-/// Everything else is at most [BH, L, dhv].
-struct Chunk {
-    c0: usize,     // chunk start in T
-    len: usize,    // chunk length (the last chunk may be short)
-    bvec: DTensor, // [BH, L]  b_t: carried state → row t
-    avec: DTensor, // [BH, L]  a_j: row j → outgoing state
-    qn: DTensor,   // [BH, L]  (intra + inter)
-    psi: DTensor,  // [BH, L]
-    /// Per-row stabilizer. Backward needs it because ψ = max(|qn|, exp(−m)), so the
-    /// branch "did qn win the max?" is against exp(−m), not against 1.
-    m: DTensor, // [BH, L]
-    num: DTensor,  // [BH, L, dhv]  (intra + inter)
-    dbar: DTensor, // [BH, L, L]  D̄
-    ds: DTensor,   // [BH, L, L]  D̄⊙S
-    /// The carried state entering this chunk, and the inter-chunk products it
-    /// produced. `None` on the first chunk, where the state is zero and the whole
-    /// inter path is skipped — that makes a single-chunk sequence take exactly the
-    /// pre-chunking code path, with no extra GEMMs.
-    inter: Option<Inter>,
-}
-
-/// The inter-chunk half of a chunk: incoming state plus the two products read out
-/// of it (both needed to form `db` in backward).
-///
-/// `m_prev` is deliberately absent: the stabilizer is held constant in backward
-/// (the reference approximation, as on the CPU and in the sLSTM), so no gradient
-/// flows through it — it is only ever a forward input.
-struct Inter {
-    c_prev: DTensor,    // [BH, dhv, dqk]
-    n_prev: DTensor,    // [BH, 1, dqk]
-    inter_num: DTensor, // [BH, L, dhv]   Q·C_prevᵀ   (pre-b)
-    inter_qn: DTensor,  // [BH, L, 1]     Q·n_prevᵀ   (pre-b)
-}
-
-/// Forward intermediates retained for the backward pass.
-struct Saved {
-    b: usize,
-    t: usize,
-    /// The flat `[N, in]` input, shared by all six projections (see `forward`).
-    /// Held here rather than six times inside the `Linear`s.
-    xf: DTensor,
-    qh: DTensor, // [BH, T, dqk]
-    kh: DTensor, // [BH, T, dqk]  (already ×1/√dqk)
-    vh: DTensor, // [BH, T, dhv]
-    // The forget-gate logit is still needed in backward (`revcumsum_dlogsig` chains
-    // dfc through logσ'); the input-gate logit is not — it only ever fed the D̄
-    // build, which now happens once, in forward.
-    fgh: DTensor, // [BH, T]  forget-gate logit (head-major)
-    chunks: Vec<Chunk>,
-    o: DTensor,    // [N, d]  (post-sigmoid)
-    yhat: DTensor, // [N, d]
-    /// `lin_out`'s input, kept here rather than as the projection's private copy so a
-    /// chunked sweep's later chunk cannot overwrite it. Fed back via `backward_with_x`.
-    hconcat: DTensor, // [N, d]
 }
 
 /// Forward intermediates of the **fused** path. Far smaller than `Saved`: the
@@ -216,53 +154,6 @@ impl SavedFused {
     }
 }
 
-impl Saved {
-    /// Device bytes held by the legacy (op-at-a-time) cache. Only reachable under
-    /// `MLSTM_LEGACY=1`; the per-chunk `[BH, L, L]` matrices dominate it, which is
-    /// why the fused path exists.
-    fn retained_bytes(&self) -> usize {
-        let flat: usize = [
-            &self.xf,
-            &self.qh,
-            &self.kh,
-            &self.vh,
-            &self.fgh,
-            &self.o,
-            &self.yhat,
-            &self.hconcat,
-        ]
-        .iter()
-        .map(|t| t.capacity() * 4)
-        .sum();
-        let chunks: usize = self
-            .chunks
-            .iter()
-            .map(|c| {
-                [
-                    &c.bvec, &c.avec, &c.qn, &c.psi, &c.m, &c.num, &c.dbar, &c.ds,
-                ]
-                .iter()
-                .map(|t| t.capacity() * 4)
-                .sum::<usize>()
-            })
-            .sum();
-        flat + chunks
-    }
-}
-
-/// Which forward ran, and hence which backward must.
-enum Cache {
-    Fused(SavedFused),
-    Legacy(Saved),
-}
-
-/// `MLSTM_LEGACY=1` forces the op-at-a-time chunk loop — the A/B baseline for
-/// `mlstm_fused_bench`, and the escape hatch if a fused kernel ever misbehaves.
-fn legacy_forced() -> bool {
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("MLSTM_LEGACY").is_ok())
-}
-
 pub struct MLstm {
     pub input_size: usize,
     pub d: usize,
@@ -283,23 +174,16 @@ pub struct MLstm {
     lin_f: Linear,
     lin_out: Linear,
     headnorm: RmsNorm, // head-wise (group == dhv)
-    /// Whether q/k/v can be produced bf16 straight out of the projection, skipping
-    /// the fp32 buffer and the pass that narrows it. Everything but the per-call
-    /// fused-path check is fixed for the cell's lifetime, so it is resolved once
-    /// here: the env switch is a `OnceLock`, `slab_bf16` is decided at kernel load,
-    /// and only the logit head is ever pinned to fp32.
-    bf16_qkv: bool,
-
     /// Forward caches awaiting a backward, one per chunk in eviction order.
     ///
     /// A chunked sweep forwards every chunk before unwinding any, so chunk c's cache
     /// must survive chunk c+1's forward; backward pops from the end (right to left).
     /// The unchunked path is this with a single element.
-    saved: Vec<Cache>,
-    /// Scratch buffers for this cell's temporaries, recycled by size. The
-    /// projections and head-major reorgs produce a dozen values that die within
-    /// the same call; pooling them means the cell converges on the peak number
-    /// live at once instead of reallocating each one every window.
+    saved: Vec<SavedFused>,
+    /// Scratch buffers for this cell's temporaries, recycled by size. Forward and
+    /// backward produce a dozen values that die within the same call; pooling them
+    /// means the cell converges on the peak number live at once instead of
+    /// reallocating each one every window.
     pool: Pool,
     /// Host parking for the fused cache's large per-N tensors, when the surrounding
     /// stack opted in (`Block::enable_offload` → `MLstm::enable_offload`).
@@ -356,12 +240,6 @@ impl MLstm {
             Linear::from_parts(gpu, wk, bk),
             Linear::from_parts(gpu, wv, bv),
         );
-        let bf16_qkv = bf16_qkv_enabled()
-            && !ops::mlstm_head_major()
-            && gpu.kernels.slab_bf16
-            && lin_q.is_bf16()
-            && lin_k.is_bf16()
-            && lin_v.is_bf16();
         Self {
             input_size,
             d,
@@ -369,7 +247,6 @@ impl MLstm {
             dqk,
             dhv,
             inv_sqrt_dqk,
-            bf16_qkv,
             chunk: chunk_len(),
             lin_q,
             lin_k,
@@ -487,51 +364,27 @@ impl MLstm {
         )
     }
 
-    /// Override the chunk length (0 = single-chunk). Lets a caller — or a test —
-    /// pick a length per cell instead of taking the `config`/env default.
+    /// Override the chunk length. Lets a caller — or a test — pick a length per cell
+    /// instead of taking the `config`/env default; `fused_chunk` clamps it into what
+    /// the kernels support.
     pub fn set_chunk(&mut self, chunk: usize) {
         self.chunk = chunk;
     }
 
-    /// The chunk length the **fused** kernels would run this sequence at, or `None`
-    /// if it must take the op-at-a-time path.
+    /// The chunk length the fused kernels run this sequence at.
     ///
-    /// `chunk == 0` means "one chunk over the whole sequence", which the fused
-    /// kernels cannot do beyond `FUSED_MAX_L` (the decay matrix would not fit in
-    /// shared memory) — and it is only ever set to A/B the O(T²) single-chunk form,
-    /// so it keeps the old path rather than being silently reblocked. A configured
-    /// chunk longer than `FUSED_MAX_L` *is* silently clamped: chunk length is a
-    /// blocking choice with no effect on the result, which
-    /// `mlstm_chunking_matches_single_chunk` pins.
-    fn fused_chunk(&self, gpu: &Gpu, t: usize) -> Option<usize> {
-        if legacy_forced() || self.chunk == 0 {
-            return None;
-        }
+    /// Chunk length is a blocking choice with no effect on the result
+    /// (`mlstm_chunking_matches_single_chunk` pins that), so a configured chunk is
+    /// clamped into what the kernels support rather than dispatched on: longer than
+    /// `FUSED_MAX_L` clamps down (the decay matrix must fit in shared memory), and
+    /// `chunk == 0` clamps UP to 1, a step-by-step recurrence.
+    fn fused_chunk(&self, gpu: &Gpu, t: usize, bh: usize) -> usize {
         let l = self.chunk.min(ops::FUSED_MAX_L).min(t).max(1);
-        if !ops::mlstm_fused_supported(l, self.dqk, self.dhv) {
-            return None;
-        }
-        // The fused kernels hold their decay matrix (and backward's state tiles) in
-        // shared memory; at the backbone's head dims that can exceed what this device
-        // lets one block opt into. Fall back to the op-at-a-time path rather than
-        // failing the opt-in — reducing `l` barely helps, the `[dhv, dqk]` tiles
-        // dominate, and the scalar path has the same footprint.
-        let mma = gpu.kernels.has_mma && ops::mma_enabled_pub();
-        if ops::mlstm_fused_smem_bytes(l, self.dqk, self.dhv, mma) > gpu.max_shared_optin {
-            return None;
-        }
-        Some(l)
-    }
-
-    /// Chunk boundaries for a sequence of length `t`: `[(c0, len), …]`. A `t` that
-    /// already fits in one chunk yields a single full-length chunk, i.e. exactly
-    /// the pre-chunking path.
-    fn chunk_spans(&self, t: usize) -> Vec<(usize, usize)> {
-        let l = match self.chunk {
-            0 => t,
-            l => l.min(t),
-        };
-        (0..t).step_by(l).map(|c0| (c0, l.min(t - c0))).collect()
+        debug_assert!(
+            ops::mlstm_fused_smem_bytes(l, self.dqk, self.dhv, bh) <= gpu.max_shared_optin,
+            "fused mLSTM shared memory exceeds this device's opt-in limit",
+        );
+        l
     }
 
     /// Forward over `[B, T, in]` → `[B, T, d]`.
@@ -541,8 +394,7 @@ impl MLstm {
     /// the recurrent state `(C, n, m)` carried across chunk boundaries. One chunk
     /// covering the whole sequence reduces to the single-chunk form.
     ///
-    /// `out` is the caller's `[B, T, d]` buffer, written in place; the internals
-    /// still allocate their per-chunk temporaries.
+    /// `out` is the caller's `[B, T, d]` buffer, written in place.
     pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
         // Release the previous eviction before allocating anything here: freeing
         // returns memory to the CUDA allocator, which must not hand it back while a
@@ -560,300 +412,89 @@ impl MLstm {
         let (d, h, dqk, dhv) = (self.d, self.heads, self.dqk, self.dhv);
         assert_eq!(out.dims(), [b, t, d], "MLstm::forward — output shape");
         let rows = b * t; // flattened [B, T] positions
-        let bh = b * h; // batch × head, the fused kernels' outer dim
+        let shape = ops::MlstmShape { b, h, t, dqk, dhv };
 
         // Backward needs this for every projection's dW, so it outlives the call and
         // is not pooled (`assert_drained` in `backward_alloc` wants the pool whole).
         let mut xf = DTensor::uninit(gpu, &[rows, inp]);
         xf.copy_from(gpu, x);
-        let fused = self.fused_chunk(gpu, t);
-        // Only the fused path reads q/k/v as bf16; the op-at-a-time one below slices
-        // them for cuBLAS and needs them wide.
-        let bf16_qkv = self.bf16_qkv && fused.is_some();
+        let l = self.fused_chunk(gpu, t, shape.bh());
 
-        // Pooled buffers die at the reorg below; `o` is cached for backward, so it is
-        // not. Widths differ per projection, so each is sized from its own layer.
+        // The six projections, all off the same narrowed `xf`. q/k/v land in slabs at
+        // the kernels' own width and stay exactly where the projection wrote them —
+        // position-major `[rows, H*W]` is what the fused kernels address. The gate
+        // logits stay fp32: they are exponents feeding the stabilizer, where an
+        // absolute error becomes a multiplicative one, and at `[rows, H]` they are a
+        // factor of `dqk` smaller than q/k/v so narrowing would buy nothing.
+        //
+        // All of these outlive the call — backward reads them — so none is pooled.
+        let mut qh = ops::SlabBuf::new(gpu, &[rows, self.lin_q.output_size()]);
+        let mut kh = ops::SlabBuf::new(gpu, &[rows, self.lin_k.output_size()]);
+        let mut vh = ops::SlabBuf::new(gpu, &[rows, self.lin_v.output_size()]);
         let mut o = DTensor::uninit(gpu, &[rows, self.lin_o.output_size()]);
-        let mut ig = self.pool.take(gpu, &[rows, self.lin_i.output_size()]); // [rows, H]
-        let mut fg = self.pool.take(gpu, &[rows, self.lin_f.output_size()]); // [rows, H]
-        let mut qkv_w: Option<[DTensor; 3]> = None;
-        let mut qkv_b: Option<[super::BTensor; 3]> = None;
+        let mut igh = DTensor::uninit(gpu, &[rows, self.lin_i.output_size()]);
+        let mut fgh = DTensor::uninit(gpu, &[rows, self.lin_f.output_size()]);
         ops::with_shared_lhs(gpu, &xf, |xf_b| {
-            if bf16_qkv {
-                let mk = |l: &mut Linear, w: usize| {
-                    let mut t = super::BTensor::uninit(gpu, &[rows, w]);
-                    l.forward_staged_bf16(gpu, xf_b, &mut t);
-                    t
-                };
-                let (wq, wk, wv) = (
-                    self.lin_q.output_size(),
-                    self.lin_k.output_size(),
-                    self.lin_v.output_size(),
-                );
-                let qb = mk(&mut self.lin_q, wq);
-                let kb = mk(&mut self.lin_k, wk);
-                let vb = mk(&mut self.lin_v, wv);
-                qkv_b = Some([qb, kb, vb]);
-            } else {
-                let mut q = self.pool.take(gpu, &[rows, self.lin_q.output_size()]);
-                let mut k = self.pool.take(gpu, &[rows, self.lin_k.output_size()]);
-                let mut v = self.pool.take(gpu, &[rows, self.lin_v.output_size()]);
-                self.lin_q.forward_staged(gpu, &xf, xf_b, &mut q);
-                self.lin_k.forward_staged(gpu, &xf, xf_b, &mut k);
-                self.lin_v.forward_staged(gpu, &xf, xf_b, &mut v);
-                qkv_w = Some([q, k, v]);
-            }
+            self.lin_q.forward_staged_slab(gpu, &xf, xf_b, &mut qh);
+            self.lin_k.forward_staged_slab(gpu, &xf, xf_b, &mut kh);
+            self.lin_v.forward_staged_slab(gpu, &xf, xf_b, &mut vh);
             self.lin_o.forward_staged(gpu, &xf, xf_b, &mut o);
-            self.lin_i.forward_staged(gpu, &xf, xf_b, &mut ig);
-            self.lin_f.forward_staged(gpu, &xf, xf_b, &mut fg);
+            self.lin_i.forward_staged(gpu, &xf, xf_b, &mut igh);
+            self.lin_f.forward_staged(gpu, &xf, xf_b, &mut fgh);
         });
         // k needs no rescale: 1/√dqk is folded into lin_k's weights. `o` is squashed
         // later, fused into the product that consumes it.
 
-        // Chosen before the q/k/v reorg: the fused kernels stride over the projection
-        // output as it lies, while the path below slices q/k/v for cuBLAS, which needs
-        // one fixed stride between matrices and so must gather.
-        if let Some(l) = fused {
-            // position-major skips the reorg and lets the kernels stride; head-major
-            // pays a streaming pass for row locality, re-used once per chunk. Backward
-            // must read them the same way, so the choice is recorded in the cache.
-            // These buffers leave the pool for good — backward reads them.
-            let head_major = ops::mlstm_head_major();
-            let (qh, kh, vh, igh, fgh) = if let Some([qb, kb, vb]) = qkv_b {
-                // Already bf16 out of the projection; nothing to narrow or permute.
-                (
-                    ops::SlabBuf::Bf16(qb),
-                    ops::SlabBuf::Bf16(kb),
-                    ops::SlabBuf::Bf16(vb),
-                    self.pool.detach(ig),
-                    self.pool.detach(fg),
-                )
-            } else {
-                let [q, k, v] = qkv_w.take().expect("fp32 q/k/v when not bf16_qkv");
-                if head_major {
-                    let g = |src: &DTensor, w: usize| {
-                        ops::SlabBuf::from_f32(gpu, ops::head_gather(gpu, src, b, h, t, w))
-                    };
-                    let (qh, kh, vh) = (g(&q, dqk), g(&k, dqk), g(&v, dhv));
-                    let igh = ops::head_gather(gpu, &ig, b, h, t, 1).reshaped(&[bh, t]);
-                    let fgh = ops::head_gather(gpu, &fg, b, h, t, 1).reshaped(&[bh, t]);
-                    self.pool.put_all([q, k, v, ig, fg]);
-                    (qh, kh, vh, igh, fgh)
-                } else {
-                    // `from_f32` narrows without permuting and consumes the fp32 tensor,
-                    // so the wide buffer never outlives the narrow one. The gate logits
-                    // stay fp32 — the reference pins vecI/vecB to fp32, and at [rows, H]
-                    // they are a factor of `dqk` smaller than q/k/v, so narrowing buys
-                    // nothing.
-                    (
-                        ops::SlabBuf::from_f32(gpu, self.pool.detach(q)),
-                        ops::SlabBuf::from_f32(gpu, self.pool.detach(k)),
-                        ops::SlabBuf::from_f32(gpu, self.pool.detach(v)),
-                        self.pool.detach(ig),
-                        self.pool.detach(fg),
-                    )
-                }
-            };
-            let st = if head_major {
-                ops::MlstmStrides::head_major(b, h, t, dqk, dhv)
-            } else {
-                ops::MlstmStrides::position_major(b, h, t, dqk, dhv)
-            };
-            // Carry the recurrent state in from the previous chunk when the surrounding
-            // sweep is chunked; `None` (the unchunked case) starts it at zero inside
-            // the kernel. The outgoing state is taken below, after the cache is built.
-            let fused = ops::mlstm_fused_fw(
-                gpu,
-                &qh,
-                &kh,
-                &vh,
-                &igh,
-                &fgh,
-                l,
-                if self.carry {
-                    self.carry_state.as_ref()
-                } else {
-                    None
-                },
-                st,
-            );
+        // Carry the recurrent state in from the previous chunk when the surrounding
+        // sweep is chunked; `None` (the unchunked case) starts it at zero inside
+        // the kernel. The outgoing state is taken below, after the cache is built.
+        let fused = ops::mlstm_fused_fw(
+            gpu,
+            &qh,
+            &kh,
+            &vh,
+            &igh,
+            &fgh,
+            l,
             if self.carry {
-                let bh = b * h;
-                self.carry_state = Some(fused.final_state(gpu, bh, dhv, dqk));
-            }
-            // The head norm wants [rows, d]: position-major `ytil` already is, and only
-            // needs widening to fp32; head-major has to be scattered.
-            let mut h_tilde = self.pool.take(gpu, &[rows, d]);
-            let yt = fused.ytil.as_f32(gpu, &mut h_tilde);
-            let mut yhat = DTensor::uninit(gpu, &[rows, d]);
-            self.headnorm.forward(gpu, yt, &mut yhat);
-            self.pool.put(h_tilde);
-            // `hconcat` is kept in the cache rather than pooled, and `lin_out` takes it
-            // back through `backward_with_x`: a chunked sweep would otherwise have the
-            // next chunk's forward overwrite the private copy `forward` saves.
-            let mut hconcat = DTensor::uninit(gpu, &[rows, d]);
-            ops::ogate_fwd(gpu, &mut o, &yhat, &mut hconcat);
-            out.reshape_to(&[rows, d]);
-            self.lin_out.forward_shared(gpu, &hconcat, out);
-            out.reshape_to(&[b, t, d]);
-            self.saved.push(Cache::Fused(SavedFused {
-                b,
-                t,
-                xf: Some(xf),
-                qh: Some(qh),
-                kh: Some(kh),
-                vh: Some(vh),
-                igh,
-                fgh,
-                fused,
-                o: Some(o),
-                yhat: Some(yhat),
-                hconcat: Some(hconcat),
-            }));
-            self.evict_saved(gpu);
-            return;
-        }
-
-        // Op-at-a-time path: q/k/v go head-major as fp32, because this path slices
-        // them and hands the slices to cuBLAS, which needs one fixed stride between
-        // matrices and so cannot read the projection output where it lies. `bf16_qkv`
-        // requires the fused path, so the fp32 buffers are always the ones here.
-        let [q, k, v] = qkv_w.take().expect("op-at-a-time path needs fp32 q/k/v");
-        let qh = ops::head_gather(gpu, &q, b, h, t, dqk); // [BH, T, dqk]
-        let kh = ops::head_gather(gpu, &k, b, h, t, dqk);
-        let vh = ops::head_gather(gpu, &v, b, h, t, dhv); // [BH, T, dhv]
-        let igh = ops::head_gather(gpu, &ig, b, h, t, 1).reshaped(&[bh, t]); // [BH, T]
-        let fgh = ops::head_gather(gpu, &fg, b, h, t, 1).reshaped(&[bh, t]);
-        self.pool.put_all([q, k, v, ig, fg]);
-
-        // Recurrent state carried across chunks (stabilized, as on the CPU).
-        let mut c_state = DTensor::zeros(gpu, &[bh, dhv, dqk]);
-        let mut n_state = DTensor::zeros(gpu, &[bh, 1, dqk]);
-        let mut m_state = DTensor::zeros(gpu, &[bh]);
-
-        let spans = self.chunk_spans(t);
-        let last_span = spans.len() - 1;
-        let mut ytil = DTensor::uninit(gpu, &[bh, t, dhv]);
-        let mut chunks = Vec::with_capacity(spans.len());
-
-        for (ci, &(c0, len)) in spans.iter().enumerate() {
-            // One launch for all five: q/k/v are [BH, T, dqk|dhv] and the two gate
-            // tensors are [BH, T, 1], so they share BH and T and differ only in width.
-            let mut sl = ops::slice_t_batch(
-                gpu,
-                &[(&qh, dqk), (&kh, dqk), (&vh, dhv), (&igh, 1), (&fgh, 1)],
-                bh,
-                t,
-                c0,
-                len,
-            )
-            .into_iter();
-            let qc = sl.next().expect("qc"); // [BH, L, dqk]
-            let kc = sl.next().expect("kc");
-            let vc = sl.next().expect("vc"); // [BH, L, dhv]
-            let igc = sl.next().expect("igc").reshaped(&[bh, len]);
-            let fgc = sl.next().expect("fgc").reshaped(&[bh, len]);
-
-            // Decay/stabilizer machinery, on the chunk-LOCAL cumulative log-forget.
-            // `m_state` enters via the `fc_t + m_prev` branch of the row-max, which
-            // is what makes the local stabilizer equal the global one.
-            let fc = ops::cumsum_logsig(gpu, &fgc); // [BH, L]
-            let m = ops::mlstm_rowmax_m(gpu, &fc, &igc, &m_state);
-            let (bvec, avec) = ops::mlstm_chunk_ab(gpu, &fc, &igc, &m, &m_state);
-
-            // Intra-chunk (the parallel form). S, D̄ and DS are the [BH, L, L]
-            // tensors; S never outlives this scope, D̄/DS are kept for backward.
-            let (mut num, mut qn, psi_intra, dbar, ds) = {
-                let s = ops::matmul_batched_nt(gpu, &qc, &kc); // S = Q·Kᵀ  [BH, L, L]
-                let (dbar, ds, qn, psi) = ops::mlstm_ds(gpu, &s, &fc, &igc, &m);
-                let num = ops::matmul_batched_nn(gpu, &ds, &vc); // (D̄⊙S)·V  [BH, L, dhv]
-                (num, qn, psi, dbar, ds)
-            };
-
-            // Inter-chunk: read the carried state out through Q, scaled by b_t.
-            // Skipped on the first chunk, where the state is still zero.
-            let (inter, psi) = if ci == 0 {
-                (None, psi_intra)
+                self.carry_state.as_ref()
             } else {
-                let inter_num = ops::matmul_batched_nt(gpu, &qc, &c_state); // [BH, L, dhv]
-                let inter_qn = ops::matmul_batched_nt(gpu, &qc, &n_state); // [BH, L, 1]
-                ops::mul_rows_add(gpu, &mut num, &inter_num, &bvec, dhv);
-                ops::mul_rows_add(gpu, &mut qn, &inter_qn, &bvec, 1);
-                let psi = ops::psi_from_qn(gpu, &qn, &m); // ψ follows the COMBINED qn
-                let inter = Inter {
-                    c_prev: c_state.dup(gpu),
-                    n_prev: n_state.dup(gpu),
-                    inter_num,
-                    inter_qn,
-                };
-                (Some(inter), psi)
-            };
-
-            let yc = ops::div_rows(gpu, &num, &psi, dhv); // ỹ  [BH, L, dhv]
-            ops::unslice_t(gpu, &mut ytil, &yc, c0);
-
-            // End-of-chunk state update (skipped after the last chunk — nothing reads
-            // it). a_j is the last row of D̄ and g = b_last, both already in hand:
-            //   C ← g·C + (a⊙V)ᵀ·K ,  n ← g·n + Σ_j a_j k_j
-            if ci != last_span {
-                let g = ops::slice_t_as(gpu, &bvec, bh, len, 1, len - 1, 1).reshaped(&[bh]); // [BH]
-                let va = ops::mul_rows(gpu, &vc, &avec, dhv); // [BH, L, dhv]
-                let mut c_new = ops::matmul_batched_tn(gpu, &va, &kc); // [BH, dhv, dqk]
-                let a3 = avec.dup(gpu).reshaped(&[bh, len, 1]);
-                let mut n_new = ops::matmul_batched_tn(gpu, &a3, &kc); // [BH, 1, dqk]
-                ops::mul_rows_add(gpu, &mut c_new, &c_state, &g, dhv * dqk);
-                ops::mul_rows_add(gpu, &mut n_new, &n_state, &g, dqk);
-                c_state = c_new;
-                n_state = n_new;
-                // m_new = the chunk's last-row stabilizer.
-                m_state = ops::slice_t_as(gpu, &m, bh, len, 1, len - 1, 1).reshaped(&[bh]);
-            }
-
-            chunks.push(Chunk {
-                c0,
-                len,
-                bvec,
-                avec,
-                qn,
-                psi,
-                m,
-                num,
-                dbar,
-                ds,
-                inter,
-            });
+                None
+            },
+            shape,
+        );
+        if self.carry {
+            self.carry_state = Some(fused.final_state(gpu, shape.bh(), dhv, dqk));
         }
-
-        // Back to position-major, head-norm, o-gate, output projection. `h_tilde`
-        // and `hconcat` die here; `yhat` is cached for backward.
-        let mut h_tilde = self.pool.take(gpu, &[rows, d]); // [rows, d]
-        ops::head_scatter_into(gpu, &ytil, b, h, t, dhv, &mut h_tilde);
+        // `ytil` comes out `[rows, d]` already; the head norm only needs it widened.
+        let mut h_tilde = self.pool.take(gpu, &[rows, d]);
+        let yt = fused.ytil.as_f32(gpu, &mut h_tilde);
         let mut yhat = DTensor::uninit(gpu, &[rows, d]);
-        self.headnorm.forward(gpu, &h_tilde, &mut yhat);
+        self.headnorm.forward(gpu, yt, &mut yhat);
         self.pool.put(h_tilde);
-        // `hconcat` is cached rather than pooled, and `lin_out` takes it back through
-        // `backward_with_x`: under a chunked sweep the private copy `forward`
-        // saves would be overwritten by the next chunk's forward.
+        // `hconcat` is kept in the cache rather than pooled, and `lin_out` takes it
+        // back through `backward_with_x`: a chunked sweep would otherwise have the
+        // next chunk's forward overwrite the private copy `forward` saves.
         let mut hconcat = DTensor::uninit(gpu, &[rows, d]);
-        ops::ogate_fwd(gpu, &mut o, &yhat, &mut hconcat); // σ(o) ⊙ ŷ  [rows, d]
+        ops::ogate_fwd(gpu, &mut o, &yhat, &mut hconcat);
         out.reshape_to(&[rows, d]);
-        self.lin_out.forward_shared(gpu, &hconcat, out); // [rows, d]
+        self.lin_out.forward_shared(gpu, &hconcat, out);
         out.reshape_to(&[b, t, d]);
-
-        // `o`/`yhat` are unused after `mul`, so move (not dup) them into the cache.
-        self.saved.push(Cache::Legacy(Saved {
+        self.saved.push(SavedFused {
             b,
             t,
-            xf,
-            qh,
-            kh,
-            vh,
+            xf: Some(xf),
+            qh: Some(qh),
+            kh: Some(kh),
+            vh: Some(vh),
+            igh,
             fgh,
-            chunks,
-            o,
-            yhat,
-            hconcat,
-        }));
+            fused,
+            o: Some(o),
+            yhat: Some(yhat),
+            hconcat: Some(hconcat),
+        });
+        self.evict_saved(gpu);
     }
 
     /// Park this cell's saved activations on the host, if offload is enabled.
@@ -871,7 +512,7 @@ impl MLstm {
         use super::offload::Parked;
         let Some(park) = &mut self.park else { return };
         // The chunk just forwarded — the one this call is closing out.
-        let Some(Cache::Fused(sv)) = self.saved.last_mut() else {
+        let Some(sv) = self.saved.last_mut() else {
             return;
         };
         // Fixed order, mirrored exactly by `restore_saved`.
@@ -901,7 +542,7 @@ impl MLstm {
         let Some(park) = &mut self.park else { return };
         // Backward pops from the end, so the cache being refilled is the last one —
         // matching the park's own LIFO restore order.
-        let Some(Cache::Fused(sv)) = self.saved.last_mut() else {
+        let Some(sv) = self.saved.last_mut() else {
             return;
         };
         let mut it = park.restore(gpu).into_iter();
@@ -978,23 +619,6 @@ impl MLstm {
         self.saved.clear();
     }
 
-    /// Whether this cell produces q/k/v bf16 straight out of the projection.
-    pub fn uses_bf16_qkv(&self) -> bool {
-        self.bf16_qkv
-    }
-
-    /// Force the q/k/v path, so both can be exercised in one process. Turning it on
-    /// still requires the path to be supported; normal construction takes the same
-    /// decision from the environment.
-    pub fn set_bf16_qkv(&mut self, gpu: &Gpu, on: bool) {
-        self.bf16_qkv = on
-            && !ops::mlstm_head_major()
-            && gpu.kernels.slab_bf16
-            && self.lin_q.is_bf16()
-            && self.lin_k.is_bf16()
-            && self.lin_v.is_bf16();
-    }
-
     /// Retained activation bytes split `(saved_cache, other)`.
     ///
     /// `saved_cache` is what `drop_saved_act` releases. `other` is the pooled scratch
@@ -1009,13 +633,7 @@ impl MLstm {
     /// Device bytes held by the forward caches, summed over every chunk still awaiting
     /// its backward.
     fn saved_bytes(&self) -> usize {
-        self.saved
-            .iter()
-            .map(|c| match c {
-                Cache::Fused(s) => s.retained_bytes(),
-                Cache::Legacy(s) => s.retained_bytes(),
-            })
-            .sum()
+        self.saved.iter().map(SavedFused::retained_bytes).sum()
     }
 
     /// Release everything a forward left behind that no backward will read: the
@@ -1084,14 +702,12 @@ impl MLstm {
         // `take`, not `as_ref`: the cache holds a window's activations, and dropping
         // them at the end of this call (rather than when the next forward overwrites
         // the field) keeps them from staying resident across the optimizer step.
-        match self.saved.pop().expect("MLstm::backward before forward") {
-            Cache::Fused(sv) => self.backward_fused(gpu, dy, sv),
-            Cache::Legacy(sv) => self.backward_legacy(gpu, dy, sv),
-        }
+        let sv = self.saved.pop().expect("MLstm::backward before forward");
+        self.backward_fused(gpu, dy, sv)
     }
 
     /// Backward of the fused path: two kernels for the whole chunkwise core, with
-    /// the same projection/head-norm/o-gate shell as the op-at-a-time path.
+    /// the same projection/head-norm/o-gate shell around it.
     fn backward_fused(&mut self, gpu: &Gpu, dy: &DTensor, sv: SavedFused) -> DTensor {
         let (d, h, dqk, dhv, inp) = (self.d, self.heads, self.dqk, self.dhv, self.input_size);
         let (b, t) = (sv.b, sv.t);
@@ -1132,7 +748,7 @@ impl MLstm {
             } else {
                 None
             },
-            ops::MlstmStrides::position_major(b, h, t, dqk, dhv),
+            ops::MlstmShape { b, h, t, dqk, dhv },
         );
         self.pool.put(d_ytil);
         if self.carry {
@@ -1173,240 +789,6 @@ impl MLstm {
         self.pool.put(part);
         drop((dq, dk, dv, do_pre, d_ig, d_fg));
         acc.reshaped(&[b, t, inp])
-    }
-
-    fn backward_legacy(&mut self, gpu: &Gpu, dy: &DTensor, sv: Saved) -> DTensor {
-        let (d, h, dqk, dhv, inp) = (self.d, self.heads, self.dqk, self.dhv, self.input_size);
-        let sv = &sv;
-        let (b, t) = (sv.b, sv.t);
-        let (n, bh) = (b * t, b * h);
-
-        // The shell before the chunk loop is all temporaries; they come from the
-        // pool and go back as soon as their consumer has read them.
-        let mut dy_flat = self.pool.take(gpu, &[n, d]);
-        dy_flat.copy_from(gpu, dy);
-
-        // Output projection + o-gate.
-        let mut d_hconcat = self.pool.take(gpu, &[n, d]); // [N, d]
-        self.lin_out
-            .backward_with_x(gpu, &sv.hconcat, &dy_flat, &mut d_hconcat);
-        self.pool.put(dy_flat);
-        let (do_pre, d_yhat) = ops::ogate_bwd(gpu, &d_hconcat, &sv.o, &sv.yhat);
-        self.pool.put(d_hconcat);
-
-        // Head-norm backward → d_h_tilde, then head-gather to head-major d_ytil.
-        let mut d_h_tilde = self.pool.take(gpu, &[n, d]); // [N, d]
-        self.headnorm.backward(gpu, &d_yhat, &mut d_h_tilde);
-        let d_ytil = ops::head_gather(gpu, &d_h_tilde, b, h, t, dhv); // [BH, T, dhv]
-        // `d_h_tilde` is the pool's; `d_yhat` came from `ogate_bwd`, so it is only
-        // dropped — the pool must get back exactly what it lent.
-        self.pool.put(d_h_tilde);
-        drop(d_yhat);
-
-        // Full-sequence grad buffers; each chunk writes its own disjoint T-range.
-        let mut dqh = DTensor::uninit(gpu, &[bh, t, dqk]);
-        let mut dkh = DTensor::uninit(gpu, &[bh, t, dqk]);
-        let mut dvh = DTensor::uninit(gpu, &[bh, t, dhv]);
-        let mut digh = DTensor::uninit(gpu, &[bh, t, 1]);
-        let mut d_fgh3 = DTensor::uninit(gpu, &[bh, t, 1]);
-
-        // Grad wrt the state leaving the chunk under consideration. Zero for the
-        // last chunk (nothing downstream reads its outgoing state).
-        let mut dc_carry = DTensor::zeros(gpu, &[bh, dhv, dqk]);
-        let mut dn_carry = DTensor::zeros(gpu, &[bh, 1, dqk]);
-
-        for (ci, ch) in sv.chunks.iter().enumerate().rev() {
-            let (c0, len) = (ch.c0, ch.len);
-            let is_last = ci + 1 == sv.chunks.len();
-
-            let mut sl = ops::slice_t_batch(
-                gpu,
-                &[
-                    (&sv.qh, dqk),
-                    (&sv.kh, dqk),
-                    (&sv.vh, dhv),
-                    (&sv.fgh, 1),
-                    (&d_ytil, dhv),
-                ],
-                bh,
-                t,
-                c0,
-                len,
-            )
-            .into_iter();
-            let qc = sl.next().expect("qc"); // [BH, L, dqk]
-            let kc = sl.next().expect("kc");
-            let vc = sl.next().expect("vc"); // [BH, L, dhv]
-            let fgc = sl.next().expect("fgc").reshaped(&[bh, len]);
-            let d_ytil_c = sl.next().expect("d_ytil_c"); // [BH, L, dhv]
-
-            // ỹ = num/ψ  → d_num, d_qn  (num/ψ/qn all include the inter term).
-            let (d_num, d_qn) =
-                ops::div_rows_bwd(gpu, &d_ytil_c, &ch.num, &ch.psi, &ch.qn, &ch.m, dhv);
-
-            // The [BH, L, L] tensors, from forward's cache. Everything derived from
-            // them below is at most [BH, L, dqk].
-            let (mut dvc, d_s, p) = {
-                // num = DS·V:  dV = DSᵀ·d_num ;  dDS(num path) = d_num·Vᵀ.
-                let dvc = ops::matmul_batched_tn(gpu, &ch.ds, &d_num); // [BH, L, dhv]
-                let dds_num = ops::matmul_batched_nt(gpu, &d_num, &vc); // [BH, L, L]
-
-                // DS = D̄⊙S + qn-sum:  dS and P (= dD̄⊙D̄, feeds fc/ig grads).
-                let (d_s, p) = ops::mlstm_ds_bwd(gpu, &dds_num, &d_qn, &ch.dbar, &ch.ds);
-                (dvc, d_s, p)
-            };
-
-            // S = Q·Kᵀ:  dQ = dS·K ;  dK = dSᵀ·Q.
-            let mut dqc = ops::matmul_batched_nn(gpu, &d_s, &kc); // [BH, L, dqk]
-            let mut dkc = ops::matmul_batched_tn(gpu, &d_s, &qc); // [BH, L, dqk]
-            drop(d_s);
-
-            // Decay grads from the intra-chunk D̄. `mlstm_dfc_dig` WRITES these; the
-            // a/b contributions below accumulate on top.
-            let (mut dfc, mut dig) = ops::mlstm_dfc_dig(gpu, &p); // [BH, L] each
-            drop(p);
-
-            let mut db = DTensor::zeros(gpu, &[bh, len]); // grad wrt b_t
-            let mut da = DTensor::zeros(gpu, &[bh, len]); // grad wrt a_j
-
-            // state-update path: how this chunk fed the NEXT chunk's state
-            //   C_out = g·C_in + (a⊙V)ᵀ·K ,  n_out = g·n_in + Σ_j a_j k_j
-            // Skipped for the last chunk (dc_carry / dn_carry are zero there).
-            let (mut dc_in, mut dn_in) = (None, None);
-            if !is_last {
-                let a3 = ch.avec.dup(gpu).reshaped(&[bh, len, 1]);
-                let va = ops::mul_rows(gpu, &vc, &ch.avec, dhv); // a⊙V  [BH, L, dhv]
-
-                // C_out = Vaᵀ·K:  dVa = K·dC_outᵀ ;  dK += Va·dC_out.
-                let dva = ops::matmul_batched_nt(gpu, &kc, &dc_carry); // [BH, L, dhv]
-                ops::add_assign(gpu, &mut dkc, &ops::matmul_batched_nn(gpu, &va, &dc_carry));
-                // Va = a⊙V:  dV += a⊙dVa ;  da += Σ_p dVa·V.
-                ops::mul_rows_add(gpu, &mut dvc, &dva, &ch.avec, dhv);
-                ops::row_dot_add(gpu, &mut da, &dva, &vc, dhv);
-
-                // n_out = Σ_j a_j k_j:  dK += a ⊗ dn_out ;  da += K·dn_outᵀ.
-                ops::add_assign(gpu, &mut dkc, &ops::matmul_batched_nn(gpu, &a3, &dn_carry));
-                let da_n = ops::matmul_batched_nt(gpu, &kc, &dn_carry); // [BH, L, 1]
-                ops::add_assign(gpu, &mut da, &da_n.reshaped(&[bh, len]));
-
-                // g·state: dg = Σ(dC_out ⊙ C_in) + Σ(dn_out ⊙ n_in); dstate_in += g·dC_out.
-                // Only reachable when this chunk HAS an incoming state (ci > 0) — for
-                // chunk 0 the state is zero, so g contributes nothing and there is no
-                // predecessor to hand dC_in to.
-                if let Some(it) = &ch.inter {
-                    let g = ops::slice_t_as(gpu, &ch.bvec, bh, len, 1, len - 1, 1).reshaped(&[bh]);
-                    let mut dg = DTensor::zeros(gpu, &[bh]);
-                    ops::group_dot_add(gpu, &mut dg, &dc_carry, &it.c_prev);
-                    ops::group_dot_add(gpu, &mut dg, &dn_carry, &it.n_prev);
-
-                    let mut dc = DTensor::zeros(gpu, &[bh, dhv, dqk]);
-                    let mut dn = DTensor::zeros(gpu, &[bh, 1, dqk]);
-                    ops::mul_rows_add(gpu, &mut dc, &dc_carry, &g, dhv * dqk);
-                    ops::mul_rows_add(gpu, &mut dn, &dn_carry, &g, dqk);
-                    dc_in = Some(dc);
-                    dn_in = Some(dn);
-
-                    // g IS b_last, so dg lands on the last column of db.
-                    let mut dg_pad = DTensor::zeros(gpu, &[bh, len, 1]);
-                    ops::unslice_t_as(gpu, &mut dg_pad, &dg, 1, len - 1);
-                    ops::add_assign(gpu, &mut db, &dg_pad.reshaped(&[bh, len]));
-                }
-            }
-
-            // inter path: how this chunk READ its incoming state
-            //   num += b⊙(Q·C_inᵀ) ,  qn += b⊙(Q·n_inᵀ)
-            if let Some(it) = &ch.inter {
-                // db from both products (they are saved pre-b, which is what db needs).
-                ops::row_dot_add(gpu, &mut db, &d_num, &it.inter_num, dhv);
-                ops::row_dot_add(gpu, &mut db, &d_qn, &it.inter_qn, 1);
-
-                let d_inter_num = ops::mul_rows(gpu, &d_num, &ch.bvec, dhv); // [BH, L, dhv]
-                let d_inter_qn = ops::mul_rows(gpu, &d_qn, &ch.bvec, 1).reshaped(&[bh, len, 1]);
-
-                // dQ from both readouts.
-                dqc = ops::add(
-                    gpu,
-                    &dqc,
-                    &ops::matmul_batched_nn(gpu, &d_inter_num, &it.c_prev),
-                );
-                dqc = ops::add(
-                    gpu,
-                    &dqc,
-                    &ops::matmul_batched_nn(gpu, &d_inter_qn, &it.n_prev),
-                );
-
-                // dC_in / dn_in from both readouts (adding to the g·state term above).
-                let dc_r = ops::matmul_batched_tn(gpu, &d_inter_num, &qc); // [BH, dhv, dqk]
-                let dn_r = ops::matmul_batched_tn(gpu, &d_inter_qn, &qc); // [BH, 1, dqk]
-                dc_in = Some(match dc_in {
-                    Some(dc) => ops::add(gpu, &dc, &dc_r),
-                    None => dc_r,
-                });
-                dn_in = Some(match dn_in {
-                    Some(dn) => ops::add(gpu, &dn, &dn_r),
-                    None => dn_r,
-                });
-            }
-
-            // a/b → (dfc, dig), accumulated onto the intra-chunk D̄ contribution.
-            ops::mlstm_chunk_ab_bwd(gpu, &db, &da, &ch.bvec, &ch.avec, &mut dfc, &mut dig);
-
-            // dfc → d(f-logit) via reverse-cumsum·logσ' — within the chunk, since fc
-            // is the chunk-local cumsum.
-            let d_fgc = ops::revcumsum_dlogsig(gpu, &dfc, &fgc); // [BH, L]
-
-            // One launch for all five; the widths are explicit, so the rank-2 gate
-            // gradients need no reshape (and hence no temporary).
-            ops::unslice_t_batch(
-                gpu,
-                &mut [
-                    (&mut dqh, &dqc, dqk),
-                    (&mut dkh, &dkc, dqk),
-                    (&mut dvh, &dvc, dhv),
-                    (&mut digh, &dig, 1),
-                    (&mut d_fgh3, &d_fgc, 1),
-                ],
-                bh,
-                t,
-                c0,
-                len,
-            );
-
-            // Hand the incoming-state grads to the predecessor chunk.
-            dc_carry = dc_in.unwrap_or_else(|| DTensor::zeros(gpu, &[bh, dhv, dqk]));
-            dn_carry = dn_in.unwrap_or_else(|| DTensor::zeros(gpu, &[bh, 1, dqk]));
-        }
-
-        // Scatter head-major grads back to position-major [N, ·].
-        let dq = ops::head_scatter(gpu, &dqh, b, h, t, dqk); // [N, d_qk]
-        // No 1/√dqk here: it lives in lin_k's weights, so dk is already in their scale.
-        let dk = ops::head_scatter(gpu, &dkh, b, h, t, dqk);
-        let dv = ops::head_scatter(gpu, &dvh, b, h, t, dhv); // [N, d]
-        let d_ig = ops::head_scatter(gpu, &digh, b, h, t, 1); // [N, H]
-        let d_fg = ops::head_scatter(gpu, &d_fgh3, b, h, t, 1);
-
-        // Projection backward; sum the input grads (all share the saved xf, held
-        // once in the cache rather than copied into each of the six `Linear`s).
-        // dx is the sum of the six projection backwards, accumulated into one
-        // buffer with one pooled scratch — not a fresh [N, in] per term.
-        let mut dxf = DTensor::uninit(gpu, &[n, inp]);
-        let mut part = self.pool.take(gpu, &[n, inp]);
-        ops::with_shared_lhs(gpu, &sv.xf, |xf_b| {
-            self.lin_q
-                .backward_staged_x(gpu, &sv.xf, xf_b, &dq, &mut dxf);
-            for (lin, grad) in [
-                (&mut self.lin_k, &dk),
-                (&mut self.lin_v, &dv),
-                (&mut self.lin_o, &do_pre),
-                (&mut self.lin_i, &d_ig),
-                (&mut self.lin_f, &d_fg),
-            ] {
-                lin.backward_staged_x(gpu, &sv.xf, xf_b, grad, &mut part);
-                ops::add_assign(gpu, &mut dxf, &part);
-            }
-        });
-        self.pool.put(part);
-        dxf.reshaped(&[b, t, inp])
     }
 
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
@@ -1679,7 +1061,7 @@ mod tests {
         // Non-trivial gate weights so the decay/stabilizer path is exercised — with
         // zero gates every chunk would decay identically and the test would pass
         // vacuously.
-        // Seeded for the same reason as `mlstm_fused_matches_legacy`: this compares
+        // Seeded for the same reason as `mlstm_fused_chunking_matches_unit_chunk`: this compares
         // two chunk blockings whose sums reassociate, so it is a tolerance test and
         // must not redraw its data every run.
         proto.wi = Tensor::random_seeded(&[inp, heads], 0.3, 0xB1);
@@ -1726,49 +1108,18 @@ mod tests {
         }
     }
 
-    /// Producing q/k/v bf16 out of the projection must match narrowing an fp32
-    /// buffer afterwards. Both round once, so this is exact-equality: the epilogue
-    /// bias and `broadcast_row` + `beta=1` feed the same accumulator, and the same
-    /// rounding lands on the same values.
-    #[test]
-    fn mlstm_bf16_qkv_matches_narrowed_fp32() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        let (b, t, inp, d, heads, dqk) = (2, 128, 64, 256, 8, 32);
-        let proto = CpuMLstm::new(inp, d, heads, dqk);
-        let x = DTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, inp], 0.5, 0xB1));
-        let g = DTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, d], 1.0, 0xB2));
-
-        let run = |on: bool| {
-            let mut dev = MLstm::from_cpu(&gpu, &proto);
-            dev.set_bf16_qkv(&gpu, on);
-            assert_eq!(dev.uses_bf16_qkv(), on, "path not selected");
-            let mut yt = DTensor::uninit(&gpu, &[b, t, d]);
-            dev.forward(&gpu, &x, &mut yt);
-            let y = yt.to_host(&gpu).data;
-            let dx = dev.backward_alloc(&gpu, &g).to_host(&gpu).data;
-            let dwq = dev.lin_q.dw.to_host(&gpu).data;
-            (y, dx, dwq)
-        };
-
-        let (y_on, dx_on, dwq_on) = run(true);
-        let (y_off, dx_off, dwq_off) = run(false);
-        assert_eq!(y_on, y_off, "forward differs");
-        assert_eq!(dx_on, dx_off, "dx differs");
-        assert_eq!(dwq_on, dwq_off, "dW_q differs");
-    }
-
-    /// The fused kernels vs the op-at-a-time path at the **backbone's real shape**.
+    /// Chunked (L = 32) vs step-by-step (L = 1), at a shape wide enough to matter.
     ///
-    /// The other tests run at toy dims (dqk = dhv = 4, T = 20), where a fused block
-    /// uses a few hundred bytes of shared memory and most of its 256 threads idle.
-    /// This one runs dqk = dhv = 64 over a T that spans many chunks and ends on a
-    /// SHORT one (T = 200 = 6·32 + 8), which is what actually exercises the shared-
-    /// memory staging, the block-wide max/sum reductions, and the `len` masking on
-    /// the ragged final chunk. A bug in any of those is invisible at the toy dims.
+    /// The chunk length is a blocking choice with no effect on the result, so the two
+    /// must agree — what is on trial is the inter-chunk state carry and the ragged
+    /// final chunk. The other tests run at toy dims (dqk = dhv = 4, T = 20), where a
+    /// fused block uses a few hundred bytes of shared memory and most of its threads
+    /// idle. This one runs dqk = dhv = 64 over a T that spans many chunks and ends on
+    /// a SHORT one (T = 200 = 6·32 + 8), which is what exercises the shared-memory
+    /// staging, the block-wide max/sum reductions, and the `len` masking. A bug in
+    /// any of those is invisible at the toy dims.
     #[test]
-    fn mlstm_fused_matches_legacy() {
+    fn mlstm_fused_chunking_matches_unit_chunk() {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
@@ -1805,29 +1156,24 @@ mod tests {
             (y, dx, wf, wout)
         };
 
-        // The fusion algebra is what is on trial here, so this runs the SCALAR fused
-        // kernels: their dots are fp32 and the comparison against the op-at-a-time
-        // path stays exact to fp32 tolerance. The tensor-core dots are a separate,
-        // deliberately looser question — see `mlstm_fused_mma_matches_scalar`.
-        let _mma = with_mma(false);
+        // L = 1 degenerates the chunkwise form to a pure step-by-step recurrence (no
+        // intra-chunk parallel term at all); L = 32 is the real blocking. The state
+        // carry is the only thing that can make them differ.
+        let (y0, dx0, wf0, wo0) = run(1);
+        let (y1, dx1, wf1, wo1) = run(32);
 
-        let (y0, dx0, wf0, wo0) = run(0); // op-at-a-time, single chunk
-        let (y1, dx1, wf1, wo1) = run(32); // fused
-
-        // The two sides no longer share a storage dtype. The fused path keeps its
-        // saved q/k/v and ytil in bf16 (the reference's DTYPE tensors), while the
-        // op-at-a-time path is fp32 throughout — so this compares the fusion algebra
-        // ACROSS a precision boundary, and the floor is bf16's half-ulp (2^-8), not
-        // fp32 reassociation. `GPU_NO_BF16=1` puts both sides back on fp32 and the
-        // original tolerances apply.
+        // Both sides keep their saved q/k/v and ytil in bf16 (the reference's DTYPE
+        // tensors), so the floor is bf16's half-ulp (2^-8) rather than fp32
+        // reassociation, and both sides' dots are on the tensor cores. `GPU_NO_BF16=1`
+        // puts the slabs back on fp32 and the original tolerances apply.
         let slab = if gpu.kernels.slab_bf16 { 8.0 } else { 1.0 };
         assert_close(&y1, &y0, 2e-3 * slab, "y");
         assert_close(&dx1, &dx0, 2e-3 * slab, "dx");
         // The weights come out of an Adam step, so they sit at ~1e-2 while the two
         // paths' GEMMs reassociate at ~1e-3 relative. An ABSOLUTE 2e-5 on values of
-        // that size is really a 4e-4 relative demand, tighter than fp32 summation
-        // order guarantees — which is what made this test intermittent. Compare
-        // against the tensor's own scale, as `mlstm_fused_mma_matches_scalar` does.
+        // that size is really a 4e-4 relative demand, tighter than summation order
+        // guarantees — which is what made this test intermittent. Compare against
+        // the tensor's own scale.
         // Adam divides by √v̂, which amplifies a small gradient difference on a
         // near-zero-gradient weight, so the weight check needs more headroom than
         // the activations above.
@@ -1835,103 +1181,96 @@ mod tests {
         assert_close_rel(&wo1, &wo0, 5e-3 * slab, "w_out");
     }
 
-    /// Serializes the tests that select a kernel path through the process-global
-    /// mma flag. Cargo runs a suite's tests on parallel threads in ONE process, so
-    /// the flag is shared: without this lock, `mlstm_fused_matches_legacy` (which
-    /// wants the scalar dots) and `mlstm_fused_mma_matches_scalar` (which wants the
-    /// tensor-core dots) race, and whichever loses runs against the other's kernel
-    /// and misses its tolerance. That was an intermittent failure in roughly half
-    /// of full-suite runs while passing whenever either test ran alone.
-    static MMA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Holds the flag for the caller's scope and restores it on exit, panic or not,
-    /// so one test's A/B neither races nor leaks into the next.
-    struct MmaGuard(Option<std::sync::MutexGuard<'static, ()>>);
-    impl Drop for MmaGuard {
-        fn drop(&mut self) {
-            super::ops::set_mma_enabled(true);
-            // Release the lock only after the flag is back to its default.
-            self.0.take();
-        }
-    }
-    fn with_mma(on: bool) -> MmaGuard {
-        // A poisoned lock just means some earlier test panicked; the flag is reset
-        // by that test's own guard, so the state is still sound to take over.
-        let g = MMA_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        super::ops::set_mma_enabled(on);
-        MmaGuard(Some(g))
-    }
-
-    /// The tensor-core (`mma.sync`, TF32) forward against the scalar fp32 one, at
-    /// the backbone's real shape and with a short final chunk.
+    /// The fused forward and backward against the CPU scalar recurrence at a shape
+    /// with a SHORT final chunk (T = 200 = 6·32 + 8).
     ///
-    /// The two kernels implement the *same* algorithm on the same shared-memory
-    /// plan; the only difference is that the three contractions (`Q·Kᵀ`, `(D̄⊙S)·V`,
-    /// `Q·C_prevᵀ`) run on the tensor cores, which round their inputs to TF32 — 10
-    /// mantissa bits instead of 24, fp32 exponent and fp32 accumulate. So this is
-    /// not an exactness check and must not be tightened into one: it asserts that
-    /// the mma fragment layouts, the zero-padding of the ragged chunk, and the
-    /// fused decay/mask epilogue are all *right*, to a tolerance that a wrong
-    /// fragment index (which garbles the result outright, not by 1e-3) cannot pass.
-    ///
-    /// It also covers what the scalar path cannot reach on its own: a `dhv`/`dqk`
-    /// that is not a multiple of the mma tile, and a `len` shorter than one tile.
+    /// What is on trial is the ragged tail: the mma fragment loaders read whole
+    /// 16x8x16 blocks, so every buffer is zero-filled past `len` and the pad rows must
+    /// contribute nothing. A wrong fragment index or a missed zero-fill garbles the
+    /// result outright rather than by 1e-3, so the tolerance is loose on purpose —
+    /// the operands are bf16, and the dots accumulate over 200 timesteps.
     #[test]
-    fn mlstm_fused_mma_matches_scalar() {
+    fn mlstm_fused_ragged_chunk_matches_cpu() {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        if !gpu.kernels.has_mma {
-            eprintln!("skipping: device has no tensor cores (needs sm_80+)");
-            return;
-        }
         let (b, t, inp, d, heads, dqk) = (2, 200, 64, 512, 8, 64); // dhv = 64
         assert!(
             t % super::ops::FUSED_MAX_L != 0,
             "the last chunk must be short"
         );
 
-        let mut proto = CpuMLstm::new(inp, d, heads, dqk);
-        proto.wi = Tensor::random(&[inp, heads], 0.3);
-        proto.wf = Tensor::random(&[inp, heads], 0.3);
+        let mut cpu = CpuMLstm::new(inp, d, heads, dqk);
+        cpu.wi = Tensor::random_seeded(&[inp, heads], 0.3, 0xE1);
+        cpu.wf = Tensor::random_seeded(&[inp, heads], 0.3, 0xE2);
+        let mut dev = MLstm::from_cpu(&gpu, &cpu);
+        dev.set_chunk(32);
 
-        let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, inp], 0.5));
-        let g = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
+        let x = Tensor::random_seeded(&[b, t, inp], 0.5, 0xE3);
+        let g = Tensor::random_seeded(&[b, t, d], 1.0, 0xE4);
 
-        let run = |mma: bool| {
-            let _guard = with_mma(mma);
-            let mut dev = MLstm::from_cpu(&gpu, &proto);
-            dev.set_chunk(32);
-            let mut yt = DTensor::uninit(&gpu, &[b, t, d]);
-            dev.forward(&gpu, &x, &mut yt);
-            let y = yt.to_host(&gpu).data;
-            let dx = dev.backward_alloc(&gpu, &g).to_host(&gpu).data;
-            (y, dx)
+        let y_cpu = cpu.forward(&x);
+        let mut yt = DTensor::uninit(&gpu, &[b, t, d]);
+        dev.forward(&gpu, &DTensor::from_host(&gpu, &x), &mut yt);
+        assert_close_rel(&yt.to_host(&gpu).data, &y_cpu.data, 1e-2, "y");
+
+        let dx_cpu = cpu.backward(&g);
+        let dx = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
+        assert_close_rel(&dx.to_host(&gpu).data, &dx_cpu.data, 1e-2, "dx");
+    }
+
+    /// The fused kernels at a head width wide enough to TILE, against the CPU scalar
+    /// recurrence.
+    ///
+    /// The other CPU checks run `dqk = 4`, where `MLSTM_KT`/`MLSTM_VT` exceed the head
+    /// dim and both slice loops are a single pass — so they exercise none of the
+    /// head-dim tiling. Here `dqk = dhv = 96` gives NKT = NVT = 3, and the CPU
+    /// recurrence is an independent implementation rather than a second GPU path.
+    #[test]
+    fn mlstm_fused_tiled_matches_cpu() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
         };
+        // T spans several fused chunks (FUSED_MAX_L = 32) so the state carry is
+        // covered too; dqk = dhv = 96 is the backbone's width.
+        let (b, t, inp, d, heads, dqk) = (2, 70, 12, 768, 8, 96);
 
-        let (y0, dx0) = run(false); // scalar fp32 dots — the oracle
-        let (y1, dx1) = run(true); // tensor-core TF32 dots
+        let mut cpu = CpuMLstm::new(inp, d, heads, dqk);
+        cpu.wi = Tensor::random_seeded(&[inp, heads], 0.3, 0xD1);
+        cpu.wf = Tensor::random_seeded(&[inp, heads], 0.3, 0xD2);
+        let mut dev = MLstm::from_cpu(&gpu, &cpu);
 
-        // TF32 error is relative to the size of the DOT, not of the element, so the
-        // scale to divide by is the tensor's own magnitude — a per-element relative
-        // check would explode on the elements that happen to sit near zero.
-        let close = |got: &[f32], want: &[f32], tol: f32, what: &str| {
-            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            let worst = got
-                .iter()
-                .zip(want)
-                .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
-            println!(
-                "{what}: worst |mma - scalar| {worst:.3e} on a scale of {scale:.3e} -> {:.2e} relative",
-                worst / scale
-            );
-            assert!(
-                worst / scale < tol,
-                "{what}: worst |mma - scalar| {worst:.3e} vs scale {scale:.3e} exceeds {tol:.0e}"
-            );
-        };
-        close(&y1, &y0, 5e-3, "y");
-        close(&dx1, &dx0, 5e-3, "dx");
+        let x = Tensor::random_seeded(&[b, t, inp], 0.5, 0xD3);
+        let g = Tensor::random_seeded(&[b, t, d], 1.0, 0xD4);
+
+        // Relative, not absolute: at this width `y` lands around 2e-4, so an absolute
+        // 5e-3 would be ~20x the signal and pass on nearly any output.
+        //
+        // The bound is bf16's half-ulp (2^-8 ~ 3.9e-3) with room for the accumulated
+        // rounding on top: the fused path stores q/k/v and ytil narrow, so a tighter
+        // relative bound is measuring the storage format, not the kernel. Sitting at
+        // 5e-3 made this fail ~2 runs in 3 at 5.07e-3.
+        let y_cpu = cpu.forward(&x);
+        let mut y_dev = DTensor::uninit(&gpu, &[b, t, d]);
+        dev.forward(&gpu, &DTensor::from_host(&gpu, &x), &mut y_dev);
+        assert_close_rel(&y_dev.to_host(&gpu).data, &y_cpu.data, 1e-2, "y");
+
+        // dx is looser than y: it carries the bf16 q/k/v narrowing and the TF32 mma
+        // rounding of every backward contraction, against an fp32 CPU recurrence.
+        // The injected-bug check that justifies this test lands at 2.2e-1, two orders
+        // above either bound.
+        // dx is looser than y: it carries the bf16 q/k/v narrowing and the TF32 mma
+        // rounding of every backward contraction, against an fp32 CPU recurrence.
+        // The injected-bug check that justifies this test lands at 2.2e-1, an order
+        // above either bound.
+        //
+        // Weights after an Adam step are deliberately NOT compared: the update is
+        // `lr·g/(√(g²)+ε)`, which normalizes away the gradient's magnitude and turns
+        // a last-bit difference into a full-size one — 3.1e-2 here. `dx` is the
+        // gradient check; a weight check on top of it only measures the optimizer.
+        let dx_cpu = cpu.backward(&g);
+        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
+        assert_close_rel(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 1e-2, "dx");
     }
 
     /// The chunked path vs the CPU scalar recurrence — the same check as
@@ -1977,105 +1316,12 @@ mod tests {
         );
     }
 
-    /// The same q/k/v, handed in position-major with matching strides, must give the
-    /// same result as the head-major reorg.
-    ///
-    /// This is the property that lets a caller skip `head_gather` entirely: the
-    /// kernels address through `MlstmStrides`, so the layout is an argument rather
-    /// than a packing. Run at `b > 1`, where the row index is `b*T + t` and the batch
-    /// and head strides are not proportional — the case a single fused `bh` stride
-    /// could not express. The two runs must agree bit for bit: same arithmetic, same
-    /// order, only the addressing differs.
-    #[test]
-    fn mlstm_fused_position_major_matches_head_major() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        let _mma = with_mma(false);
-        let (b, h, t, dqk, dhv, l) = (3usize, 4usize, 96usize, 64usize, 64usize, 32usize);
-        let bh = b * h;
-
-        let mk = |dims: &[usize], seed: u64| {
-            DTensor::from_host(&gpu, &Tensor::random_seeded(dims, 0.5, seed))
-        };
-        let (q, k, v) = (
-            mk(&[bh, t, dqk], 0x1),
-            mk(&[bh, t, dqk], 0x2),
-            mk(&[bh, t, dhv], 0x3),
-        );
-        let (ig, fg) = (mk(&[bh, t], 0x4), mk(&[bh, t], 0x5));
-
-        // [B*H, T, W] -> [N, H*W] with N = B*T: the layout the projections emit.
-        let to_pos = |src: &DTensor, w: usize| {
-            let hst = src.to_host(&gpu);
-            let mut out = vec![0.0; b * t * h * w];
-            for bb in 0..b {
-                for hh in 0..h {
-                    for tt in 0..t {
-                        for c in 0..w {
-                            out[(bb * t + tt) * (h * w) + hh * w + c] =
-                                hst.data[((bb * h + hh) * t + tt) * w + c];
-                        }
-                    }
-                }
-            }
-            DTensor::from_host(&gpu, &Tensor::new(&[b * t, h * w], out))
-        };
-
-        let ytil_host = |f: &ops::MlstmFused| {
-            let mut s = DTensor::uninit(&gpu, &[bh * t * dhv]);
-            f.ytil.as_f32(&gpu, &mut s).to_host(&gpu).data
-        };
-        let slab = |src: &DTensor| ops::SlabBuf::from_f32(&gpu, src.dup(&gpu));
-
-        let hm = ops::mlstm_fused_fw(
-            &gpu,
-            &slab(&q),
-            &slab(&k),
-            &slab(&v),
-            &ig,
-            &fg,
-            l,
-            None,
-            ops::MlstmStrides::head_major(b, h, t, dqk, dhv),
-        );
-        let pm = ops::mlstm_fused_fw(
-            &gpu,
-            &slab(&to_pos(&q, dqk)),
-            &slab(&to_pos(&k, dqk)),
-            &slab(&to_pos(&v, dhv)),
-            &to_pos(&ig, 1).reshaped(&[b * t, h]),
-            &to_pos(&fg, 1).reshaped(&[b * t, h]),
-            l,
-            None,
-            ops::MlstmStrides::position_major(b, h, t, dqk, dhv),
-        );
-
-        // The two runs write `ytil` in their OWN layouts, so compare through the
-        // index rather than element by element.
-        let (hm_y, pm_y) = (ytil_host(&hm), ytil_host(&pm));
-        assert_eq!(hm_y.len(), pm_y.len());
-        for bb in 0..b {
-            for hh in 0..h {
-                for tt in 0..t {
-                    for c in 0..dhv {
-                        let i_hm = ((bb * h + hh) * t + tt) * dhv + c;
-                        let i_pm = (bb * t + tt) * (h * dhv) + hh * dhv + c;
-                        assert_eq!(
-                            hm_y[i_hm], pm_y[i_pm],
-                            "ytil differs at (b{bb} h{hh} t{tt} c{c})"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     /// The fused forward, run in chunks with the state carried, must reproduce the
     /// single whole-sequence call.
     ///
     /// This is the load-bearing property of the chunked sweep, tested at the kernel
-    /// level so a failure points at `mlstm_fw_C`'s `CARRY` seeding rather than at
+    /// level so a failure points at the `CARRY` seeding in `mlstm_fw_gates` /
+    /// `mlstm_fw_scan` rather than at
     /// anything layered above it. `m` is the stabilizer: seeding it wrong does not
     /// crash and produces no NaN, it silently rescales every value in the chunk — so
     /// comparing `ytil` (the kernel's output) across the split is the only thing that
@@ -2085,7 +1331,6 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        let _mma = with_mma(false); // scalar dots, so the split stays an fp32 question
         let (bh, dqk, dhv, l) = (4, 64, 64, 32);
         let parts = [64usize, 64, 32]; // ragged: the last chunk is short
         let t: usize = parts.iter().sum();
@@ -2115,7 +1360,13 @@ mod tests {
             &fg,
             l,
             None,
-            ops::MlstmStrides::head_major(bh, 1, t, dqk, dhv),
+            ops::MlstmShape {
+                b: bh,
+                h: 1,
+                t,
+                dqk,
+                dhv,
+            },
         );
         let want = ytil_host(&whole, bh * t * dhv);
 
@@ -2145,7 +1396,13 @@ mod tests {
                 &fgc.reshaped(&[bh, c]),
                 l,
                 state.as_ref(),
-                ops::MlstmStrides::head_major(bh, 1, c, dqk, dhv),
+                ops::MlstmShape {
+                    b: bh,
+                    h: 1,
+                    t: c,
+                    dqk,
+                    dhv,
+                },
             );
             per_chunk.push(ytil_host(&f, bh * c * dhv));
             state = Some(f.final_state(&gpu, bh, dhv, dqk));
