@@ -82,9 +82,9 @@ pub const WORD_BLOCKS: usize = 32;
 /// chunk passing through all blocks with the recurrent state carried across the chunk
 /// borders, so only the chunks in flight are resident.
 ///
-/// Sized above the sLSTM's `GRAPH_MIN_T` (32) so every chunk still takes the captured-
-/// graph path — the backbone is launch-bound at batch 1, and dropping to the per-step
-/// loop would cost far more than the memory is worth.
+/// Sized above the sLSTM's `FUSED_MIN_T` (32) so every chunk still runs its T-loop as
+/// one time-fused launch — the backbone is launch-bound at batch 1, and dropping to
+/// the per-step loop would cost far more than the memory is worth.
 ///
 /// It also sets how many times each backbone cell is invoked per step
 /// (`words / BACKBONE_CHUNK` per layer per window), and a shorter chunk runs those
@@ -170,7 +170,7 @@ pub const PARQUET_LANGUAGE_COLUMN: &str = "language";
 /// Corpus path. A `.parquet` extension selects the parquet reader (one row per
 /// document, column `text` — override with `PARQUET_TEXT_COLUMN`); anything else
 /// is read as plain text with `<|endoftext|>` document separators.
-pub const TRAIN_DATA: &str = "../../training_data/000_00002.parquet";
+pub const TRAIN_DATA: &str = "../../training_data/000_00003.parquet";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
 // Post-training (SFT / instruction tuning)

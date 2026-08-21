@@ -96,9 +96,9 @@ extern "C" __global__ void slstm_gate_matvec_t(
 extern "C" __global__ void slstm_step_fused(
         float* g, const float* gh, const float* bcat, slab_t* h_prev,
         float* c_state, float* n_state, float* m_state, float* h_state,
-        float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
+        slab_t* h_narrow, float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
         float* i_prime, float* f_prime, float* c_out, float* n_out,
-        float* out, int t, int T, int H, int BH) {
+        float* out, int t, int T, int H, int BH, int first) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= BH) return;
     int b = k / H, j = k % H;
@@ -106,19 +106,27 @@ extern "C" __global__ void slstm_step_fused(
     long long s = (long long)(b * T + t) * H + j;
     int ho = b * 4 * H + j; // gh row for this batch element
 
-    float z_pre = g[go]         + gh[ho]           + bcat[j];
-    float i_pre = g[go + H]     + gh[ho + H]       + bcat[H + j];
-    float f_pre = g[go + 2 * H] + gh[ho + 2 * H]   + bcat[2 * H + j];
-    float o_pre = g[go + 3 * H] + gh[ho + 3 * H]   + bcat[3 * H + j];
+    // `first` is the start of a sequence that carries nothing in: h_{-1} is zero, so
+    // `gh = h_{-1}·Wh` is zero and the whole carried state is zero. Substituting the
+    // zeros here is what lets the host skip both that GEMM and the state's memset —
+    // exactly equivalent, since the values it would have read are these.
+    float hp = first ? 0.0f : h_state[k];
+    float mp = first ? 0.0f : m_state[k];
+    float np = first ? 0.0f : n_state[k];
+    float cp = first ? 0.0f : c_state[k];
+
+    float z_pre = g[go]         + (first ? 0.0f : gh[ho])           + bcat[j];
+    float i_pre = g[go + H]     + (first ? 0.0f : gh[ho + H])       + bcat[H + j];
+    float f_pre = g[go + 2 * H] + (first ? 0.0f : gh[ho + 2 * H])   + bcat[2 * H + j];
+    float o_pre = g[go + 3 * H] + (first ? 0.0f : gh[ho + 3 * H])   + bcat[3 * H + j];
     g[go + 2 * H] = f_pre; // biased forget pre-activation, saved for backward
 
-    slab_st(h_prev, s, h_state[k]);
+    slab_st(h_prev, s, hp);
 
     float z = tanhf(z_pre);
     float o = stable_sigmoid(o_pre);
     float log_f = log_sigmoid(f_pre);
-    float fm = log_f + m_state[k];
-    float np = n_state[k];
+    float fm = log_f + mp;
     // See `slstm_cell_step`: n == 0 is the first step of a sequence, where m must be
     // ĩ so that i' is exactly 1 and h = c/n cannot become 0/0.
     float m = (np == 0.0f) ? i_pre : fmaxf(fm, i_pre);
@@ -130,7 +138,6 @@ extern "C" __global__ void slstm_step_fused(
     // clamped -- it is the stabilized normalizer and exp(-m) cancels in c/n.
     float ip = fminf(1.0f, expf(i_pre - m));
     float fp = fminf(1.0f, expf(fm - m));
-    float cp = c_state[k];
     float c = fp * cp + ip * z;
     float n = fp * np + ip;
 
@@ -144,6 +151,9 @@ extern "C" __global__ void slstm_step_fused(
     // h = o·c/n — the exp(−m) in c and n cancels. See `slstm_cell_step`.
     float hh = o * c / n;
     h_state[k] = hh;
+    // The narrowed twin the next step's `h·Wh` GEMM reads. Writing it here is what
+    // keeps that GEMM's operand bf16 without a cast launch inside the loop.
+    slab_st(h_narrow, k, hh);
     out[s] = hh;
 }
 

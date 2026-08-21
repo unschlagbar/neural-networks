@@ -1561,8 +1561,8 @@ mod tests {
     /// A **chunked** sLSTM sweep must be bit-exact under offload.
     ///
     /// The unchunked tests above never reach the cell's park: it only holds the caches
-    /// a chunked sweep sets aside (`SLstm::chunk_saved`), because the live buffers stay
-    /// resident to keep the captured graphs' device pointers valid. So this is the test
+    /// a chunked sweep sets aside (`SLstm::chunk_saved`), because the live buffers are
+    /// about to be written again and stay resident. So this is the test
     /// that actually covers `SLstm::enable_offload` — several chunks forwarded before
     /// any is unwound, then unwound right to left, which is the backbone's shape.
     #[test]

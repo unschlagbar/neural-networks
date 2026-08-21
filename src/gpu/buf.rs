@@ -14,14 +14,12 @@
 //! reallocates when it does not. In steady state (the same shapes recurring, as
 //! in a training loop) it never allocates at all.
 //!
-//! # Why the address stability matters
+//! # Why reuse matters
 //!
-//! A captured CUDA graph bakes the raw device pointer of every buffer its nodes
-//! touch into the graph itself, so replaying it is only correct while those
-//! buffers are still at the addresses they had at capture time. `gpu::slstm`
-//! discovered this the hard way — see the use-after-free documented in
-//! `SLstm::forward` — and grew a private `take_uninit` to pin its buffers down.
-//! `Buf` is that mechanism, generalized so every layer gets it.
+//! A step issues thousands of ops, and a layer that returns a fresh tensor per call
+//! puts an allocate/free pair on the hot path for each of them. `gpu::slstm` grew a
+//! private `take_uninit` for its own buffers first; `Buf` is that mechanism,
+//! generalized so every layer gets it.
 //!
 //! # Contract
 //!
@@ -91,8 +89,8 @@ fn size_class(n: usize) -> usize {
 /// it is asked for changes.
 ///
 /// Starts empty; the first [`get`](Self::get) allocates. Holding this rather than
-/// returning fresh tensors is what keeps a layer's output address stable, which
-/// is what makes graph replay legal and keeps the allocator off the hot path.
+/// returning fresh tensors keeps the allocator off the hot path and, as a side
+/// effect, a layer's output address stable across calls.
 #[derive(Default)]
 pub struct Buf {
     slot: Option<DTensor>,
@@ -521,8 +519,7 @@ mod tests {
     use super::*;
 
     /// The whole point: asking for the same shape twice must not reallocate, and
-    /// the device pointer must not move. Pointer stability is what graph capture
-    /// depends on, so this is the property to pin.
+    /// the device pointer must not move.
     #[test]
     fn same_shape_reuses_the_allocation() {
         let Some(gpu) = super::super::test_gpu() else {

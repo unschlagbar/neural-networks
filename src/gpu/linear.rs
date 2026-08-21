@@ -83,9 +83,9 @@ impl Linear {
     /// Release the saved forward input and the bf16 GEMM staging.
     ///
     /// Neither is read outside a forward→backward pair, but both are kept across
-    /// calls (stable addresses for graph replay, and to keep the cast off the hot
-    /// path) and both reuse by **capacity** — so in a stack with varying window
-    /// sizes they settle at the largest window ever seen.
+    /// calls (to keep the allocator and the cast off the hot path) and both reuse by
+    /// **capacity** — so in a stack with varying window sizes they settle at the
+    /// largest window ever seen.
     pub fn drop_saved_act(&mut self, gpu: &Gpu) {
         self.x = DTensor::zeros(gpu, &[0, self.input]);
         self.gemm.clear();

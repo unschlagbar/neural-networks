@@ -14,8 +14,8 @@ use super::Gpu;
 use crate::tensor::{MAX_RANK, Tensor};
 
 /// Records the device address of every `uninit` allocation, so a run can be checked
-/// for pointer stability across steps — the precondition for replaying a captured
-/// CUDA graph, whose nodes bake in raw pointers.
+/// for pointer stability across steps — i.e. how much of the allocator traffic the
+/// per-layer buffer reuse is actually catching.
 ///
 /// Diagnostic only, off unless `GPU_PTR_PROBE=1`; `dump` prints per-step overlap.
 pub mod ptr_probe {

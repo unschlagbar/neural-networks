@@ -488,9 +488,9 @@ pub fn shared_lhs_bytes() -> usize {
 }
 
 thread_local! {
-    /// Ping-pong partner buffers for the fused sLSTM T-loops: `[B, H]` for the
-    /// forward's h, `[B, 4H]` for the backward's gate deltas, and `[B, H]` for the
-    /// backward's `dh_recur`.
+    /// Ping-pong partner buffers for the fused sLSTM T-loops: `[B, HP]` for the
+    /// forward's bf16 `h` mirror (two planes packed into one fp32 buffer), `[B, 4H]`
+    /// for the backward's gate deltas, and `[B, H]` for the backward's `dh_recur`.
     ///
     /// Kept across calls because they are a few KB and every cell in the stack wants
     /// the same shapes; reallocating per launch would churn the pool inside the
@@ -2172,6 +2172,31 @@ impl SlabBuf {
             SlabBuf::Bf16(t) => t.shrink_to(dims),
         }
     }
+
+    /// Present this slab at `dims`, reallocating only when the current buffer is too
+    /// small — the [`SlabBuf`] twin of `Buf::get`.
+    pub fn fit(&mut self, gpu: &Gpu, dims: &[usize]) {
+        let n: usize = dims.iter().product();
+        if self.capacity() >= n {
+            self.shrink_to(dims);
+        } else {
+            *self = SlabBuf::new(gpu, dims);
+        }
+    }
+
+    /// Fill from an fp32 tensor of this slab's shape — a narrowing cast on the bf16
+    /// path, a device-to-device copy on the fp32 one.
+    pub fn store(&mut self, gpu: &Gpu, src: &DTensor) {
+        let n = self.dims().iter().product::<usize>();
+        assert!(n <= src.capacity(), "SlabBuf::store: source is too small");
+        match self {
+            SlabBuf::Bf16(t) => t.store(gpu, src),
+            SlabBuf::F32(t) => gpu
+                .stream
+                .memcpy_dtod(&src.buf.slice(..n), &mut t.buf.slice_mut(..n))
+                .expect("SlabBuf::store"),
+        }
+    }
 }
 
 /// Push a slab as a kernel argument at whichever width it holds.
@@ -2202,6 +2227,10 @@ macro_rules! push_slab_ref {
 /// One fused forward step: add the biases, advance `(c,n,m,h)_state`, fill the
 /// saved slabs at `t` and write `out[:, t, :]`. `g`'s forget block is left holding
 /// the biased forget pre-activation for backward.
+///
+/// `h_narrow` receives the new `h` at the slab width — the left operand the *next*
+/// step's `h·Wh` GEMM reads. Producing it here is what lets that GEMM run on bf16
+/// operands without a narrowing launch of its own inside the T-loop.
 #[allow(clippy::too_many_arguments)]
 pub fn slstm_step_fused(
     gpu: &Gpu,
@@ -2212,14 +2241,17 @@ pub fn slstm_step_fused(
     n_state: &mut DTensor,
     m_state: &mut DTensor,
     h_state: &mut DTensor,
+    h_narrow: &mut SlabBuf,
     slabs: &mut SlstmSlabs,
     out: &mut DTensor,
     t: usize,
+    first: bool,
 ) {
     let (b, h) = (c_state.rows(), c_state.cols());
     let bh = b * h;
     let big_t = out.shape[1];
     let (t_i, bigt_i, h_i, bh_i) = (t as i32, big_t as i32, h as i32, bh as i32);
+    let first_i = i32::from(first);
     let f = gpu.kernels.get("slstm_step_fused");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut g.buf).arg(&gh.buf).arg(&bcat.buf);
@@ -2227,9 +2259,9 @@ pub fn slstm_step_fused(
     lb.arg(&mut c_state.buf)
         .arg(&mut n_state.buf)
         .arg(&mut m_state.buf)
-        .arg(&mut h_state.buf)
-        .arg(&mut slabs.c_prev.buf)
-        .arg(&mut slabs.n_prev.buf);
+        .arg(&mut h_state.buf);
+    push_slab!(lb, *h_narrow);
+    lb.arg(&mut slabs.c_prev.buf).arg(&mut slabs.n_prev.buf);
     push_slab!(lb, slabs.zt);
     push_slab!(lb, slabs.ot);
     lb.arg(&mut slabs.i_prime.buf)
@@ -2240,36 +2272,24 @@ pub fn slstm_step_fused(
         .arg(&t_i)
         .arg(&bigt_i)
         .arg(&h_i)
-        .arg(&bh_i);
+        .arg(&bh_i)
+        .arg(&first_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slstm_step_fused");
 }
 
-/// Whether the fused kernels stage their `Wh` slice (and the `h` they multiply) in
-/// **bf16** inside shared memory, accumulating in fp32.
+/// Whether the fused **backward** stages its `Wh` rows in bf16 inside shared memory,
+/// accumulating in fp32.
 ///
 /// This is FlashRNN's arrangement — `R_shared` is `FLASHRNN_DTYPE_R` (bf16) while
-/// `ACC_DTYPE` stays `float`. Unlike the earlier standalone `SLSTM_BF16` path, the
-/// conversion happens where the data already lives (shared memory / registers), so
-/// it costs a couple of ALU ops rather than a separate kernel and a global
-/// round-trip per timestep — which is exactly why that version lost at H=512.
+/// `ACC_DTYPE` stays `float`. The conversion happens where the data already lives
+/// (shared memory / registers), so it costs a couple of ALU ops rather than a
+/// separate kernel and a global round-trip per timestep.
 ///
-/// Halving the weights' shared footprint also lets a block own more units, which
-/// is what decides whether the fused path exists at all above H=640.
-///
-/// **On by default**; `SLSTM_NO_BF16=1` forces fp32 staging, which is the A/B
-/// baseline.
-///
-/// At H=512 this was neutral (5.66ms against 5.60ms) and the path was off: the grid
-/// there is pinned by the SM count, not by shared memory, so `geometry` picks one
-/// block per SM under either dtype and the freed shared memory buys nothing a
-/// cooperative grid can use.
-///
-/// At H=768 — the backbone's width — the grid becomes shared-memory-bound instead,
-/// which is the case that paragraph predicted. A block's fp32 slice needs
-/// `H*4*units*4` bytes, so `max_units` falls to 8 and the grid would need 96 blocks
-/// of an 84-SM card: the cooperative launch cannot be co-resident and the fused path
-/// **declines entirely**, dropping the cell to the per-step loop. bf16 staging halves
-/// the slice, 10 units fit per block, 77 blocks suffice, and the path exists again.
+/// Halving the weights' shared footprint also lets a block own more units, which is
+/// what decides whether the path exists at all above H=640: a staged row costs `4H`,
+/// so at fp32 `max_units` falls to 8 at H=768 and the grid would need 96 blocks of an
+/// 84-SM card — not co-resident, so the cooperative launch is declined and the cell
+/// drops to the per-step loop. bf16 staging halves the row and the path exists again.
 /// Measured on the sLSTM cell at B=1, T=1024: 20.50 -> 9.56ms; on a whole 4096-word
 /// training step, 1017 -> 715ms.
 ///
@@ -2277,6 +2297,9 @@ pub fn slstm_step_fused(
 /// loop moves from ~1e-6 to ~1e-3 relative (see `examples/fused_bf16_parity.rs`),
 /// which is the storage dtype's noise floor, not a defect. The accumulator stays
 /// fp32 throughout.
+///
+/// **On by default**; `SLSTM_NO_BF16=1` forces fp32 staging, which is the A/B
+/// baseline. It does not reach the forward, which stages bf16 unconditionally.
 pub fn fused_bf16_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("SLSTM_NO_BF16").is_err())
@@ -2294,12 +2317,16 @@ fn fused_blocks_override() -> Option<usize> {
 /// loops, so any width is correct; it only trades warps-in-flight against lanes
 /// left idle when a phase has less work than the block is wide.
 ///
-/// 768 measured best at the backbone shape (H=768, B=1, 77 blocks), swept against
-/// the real step: bwd 2566 -> 2059 us/call, fwd 1822 -> 1690, 352.6 -> 331.9 ms/step.
-/// The intuition that a narrow block would suit the pointwise phase — which fills
-/// only B*nj = 10 lanes there — is backwards: that phase is a short prologue, while
-/// the reduction that follows it is the whole cost, and the reduction scales with
-/// warps. Narrowing starves the reduction to save nothing (64 threads: bwd 4768).
+/// 768 measured best at the backbone shape (H=768, B=1, 77 blocks) for both
+/// directions, swept against the real step. The intuition that a narrow block would
+/// suit the pointwise phase — which fills only `B*nj` = 10 lanes there — is
+/// backwards: that phase is a short prologue, while the reduction that follows it is
+/// the whole cost, and the reduction scales with warps. Narrowing starves the
+/// reduction to save nothing (64 threads: bwd 4768 us/call against 2059).
+///
+/// 1024 is a cliff, not a continuation: the forward holds its `h` slice in registers,
+/// and at 1024 threads the per-thread budget (64) is too small for it, so the array
+/// spills to local memory and the call goes 2.09 -> 7.92 us/timestep.
 fn fused_block_threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -2311,70 +2338,98 @@ fn fused_block_threads() -> usize {
     })
 }
 
-/// Launch geometry for [`slstm_fused_time`]: `(blocks, threads, cols_per_block,
+/// Rows the fused forward's staged `Wh` slice is padded to. Its lanes read eight
+/// bf16 per shared access, so a warp covers 256 rows per pass and the tail is
+/// zero-filled rather than branched around.
+const FUSED_ROW_PAD: usize = 256;
+
+/// Padded row count of the fused forward's staged `Wh` slice and `h` mirror.
+pub fn fused_hp(h: usize) -> usize {
+    h.div_ceil(FUSED_ROW_PAD) * FUSED_ROW_PAD
+}
+
+/// Launch geometry for [`slstm_fused_time`]: `(blocks, threads, units_per_block,
 /// shared_bytes)`, or `None` when the shape does not fit the kernel's contract.
 ///
-/// The constraint that drives everything is shared memory: each block stages an
-/// `[H, cols_per_block]` fp32 slice of `Wh`, so `H * cols_per_block * 4` must fit
-/// the device's opt-in limit. We pick the *smallest* block count that satisfies
-/// that (fewest blocks => cheapest `grid.sync()`), then check the whole grid can
-/// actually be co-resident — a cooperative launch deadlocks if it cannot.
+/// The constraint that drives everything is shared memory: each block stages a
+/// `[HP, 4*units]` bf16 slice of `Wh` plus a `[B, 4*units]` fp32 gate scratch, and
+/// the total must fit the device's opt-in limit. Blocks are then spread over as many
+/// SMs as the grid may use, and the whole grid must be co-resident — a cooperative
+/// launch deadlocks if it cannot be.
 pub fn slstm_fused_time_geometry(
     gpu: &Gpu,
     h: usize,
     b: usize,
 ) -> Option<(usize, usize, usize, usize)> {
-    let h4 = 4 * h;
+    let hp = fused_hp(h);
     let threads = fused_block_threads();
     // Leave a little headroom under the opt-in cap for the driver's own use.
     let smem_cap = gpu.max_shared_optin.saturating_sub(1024);
-    // `cols_per_block` counts HIDDEN UNITS; each carries four Wh columns, so a block
-    // stages `[H, 4*units]` weights plus a `[B, 4*units]` fp32 gate scratch. Under
-    // bf16 the weights are 2 bytes instead of 4 and a `[B, H]` bf16 mirror of h is
-    // added; the gate scratch stays fp32 either way (it feeds the recurrence).
-    let wbytes = if fused_bf16_enabled() { 2 } else { 4 };
-    let h_mirror = if fused_bf16_enabled() { b * h * 2 } else { 0 };
-    let bytes_per_unit = |units: usize| h * 4 * units * wbytes + b * 4 * units * 4 + h_mirror;
-    let max_units = {
-        let per_unit = h * 4 * wbytes + b * 4 * 4;
-        smem_cap.saturating_sub(h_mirror) / per_unit
-    };
+    // Per hidden unit: four staged Wh columns of HP bf16 rows, and four fp32 gate
+    // accumulators per batch row. Storage is bf16 (FlashRNN's `DTYPE_R`), the
+    // accumulator stays fp32 — see the kernel.
+    let per_unit = hp * 4 * 2 + b * 4 * 4;
+    let max_units = smem_cap / per_unit;
     if max_units == 0 {
         return None; // one unit's slice does not fit: H is too large for this path
     }
     // Spread over as many SMs as the grid may use, not as few blocks as possible.
     // The fewest-blocks choice minimises `grid.sync()` cost but leaves most of the
-    // device idle — at H=512 it picks 42 blocks of an 84-SM card, and the gate
-    // reduction (not the sync) is what dominates, so halving the parallelism there
-    // costs far more than the extra sync saves.
+    // device idle, and the gate reduction (not the sync) is what dominates — so
+    // halving the parallelism costs far more than the extra sync saves.
     let min_blocks = h.div_ceil(max_units);
     let blocks = gpu.sm_count.max(min_blocks).min(h);
     // `SLSTM_BLOCKS` re-opens that tradeoff to measurement: it is a choice, not a
-    // derived optimum, and it moves with H and the staging dtype. Swept at H=768/bf16
-    // (60 -> 10.57ms, 77 -> 9.90ms, 84 -> 9.92ms): wider still wins, default stands.
+    // derived optimum, and it moves with H. Swept at H=768 (60 -> 10.57ms,
+    // 77 -> 9.90ms, 84 -> 9.92ms): wider still wins, default stands.
     let blocks = fused_blocks_override().unwrap_or(blocks).max(min_blocks).min(h);
-    let cols_per_block = h.div_ceil(blocks);
+    let units_per_block = h.div_ceil(blocks);
     // Recompute: rounding the slice up may need fewer blocks than requested.
-    let blocks = h.div_ceil(cols_per_block);
-    let shared_bytes = bytes_per_unit(cols_per_block);
-    if shared_bytes > smem_cap {
+    let blocks = h.div_ceil(units_per_block);
+    // The kernel's pointwise phase is one thread per (batch row, owned unit), fixed
+    // for the whole T-loop so that the recurrent state can live in registers. Widen
+    // the block if the default is too narrow for that; a shape that needs more than
+    // a block can hold takes the per-step path instead.
+    let threads = threads.max(b * units_per_block).next_multiple_of(32);
+    if threads > 1024 {
         return None;
     }
-    // A cooperative launch requires the WHOLE grid to be co-resident: `grid.sync()`
-    // blocks until every block arrives, so a block that has not been scheduled yet
-    // deadlocks the kernel. With one block per SM at this shared-memory footprint
-    // (98 KB of a ~100 KB budget leaves room for exactly one), the grid must fit in
-    // the SM count. Declining here is what keeps large H on the per-step path
-    // instead of hanging the device.
-    if blocks > gpu.sm_count {
+    let shared_bytes = units_per_block * per_unit;
+    // A cooperative grid must be co-resident, and at this shared footprint an SM holds
+    // one block — so more blocks than SMs cannot work. This is the cheap bound callers
+    // can use as a predicate; `coop_grid_fits` asks the driver for the real one, which
+    // also accounts for registers, once the function is in hand.
+    if shared_bytes > smem_cap || blocks > gpu.sm_count {
         return None;
     }
-    // The pointwise phase is grid-strided over B*H, so any grid covers it; but the
-    // gate phase needs every column owned by some block, which `blocks` guarantees.
-    debug_assert!(blocks * cols_per_block >= h);
-    let _ = h4;
-    let _ = b;
-    Some((blocks, threads, cols_per_block, shared_bytes))
+    Some((blocks, threads, units_per_block, shared_bytes))
+}
+
+/// Whether the driver will schedule `blocks` of this kernel as a cooperative grid.
+///
+/// A cooperative launch requires the WHOLE grid to be co-resident — `grid.sync()`
+/// blocks until every block arrives, so an unscheduled block would deadlock it — and
+/// the driver enforces that with `maxActiveBlocksPerSM * smCount`. Shared memory is
+/// not the only thing that sets that number — registers can take it to zero, and then
+/// a grid the geometry thought was fine comes back as
+/// `CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE` at launch. Asking makes the decline a
+/// decision the caller can fall back from instead of an error message.
+fn coop_grid_fits(
+    gpu: &Gpu,
+    f: &cudarc::driver::CudaFunction,
+    blocks: usize,
+    threads: usize,
+    shared: usize,
+) -> bool {
+    match f.occupancy_max_active_blocks_per_multiprocessor(threads as u32, shared, None) {
+        Ok(per_sm) => blocks <= per_sm as usize * gpu.sm_count,
+        // No answer is not a licence to try: a launch that is too large is a hard
+        // error and the per-step path is always available.
+        Err(e) => {
+            eprintln!("slstm fused: occupancy query failed: {e:?}");
+            false
+        }
+    }
 }
 
 /// Launch geometry for [`slstm_fused_time_bwd`], mirroring
@@ -2469,6 +2524,9 @@ pub fn slstm_fused_time_bwd(
         eprintln!("slstm_fused_time_bwd: shared-memory opt-in failed: {e:?}");
         return false;
     }
+    if !coop_grid_fits(gpu, &f, blocks, threads, shared_bytes) {
+        return false;
+    }
     let cfg = LaunchConfig {
         grid_dim: (blocks as u32, 1, 1),
         block_dim: (threads as u32, 1, 1),
@@ -2528,31 +2586,26 @@ pub fn slstm_fused_time(
     slabs: &mut SlstmSlabs,
     out: &mut DTensor,
     t: usize,
+    carry: bool,
 ) -> bool {
     if !gpu.kernels.has_coop {
         return false;
     }
     let (b, h) = (c_state.rows(), c_state.cols());
-    let Some((blocks, threads, cols_per_block, shared_bytes)) =
+    let Some((blocks, threads, units_per_block, shared_bytes)) =
         slstm_fused_time_geometry(gpu, h, b)
     else {
         return false;
     };
-    let (t_i, h_i, b_i, cpb_i) = (t as i32, h as i32, b as i32, cols_per_block as i32);
-    // Prefer the (H, B)-specialized build. The generic module is only a valid
-    // fallback when bf16 staging is OFF: it is compiled without -DFUSED_BF16, so it
-    // stages fp32 and would read past a shared allocation that `geometry` sized for
-    // bf16. With bf16 on and no specialized build available, decline instead and let
-    // the caller take the per-step path.
-    let f =
-        match gpu
-            .kernels
-            .specialized(&gpu.context, "slstm_fused_time", h, b, fused_bf16_enabled())
-        {
-            Some(f) => f,
-            None if !fused_bf16_enabled() => gpu.kernels.get("slstm_fused_time"),
-            None => return false,
-        };
+    // Specialized build only — the kernel keeps its slice of `h` in a register array
+    // sized by H, which a runtime H would put in local memory. Decline rather than
+    // launch a slower shape-generic twin; the caller has the per-step loop.
+    let Some(f) = gpu
+        .kernels
+        .specialized(&gpu.context, "slstm_fused_time", h, b, fused_bf16_enabled())
+    else {
+        return false;
+    };
     // Opt into the larger shared-memory carve-out; without this the launch fails
     // for any slice above the default 48 KB.
     if let Err(e) = f.set_attribute(
@@ -2562,12 +2615,20 @@ pub fn slstm_fused_time(
         eprintln!("slstm_fused_time: shared-memory opt-in failed: {e:?}");
         return false;
     }
+    // After the opt-in, which is what decides how many blocks an SM can hold.
+    if !coop_grid_fits(gpu, &f, blocks, threads, shared_bytes) {
+        return false;
+    }
     let cfg = LaunchConfig {
         grid_dim: (blocks as u32, 1, 1),
         block_dim: (threads as u32, 1, 1),
         shared_mem_bytes: shared_bytes as u32,
     };
-    with_fused_alt(gpu, b, h, false, |h_alt| {
+    let (t_i, upb_i, carry_i) = (t as i32, units_per_block as i32, i32::from(carry));
+    // The kernel's `h` mirror: two [B, HP] bf16 planes packed into one fp32 [B, HP]
+    // scratch (two bf16 to a float), ping-ponged so a block writing step t cannot
+    // race a block still reading step t-1.
+    with_fused_alt(gpu, b, fused_hp(h), false, |hmir| {
         let mut lb = gpu.stream.launch_builder(&f);
         lb.arg(&wh.buf).arg(&mut g.buf).arg(&bcat.buf);
         push_slab!(lb, slabs.h_prev);
@@ -2575,7 +2636,7 @@ pub fn slstm_fused_time(
             .arg(&mut n_state.buf)
             .arg(&mut m_state.buf)
             .arg(&mut h_state.buf)
-            .arg(&mut h_alt.buf)
+            .arg(&mut hmir.buf)
             .arg(&mut slabs.c_prev.buf)
             .arg(&mut slabs.n_prev.buf);
         push_slab!(lb, slabs.zt);
@@ -2586,9 +2647,8 @@ pub fn slstm_fused_time(
             .arg(&mut slabs.n.buf)
             .arg(&mut out.buf)
             .arg(&t_i)
-            .arg(&h_i)
-            .arg(&b_i)
-            .arg(&cpb_i);
+            .arg(&upb_i)
+            .arg(&carry_i);
         // SAFETY: the geometry above guarantees the grid is co-resident (a cooperative
         // launch deadlocks otherwise) and that every block's shared slice fits.
         match unsafe { lb.launch_cooperative(cfg) } {

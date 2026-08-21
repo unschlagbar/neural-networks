@@ -20,17 +20,22 @@
 //! state `(h,c,n,m)` stays resident in `DTensor`s across the entire T-loop** — no
 //! per-step host transfer.
 //!
-//! The four gates run **fused**: a timestep is one cuBLAS GEMM plus one kernel.
-//! That matters because the backbone runs this cell at batch 1 over ~2000 words,
-//! where every launch is pure latency — the per-timestep GEMM there is a
-//! matrix-vector product that takes far less time than the launch itself, so the
-//! step cost is simply the number of launches.
+//! The four gates run **fused**: they are one `[·, 4H]` column block, so a timestep
+//! is one matmul plus one elementwise pass rather than four of each. `x·Wx` for
+//! **all** timesteps is a single GEMM hoisted out of the loop (it has no recurrent
+//! dependency), landing in a `[B, T, 4H]` gate buffer `g`; only the recurrent half
+//! `g[:, t, :] += h_{t-1}·Wh` and the elementwise recurrence stay inside it.
 //!
-//! Concretely, per timestep `t`:
-//!   * `x·Wx` for **all** timesteps is one GEMM hoisted out of the loop (it has no
-//!     recurrent dependency), landing in a `[B, T, 4H]` gate buffer `g`;
-//!   * the loop only adds the recurrent half, `g[:, t, :] += h_{t-1}·Wh`;
-//!   * `slstm_step_fused` adds the biases and runs the elementwise recurrence.
+//! That inner loop runs one of two ways, chosen by [`SLstm::fwd_loop`]:
+//!
+//!   * **long T** (the backbone, B=1 over a whole chunk of words) — `slstm_fused_time`
+//!     runs the entire T-loop as ONE cooperative launch, with `Wh` staged in shared
+//!     memory and `grid.sync()` in place of the per-step launches. See the kernel in
+//!     `cuda/slstm_coop.cu`; it is where essentially all of the forward's GPU time is.
+//!   * **short T** (the encoder/decoder, one word per sequence) — two launches per
+//!     timestep, a cuBLAS matmul for `h_{t-1}·Wh` plus `slstm_step_fused`. A whole
+//!     word is a handful of steps, so there is no launch cost worth fusing away, and
+//!     the batch is wide enough that cuBLAS beats anything hand-written.
 //!
 //! Backward mirrors it: the per-step kernel writes the four gate deltas back into
 //! `g` (its forward contents are dead by then), the loop carries only the BPTT
@@ -45,9 +50,6 @@
 //! never per step. Gate order stays z=0, i=1, f=2, o=3: the column blocks of the
 //! fused `[·, 4H]`, with the input rows above the recurrent rows in `[rows, H]`.
 
-use cudarc::driver::CudaGraph;
-use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
-
 use super::block::phase;
 use super::ops::{self, SlabBuf, SlstmSlabs};
 use super::rms_norm::RmsNorm;
@@ -55,59 +57,13 @@ use super::{DTensor, Gpu};
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
 
-/// Below this sequence length the T-loop runs eagerly instead of as a captured
-/// CUDA graph. Capturing costs one `cuGraphInstantiate` (hundreds of us), which a
-/// short loop never earns back — and the encoder/decoder call this cell with T =
-/// a word length (<= MAX_WORD_BYTES + 1), a shape that also changes from group to
-/// group, so they would re-instantiate constantly. The backbone, which is where
-/// the launch cost actually hurts (T = the window's word count, ~1000), captures.
-const GRAPH_MIN_T: usize = 32;
-
-/// A captured T-loop plus the shape it was captured at. A graph bakes in the
-/// device pointer of every buffer its nodes touch, so it may only be replayed
-/// when those buffers are still the same allocations — which is exactly when
-/// `(b, t)` is unchanged, since that is what decides whether the activation
-/// buffers below were reallocated.
-struct LoopGraph {
-    b: usize,
-    t: usize,
-    /// Device addresses of every buffer the capture baked in. A graph replays the
-    /// pointers it was captured against, so a matching `(b, t)` is not enough: the
-    /// chunked sweep hands each chunk its own `g`/`slabs` (see `chunk_saved`), and
-    /// replaying across that swap reads the previous chunk's freed allocations.
-    ptrs: Vec<u64>,
-    graph: CudaGraph,
-}
-
-/// The device addresses a captured sLSTM loop depends on, in a fixed order.
-fn loop_ptrs(gpu: &Gpu, g: &DTensor, slabs: &SlstmSlabs, dy: &DTensor) -> Vec<u64> {
-    use cudarc::driver::DevicePtr;
-    let f32_ptr = |t: &DTensor| t.buf.device_ptr(&gpu.stream).0;
-    let slab_ptr = |s: &ops::SlabBuf| match s {
-        ops::SlabBuf::F32(t) => t.buf.device_ptr(&gpu.stream).0,
-        ops::SlabBuf::Bf16(t) => t.buf.device_ptr(&gpu.stream).0,
-    };
-    vec![
-        f32_ptr(g),
-        f32_ptr(dy),
-        f32_ptr(&slabs.c_prev),
-        f32_ptr(&slabs.n_prev),
-        f32_ptr(&slabs.i_prime),
-        f32_ptr(&slabs.f_prime),
-        f32_ptr(&slabs.c),
-        f32_ptr(&slabs.n),
-        slab_ptr(&slabs.zt),
-        slab_ptr(&slabs.ot),
-        slab_ptr(&slabs.h_prev),
-    ]
-}
-
-/// `GPU_NO_GRAPH=1` forces the eager per-timestep launch path — the A/B baseline
-/// for `slstm_launch_bench`, and the fallback if a driver ever mis-captures.
-fn graphs_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("GPU_NO_GRAPH").is_ok())
-}
+/// Below this sequence length the T-loop runs step by step instead of as one
+/// time-fused cooperative launch. The fused kernel amortises its `Wh` staging over
+/// the whole sequence, so a handful of timesteps never earns it back — and the
+/// encoder/decoder call this cell with T = a word length (<= MAX_WORD_BYTES + 1),
+/// which is exactly that case. The backbone, where T is a whole chunk of words,
+/// fuses.
+const FUSED_MIN_T: usize = 32;
 
 /// The time-fused T-loop (`slstm_fused_time` / `_bwd`): the whole forward or
 /// backward sequence as ONE cooperative launch instead of two launches per
@@ -185,6 +141,15 @@ pub struct SLstm {
     /// (`h_{t-1}·Wh` forward, the gate deltas backward). It exists so both of those
     /// GEMMs stay dense at any batch size — see `slstm_step_fused` in `kernels.rs`.
     gh: DTensor,
+    /// The left operand of the per-timestep recurrent GEMM: `h_{t-1}` at the slab
+    /// width, `[B, H]`.
+    ///
+    /// `slstm_step_fused` writes it alongside the fp32 `h_state`, so on the bf16 path
+    /// that GEMM gets tensor-core operands without a narrowing launch of its own —
+    /// and it is worth having: at the encoder's shape (`[512,256]x[256,1024]`) the
+    /// fp32 SIMT kernel cuBLAS picks runs at 22 TFLOP/s, 39% of this card's fp32 peak
+    /// and a small fraction of what the same matmul does in bf16.
+    h_narrow: ops::SlabBuf,
     /// `[1, N]` of ones: the bias gradient is the column sum of the gate deltas,
     /// which cuBLAS reduces as a `ones · dgates` GEMM straight into `dbcat`.
     ones: DTensor,
@@ -197,45 +162,42 @@ pub struct SLstm {
     // [B, T, H] slabs, and the flattened input [B·T, in] (needed for dWx).
     //
     // These are *reused* across calls rather than reallocated, and `out` / `dy_buf`
-    // exist for the same reason: a captured graph's nodes hold raw device pointers,
-    // so replaying it is only correct if every buffer the loop touches is still at
-    // the address it had at capture time. `take_uninit` keeps the allocation
-    // whenever the shape matches, and a shape that matches is precisely a shape the
-    // graph cache hits — the two conditions cannot drift apart.
+    // exist for the same reason: a stack runs the same handful of shapes over and
+    // over (one rectangle per length bucket, one chunk length on the backbone), so
+    // `take_uninit` turns what would be an allocate/free pair per call per buffer
+    // into a pointer move.
     g: Option<DTensor>,
     slabs: Option<SlstmSlabs>,
-    x_saved: Option<DTensor>,
+    /// The forward's input at the width the GEMMs consume it: `[B·T, in]`.
+    ///
+    /// Not a copy of `x` — a *narrowing* of it. `x` itself cannot be held (the caller
+    /// returns its buffer to the pool the moment forward returns, and `dWx = xᵀ·dg`
+    /// needs it again in backward), and both GEMMs that read it want bf16 anyway. So
+    /// the one cast the forward GEMM was doing per call is hoisted here and the
+    /// backward GEMM reuses its result — one narrowing instead of a copy plus two.
+    x_saved: Option<SlabBuf>,
     out_buf: Option<DTensor>,
     /// Forward caches of earlier chunks of a chunked sweep, oldest first.
     ///
-    /// The buffers above are reused call to call to keep the graphs' device pointers
-    /// valid, which is exactly what a chunked sweep cannot have: chunk c+1's forward
-    /// would overwrite what chunk c's backward reads. So each chunk's `(g, slabs,
-    /// x_saved)` is moved aside here when the next chunk's forward takes fresh
-    /// buffers, and backward pops them right to left. Only what backward *reads*
-    /// moves; `out_buf`/`dy_buf` are written through and stay stable, so replay
-    /// survives.
+    /// The buffers above are reused call to call, which is exactly what a chunked
+    /// sweep cannot have: chunk c+1's forward would overwrite what chunk c's backward
+    /// reads. So each chunk's `(g, slabs, x_saved)` is moved aside here when the next
+    /// chunk's forward takes fresh buffers, and backward pops them right to left.
+    /// Only what backward *reads* moves; `out_buf`/`dy_buf` are written through.
     ///
     /// Empty on the unchunked path, where the reuse above is untouched.
     chunk_saved: Vec<SlstmChunk>,
     /// Host staging for the chunk caches above, when the surrounding block opted in.
     ///
-    /// Only the *set-aside* chunks ride. The live `g`/`slabs`/`x_saved` slots stay on
-    /// the device: their addresses are what the captured graphs were built against
-    /// (see `take_uninit`), so moving them would invalidate replay.
+    /// Only the *set-aside* chunks ride: the live `g`/`slabs`/`x_saved` slots are
+    /// about to be written again, so parking them would buy nothing.
     park: Option<super::offload::HostPark>,
-    /// Backward's incoming `dy`, copied into a stable buffer: the caller hands us a
-    /// fresh `DTensor` every time, whose pointer a graph cannot depend on.
+    /// Where the post-cell norm's backward lands, so the loop reads a buffer this
+    /// cell owns and reuses instead of allocating one per call.
     dy_buf: Option<DTensor>,
     /// Scratch for widening a bf16 `h_prev` slab back to fp32 for the `dWh` GEMM
     /// (cuBLAS has no bf16 operand here). Unused on the fp32 slab path.
     h_prev_f32: Option<DTensor>,
-    /// The `(b, t)` the buffers above are currently allocated for. A captured graph
-    /// is only valid for the allocation it was captured against, so the graphs are
-    /// dropped whenever this changes — see [`Self::forward`].
-    buf_shape: Option<(usize, usize)>,
-    fwd_graph: Option<LoopGraph>,
-    bwd_graph: Option<LoopGraph>,
     batch: usize,
     /// bf16 staging for the three **whole-sequence** GEMMs (`x·Wx`, `dg·Wxᵀ`,
     /// `xᵀ·dg`). Those run once per call over `[N, ·]`, exactly like a `Linear`'s, and
@@ -244,8 +206,13 @@ pub struct SLstm {
     /// staging would cost a cast per step, and the fused kernels own that path anyway.
     gemm_x: ops::GemmBf16,
     gemm_dx: ops::GemmBf16,
-    /// Whether those three take the bf16 path. Pinned at construction so forward and
-    /// backward cannot disagree.
+    /// Weight cache for the **per-timestep** recurrent GEMM `h_{t-1}·Whr`. Separate
+    /// from the two above only because `GemmBf16` holds one cached weight and this
+    /// one is `whr`, not `wx`; its left operand is [`h_narrow`](Self::h_narrow), which
+    /// arrives already narrowed, so a step of the loop is still one GEMM.
+    gemm_h: ops::GemmBf16,
+    /// Whether the whole-sequence GEMMs take the bf16 path. Pinned at construction so
+    /// forward and backward cannot disagree.
     bf16: bool,
 }
 
@@ -260,7 +227,7 @@ enum SlstmChunk {
     Resident {
         g: DTensor,
         slabs: SlstmSlabs,
-        x_saved: DTensor,
+        x_saved: SlabBuf,
     },
     Parked,
 }
@@ -269,7 +236,7 @@ enum SlstmChunk {
 ///
 /// Written out rather than derived so the two directions cannot drift: a mismatch here
 /// is a silent shape/width swap, not a compile error.
-fn park_order(g: DTensor, slabs: SlstmSlabs, x_saved: DTensor) -> Vec<super::offload::Parked> {
+fn park_order(g: DTensor, slabs: SlstmSlabs, x_saved: SlabBuf) -> Vec<super::offload::Parked> {
     use super::offload::Parked;
     vec![
         Parked::from(g),
@@ -287,7 +254,7 @@ fn park_order(g: DTensor, slabs: SlstmSlabs, x_saved: DTensor) -> Vec<super::off
 }
 
 /// Rebuild a chunk cache from `park_order`'s output, in the same order.
-fn park_unorder(p: Vec<super::offload::Parked>) -> (DTensor, SlstmSlabs, DTensor) {
+fn park_unorder(p: Vec<super::offload::Parked>) -> (DTensor, SlstmSlabs, SlabBuf) {
     use super::offload::Parked;
     assert_eq!(p.len(), 11, "slstm park: restored buffer count");
     let mut it = p.into_iter();
@@ -300,11 +267,13 @@ fn park_unorder(p: Vec<super::offload::Parked>) -> (DTensor, SlstmSlabs, DTensor
         }
     }
     let g = wide(&mut it, "g");
-    let x_saved = wide(&mut it, "x_saved");
+    let slab = |it: &mut std::vec::IntoIter<super::offload::Parked>| {
+        SlabBuf::from(it.next().expect("slstm park: short restore"))
+    };
+    let x_saved = slab(&mut it);
     let (c_prev, n_prev) = (wide(&mut it, "c_prev"), wide(&mut it, "n_prev"));
     let (i_prime, f_prime) = (wide(&mut it, "i_prime"), wide(&mut it, "f_prime"));
     let (c, n) = (wide(&mut it, "c"), wide(&mut it, "n"));
-    let mut slab = || SlabBuf::from(it.next().expect("slstm park: short restore"));
     let slabs = SlstmSlabs {
         c_prev,
         n_prev,
@@ -312,20 +281,58 @@ fn park_unorder(p: Vec<super::offload::Parked>) -> (DTensor, SlstmSlabs, DTensor
         f_prime,
         c,
         n,
-        zt: slab(),
-        ot: slab(),
-        h_prev: slab(),
+        zt: slab(&mut it),
+        ot: slab(&mut it),
+        h_prev: slab(&mut it),
     };
     (g, slabs, x_saved)
 }
 
 /// Keep `slot`'s buffer when it already has the wanted shape, else allocate a
-/// fresh (uninitialised) one. The reuse is what makes the device pointers stable
-/// across calls, which is what makes graph replay legal.
+/// fresh (uninitialised) one — so a stack that repeats a handful of shapes keeps
+/// the allocator off the hot path.
 fn take_uninit(gpu: &Gpu, slot: Option<DTensor>, dims: &[usize]) -> DTensor {
     match slot {
         Some(t) if t.dims() == dims => t,
         _ => DTensor::uninit(gpu, dims),
+    }
+}
+
+/// [`take_uninit`] for the narrowed input: keep `slot` when it is wide enough, else
+/// allocate at the width the GEMMs will read it at. `bf16` is the cell's GEMM path,
+/// not the slab flag — this buffer feeds cuBLAS, not the fused kernels.
+fn fit_saved(gpu: &Gpu, slot: Option<SlabBuf>, bf16: bool, dims: &[usize]) -> SlabBuf {
+    let n: usize = dims.iter().product();
+    match slot {
+        Some(mut s) if matches!(s, SlabBuf::Bf16(_)) == bf16 && s.capacity() >= n => {
+            s.shrink_to(dims);
+            s
+        }
+        _ if bf16 => SlabBuf::Bf16(super::BTensor::uninit(gpu, dims)),
+        _ => SlabBuf::F32(DTensor::uninit(gpu, dims)),
+    }
+}
+
+/// [`take_uninit`] for the whole saved set. fp32 for the stabilizer-carrying slabs,
+/// kernel-matched width for the plain activations — see `SlstmSlabs` and `gpu::bf16`.
+fn fit_slabs(gpu: &Gpu, slot: Option<SlstmSlabs>, dims: &[usize]) -> SlstmSlabs {
+    if let Some(s) = slot
+        && s.c.dims() == dims
+    {
+        return s;
+    }
+    let wide = || DTensor::uninit(gpu, dims);
+    let slab = || SlabBuf::new(gpu, dims);
+    SlstmSlabs {
+        c_prev: wide(),
+        n_prev: wide(),
+        i_prime: wide(),
+        f_prime: wide(),
+        c: wide(),
+        n: wide(),
+        zt: slab(),
+        ot: slab(),
+        h_prev: slab(),
     }
 }
 
@@ -427,6 +434,7 @@ impl SLstm {
             n_state: DTensor::zeros(gpu, &[0, 0]),
             m_state: DTensor::zeros(gpu, &[0, 0]),
             gh: DTensor::zeros(gpu, &[0, 0]),
+            h_narrow: ops::SlabBuf::new(gpu, &[0, 0]),
             ones: DTensor::zeros(gpu, &[0, 0]),
             dh_bptt: DTensor::zeros(gpu, &[0, 0]),
             dc_bptt: DTensor::zeros(gpu, &[0, 0]),
@@ -437,14 +445,12 @@ impl SLstm {
             out_buf: None,
             dy_buf: None,
             h_prev_f32: None,
-            buf_shape: None,
             chunk_saved: Vec::new(),
             park: None,
-            fwd_graph: None,
-            bwd_graph: None,
             batch: 0,
             gemm_x: ops::GemmBf16::new(),
             gemm_dx: ops::GemmBf16::new(),
+            gemm_h: ops::GemmBf16::new(),
             bf16: ops::gemm_bf16_enabled(gpu),
         }
     }
@@ -598,8 +604,38 @@ impl SLstm {
         &self.post_norm.gamma
     }
 
-    /// Forward over a whole `[B, T, in]` sequence into `y` `[B, T, H]`. State
-    /// resets to zero at t=0 and stays device-resident across the T-loop.
+    /// Move the live forward cache into [`chunk_saved`](Self::chunk_saved), so the
+    /// call about to run can take fresh buffers without destroying it.
+    ///
+    /// A chunked sweep forwards every chunk before unwinding any, so the previous
+    /// chunk's `(g, slabs, x_saved)` is still owed a backward. Unchunked there is
+    /// nothing to preserve and this is never called.
+    fn set_aside_chunk(&mut self, gpu: &Gpu) {
+        let (Some(g), Some(slabs), Some(x_saved)) =
+            (self.g.take(), self.slabs.take(), self.x_saved.take())
+        else {
+            return; // first chunk of the sweep: nothing forwarded yet
+        };
+        // With offload on, the cache goes to the host instead of staying resident. The
+        // device tensors are handed to the park, which holds them until its D2H has
+        // landed — the next chunk's eviction releases them, so the copy overlaps that
+        // chunk's compute.
+        match &mut self.park {
+            Some(park) => {
+                park.evict(gpu, park_order(g, slabs, x_saved));
+                self.chunk_saved.push(SlstmChunk::Parked);
+            }
+            None => self
+                .chunk_saved
+                .push(SlstmChunk::Resident { g, slabs, x_saved }),
+        }
+    }
+
+    /// Forward over a whole `[B, T, in]` sequence into `y` `[B, T, H]`.
+    ///
+    /// The recurrence starts from zero unless [`set_carry`](Self::set_carry) says this
+    /// call continues the previous one's sequence, and the whole state stays
+    /// device-resident across the T-loop either way.
     pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
         // Release the previous eviction before allocating anything here: freeing
         // returns memory to the CUDA allocator, which must not hand it back while a
@@ -620,38 +656,19 @@ impl SLstm {
         let n = b * t;
         self.batch = b;
 
-        // A captured graph holds raw device pointers, so it is bound to the exact
-        // ALLOCATIONS it was captured against — not merely to a shape. Every buffer
-        // below is refit (and thus possibly reallocated) whenever `(b, t)` changes,
-        // so that is the moment both graphs die.
-        //
-        // This has to happen here, unconditionally, rather than inside `fwd_loop`:
-        // a window shorter than GRAPH_MIN_T takes the eager path and never consults
-        // the cache, but it still refits the buffers underneath it. Skipping the
-        // invalidation there let a long window -> short window -> long window
-        // sequence (which the dataset produces constantly, since windows never cross
-        // document borders) find a cached graph whose `(b, t)` matched again while
-        // its nodes pointed at memory the short window had already handed back to
-        // the pool. That is a use-after-free on the device: it shows up as an
-        // illegal access, and then as a sticky CUBLAS_STATUS_EXECUTION_FAILED on
-        // whatever GEMM runs next.
-        if self.buf_shape != Some((b, t)) {
-            self.fwd_graph = None;
-            self.bwd_graph = None;
-            self.buf_shape = Some((b, t));
-        }
-
         // `wx`/`whr`/`bcat` are the parameters themselves — already in the layout the
         // GEMMs below want, so there is nothing to pack here.
 
-        // Recurrent state starts at zero — unless this call continues a sequence the
-        // previous call left off (see `set_carry`), where it starts at whatever that
-        // call ended with. Carrying is what makes a chunked sweep reproduce the
-        // unchunked recurrence exactly rather than resetting at every chunk border.
+        // Whether this call continues the sequence the previous one left off (see
+        // `set_carry`), which is what makes a chunked sweep reproduce the unchunked
+        // recurrence exactly instead of resetting at every chunk border. A shape change
+        // ends the carry regardless: a carried state is only meaningful for the batch
+        // it was produced at.
         //
-        // A shape change forces zeros regardless: a carried state is only meaningful
-        // for the batch it was produced at, and `fit_zeros` would have reallocated it
-        // anyway.
+        // Without a carry the buffers below are *not* zeroed — the kernels take `carry`
+        // and start from literal zeros, which is the same arithmetic without four
+        // memsets and, on the per-step path, without the t=0 GEMM whose operand they
+        // would have been.
         let carry = self.carry && self.h_state.dims() == [b, h];
         for s in [
             &mut self.h_state,
@@ -659,94 +676,47 @@ impl SLstm {
             &mut self.n_state,
             &mut self.m_state,
         ] {
-            if !carry {
-                fit_zeros(gpu, s, &[b, h]);
-            }
+            fit_uninit(gpu, s, &[b, h]);
         }
 
-        // A chunked sweep continues the recurrence (`carry`) and forwards every chunk
-        // before unwinding any, so the previous chunk's cache is still owed a backward:
-        // set it aside instead of letting `take_uninit` hand its buffers to this chunk.
-        // Unchunked, there is nothing to preserve and the buffers are reused as before.
         if carry {
-            if let (Some(g), Some(slabs), Some(x_saved)) =
-                (self.g.take(), self.slabs.take(), self.x_saved.take())
-            {
-                // With offload on, this chunk's cache goes to the host instead of
-                // staying resident. The device tensors are handed to the park, which
-                // holds them until its D2H has landed — the next chunk's eviction
-                // releases them, so the copy overlaps that chunk's compute.
-                match &mut self.park {
-                    Some(park) => {
-                        park.evict(gpu, park_order(g, slabs, x_saved));
-                        self.chunk_saved.push(SlstmChunk::Parked);
-                    }
-                    None => self.chunk_saved.push(SlstmChunk::Resident { g, slabs, x_saved }),
-                }
-            }
+            self.set_aside_chunk(gpu);
         }
+
+        // Narrow `x` into the cell's own `[N, in]` buffer. This is the only place the
+        // input is read at full width: the forward GEMM below and backward's
+        // `dWx = xᵀ·dg` both consume the narrowed copy, and `x` itself is gone by then
+        // (the caller returns its buffer to the pool the moment this returns).
+        //
+        // `store` takes the leading `N·in` elements, which is what `x` holds — a
+        // pooled buffer may be *larger* than [B, T, in] (`Buf`/`Pool` reuse by
+        // capacity), and copying its whole allocation would move capacity, not content.
+        let mut x_flat = fit_saved(gpu, self.x_saved.take(), self.bf16, &[n, inp]);
+        phase::timed(gpu, phase::Bucket::SlstmCopyFwd, || x_flat.store(gpu, x));
 
         // The input half of every gate pre-activation, for all timesteps at once —
         // it has no recurrent dependency, so it is one GEMM outside the loop.
-        let mut x_flat = take_uninit(gpu, self.x_saved.take(), &[n, inp]);
-        // The copy is for LIFETIME, not layout: `backward` needs `x` again for
-        // `dWx = xᵀ·dg`, and by then the caller has returned its buffer to the pool
-        // and someone else owns that memory. `x_flat` is the cell's own copy, held
-        // across the forward→backward boundary as `x_saved`.
         //
-        // Slice both sides because `x` may be a pooled buffer larger than [B, T, in]
-        // (`Buf`/`Pool` reuse by capacity) while `x_flat` is exactly [N, in]:
-        // `memcpy_dtod` asserts dst >= src, so copying the raw `buf`s would trip on
-        // any oversized input — and would move capacity rather than content.
-        let n_x = x_flat.len();
-        phase::timed(gpu, phase::Bucket::SlstmCopyFwd, || {
-            gpu.stream
-                .memcpy_dtod(&x.buf.slice(..n_x), &mut x_flat.buf.slice_mut(..n_x))
-                .expect("copy x");
-        });
         // One buffer, two views: the GEMM wants [N, 4H], the time loop wants
         // [B, T, 4H]. `reshaped` is metadata-only, so the allocation is untouched.
         let mut g = take_uninit(gpu, self.g.take(), &[b, t, h4]).reshaped(&[n, h4]);
-        let (bf16, gemm_x, wx_w) = (self.bf16, &mut self.gemm_x, &self.wx);
-        phase::timed(gpu, phase::Bucket::SlstmGemmFwd, || {
-            if bf16 {
-                gemm_x.run_wb(gpu, ops::MmForm::Nn, &x_flat, wx_w, &mut g, 0.0);
-            } else {
-                ops::matmul_nn_into(gpu, &x_flat, wx_w, &mut g, 0.0);
-            }
+        let (gemm_x, wx_w) = (&mut self.gemm_x, &self.wx);
+        phase::timed(gpu, phase::Bucket::SlstmGemmFwd, || match &x_flat {
+            SlabBuf::Bf16(xb) => gemm_x.run_staged_lhs(gpu, ops::MmForm::Nn, xb, wx_w, &mut g, 0.0),
+            SlabBuf::F32(xf) => ops::matmul_nn_into(gpu, xf, wx_w, &mut g, 0.0),
         });
         let mut g = g.reshaped(&[b, t, h4]);
 
-        let mut slabs = match self.slabs.take() {
-            Some(s) if s.c.dims() == [b, t, h].as_slice() => s,
-            _ => {
-                // fp32 for the stabilizer-carrying slabs, kernel-matched width for
-                // the plain activations — see `SlstmSlabs` and `gpu::bf16`.
-                let f32_slab = || DTensor::uninit(gpu, &[b, t, h]);
-                let act_slab = || ops::SlabBuf::new(gpu, &[b, t, h]);
-                SlstmSlabs {
-                    c_prev: f32_slab(),
-                    n_prev: f32_slab(),
-                    i_prime: f32_slab(),
-                    f_prime: f32_slab(),
-                    c: f32_slab(),
-                    n: f32_slab(),
-                    zt: act_slab(),
-                    ot: act_slab(),
-                    h_prev: act_slab(),
-                }
-            }
-        };
+        let mut slabs = fit_slabs(gpu, self.slabs.take(), &[b, t, h]);
         let mut out = take_uninit(gpu, self.out_buf.take(), &[b, t, h]);
-        fit_uninit(gpu, &mut self.gh, &[b, h4]);
 
         phase::timed(gpu, phase::Bucket::SlstmLoopFwd, || {
-            self.fwd_loop(gpu, &mut g, &mut slabs, &mut out, b, t);
+            self.fwd_loop(gpu, &mut g, &mut slabs, &mut out, t, carry);
         });
 
-        // `out` is the graph's write target and must keep its address, so the loop
-        // writes there and the result reaches the caller's buffer through the
-        // post-cell norm — which is also what moves it, so there is no separate copy.
+        // The loop writes `out`, and the result reaches the caller's buffer through
+        // the post-cell norm — which is also what moves it, so there is no separate
+        // copy.
         //
         // The norm is position-wise and folds the leading axes itself, so both sides
         // stay [B, T, H]. `y` was asserted that shape on entry, so the write covers
@@ -760,29 +730,29 @@ impl SLstm {
         self.out_buf = Some(out);
     }
 
-    /// The forward time loop: replayed from a captured CUDA graph when T is long
-    /// enough to be worth it, else issued step by step.
+    /// The forward time loop: one cooperative launch when T is long enough, else
+    /// step by step.
     ///
-    /// At the backbone's shape (B=1, H=512) a timestep is a `[1,512]x[512,2048]`
-    /// matvec — ~2 us of GPU work — while *submitting* it costs the host 18 us for
-    /// the cuBLAS call plus 7 us for the kernel. The card therefore idles waiting on
-    /// the driver, and no faster card can help. Capturing the loop once and replaying
-    /// it turns those 2·T submissions into a single `cuGraphLaunch`.
+    /// The split exists because a long loop at batch 1 is pure launch latency: a
+    /// timestep there is a `[1,H]x[H,4H]` matvec — a couple of us of GPU work — while
+    /// *submitting* it costs the host far more, so the card idles on the driver and no
+    /// faster card can help. `slstm_fused_time` removes the submissions entirely. A
+    /// short T (a word, in the encoder/decoder) has too few of them to be worth the
+    /// kernel's `Wh` staging, and its batch is wide enough that the per-step matmul is
+    /// real work rather than latency.
     fn fwd_loop(
         &mut self,
         gpu: &Gpu,
         g: &mut DTensor,
         slabs: &mut SlstmSlabs,
         out: &mut DTensor,
-        b: usize,
         t: usize,
+        carry: bool,
     ) {
-        // The time-fused kernel replaces the whole loop with one cooperative launch,
-        // so it comes before the graph path (a cooperative launch cannot be stream
-        // captured anyway) and before the eager path. It declines by returning false
-        // when the shape does not fit, leaving both fallbacks intact.
-        if self.force_fused_time.unwrap_or_else(fused_time_enabled)
-            && t >= GRAPH_MIN_T
+        // The kernel declines by returning false when the shape does not fit or the
+        // shape-specialized build is unavailable, leaving the per-step path intact.
+        if t >= FUSED_MIN_T
+            && self.force_fused_time.unwrap_or_else(fused_time_enabled)
             && ops::slstm_fused_time(
                 gpu,
                 &self.whr,
@@ -795,52 +765,15 @@ impl SLstm {
                 slabs,
                 out,
                 t,
+                carry,
             )
         {
             return;
         }
-        if t < GRAPH_MIN_T || graphs_disabled() {
-            self.fwd_steps(gpu, g, slabs, out, t);
-            return;
-        }
-        let ptrs = loop_ptrs(gpu, g, slabs, out);
-        if self
-            .fwd_graph
-            .as_ref()
-            .map_or(true, |c| (c.b, c.t) != (b, t) || c.ptrs != ptrs)
-        {
-            // Drop the stale exec first: its nodes point into buffers that the shape
-            // change above has just reallocated.
-            self.fwd_graph = None;
-            gpu.stream
-                .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                .expect("begin capture");
-            self.fwd_steps(gpu, g, slabs, out, t);
-            // Capture records the launches instead of running them, so the recurrent
-            // state is untouched here and the `launch` below is what executes them.
-            //
-            // AUTO_FREE_ON_LAUNCH is the only flag cudarc's enum exposes (it has no
-            // zero variant); it only concerns memory *allocated by graph nodes*, and
-            // the loop allocates nothing, so it is a no-op for us.
-            let graph = gpu
-                .stream
-                .end_capture(
-                    CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-                )
-                .expect("end capture")
-                .expect("stream was not capturing");
-            self.fwd_graph = Some(LoopGraph { b, t, ptrs, graph });
-        }
-        self.fwd_graph
-            .as_ref()
-            .unwrap()
-            .graph
-            .launch()
-            .expect("graph launch");
+        self.fwd_steps(gpu, g, slabs, out, t, carry);
     }
 
-    /// The loop body, issued eagerly. Called both to run the steps and — under
-    /// stream capture — to record them into a graph.
+    /// The loop body, one timestep at a time.
     fn fwd_steps(
         &mut self,
         gpu: &Gpu,
@@ -848,13 +781,41 @@ impl SLstm {
         slabs: &mut SlstmSlabs,
         out: &mut DTensor,
         t: usize,
+        carry: bool,
     ) {
+        // The scratch only this path needs: the contiguous `[B, 4H]` gate half and the
+        // narrowed `h` its GEMM reads. Fitted here rather than in `forward` because
+        // which path runs is not known until the fused one has been *tried* — it can
+        // decline at launch, not just at geometry.
+        let (b, h) = (self.h_state.rows(), self.h_state.cols());
+        fit_uninit(gpu, &mut self.gh, &[b, 4 * h]);
+        self.h_narrow.fit(gpu, &[b, h]);
+        if carry {
+            // `slstm_step_fused` refreshes `h_narrow` every step, so only a carried
+            // starting value has to be staged; without a carry the loop skips step 0's
+            // GEMM outright and never reads it.
+            let (h_narrow, h_state) = (&mut self.h_narrow, &self.h_state);
+            h_narrow.store(gpu, h_state);
+        }
         for step in 0..t {
             // Recurrent half of the gates (one dense GEMM into the contiguous
             // scratch), then the elementwise recurrence: two launches per timestep.
-            // The bf16 variant adds a third (the h round-trip) but halves the Wh
-            // traffic, which at B=1 is what the GEMM's time is actually made of.
-            ops::matmul_nn_into(gpu, &self.h_state, &self.whr, &mut self.gh, 0.0);
+            // The GEMM's left operand is the narrowed `h` the previous step's kernel
+            // wrote, so the bf16 path adds no third launch.
+            //
+            // At a sequence start it is skipped outright: `h_{-1}` is zero, so the
+            // product is, and the kernel substitutes that. At the encoder's shape that
+            // is a `[512,256]x[256,1024]` GEMM saved out of every group's T of them.
+            let first = step == 0 && !carry;
+            if !first {
+                let Self { gemm_h, h_narrow, whr, gh, .. } = self;
+                match h_narrow {
+                    ops::SlabBuf::Bf16(h) => {
+                        gemm_h.run_staged_lhs(gpu, ops::MmForm::Nn, h, whr, gh, 0.0)
+                    }
+                    ops::SlabBuf::F32(h) => ops::matmul_nn_into(gpu, h, whr, gh, 0.0),
+                }
+            }
             ops::slstm_step_fused(
                 gpu,
                 g,
@@ -864,9 +825,11 @@ impl SLstm {
                 &mut self.n_state,
                 &mut self.m_state,
                 &mut self.h_state,
+                &mut self.h_narrow,
                 slabs,
                 out,
                 step,
+                first,
             );
         }
     }
@@ -919,10 +882,8 @@ impl SLstm {
         // The post-cell norm is the last thing forward applied, so it is the first
         // thing to undo: its `dx` is what the recurrence actually receives.
         //
-        // It lands directly in `dy_buf` — the loop reads that every step, and the
-        // caller hands us a different `dy` each time, a pointer a captured graph
-        // cannot follow. Undoing the norm into our own buffer therefore costs nothing
-        // extra: it replaces the copy that was there for the same reason.
+        // It lands in `dy_buf`, the buffer this cell reuses call to call, so undoing
+        // the norm doubles as the staging the loop would otherwise need.
         let mut dy_buf = take_uninit(gpu, self.dy_buf.take(), &[b, t, h]);
         phase::timed(gpu, phase::Bucket::SlstmCopyBwd, || {
             self.post_norm.backward(gpu, dy, &mut dy_buf);
@@ -931,7 +892,7 @@ impl SLstm {
         // The only thing the loop must carry is BPTT: the gate deltas go straight
         // back into `g`, and everything derived from them waits until the loop ends.
         phase::timed(gpu, phase::Bucket::SlstmLoopBwd, || {
-            self.bwd_loop(gpu, &dy_buf, &mut g, &slabs, b, t);
+            self.bwd_loop(gpu, &dy_buf, &mut g, &slabs, t);
         });
         self.dy_buf = Some(dy_buf);
 
@@ -945,13 +906,12 @@ impl SLstm {
         // accumulation across windows that the unpack kernel used to do by hand.
         let wx = &self.wx;
         let dwx = &mut self.dwx;
-        let (bf16, gemm_dx) = (self.bf16, &mut self.gemm_dx);
-        phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || {
-            if bf16 {
-                gemm_dx.run_backward(gpu, &x_flat, &dg, wx, dwx, dx);
-            } else {
+        let gemm_dx = &mut self.gemm_dx;
+        phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || match &x_flat {
+            SlabBuf::Bf16(xb) => gemm_dx.run_backward_staged_x(gpu, xb, &dg, wx, dwx, dx),
+            SlabBuf::F32(xf) => {
                 ops::matmul_nt_into(gpu, &dg, wx, dx, 0.0);
-                ops::matmul_tn_into(gpu, &x_flat, &dg, dwx, 1.0);
+                ops::matmul_tn_into(gpu, xf, &dg, dwx, 1.0);
             }
         });
         // dWh = h_prevᵀ · dg goes through cuBLAS, which needs an fp32 operand, so a
@@ -985,8 +945,8 @@ impl SLstm {
         });
         self.dbcat = dbcat.reshaped(&[h4]);
 
-        // Give the buffers back (same allocations, original shapes) so the next
-        // forward reuses them — and so the captured graphs stay valid.
+        // Give the buffers back at their original shapes so the next forward reuses
+        // the same allocations.
         self.g = Some(dg.reshaped(&[b, t, h4]));
         self.slabs = Some(slabs);
         self.x_saved = Some(x_flat);
@@ -1018,21 +978,20 @@ impl SLstm {
         dx.reshape_to(&[b, t, inp]);
     }
 
-    /// The backward time loop — graph-replayed on the same terms as [`Self::fwd_loop`].
+    /// The backward time loop — time-fused on the same terms as [`Self::fwd_loop`].
     fn bwd_loop(
         &mut self,
         gpu: &Gpu,
         dy: &DTensor,
         g: &mut DTensor,
         slabs: &SlstmSlabs,
-        b: usize,
         t: usize,
     ) {
-        // One cooperative launch for the whole reverse loop; see `fwd_loop` for why
-        // this precedes the graph path. `gh` doubles as the grid-visible [B, 4H]
-        // gate-delta scratch, which is exactly what the per-step path uses it for.
-        if self.force_fused_time.unwrap_or_else(fused_time_enabled)
-            && t >= GRAPH_MIN_T
+        // One cooperative launch for the whole reverse loop. `gh` doubles as the
+        // grid-visible [B, 4H] gate-delta scratch, which is exactly what the per-step
+        // path uses it for.
+        if t >= FUSED_MIN_T
+            && self.force_fused_time.unwrap_or_else(fused_time_enabled)
             && ops::slstm_fused_time_bwd(
                 gpu,
                 &self.whr,
@@ -1048,36 +1007,7 @@ impl SLstm {
         {
             return;
         }
-        if t < GRAPH_MIN_T || graphs_disabled() {
-            self.bwd_steps(gpu, dy, g, slabs, t);
-            return;
-        }
-        let ptrs = loop_ptrs(gpu, g, slabs, dy);
-        if self
-            .bwd_graph
-            .as_ref()
-            .map_or(true, |c| (c.b, c.t) != (b, t) || c.ptrs != ptrs)
-        {
-            self.bwd_graph = None;
-            gpu.stream
-                .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                .expect("begin capture");
-            self.bwd_steps(gpu, dy, g, slabs, t);
-            let graph = gpu
-                .stream
-                .end_capture(
-                    CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-                )
-                .expect("end capture")
-                .expect("stream was not capturing");
-            self.bwd_graph = Some(LoopGraph { b, t, ptrs, graph });
-        }
-        self.bwd_graph
-            .as_ref()
-            .unwrap()
-            .graph
-            .launch()
-            .expect("graph launch");
+        self.bwd_steps(gpu, dy, g, slabs, t);
     }
 
     fn bwd_steps(
@@ -1112,6 +1042,7 @@ impl SLstm {
         // the cached bf16 copy must be assumed stale from here on.
         self.gemm_x.invalidate_w();
         self.gemm_dx.invalidate_w();
+        self.gemm_h.invalidate_w();
         let mut v = vec![&mut self.wx, &mut self.whr, &mut self.bcat];
         v.extend(self.post_norm.params_mut());
         v
@@ -1250,13 +1181,13 @@ impl SLstm {
     /// the per-batch state and BPTT channels, and the post-norm's saved `x̂`.
     pub fn act_split(&self) -> (usize, usize) {
         let saved = self.slabs.as_ref().map_or(0, |s| s.retained_bytes())
-            + self.x_saved.as_ref().map_or(0, |t| t.capacity() * 4)
+            + self.x_saved.as_ref().map_or(0, |t| t.retained_bytes())
             + self
                 .chunk_saved
                 .iter()
                 .map(|c| match c {
                     SlstmChunk::Resident { g, slabs, x_saved } => {
-                        slabs.retained_bytes() + x_saved.capacity() * 4 + g.capacity() * 4
+                        slabs.retained_bytes() + x_saved.retained_bytes() + g.capacity() * 4
                     }
                     // On the host, so it holds no device bytes — which is the point.
                     SlstmChunk::Parked => 0,
@@ -1269,10 +1200,8 @@ impl SLstm {
     /// Release every activation this cell holds — the saved slabs and input, the
     /// gate/output/dy buffers and the widening scratch.
     ///
-    /// Broader than [`drop_saved_act`](Self::drop_saved_act), which keeps the stable
-    /// buffers on purpose: their addresses are what a captured graph replays against.
-    /// Dropping them invalidates the graphs, so this also clears those — the next
-    /// forward recaptures. For a window boundary, not the hot path.
+    /// Broader than [`drop_saved_act`](Self::drop_saved_act), which keeps the reused
+    /// buffers on purpose. For a window boundary, not the hot path.
     pub fn drop_all_act(&mut self) {
         // The big per-`[B, T, ·]` buffers: these are what scale with the rectangle and
         // what a group boundary needs back.
@@ -1281,16 +1210,10 @@ impl SLstm {
         self.chunk_saved.clear();
         self.post_norm.drop_saved_act();
 
-        // `g`, `out_buf`, `dy_buf`, `h_prev_f32` and the two graphs are deliberately
-        // KEPT.
-        //
-        // A captured graph bakes in the raw device pointers of every buffer its nodes
-        // touch, so dropping those buffers means dropping the graphs, and the next call
-        // at the same `(b, t)` has to re-capture. That is not a rare event: the
+        // `g`, `out_buf`, `dy_buf` and `h_prev_f32` are deliberately KEPT: the
         // encoder and decoder run one rectangle per length bucket and the buckets
-        // repeat window after window, so the graphs are hit constantly — clearing them
-        // per group turned every one of those hits into a re-capture and roughly halved
-        // the step rate.
+        // repeat window after window, so dropping them per group would mean a fresh
+        // allocation for every group of every window.
         //
         // Keeping them costs the `[B, T, 4H]` gate buffer and two `[B, T, H]` staging
         // buffers at the LARGEST bucket's shape, which at the encoder/decoder's
@@ -1305,7 +1228,7 @@ impl SLstm {
     /// and input, the gate buffer, the stable `out`/`dy` buffers, the per-batch
     /// recurrent state and BPTT channels, and the `h_prev` widening scratch. Only the
     /// first two are released by [`drop_saved_act`](Self::drop_saved_act) — the rest
-    /// are kept deliberately, because a captured graph holds their raw pointers.
+    /// are kept deliberately, so the next call at the same shape reuses them.
     pub fn retained_bytes(&self) -> (usize, usize) {
         let params: usize = [
             &self.wx, &self.whr, &self.bcat, &self.dwx, &self.dwhr, &self.dbcat, &self.mwx,
@@ -1314,17 +1237,12 @@ impl SLstm {
         .iter()
         .map(|t| t.capacity() * 4)
         .sum();
-        let opt: usize = [
-            &self.g,
-            &self.x_saved,
-            &self.out_buf,
-            &self.dy_buf,
-            &self.h_prev_f32,
-        ]
-        .iter()
-        .filter_map(|s| s.as_ref())
-        .map(|t| t.capacity() * 4)
-        .sum();
+        let opt: usize = [&self.g, &self.out_buf, &self.dy_buf, &self.h_prev_f32]
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .map(|t| t.capacity() * 4)
+            .sum::<usize>()
+            + self.x_saved.as_ref().map_or(0, |t| t.retained_bytes());
         let live: usize = [
             &self.h_state,
             &self.c_state,
@@ -1340,7 +1258,9 @@ impl SLstm {
         .map(|t| t.capacity() * 4)
         .sum();
         let slabs = self.slabs.as_ref().map_or(0, |s| s.retained_bytes());
-        let staging = self.gemm_x.retained_bytes() + self.gemm_dx.retained_bytes();
+        let staging = self.gemm_x.retained_bytes()
+            + self.gemm_dx.retained_bytes()
+            + self.gemm_h.retained_bytes();
         let (pn_p, _) = self.post_norm.retained_bytes();
         (params + pn_p, opt + live + slabs + staging)
     }
@@ -1368,6 +1288,7 @@ impl SLstm {
         // read is stale. Missing this shows up as training silently not learning.
         self.gemm_x.invalidate_w();
         self.gemm_dx.invalidate_w();
+        self.gemm_h.invalidate_w();
         if let Some(q) = q {
             q.push(gpu, &mut self.wx, &self.dwx, &mut self.mwx, &mut self.vwx, cfg, true);
             q.push(gpu, &mut self.whr, &self.dwhr, &mut self.mwhr, &mut self.vwhr, cfg, true);
@@ -1432,13 +1353,13 @@ mod tests {
         // owns it, `backward` runs that noise through the norm's `γ·dY − x̂·S/F`
         // reduction before it reaches `dx`, which amplifies it — and, because the
         // reduction is over the whole row, makes the worst element swing a lot from
-        // run to run. Ten measured runs of `slstm_graph_path_matches_cpu` at T=64
+        // run to run. Ten measured runs of `slstm_long_t_matches_cpu` at T=64
         // spread 2.2e-2 to 5.9e-2 on `dx`, so x32 (6.4e-2) was back to clearing by a
         // hair and failing intermittently. x128 (2.6e-1) sits ~4x above the observed
         // maximum, which is the margin this bound needs to be worth having.
         //
         // That this is bf16 and not a logic error is directly checkable:
-        // `GPU_NO_BF16=1` makes both graph tests pass at the base tolerance, two
+        // `GPU_NO_BF16=1` makes both long-T tests pass at the base tolerance, two
         // orders tighter.
         if gpu.kernels.slab_bf16 {
             base * 128.0
@@ -1631,21 +1552,19 @@ mod tests {
         );
     }
 
-    /// The same parity check, but at `T > GRAPH_MIN_T` so the time loops run as
-    /// **captured CUDA graphs** — the path `slstm_matches_cpu_layer` (T=5) never
-    /// reaches. This is what pins the graph rewrite: the buffers a graph's nodes
-    /// point at are now reused across calls, so a stale pointer or a buffer that
-    /// silently moved would show up here as a numeric mismatch.
+    /// The same parity check at `T > FUSED_MIN_T`, so both time loops run as **one
+    /// cooperative launch** — the path `slstm_matches_cpu_layer` (T=5) never reaches.
     ///
-    /// Two full cycles, checked separately: the first captures and instantiates,
-    /// the second **replays**. A replay reading a wrong address is the failure mode
-    /// that a single-pass test would miss entirely.
+    /// Two full cycles with an optimizer step between them, checked separately. The
+    /// fused kernels read `whr`/`bcat` live out of the parameters, and the whole-
+    /// sequence GEMMs read a *cached* bf16 copy of `wx`; a second pass against
+    /// changed weights is what catches a cache that was not invalidated.
     #[test]
-    fn slstm_graph_path_matches_cpu() {
+    fn slstm_long_t_matches_cpu() {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        assert!(64 > GRAPH_MIN_T, "this test must exercise the graph path");
+        assert!(64 > FUSED_MIN_T, "this test must exercise the time-fused path");
         let (b, t, inp, h) = (2, 64, 8, 12);
 
         let mut cpu = CpuRef::new(inp, h);
@@ -1666,8 +1585,8 @@ mod tests {
             assert_close(&dev.gate_dw(&gpu, 0), &cpu.cell.dwz.data, tol(&gpu, 2e-3));
             assert_close(&dev.gate_dw(&gpu, 2), &cpu.cell.dwf.data, tol(&gpu, 2e-3));
 
-            // Step between passes, so the replay runs against *changed* weights —
-            // the graph must read the packed operands live, not a stale copy.
+            // Step between passes, so the second cycle runs against *changed*
+            // weights — the loop must read the packed operands live, not a stale copy.
             cfg.t = pass + 1;
             cpu.step(&cfg);
             dev.step(&gpu, &cfg);
@@ -1679,19 +1598,17 @@ mod tests {
         }
     }
 
-    /// A cell whose shape changes must not replay a graph captured at the old shape:
-    /// refitting the buffers reallocates them, and the old graph's nodes still point
-    /// at the memory that was handed back.
+    /// The cell's per-call buffers are *reused* whenever the shape matches and
+    /// reallocated when it does not, so a run of differently shaped windows walks
+    /// them through allocate/reuse/free repeatedly. This is the real training
+    /// pattern — windows never cross a document border, so every short document
+    /// yields a short window — and anything that survived a call it should not
+    /// (a stale slab, a scratch sized for the previous shape) shows up here.
     ///
-    /// The sequence matters. The short T here (`8`, below GRAPH_MIN_T) is the one
-    /// that broke a real training run: it takes the *eager* path, so it consults no
-    /// graph cache — but it reallocates the buffers all the same. Coming back to a
-    /// long T that was captured earlier then found a cache entry whose `(b, t)` key
-    /// matched while its nodes addressed freed memory. The backbone meets this
-    /// constantly, because windows never cross document borders and every short
-    /// document yields a short window. So: long, short-eager, long-again.
+    /// The sequence matters: long, short, long-again, so a shape is revisited after
+    /// its buffers have been handed back once.
     #[test]
-    fn slstm_graph_survives_shape_changes() {
+    fn slstm_survives_shape_changes() {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
@@ -1702,7 +1619,7 @@ mod tests {
         // Freed device memory only *shows* it was reused if somebody reuses it. In
         // the real model the encoder/decoder's per-group temporaries do that between
         // two backbone sweeps; here nothing else allocates, so the pool would hand
-        // the very same addresses back and a stale graph would still read plausible
+        // the very same addresses back and a stale read would still see plausible
         // data. Grab (and dirty) a block between windows to stand in for that churn.
         let poison = |floats: usize| {
             let mut d = DTensor::uninit(&gpu, &[floats]);
@@ -1724,14 +1641,53 @@ mod tests {
         }
     }
 
+    /// A shape long enough to *ask* for the time-fused path but too wide for it must
+    /// still run, and run correctly.
+    ///
+    /// `ops::slstm_fused_time` can decline in two places — the geometry, and the launch
+    /// itself, where the driver refuses a cooperative grid it cannot make co-resident.
+    /// So `forward` cannot know which loop will run, and anything the per-step loop
+    /// needs has to be prepared by that loop rather than guessed at in advance. It was
+    /// guessed at once: the per-step scratch was skipped whenever T was long, and the
+    /// first shape that declined at launch reached the fallback with an unallocated
+    /// operand and panicked inside cuBLAS.
+    ///
+    /// The batch here is what declines: the pointwise phase is one thread per (batch
+    /// row, owned unit), so a batch this wide needs a block wider than the hardware
+    /// allows. `T` is above `FUSED_MIN_T` all the same.
+    #[test]
+    fn wide_batch_falls_back_to_the_per_step_loop() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let (b, t, h) = (1088usize, 32usize, 32usize);
+        let s = 1.0 / (h as f32).sqrt();
+        let w: Vec<Tensor> = (0..4).map(|g| Tensor::random(&[2 * h, h], s * (1.0 + g as f32 * 0.05))).collect();
+        let bi: Vec<Tensor> = (0..4).map(|g| Tensor::random(&[h], 0.2)).collect();
+        let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 0.5));
+
+        let build = || {
+            SLstm::from_parts(
+                &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3], None,
+            )
+        };
+        // Default selection: asks for the fused path, gets told no, falls back.
+        let got = build().forward_alloc(&gpu, &x).to_host(&gpu);
+        // The path it lands on, pinned directly.
+        let mut forced = build();
+        forced.force_fused_time = Some(false);
+        let want = forced.forward_alloc(&gpu, &x).to_host(&gpu);
+        assert_eq!(got.data, want.data, "fallback must be the per-step loop exactly");
+        assert!(got.data.iter().all(|v| v.is_finite()), "non-finite output");
+    }
+
     /// The time-fused forward (one cooperative launch for the whole T-loop) must
     /// agree with the per-step path it replaces.
     ///
     /// `fused_time_enabled()` reads its env var through a `OnceLock`, so this
     /// drives `ops::slstm_fused_time` directly rather than toggling the flag: the
     /// point is that the kernel computes the same thing, not how it is selected.
-    /// T is above `GRAPH_MIN_T` so the comparison is against the graph path that
-    /// actually runs at backbone shapes.
+    /// T is above `FUSED_MIN_T`, the length at which the cell actually selects it.
     ///
     /// Tolerances follow the staging dtype: bf16 staging (the default — see
     /// `ops::fused_bf16_enabled`) keeps an 8-bit mantissa on `Wh`, so agreement is

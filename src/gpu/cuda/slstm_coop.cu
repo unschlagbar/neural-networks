@@ -1,14 +1,19 @@
 // Cooperative-launch sLSTM: the whole time loop in one grid-synchronising kernel.
 // Behind COOP_KERNELS; drags in libcu++ via <cooperative_groups.h>, so it has the
-// largest include requirement of any module. FUSED_BF16 selects bf16 gate staging,
-// SLSTM_H / SLSTM_B are the shape-specialisation constants (see Kernels::specialized).
+// largest include requirement of any module. FUSED_BF16 selects bf16 gate staging
+// for the backward, SLSTM_H / SLSTM_B are the shape-specialisation constants (see
+// Kernels::specialized).
 
 #ifdef COOP_KERNELS
 #include <cooperative_groups.h>
-#ifdef FUSED_BF16
 #include <cuda_bf16.h>
-#endif
 namespace cg = cooperative_groups;
+
+// Eight bf16 in one 128-bit shared/global access — the widest either supports.
+union bf16x8 {
+    int4 raw;
+    __nv_bfloat162 pair[4];
+};
 
 // Time-fused sLSTM forward: the ENTIRE T-loop in ONE launch (FlashRNN's
 // `cuda_fused` idea, arXiv 2412.07752). At B=1 the per-step path is a GEMV plus a
@@ -17,9 +22,9 @@ namespace cg = cooperative_groups;
 //
 //   * Wh is loaded ONCE into shared memory, before the loop, instead of streaming
 //     from HBM at every timestep. Each block owns a contiguous slice of Wh's 4H
-//     output columns (`cols_per_block`), so the whole matrix lives on-chip across
+//     output columns (`units_per_block`), so the whole matrix lives on-chip across
 //     the grid and no block needs more than its slice.
-//   * the two per-step launches become one `grid.sync()` (measured ~0.74us here,
+//   * the two per-step launches become one `grid.sync()` (measured ~0.9us here,
 //     against ~6.6us for the launch pair).
 //
 // Cross-block consistency is the reason this must be a *cooperative* launch: block
@@ -27,214 +32,251 @@ namespace cg = cooperative_groups;
 // the previous step, which other blocks produced. `grid.sync()` after the state
 // update is what makes h_t visible everywhere before step t+1 reads it.
 //
-// Shape contract: gridDim.x * cols_per_block >= 4H, blockDim.x threads per block,
-// B*H <= blockDim.x * gridDim.x for the state update. `wh` is [H, 4H] row-major.
-// Under FUSED_BF16 the staged operands are bf16 and the accumulators fp32; above
-// H=640 that is what keeps the grid co-resident at all (see `fused_bf16_enabled`).
-// SPECIALIZATION (FlashRNN's `-DFLASHRNN_HIDDEN_SIZE=... -DFLASHRNN_BATCH_SIZE=...`
-// in `flashrnn.py`): when SLSTM_H / SLSTM_B are defined, H and B become compile-time
-// constants and the runtime arguments are ignored. That lets the compiler give the
-// reduction a static trip count, turn the /32 and %32 into shifts, and — at B == 1,
-// which is what the backbone always runs — delete the batch indexing entirely.
+// Precision follows FlashRNN's split: bf16 is the STORAGE dtype for everything the
+// loop re-reads (the staged `Wh` slice, the `h` mirror), fp32 is the ARITHMETIC
+// dtype — every accumulator and the whole stabilizer group stay wide. A conversion
+// costs a couple of ALU ops because both sides are already in registers or shared
+// memory; the earlier standalone bf16 path lost only because it converted through a
+// separate kernel over HBM.
 //
-// Sequence length is deliberately NOT specialized, exactly as upstream: `steps` is a
-// runtime argument to their `Run()` too. T is the outer loop's bound, walked once
-// with a data dependency between iterations, so there is nothing to unroll or size
-// by it — and here windows never cross a document border, so T varies per window and
-// specializing on it would mean an NVRTC compile per window length.
-#ifdef SLSTM_H
+// SPECIALIZATION (FlashRNN's `-DFLASHRNN_HIDDEN_SIZE=... -DFLASHRNN_BATCH_SIZE=...`
+// in `flashrnn.py`): H and B are compile-time constants here, which is what lets the
+// reduction below hold its slice of `h` in a REGISTER ARRAY. There is deliberately no
+// generic build of this kernel — a runtime H would put that array in local memory and
+// give back the whole win — so `ops::slstm_fused_time` declines when the specialized
+// build is unavailable and the caller takes the per-step loop.
+//
+// Sequence length is NOT specialized, exactly as upstream: `steps` is a runtime
+// argument to their `Run()` too. T is the outer loop's bound, walked once with a data
+// dependency between iterations, so there is nothing to unroll or size by it — and
+// here windows never cross a document border, so T varies per window and specializing
+// on it would mean an NVRTC compile per window length.
+#if defined(SLSTM_H) && defined(SLSTM_B)
+
 #define FUSED_H SLSTM_H
-#else
-#define FUSED_H H
-#endif
-#ifdef SLSTM_B
 #define FUSED_B SLSTM_B
-#else
-#define FUSED_B B
-#endif
+
+// Rows of one Wh column a lane pulls per 128-bit access, and the rows a whole warp
+// covers per pass. The staged slice is padded to a multiple of FUSED_RPP and the tail
+// zero-filled, so the reduction has a static trip count and no tail branch — the
+// padding contributes exact zeros.
+#define FUSED_RPL 8
+#define FUSED_RPP (32 * FUSED_RPL)
+#define FUSED_HP (((FUSED_H) + FUSED_RPP - 1) / FUSED_RPP * FUSED_RPP)
+#define FUSED_PASSES (FUSED_HP / FUSED_RPP)
+#define FUSED_HSLICE (FUSED_HP / 32)
+
+// Load a lane's slice of `src` (bf16, FUSED_HP-strided) into `dst` fp32 registers.
+__device__ __forceinline__ void fused_load_slice(float* dst, const __nv_bfloat16* src,
+                                                 int lane) {
+    #pragma unroll
+    for (int p = 0; p < FUSED_PASSES; ++p) {
+        bf16x8 v;
+        v.raw = *(const int4*)(src + p * FUSED_RPP + lane * FUSED_RPL);
+        #pragma unroll
+        for (int q = 0; q < FUSED_RPL / 2; ++q) {
+            float2 f = __bfloat1622float2(v.pair[q]);
+            dst[p * FUSED_RPL + 2 * q] = f.x;
+            dst[p * FUSED_RPL + 2 * q + 1] = f.y;
+        }
+    }
+}
 
 extern "C" __global__ void slstm_fused_time(
         const float* __restrict__ wh, float* g, const float* __restrict__ bcat,
         slab_t* h_prev, float* c_state, float* n_state, float* m_state, float* h_state,
-        float* h_alt, float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
+        float* hmir, float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
         float* i_prime, float* f_prime, float* c_out, float* n_out,
-        float* out, int T, int H_rt, int B_rt, int cols_per_block) {
-    extern __shared__ float smem[];
+        float* out, int T, int units_per_block, int carry) {
+    extern __shared__ __align__(16) float smem[];
     cg::grid_group grid = cg::this_grid();
-
-#ifdef SLSTM_H
-    (void)H_rt;
-#else
-    const int H = H_rt;
-#endif
-#ifdef SLSTM_B
-    (void)B_rt;
-#else
-    const int B = B_rt;
-#endif
 
     // Each block owns a contiguous range of HIDDEN UNITS [j0, j0+nj), and for each
     // it owns all four gate columns j, H+j, 2H+j, 3H+j. That pairing is what lets
-    // the pointwise phase below read gate values this same block just wrote, so
-    // only ONE grid.sync() per step is needed (for h_t) instead of two: `cols_per_block`
-    // counts hidden units here, not raw Wh columns.
+    // the pointwise phase below read gate values this same block just wrote, so only
+    // ONE grid.sync() per step is needed (for h_t) instead of two.
     const int H4 = 4 * FUSED_H;
-    const int j0 = blockIdx.x * cols_per_block;
-    const int nj = max(0, min(cols_per_block, FUSED_H - j0));
-    const int ncol = 4 * nj;                            // Wh columns staged by this block
+    const int j0 = blockIdx.x * units_per_block;
+    const int nj = min(units_per_block, FUSED_H - j0);
+    const int ncol = 4 * nj;                       // Wh columns staged by this block
 
-    // Shared layout. With FUSED_BF16 the Wh slice is bf16 (half the footprint, so a
-    // block can own twice the units at the same shared budget) and is followed by a
-    // bf16 mirror of h_state; the fp32 gate scratch comes last and stays fp32
-    // because it is what the recurrence consumes.
-    //
-    // This is FlashRNN's split (`R_shared` is FLASHRNN_DTYPE_R = bf16 while
-    // ACC_DTYPE stays float): bf16 is the STORAGE dtype for the operands that get
-    // re-read every timestep, fp32 is the ARITHMETIC dtype. Their kernel converts
-    // too — `type2float` on the way into the accumulator, `float2type` on the way
-    // out — but both sides are already in registers or shared memory, so a
-    // conversion is a couple of ALU ops. The earlier standalone `SLSTM_BF16` path
-    // lost because it converted through a separate kernel over HBM, paying a whole
-    // launch and a round-trip per timestep to save a read it never got to reuse.
-#ifdef FUSED_BF16
+    // Shared: this block's Wh columns, then the fp32 gate scratch the recurrence
+    // consumes. The gate scratch stays wide — it is an accumulator.
     __nv_bfloat16* wsh = (__nv_bfloat16*)smem;
-    __nv_bfloat16* hsh = wsh + (long long)FUSED_H * ncol;
-    float* gacc = (float*)(hsh + (long long)FUSED_B * FUSED_H);
-#else
-    float* wsh = smem;
-    float* gacc = smem + (long long)FUSED_H * ncol;
-#endif
+    float* gacc = (float*)(wsh + (long long)ncol * FUSED_HP);
 
-    // Stage this block's Wh slice into shared memory, once for all T, TRANSPOSED:
-    // wsh[c * H + r] = wh[r * H4 + col0 + c], i.e. column-major so that one
-    // column is contiguous. The reduction below has the 32 lanes of a warp stride
-    // consecutive `r` for a fixed column; storing row-major would make that a
-    // stride-`ncol` walk (a bank conflict on every access), while this makes it a
-    // fully coalesced read of consecutive elements.
+    // Stage the Wh slice, once for all T, TRANSPOSED: wsh[c * HP + r], i.e. column-
+    // major so one column is contiguous and a lane's 8 rows are one 128-bit access.
     // Local column c in [0, 4*nj) maps to gate g = c / nj and unit j = j0 + c % nj,
-    // i.e. global Wh column g * H + j.
-    if (ncol > 0) {
-        for (int i = threadIdx.x; i < FUSED_H * ncol; i += blockDim.x) {
-            int r = i / ncol, c = i - r * ncol;
-            int gidx = c / nj, j = j0 + (c - gidx * nj);
-            float v = wh[(long long)r * H4 + gidx * FUSED_H + j];
-#ifdef FUSED_BF16
-            wsh[(long long)c * FUSED_H + r] = __float2bfloat16(v);
-#else
-            wsh[(long long)c * FUSED_H + r] = v;
-#endif
-        }
+    // i.e. global Wh column g * H + j. The traversal is row-major so the strided
+    // global read still coalesces across `c`.
+    const __nv_bfloat16 bzero = __float2bfloat16(0.0f);
+    for (int i = threadIdx.x; i < FUSED_HP * ncol; i += blockDim.x) {
+        int r = i / ncol, c = i - r * ncol;
+        int gidx = c / nj, j = j0 + (c - gidx * nj);
+        wsh[(long long)c * FUSED_HP + r] =
+            (r < FUSED_H) ? __float2bfloat16(wh[(long long)r * H4 + gidx * FUSED_H + j])
+                          : bzero;
     }
-    grid.sync(); // Wh staged everywhere AND initial h_state visible to all blocks
 
-    // h ping-pong. The mirror below reads the WHOLE h vector while the pointwise
-    // phase writes only this block's slice, so reading and writing the same buffer
-    // is a cross-block write-after-read hazard that costs a second grid barrier per
-    // step to close. Writing step t's h into the other buffer removes the hazard
-    // itself: nothing overwrites what a straggler is still mirroring.
-    float* h_cur = h_state;
-    float* h_nxt = h_alt;
+    // The bf16 mirror of h the reduction reads: TWO [B, HP] planes packed into the
+    // caller's fp32 [B, HP] buffer (two bf16 to a float). Two, because a block writes
+    // its own units of step t while another may still be reading step t-1 — a
+    // cross-block write-after-read that would otherwise cost a second barrier per
+    // step. Writing into the other plane removes the hazard itself.
+    __nv_bfloat16* hb_cur = (__nv_bfloat16*)hmir;
+    __nv_bfloat16* hb_nxt = hb_cur + (long long)FUSED_B * FUSED_HP;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < FUSED_B * FUSED_HP;
+         i += blockDim.x * gridDim.x) {
+        int b = i / FUSED_HP, r = i - b * FUSED_HP;
+        // Both planes' row padding must be a real zero: it multiplies Wh padding that
+        // is also zero, and an uninitialised NaN there would poison the sum. `carry`
+        // off means this call starts a sequence, so h_{-1} is zero by definition and
+        // `h_state` holds whatever the previous call left — the host no longer zeroes
+        // it, this does.
+        hb_cur[i] = (carry && r < FUSED_H) ? __float2bfloat16(h_state[b * FUSED_H + r]) : bzero;
+        hb_nxt[i] = bzero;
+    }
+    grid.sync(); // Wh staged and the h mirror complete everywhere
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warps = blockDim.x >> 5;
+
+    // Pointwise ownership is FIXED for the whole loop: thread `p` owns exactly one
+    // (batch row, hidden unit), which `geometry` guarantees by keeping the block at
+    // least `B * units_per_block` wide. That is what lets the recurrent state and the
+    // four biases live in REGISTERS — they touch global memory once at each end of
+    // the loop instead of four loads and four stores per timestep.
+    const int pw = threadIdx.x;
+    const bool owner = pw < FUSED_B * nj;
+    const int b_pw = owner ? pw / nj : 0;
+    const int jl_pw = pw - b_pw * nj;
+    const int j_pw = j0 + jl_pw;
+    const int k_pw = b_pw * FUSED_H + j_pw;
+    float c_reg = 0.0f, n_reg = 0.0f, m_reg = 0.0f, h_reg = 0.0f;
+    float bz = 0.0f, bi = 0.0f, bf = 0.0f, bo = 0.0f;
+    // Same as the mirror above: without a carry the sequence starts from zero, so
+    // there is nothing to read and nothing for the host to have zeroed.
+    if (owner && carry) {
+        c_reg = c_state[k_pw];
+        n_reg = n_state[k_pw];
+        m_reg = m_state[k_pw];
+        h_reg = h_state[k_pw];
+    }
+    if (owner) {
+        bz = bcat[j_pw];
+        bi = bcat[FUSED_H + j_pw];
+        bf = bcat[2 * FUSED_H + j_pw];
+        bo = bcat[3 * FUSED_H + j_pw];
+    }
 
     for (int t = 0; t < T; ++t) {
-#ifdef FUSED_BF16
-        // Refresh this block's bf16 mirror of the FULL h vector. It cannot be filled
-        // in-register by the pointwise phase: a block computes h only for the units
-        // it owns, while the reduction below contracts over all H of them.
-        for (int i = threadIdx.x; i < FUSED_B * FUSED_H; i += blockDim.x) {
-            hsh[i] = __float2bfloat16(h_cur[i]);
+        // This step's input half, issued BEFORE the reduction: it depends on `t`
+        // alone, so its global latency lands under the reduction instead of in front
+        // of the pointwise phase, where only the owning threads are awake to hide it.
+        long long go = ((long long)b_pw * T + t) * H4 + j_pw;
+        long long s = ((long long)b_pw * T + t) * FUSED_H + j_pw;
+        float gz = 0.0f, gi = 0.0f, gf = 0.0f, go4 = 0.0f;
+        if (owner) {
+            gz = g[go];
+            gi = g[go + FUSED_H];
+            gf = g[go + 2 * FUSED_H];
+            go4 = g[go + 3 * FUSED_H];
         }
-        __syncthreads(); // mirror complete before this block's reduction reads it
-#endif
-        // --- recurrent half: gh[b, col] = sum_r h_state[b, r] * Wh[r, col] ---
-        // ONE WARP PER COLUMN, reducing over the H rows. Assigning one *thread* per
-        // column instead would leave almost every thread idle at the shape that
-        // matters: the backbone runs B=1 with ~49 columns per block, so a
-        // thread-per-column loop fills 49 of 256 lanes and then makes each of them
-        // walk all H rows serially. Here all 256 threads work on 8 columns at a
-        // time, each lane striding the reduction, finished by a warp shuffle.
-        const int warp = threadIdx.x >> 5;
-        const int lane = threadIdx.x & 31;
-        const int warps = blockDim.x >> 5;
-        for (int i = warp; i < FUSED_B * ncol; i += warps) {
-            int b = i / ncol, c = i - b * ncol;
-            float acc = 0.0f;
-#ifdef FUSED_BF16
-            // Both operands bf16, accumulator fp32 — FlashRNN's ACC_DTYPE split.
-            const __nv_bfloat16* hrow = hsh + b * FUSED_H;
-            const __nv_bfloat16* wcol = wsh + (long long)c * FUSED_H;
-            for (int r = lane; r < FUSED_H; r += 32)
-                acc = fmaf(__bfloat162float(hrow[r]), __bfloat162float(wcol[r]), acc);
-#else
-            const float* hrow = h_cur + b * FUSED_H;
-            const float* wcol = wsh + (long long)c * FUSED_H; // column c, contiguous
-            for (int r = lane; r < FUSED_H; r += 32) acc = fmaf(hrow[r], wcol[r], acc);
-#endif
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
-            // Land in the block-local staging area right after the Wh slice: the
-            // pointwise phase below consumes these WITHOUT a grid-wide sync, because
-            // this block owns every gate column of every unit it is about to update.
-            if (lane == 0) gacc[i] = acc;
-        }
-        __syncthreads(); // block-local only: gacc written before this block reads it
 
-        // --- pointwise recurrence: one thread per (batch, hidden unit) ---
+        // --- recurrent half: gacc[b, col] = sum_r h[b, r] * Wh[r, col] ---
+        // ONE WARP PER COLUMN, lanes striding the H reduction. A thread per column
+        // instead would leave almost every lane idle at the shape that matters (B=1,
+        // ~40 columns per block) and then walk all H rows serially in each.
+        //
+        // `h` is pulled into REGISTERS once per batch row and reused by every column
+        // the warp takes. Every warp needs the whole h vector, so re-reading it per
+        // column made h roughly as much shared traffic as Wh itself — and Wh is the
+        // operand that cannot be reused at all.
+        for (int b = 0; b < FUSED_B; ++b) {
+            float hr[FUSED_HSLICE];
+            fused_load_slice(hr, hb_cur + (long long)b * FUSED_HP, lane);
+            for (int c = warp; c < ncol; c += warps) {
+                const __nv_bfloat16* wcol = wsh + (long long)c * FUSED_HP + lane * FUSED_RPL;
+                float acc = 0.0f;
+                #pragma unroll
+                for (int p = 0; p < FUSED_PASSES; ++p) {
+                    bf16x8 v;
+                    v.raw = *(const int4*)(wcol + p * FUSED_RPP);
+                    #pragma unroll
+                    for (int q = 0; q < FUSED_RPL / 2; ++q) {
+                        float2 f = __bfloat1622float2(v.pair[q]);
+                        acc = fmaf(hr[p * FUSED_RPL + 2 * q], f.x, acc);
+                        acc = fmaf(hr[p * FUSED_RPL + 2 * q + 1], f.y, acc);
+                    }
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+                // Block-local staging: the pointwise phase below consumes these
+                // WITHOUT a grid-wide sync, because this block owns every gate column
+                // of every unit it is about to update.
+                if (lane == 0) gacc[b * ncol + c] = acc;
+            }
+        }
+        __syncthreads(); // gacc written before this block reads it
+
+        // --- pointwise recurrence ---
         // Identical math to slstm_step_fused; see it for the stabilizer notes.
-        for (int i = threadIdx.x; i < FUSED_B * nj; i += blockDim.x) {
-            int b = i / nj, jl = i - b * nj;   // jl = local unit index
-            int j = j0 + jl;                   // global hidden unit
-            int k = b * FUSED_H + j;
-            long long go = ((long long)b * T + t) * H4 + j;
-            long long s = ((long long)b * T + t) * FUSED_H + j;
+        if (owner) {
+            // Gate pre-activation = input half + recurrent half (this block's gacc)
+            // + bias. gacc is laid out [b][gate][unit].
+            const float* ga = gacc + (long long)b_pw * ncol + jl_pw;
+            float z_pre = gz + ga[0] + bz;
+            float i_pre = gi + ga[nj] + bi;
+            float f_pre = gf + ga[2 * nj] + bf;
+            float o_pre = go4 + ga[3 * nj] + bo;
+            g[go + 2 * FUSED_H] = f_pre; // biased forget pre-activation, for backward
 
-            // Gate pre-activation = input half (already in g) + recurrent half
-            // (this block's gacc) + bias. gacc is laid out [b][gate][unit].
-            const float* ga = gacc + (long long)b * ncol + jl;
-            float z_pre = g[go]         + ga[0]          + bcat[j];
-            float i_pre = g[go + FUSED_H]     + ga[nj]         + bcat[FUSED_H + j];
-            float f_pre = g[go + 2 * FUSED_H] + ga[2 * nj]     + bcat[2 * FUSED_H + j];
-            float o_pre = g[go + 3 * FUSED_H] + ga[3 * nj]     + bcat[3 * FUSED_H + j];
-            g[go + 2 * FUSED_H] = f_pre; // biased forget pre-activation, saved for backward
-
-            slab_st(h_prev, s, h_cur[k]);
+            slab_st(h_prev, s, h_reg);
 
             float z = tanhf(z_pre);
             float o = stable_sigmoid(o_pre);
-            float log_f = log_sigmoid(f_pre);
-            float fm = log_f + m_state[k];
-            float np = n_state[k];
-            float m = (np == 0.0f) ? i_pre : fmaxf(fm, i_pre);
+            float fm = log_sigmoid(f_pre) + m_reg;
+            float m = (n_reg == 0.0f) ? i_pre : fmaxf(fm, i_pre);
             float ip = fminf(1.0f, expf(i_pre - m));
             float fp = fminf(1.0f, expf(fm - m));
-            float cp = c_state[k];
-            float c = fp * cp + ip * z;
-            float n = fp * np + ip;
+            float c = fp * c_reg + ip * z;
+            float n = fp * n_reg + ip;
 
-            c_prev[s] = cp;
-            n_prev[s] = np;
+            c_prev[s] = c_reg;
+            n_prev[s] = n_reg;
             slab_st(zt, s, z); slab_st(ot, s, o);
             i_prime[s] = ip; f_prime[s] = fp;
             c_out[s] = c; n_out[s] = n;
-            c_state[k] = c; n_state[k] = n; m_state[k] = m;
+            c_reg = c; n_reg = n; m_reg = m;
 
-            float hh = o * c / n;
-            h_nxt[k] = hh;
-            out[s] = hh;
+            h_reg = o * c / n;
+            hb_nxt[(long long)b_pw * FUSED_HP + j_pw] = __float2bfloat16(h_reg);
+            out[s] = h_reg;
         }
-        grid.sync(); // h_t complete before step t+1's GEMV (and mirror) reads it
+        grid.sync(); // h_t complete before step t+1's reduction reads the mirror
 
-        float* tmp = h_cur; h_cur = h_nxt; h_nxt = tmp;
+        __nv_bfloat16* tmp = hb_cur; hb_cur = hb_nxt; hb_nxt = tmp;
     }
-
-    // The caller's `h_state` must hold h_T on return. After T swaps the newest h is
-    // in `h_cur`, which is `h_alt` for odd T.
-    if (h_cur != h_state) {
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < FUSED_B * FUSED_H;
-             i += blockDim.x * gridDim.x) {
-            h_state[i] = h_cur[i];
-        }
+    // The state the next call carries in, written once rather than every timestep.
+    if (owner) {
+        c_state[k_pw] = c_reg;
+        n_state[k_pw] = n_reg;
+        m_state[k_pw] = m_reg;
+        h_state[k_pw] = h_reg;
     }
 }
+
+#endif // SLSTM_H && SLSTM_B
+
+#ifndef FUSED_H
+#define FUSED_H H
+#endif
+#ifndef FUSED_B
+#define FUSED_B B
+#endif
+
 // Time-fused sLSTM BACKWARD: the whole reverse T-loop in one cooperative launch,
 // the mirror of slstm_fused_time.
 //

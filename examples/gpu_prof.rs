@@ -187,6 +187,7 @@ fn main() {
             DTensor::zeros(&gpu, &[b, h]),
             DTensor::zeros(&gpu, &[b, h]),
         );
+        let mut hn = ops::SlabBuf::new(&gpu, &[b, h]);
         let (mut dc, mut dn) = (DTensor::zeros(&gpu, &[b, h]), DTensor::zeros(&gpu, &[b, h]));
         let dhb = DTensor::zeros(&gpu, &[b, h]);
         let mut out = DTensor::zeros(&gpu, &[b, t, h]);
@@ -202,9 +203,11 @@ fn main() {
                 &mut ns,
                 &mut ms,
                 &mut hs2,
+                &mut hn,
                 &mut slabs,
                 &mut out,
                 step % t,
+                false,
             );
             step += 1;
         });

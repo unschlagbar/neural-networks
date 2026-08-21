@@ -2367,26 +2367,26 @@ mod tests {
     /// A backbone sweep of three or more chunks must give the same gradients as one.
     ///
     /// Distinct from `backbone_chunked_matches_unchunked`, which runs chunks shorter
-    /// than `GRAPH_MIN_T` and so never exercises the captured-graph path. Here every
-    /// chunk is long enough to be captured *and* there are three of them, which is what
-    /// it takes to replay a graph after `chunk_saved` has swapped the buffers it was
-    /// captured against — a replay against freed allocations, i.e. NaN gradients from
-    /// an out-of-bounds read rather than a wrong-but-finite number. Two chunks cannot
-    /// catch it: the first replay still sees its own buffers.
+    /// than `FUSED_MIN_T` and so never exercises the time-fused loops. Here every chunk
+    /// takes them *and* there are three, which is what it takes to run a chunk after
+    /// `chunk_saved` has swapped the live buffers out from under the cell — a stale
+    /// slab there gives NaN gradients from an out-of-bounds read rather than a
+    /// wrong-but-finite number. Two chunks cannot catch it: the first still sees its
+    /// own buffers.
     #[test]
     fn backbone_three_chunks_match_unchunked() {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
         // Wide enough that a chunk's buffers are a real allocation: at a toy width the
-        // pool hands every chunk the same address back and the stale-pointer replay is
+        // pool hands every chunk the same address back and a stale reference is
         // accidentally harmless, so the bug does not reproduce.
         let cfg = ModelCfg {
             vocab: 64,
             hc: 256,
             wh: 768,
             enc_blocks: 1,
-            // Block 0 is sLSTM under the `i % 4` rule — the cell whose loop is captured.
+            // Block 0 is sLSTM under the `i % 4` rule — the cell with the fused loop.
             bb_blocks: 2,
             dec_blocks: 1,
             heads: 8,
@@ -2394,7 +2394,7 @@ mod tests {
             w_token: 63,
             cap: 30.0,
         };
-        // 384 decoded words in chunks of 128: three chunks, each well over GRAPH_MIN_T.
+        // 384 decoded words in chunks of 128: three chunks, each well over FUSED_MIN_T.
         let words_n = 385;
         let tokens: Vec<usize> = (0..words_n * 2).map(|i| 1 + i % 9).collect();
         let words: Vec<Range<usize>> = (0..words_n)

@@ -1,5 +1,5 @@
-//! Now that the backbone sLSTM's launch cost is gone (CUDA graphs), what is the
-//! GPU side actually limited by? Three candidates, and they want different fixes:
+//! Now that the backbone sLSTM's launch cost is gone (the time-fused kernel), what
+//! is the GPU side actually limited by? Three candidates, and they want different fixes:
 //!
 //!   a) MEMORY BANDWIDTH. A timestep multiplies h[B, H] by Whr[H, 4H]. At B=1 that
 //!      is a mat-VEC: it streams the entire 4H*H weight matrix (4 MB at H=512) out
@@ -74,7 +74,7 @@ fn main() {
     };
 
     let h0 = neural_networks::config::WORD_HIDDEN;
-    println!("== sLSTM fwd+bwd, T={t} (graphs on) ==\n");
+    println!("== sLSTM fwd+bwd, T={t} ==\n");
 
     println!("SWEEP B  (H={h0}; weight traffic & node count CONSTANT — only work grows)");
     println!(

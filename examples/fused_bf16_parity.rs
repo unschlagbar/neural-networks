@@ -1,9 +1,10 @@
 //! Numeric parity of the bf16-staged time-fused sLSTM against the per-step loop,
 //! at the backbone's real width.
 //!
-//! The fp32 fused path does not exist at H=768 (its shared slice needs more blocks
-//! than the device has SMs), so the reference here is the per-step loop — the path
-//! the cell falls back to today. Reports max absolute and relative error on the
+//! There is no fp32 fused path to compare against — the forward stages bf16
+//! unconditionally, and the backward's fp32 slice needs more blocks at H=768 than the
+//! device has SMs — so the reference is the per-step loop, the path the cell falls
+//! back to. Reports max absolute and relative error on the
 //! output, on dx, and on every gate's weight gradient, rather than asserting a
 //! tolerance: the point is to see the size of the bf16 staging error, and decide
 //! whether it is mantissa noise or a bug.

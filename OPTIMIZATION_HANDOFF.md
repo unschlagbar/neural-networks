@@ -566,11 +566,37 @@ It is blocked by **allocation instability**. A captured graph bakes in raw devic
 pointers; `GPU_PTR_PROBE=1` (see `gpu::dtensor::ptr_probe`) measures 44,066 allocations
 per step of which only **0.8–1.3% reuse the previous step's address**, at both 4096 and
 512 words. Replaying a graph would read and write reassigned memory — silent
-corruption. This is why the existing sLSTM graph (`src/gpu/slstm.rs:632`) works: it
-captures a loop over *persistent* state buffers, keyed on `(b,t)`.
+corruption.
+
+The sLSTM used to capture its T-loop — a loop over *persistent* state buffers, keyed
+on `(b,t)` — and that was the one place the precondition held. It has been removed:
+real training never repeats a window shape (windows never cross a document border),
+so the cache missed constantly, and the time-fused cooperative kernel now covers the
+one shape that made the capture worth having.
 
 Consequence: **the flat parameter tensor is the gate on the graph win**, not a ~2%
 optimization in its own right. That reprices it well above where it sits below.
+
+## sLSTM: three saved slabs are shifted copies of three others
+
+`slstm_step_fused` writes ten `[B, T, H]` slabs per timestep, and three of them are
+redundant by construction:
+
+| written           | equals                                    |
+|-------------------|-------------------------------------------|
+| `c_prev[:, t, :]` | `c[:, t-1, :]`                            |
+| `n_prev[:, t, :]` | `n[:, t-1, :]`                            |
+| `h_prev[:, t, :]` | `out[:, t-1, :]` (the pre-norm `h`)       |
+
+with only the `t == 0` slot — the state the call carried in — genuinely new. Dropping
+them costs one `[B, H]` buffer for that slot plus a `t == 0` branch in every backward
+reader, and buys 30% of the step kernel's store traffic and **two fp32 plus one bf16
+`[B, T, H]` buffer of activation memory per cell**, which at the backbone's shape is
+~100 MB across a chunked window.
+
+It is a forward *and* backward change (both fused kernels, both per-step kernels,
+`SlstmSlabs`, `park_order`), and the time it saves is small — the memory is the reason
+to do it.
 
 ## Ranked next steps
 

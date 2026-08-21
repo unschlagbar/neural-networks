@@ -111,7 +111,12 @@ const MMA_NAMES: &[&str] =
 
 /// Cooperative-launch kernels; need `<cooperative_groups.h>`, so they share the
 /// bf16 module's include-path requirement.
-const COOP_NAMES: &[&str] = &["slstm_fused_time", "slstm_fused_time_bwd"];
+///
+/// `slstm_fused_time` is deliberately absent: the forward exists only in the
+/// shape-specialized build (it holds its slice of `h` in a register array, which
+/// needs H at compile time), so it is reached through [`Kernels::specialized`] and
+/// this module's success is what tells the caller the specialized one will build.
+const COOP_NAMES: &[&str] = &["slstm_fused_time_bwd"];
 
 /// fp32 <-> bf16 casts. Need `<cuda_bf16.h>` only — a strictly smaller include
 /// requirement than [`COOP_NAMES`], hence their own module: a machine that cannot

@@ -5,12 +5,11 @@
 //!
 //!   cargo run --release --features cuda --example gpu_soak -- <corpus> [windows]
 //!
-//! It exists to reproduce a device-side fault that only real data triggers: the
-//! window's word count `dw` varies (windows never cross document borders, so every
-//! short document yields a short window), and the sLSTM's captured CUDA graphs are
-//! bound to the buffers they were captured against. A window shape that reallocates
-//! those buffers while a graph still refers to them is a use-after-free on the
-//! device, which surfaces — asynchronously, and possibly much later — as a sticky
+//! It exists to exercise what only real data produces: the window's word count `dw`
+//! varies (windows never cross document borders, so every short document yields a
+//! short window), so every layer's per-call buffers are refit — and sometimes
+//! reallocated — window after window. A buffer that outlives a shape it was sized for
+//! surfaces asynchronously, and possibly much later, as a sticky
 //! CUBLAS_STATUS_EXECUTION_FAILED.
 //!
 //! Prints the distribution of window shapes it actually exercised, so a clean run
@@ -72,8 +71,8 @@ fn main() {
     let t0 = Instant::now();
     let mut seen = 0usize;
     // How many windows fell in each backbone-unroll band. The short ones are the
-    // interesting ones: below 32 the sLSTM runs eagerly and refits its buffers
-    // without ever consulting the graph cache.
+    // interesting ones: below 32 the sLSTM drops off its time-fused path onto the
+    // per-step loop.
     let (mut tiny, mut short, mut full) = (0usize, 0usize, 0usize);
     let mut loss_sum = 0.0;
 

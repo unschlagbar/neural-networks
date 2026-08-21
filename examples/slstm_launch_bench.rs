@@ -18,8 +18,8 @@
 //!                whatever GPU work had not finished by then.
 //!
 //! `issue / wall ~ 1.0` means the host cannot feed the GPU fast enough — the queue
-//! never gets ahead, the card waits on the CPU, and the fix is to launch less (CUDA
-//! graphs / fusing steps), not to compute faster. `issue / wall << 1` means the GPU
+//! never gets ahead, the card waits on the CPU, and the fix is to launch less (fusing
+//! steps), not to compute faster. `issue / wall << 1` means the GPU
 //! is genuinely the bottleneck and the kernels are what to optimize.
 //!
 //! `launches` is the count the cell must issue for that T (2 per step each way plus
@@ -101,6 +101,6 @@ fn main() {
 
     println!(
         "\nissue/w near 1.00 => host-bound: the GPU is waiting on driver calls, \n\
-         and the win is in issuing fewer of them (CUDA graphs / fused steps)."
+         and the win is in issuing fewer of them (fused steps)."
     );
 }
