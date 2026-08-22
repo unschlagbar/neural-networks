@@ -2211,17 +2211,13 @@ mod tests {
         let (loss_single, w_single) = run(false);
         unsafe { std::env::remove_var("GPU_NO_GROUP") };
 
-        // Splitting a bucket changes only which rows share a rectangle, so under fp32
-        // the two legs agree to reassociation. The sLSTM's fused path stages `Wh` in
-        // bf16 (see `ops::fused_bf16_enabled`), and the two groupings then reduce the
-        // recurrence in a different order at 8-bit mantissas — so the bound follows the
-        // staging dtype. A real batching bug (a row in the wrong rectangle, a grad
-        // dropped on a split) moves these by orders of magnitude, not by 1e-5.
-        let tol = if ops::fused_bf16_enabled() {
-            1e-3
-        } else {
-            1e-5
-        };
+        // Splitting a bucket changes only which rows share a rectangle, so the two legs
+        // agree to reassociation. The sLSTM's fused path stages `Wh` in bf16, and the
+        // two groupings then reduce the recurrence in a different order at 8-bit
+        // mantissas — hence 1e-3 rather than fp32's 1e-5. A real batching bug (a row in
+        // the wrong rectangle, a grad dropped on a split) moves these by orders of
+        // magnitude, not by 1e-5.
+        let tol = 1e-3;
         assert!(
             (loss_grouped - loss_single).abs() < tol,
             "grouped loss {loss_grouped} != single-rectangle loss {loss_single}"

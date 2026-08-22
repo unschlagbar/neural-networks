@@ -1,8 +1,8 @@
 // Cooperative-launch sLSTM: the whole time loop in one grid-synchronising kernel.
 // Behind COOP_KERNELS; drags in libcu++ via <cooperative_groups.h>, so it has the
-// largest include requirement of any module. FUSED_BF16 selects bf16 gate staging
-// for the backward, SLSTM_H / SLSTM_B are the shape-specialisation constants (see
-// Kernels::specialized).
+// largest include requirement of any module. Both kernels exist only in their
+// shape-specialised builds — SLSTM_H / SLSTM_B for the forward, plus SLSTM_NJ /
+// SLSTM_TH for the backward (see Kernels::specialized).
 
 #ifdef COOP_KERNELS
 #include <cooperative_groups.h>
@@ -270,227 +270,201 @@ extern "C" __global__ void slstm_fused_time(
 
 #endif // SLSTM_H && SLSTM_B
 
-#ifndef FUSED_H
-#define FUSED_H H
-#endif
-#ifndef FUSED_B
-#define FUSED_B B
-#endif
-
-// Time-fused sLSTM BACKWARD: the whole reverse T-loop in one cooperative launch,
+// Time-fused sLSTM BACKWARD: the whole reverse T-loop in ONE cooperative launch,
 // the mirror of slstm_fused_time.
 //
-// The ownership is transposed relative to the forward. Forward, a block owning
-// hidden units [j0, j0+nj) needed those units' gate COLUMNS of Wh; backward, the
-// contraction is dh[r] = sum_c dgates[c] * Wh[r, c], so a block producing dh for
-// units [j0, j0+nj) needs those ROWS of Wh -- all 4H entries of each. That is what
-// this kernel stages: `wh_rows[nj][4H]`, read once before the loop.
+// A block owns a contiguous range of hidden units [j0, j0 + NJ). Everything else
+// follows from that range:
 //
-// Unlike the forward, the pointwise/contraction split needs a grid sync between the
-// two phases. The forward got to one because a unit's pointwise update needed only that
-// unit's own gates; here the pointwise update at step t needs dh_recur[j], which
-// is a full contraction over every OTHER unit's gate deltas. So: pointwise (needs
-// dh_recur from t+1) -> sync -> contraction (needs all gate deltas). The trailing
-// sync the contraction used to need is gone whenever the deltas are staged in shared
-// memory — see the `stage_dg` note at the swap below — which is the case for the
-// backbone, where this kernel spends nearly all of its time.
+//   * the POINTWISE update of those units is entirely block-local. Thread `p` owns
+//     (batch row b, unit u) for the whole loop, so `dc`/`dn` live in registers and
+//     reach global memory once at each end instead of twice per timestep, and the
+//     `dh` a step consumes is produced by this same block's contraction — it never
+//     leaves shared memory.
+//   * the CONTRACTION dh[j] = sum_c dgates[c] * Wh[j, c] runs over EVERY gate delta
+//     in the grid. That is the one cross-block dependency, and the only reason for a
+//     grid.sync() at all — one per timestep. `g` is the channel: the pointwise phase
+//     writes this step's deltas there for the post-loop dWx/dWh/db GEMMs anyway, and
+//     `g[:, t, :]` is exactly the [B, 4H] vector the contraction wants. No separate
+//     grid-visible scratch, and no write-after-read hazard to rotate buffers around,
+//     because a timestep only ever touches its own slice of it.
 //
-// `dgates_all` is a [B, 4H] grid-visible scratch: the pointwise phase writes this
-// step's deltas there for the contraction phase to read across blocks. The kernel
-// also writes them into `g` (whose forward contents are dead), exactly as the
-// per-step path does, so the post-loop dWx/dWh/db GEMMs are unchanged.
-extern "C" __global__ void slstm_fused_time_bwd(
+// The contraction is ONE WARP PER (batch row, owned unit), with that unit's whole
+// `Wh` row held across the warp's lanes in REGISTERS — bf16 storage (FlashRNN's
+// `DTYPE_R`, arXiv 2412.07752), fp32 accumulation (their `ACC_DTYPE`), the conversion
+// a register op. Two things follow, and both are the point:
+//
+//   * a row is read once per LAUNCH instead of once per timestep, so `Wh` never
+//     reaches shared memory or HBM inside the loop;
+//   * the reduction is a single shuffle tree whose result lands complete in lane 0 —
+//     no cross-warp fold, and nothing for the pointwise phase to sum. The obvious
+//     alternative, spreading every unit over every thread so each gate delta is read
+//     once, costs `threads * NJ` shuffle steps per timestep against this one's
+//     `threads`; measured at the backbone's shape that reduction alone was a third of
+//     the kernel.
+//
+// SPECIALIZATION: H, B, the units per block and the block width are all compile-time
+// constants (SLSTM_H / SLSTM_B / SLSTM_NJ / SLSTM_TH), which is what lets the `Wh`
+// slice be a register ARRAY — a runtime bound would put it in local memory and give
+// back the whole win. There is deliberately no generic build;
+// `ops::slstm_fused_time_bwd` declines when the specialized one is unavailable and
+// the caller takes the per-step loop. T stays a runtime argument, as it is upstream:
+// it is the outer loop's bound, with a data dependency between iterations, so there
+// is nothing to unroll by it.
+#if defined(SLSTM_H) && defined(SLSTM_B) && defined(SLSTM_NJ) && defined(SLSTM_TH)
+
+#define BW_H4 (4 * SLSTM_H)
+#define BW_VEC 4                                  // columns one LANE holds per pass
+#define BW_SPAN (32 * BW_VEC)                     // columns one warp covers per pass
+#define BW_PASSES ((BW_H4 + BW_SPAN - 1) / BW_SPAN)
+#define BW_OWNERS (SLSTM_B * SLSTM_NJ)
+// Warps sharing a unit, each taking a stride of the batch. One at B = 1 (the
+// backbone); wider batches split the rows rather than leaving warps idle.
+#define BW_WPU (SLSTM_TH / (32 * SLSTM_NJ))
+
+extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
         const float* __restrict__ wh, const float* __restrict__ dy, float* g,
-        float* dgates_all, float* dgates_alt, float* dh_recur, float* dh_alt,
-        float* dc_recur, float* dn_recur,
+        float* dh_recur, float* dc_recur, float* dn_recur,
         const slab_t* __restrict__ ot, const float* __restrict__ c_t,
         const float* __restrict__ n_t, const float* __restrict__ c_prev,
         const float* __restrict__ n_prev, const slab_t* __restrict__ zt,
-        const float* __restrict__ i_gate, const float* __restrict__ f_gate,
-        int T, int H_rt, int B_rt, int units_per_block, int stage_dg) {
-    extern __shared__ float smem[];
+        const float* __restrict__ i_gate, const float* __restrict__ f_gate, int T) {
     cg::grid_group grid = cg::this_grid();
 
-#ifdef SLSTM_H
-    (void)H_rt;
-#else
-    const int H = H_rt;
-#endif
-#ifdef SLSTM_B
-    (void)B_rt;
-#else
-    const int B = B_rt;
-#endif
+    // The block's whole dh vector: written by the contraction's lane 0, read by the
+    // owning thread at the top of the next timestep. Seeded with the gradient arriving
+    // from the chunk to the right (zero for an unchunked sweep), so a timestep reads
+    // dh from exactly one place and the first one needs no special case.
+    __shared__ float dh_sh[BW_OWNERS];
 
-    const int H4 = 4 * FUSED_H;
-    const int j0 = blockIdx.x * units_per_block;
-    const int nj = max(0, min(units_per_block, FUSED_H - j0));
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int j0 = blockIdx.x * SLSTM_NJ;
 
-    // Stage this block's Wh rows: wsh[u * H4 + c] = wh[(j0 + u) * H4 + c].
-    // Row-major keeps the contraction's lane stride contiguous in c.
-    //
-    // Under FUSED_BF16 the staged rows are bf16, halving a block's footprint so it
-    // can own twice the units. That is what decides whether this path exists at all
-    // above H=640: a row costs 4H, so at fp32 the grid needs more blocks than the
-    // device has SMs and the cooperative launch is declined. Storage is bf16, the
-    // accumulator below stays fp32 — the same split as the forward.
-#ifdef FUSED_BF16
-    __nv_bfloat16* wsh = (__nv_bfloat16*)smem;
-    float* dgsh = (float*)(wsh + (long long)nj * H4);
-#else
-    float* wsh = smem;
-    float* dgsh = wsh + (long long)nj * H4;
-#endif
-    for (int i = threadIdx.x; i < nj * H4; i += blockDim.x) {
-        int u = i / H4, c = i - u * H4;
-        float v = wh[(long long)(j0 + u) * H4 + c];
-#ifdef FUSED_BF16
-        wsh[i] = __float2bfloat16(v);
-#else
-        wsh[i] = v;
-#endif
+    // Contraction ownership: warp `warp` reduces unit `u_w` for batch rows
+    // `b0_w, b0_w + BW_WPU, ...`.
+    const int u_w = warp / BW_WPU;
+    const int b0_w = warp - u_w * BW_WPU;
+
+    // Pointwise ownership, fixed for the whole loop. The last block's range runs past
+    // H when NJ does not divide it; those threads sit out and their Wh row below is
+    // zero, so nothing they touch contributes.
+    const int b_pw = tid / SLSTM_NJ;
+    const int j_pw = j0 + (tid - b_pw * SLSTM_NJ);
+    const int k_pw = b_pw * SLSTM_H + j_pw;
+    const bool owner = tid < BW_OWNERS && j_pw < SLSTM_H;
+
+    if (owner) dh_sh[tid] = dh_recur[k_pw];
+
+    // This warp's Wh row, spread over its lanes four columns at a time. Columns past
+    // 4H and rows past H are exact zeros, so the reduction has a static trip count and
+    // no tail branch.
+    __nv_bfloat162 wr[BW_PASSES][BW_VEC / 2];
+    #pragma unroll
+    for (int p = 0; p < BW_PASSES; ++p) {
+        const int c0 = (p * 32 + lane) * BW_VEC;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (c0 < BW_H4 && j0 + u_w < SLSTM_H) {
+            v = *(const float4*)(wh + (long long)(j0 + u_w) * BW_H4 + c0);
+        }
+        wr[p][0] = __floats2bfloat162_rn(v.x, v.y);
+        wr[p][1] = __floats2bfloat162_rn(v.z, v.w);
     }
-    grid.sync();
 
-    // Delta ping-pong, for the same reason as the forward's h buffers: the staging
-    // loop below reads the whole [B, 4H] vector while the pointwise phase writes
-    // only this block's slice of it.
-    float* dg_cur = dgates_all;
-    float* dg_nxt = dgates_alt;
-    // `dh_recur` ping-pongs for the same reason: the pointwise phase READS step t+1's
-    // dh while the contraction below WRITES step t's. Sharing one buffer makes that a
-    // write-after-read across the grid, which is what the second barrier used to close
-    // — and a barrier here costs ~0.6us x T, the single largest item in this kernel.
-    // Writing into the other buffer removes the hazard itself, so the barrier goes.
-    // Each block only ever touches its own [j0, j0+nj) units of dh, so no block can
-    // observe another's half-written slice.
-    float* dh_cur = dh_recur;
-    float* dh_nxt = dh_alt;
+    float dc_reg = 0.0f, dn_reg = 0.0f;
+    if (owner) {
+        dc_reg = dc_recur[k_pw];
+        dn_reg = dn_recur[k_pw];
+    }
+
+    // Everything the pointwise phase reads at a timestep depends on `t` alone, so the
+    // NEXT step's loads are issued before the grid.sync() and land under it and the
+    // contraction. At B = 1 only a handful of lanes are awake in that phase, which is
+    // far too few to hide an HBM round trip any other way.
+    float f_dy = 0.0f, f_fpre = 0.0f, f_o = 0.0f, f_c = 0.0f, f_n = 0.0f;
+    float f_cp = 0.0f, f_np = 0.0f, f_z = 0.0f, f_i = 0.0f, f_f = 0.0f;
+    auto fetch = [&](int t) {
+        if (!owner) return;
+        const long long s = ((long long)b_pw * T + t) * SLSTM_H + j_pw;
+        const long long go = ((long long)b_pw * T + t) * BW_H4 + j_pw;
+        f_dy = dy[s];
+        f_fpre = g[go + 2 * SLSTM_H]; // biased forget pre-activation, from the forward
+        f_o = slab_ld(ot, s);
+        f_c = c_t[s];
+        f_n = n_t[s];
+        f_cp = c_prev[s];
+        f_np = n_prev[s];
+        f_z = slab_ld(zt, s);
+        f_i = i_gate[s];
+        f_f = f_gate[s];
+    };
+    fetch(T - 1);
+    __syncthreads(); // dh seeded before the first timestep reads it
 
     for (int t = T - 1; t >= 0; --t) {
-        // --- pointwise: one thread per (batch, owned unit) ---
+        // --- pointwise: one thread per (batch row, owned unit) ---
         // Identical math to slstm_step_fused_bwd; see it for the derivation.
-        for (int i = threadIdx.x; i < FUSED_B * nj; i += blockDim.x) {
-            int b = i / nj, u = i - b * nj;
-            int j = j0 + u;
-            int k = b * FUSED_H + j;
-            long long go = ((long long)b * T + t) * H4 + j;
-            long long s = ((long long)b * T + t) * FUSED_H + j;
+        if (owner) {
+            const float d_h = f_dy + dh_sh[tid];
+            const float d_o_pre = d_h * (f_c / f_n) * f_o * (1.0f - f_o);
+            const float d_c = d_h * f_o / f_n + dc_reg;
+            const float d_n = d_h * f_o * (-f_c) / (f_n * f_n) + dn_reg;
+            const float d_f_gate = d_c * f_cp + d_n * f_np;
+            const float d_i_gate = d_c * f_z + d_n;
+            const float d_z_act = d_c * f_i;
 
-            float f_pre = g[go + 2 * FUSED_H];
-            float d_h = dy[s] + dh_cur[k];
-            float o = slab_ld(ot, s);
-            float c = c_t[s];
-            float n = n_t[s];
-            float d_o_pre = d_h * (c / n) * o * (1.0f - o);
-            float d_c = d_h * o / n + dc_recur[k];
-            float d_n = d_h * o * (-c) / (n * n) + dn_recur[k];
-            float f = f_gate[s];
-            float ig = i_gate[s];
-            float z = slab_ld(zt, s);
-            float d_f_gate = d_c * c_prev[s] + d_n * n_prev[s];
-            float d_i_gate = d_c * z + d_n;
-            float d_z_act = d_c * ig;
+            const float d_z_pre = d_z_act * (1.0f - f_z * f_z);
+            const float d_i_pre = d_i_gate * f_i;
+            const float d_f_pre = d_f_gate * f_f * (1.0f - stable_sigmoid(f_fpre));
 
-            float d_z_pre = d_z_act * (1.0f - z * z);
-            float d_i_pre = d_i_gate * ig;
-            float d_f_pre = d_f_gate * f * (1.0f - stable_sigmoid(f_pre));
+            const long long go = ((long long)b_pw * T + t) * BW_H4 + j_pw;
+            g[go] = d_z_pre;
+            g[go + SLSTM_H] = d_i_pre;
+            g[go + 2 * SLSTM_H] = d_f_pre;
+            g[go + 3 * SLSTM_H] = d_o_pre;
 
-            g[go]          = d_z_pre;
-            g[go + FUSED_H]      = d_i_pre;
-            g[go + 2 * FUSED_H]  = d_f_pre;
-            g[go + 3 * FUSED_H]  = d_o_pre;
-
-            // Grid-visible copy for the contraction below.
-            long long fo = (long long)b * H4 + j;
-            dg_cur[fo]          = d_z_pre;
-            dg_cur[fo + FUSED_H]      = d_i_pre;
-            dg_cur[fo + 2 * FUSED_H]  = d_f_pre;
-            dg_cur[fo + 3 * FUSED_H]  = d_o_pre;
-
-            dc_recur[k] = d_c * f;
-            dn_recur[k] = d_n * f;
+            // Carry to step t-1: both paths are scaled by the forget gate.
+            dc_reg = d_c * f_f;
+            dn_reg = d_n * f_f;
         }
-        grid.sync(); // all gate deltas visible before any block contracts them
+        if (t > 0) fetch(t - 1);
+        grid.sync(); // this step's gate deltas visible in `g` across the grid
 
-        // Stage the whole [B, 4H] delta vector into shared memory once, so the warps
-        // below reduce against shared rather than each re-reading the same floats from
-        // global on every timestep. The cache costs `B * 4H * 4` bytes, which only fits
-        // at small B; past that `stage_dg` is off and the contraction reads `dg_cur`
-        // directly (lane-contiguous either way, so the reads stay coalesced and L2
-        // absorbs the reuse across blocks).
-        if (stage_dg) {
-            for (int i = threadIdx.x; i < FUSED_B * H4; i += blockDim.x) {
-                dgsh[i] = dg_cur[i];
-            }
-            __syncthreads();
-        }
-
-        // --- contraction: dh_recur[b, j] = sum_c dgates_all[b, c] * Wh[j, c] ---
-        // One warp per (batch, owned unit), lanes striding the 4H reduction. The
-        // staged row is contiguous in c, so the lane reads are coalesced.
-        const int warp = threadIdx.x >> 5;
-        const int lane = threadIdx.x & 31;
-        const int warps = blockDim.x >> 5;
-        for (int i = warp; i < FUSED_B * nj; i += warps) {
-            int b = i / nj, u = i - b * nj;
-            const float* dg = (stage_dg ? dgsh : dg_cur) + (long long)b * H4;
+        // --- contraction: dh[b, j] = sum_c g[b, t, c] * Wh[j, c] ---
+        #pragma unroll 1
+        for (int b = b0_w; b < SLSTM_B; b += BW_WPU) {
+            const float* dg = g + ((long long)b * T + t) * BW_H4;
             float acc = 0.0f;
-            // Four columns per lane per trip, keeping the scalar loop's column set:
-            // lane L still covers L, L+32, L+64, ... in that order, so the sum is
-            // unchanged bit for bit, but the loop runs a quarter of the trips and the
-            // four loads issue together instead of each waiting on the previous.
-            // H4 is a multiple of 4 but not always of 128, hence the tail guards.
-#ifdef FUSED_BF16
-            const __nv_bfloat16* wrow = wsh + (long long)u * H4;
-            for (int c = lane; c < H4; c += 128) {
-                acc = fmaf(dg[c], __bfloat162float(wrow[c]), acc);
-                if (c + 32 < H4) acc = fmaf(dg[c + 32], __bfloat162float(wrow[c + 32]), acc);
-                if (c + 64 < H4) acc = fmaf(dg[c + 64], __bfloat162float(wrow[c + 64]), acc);
-                if (c + 96 < H4) acc = fmaf(dg[c + 96], __bfloat162float(wrow[c + 96]), acc);
-            }
-#else
-            const float* wrow = wsh + (long long)u * H4;
-            for (int c = lane; c < H4; c += 128) {
-                acc = fmaf(dg[c], wrow[c], acc);
-                if (c + 32 < H4) acc = fmaf(dg[c + 32], wrow[c + 32], acc);
-                if (c + 64 < H4) acc = fmaf(dg[c + 64], wrow[c + 64], acc);
-                if (c + 96 < H4) acc = fmaf(dg[c + 96], wrow[c + 96], acc);
-            }
-#endif
             #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
-            if (lane == 0) dh_nxt[b * FUSED_H + j0 + u] = acc;
+            for (int p = 0; p < BW_PASSES; ++p) {
+                const int c0 = (p * 32 + lane) * BW_VEC;
+                float4 d = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                if (c0 < BW_H4) d = *(const float4*)(dg + c0);
+                const float2 w0 = __bfloat1622float2(wr[p][0]);
+                const float2 w1 = __bfloat1622float2(wr[p][1]);
+                acc = fmaf(d.x, w0.x, acc);
+                acc = fmaf(d.y, w0.y, acc);
+                acc = fmaf(d.z, w1.x, acc);
+                acc = fmaf(d.w, w1.y, acc);
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                acc += __shfl_down_sync(0xffffffff, acc, off);
+            }
+            if (lane == 0) dh_sh[b * SLSTM_NJ + u_w] = acc;
         }
-        // The barrier after the contraction is only needed when the contraction reads
-        // `dg` straight from global: there a straggler is still reading the buffer that
-        // the next step's pointwise phase overwrites, and no rotation depth fixes it
-        // (measured — a deeper buffer rotation does not help; the barrier is what the
-        // straggler needs).
-        //
-        // When the deltas are staged, each block copies its `dg` into shared memory and
-        // stops touching the global buffer at the `__syncthreads()` above, so the
-        // write-after-read window closes inside the block and the barrier is dead
-        // weight — worth ~0.6us x T, the largest single cost in this kernel. The
-        // backbone (B=1) always stages, which is where essentially all of the time is.
-        if (!stage_dg) grid.sync();
-        float* tmp = dg_cur; dg_cur = dg_nxt; dg_nxt = tmp;
-        tmp = dh_cur; dh_cur = dh_nxt; dh_nxt = tmp;
+        __syncthreads(); // dh complete before the next timestep reads it
     }
 
-    // The caller reads dh_recur as the sequence's incoming state gradient, so it must
-    // hold the newest values. After T swaps the newest dh is in `dh_cur`, which is
-    // `dh_alt` for odd T — mirror it back, exactly as the forward does for h_state.
-    if (dh_cur != dh_recur) {
-        // The last step's contraction is no longer followed by a barrier, so the grid
-        // must be squared up before one block copies units another block wrote. This
-        // is one barrier per LAUNCH, not per timestep.
-        grid.sync();
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < FUSED_B * FUSED_H;
-             i += blockDim.x * gridDim.x) {
-            dh_recur[i] = dh_cur[i];
-        }
+    // What the chunk to the left carries in, written once rather than per timestep.
+    if (owner) {
+        dh_recur[k_pw] = dh_sh[tid];
+        dc_recur[k_pw] = dc_reg;
+        dn_recur[k_pw] = dn_reg;
     }
 }
+
+#endif // SLSTM_H && SLSTM_B && SLSTM_NJ && SLSTM_TH
 
 #endif // COOP_KERNELS

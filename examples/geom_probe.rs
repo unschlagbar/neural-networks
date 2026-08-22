@@ -53,18 +53,17 @@ fn main() {
     println!("backward geometry:");
     print!("{:>6}", "H\\B");
     for b in bs {
-        print!("{:>12}", b);
+        print!("{:>18}", b);
     }
     println!();
     for h in hs {
         print!("{:>6}", h);
         for b in bs {
             match ops::slstm_fused_time_bwd_geometry(&gpu, h, b) {
-                Some((blocks, _threads, _cpb, smem, stage_dg)) => {
-                    let tag = if stage_dg { "" } else { "*" };
-                    print!("{:>12}", format!("{}bl/{}K{}", blocks, smem / 1024, tag));
+                Some((blocks, threads, units)) => {
+                    print!("{:>18}", format!("{}bl/{}th/{}u", blocks, threads, units));
                 }
-                None => print!("{:>12}", "DECLINE"),
+                None => print!("{:>18}", "DECLINE"),
             }
         }
         println!();

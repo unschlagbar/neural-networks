@@ -761,14 +761,12 @@ mod tests {
             "dw",
         );
 
-        // `db` is the one output that is not bit-reproducible: `add_col_sum` splits the
-        // row axis over `blockIdx.y` and combines the slices with `atomicAdd`, so the
-        // summation order varies with scheduling and float addition is not associative.
-        // Its value is still the same sum, hence a tolerance rather than equality.
-        assert_close(
+        // Exact, not a tolerance: `add_col_sum` folds in an order fixed by the shape,
+        // and both paths reduce the same `dy`.
+        eq(
             &shared.db.to_host(&gpu).data,
             &saving.db.to_host(&gpu).data,
-            1e-6,
+            "db",
         );
     }
 

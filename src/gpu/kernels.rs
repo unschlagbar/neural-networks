@@ -50,6 +50,8 @@ const NAMES: &[&str] = &[
     "broadcast_row",
     "broadcast_row_resid",
     "add_col_sum",
+    "col_sum_part",
+    "col_sum_merge",
     "embedding_gather",
     "embedding_scatter_add",
     "embedding_scatter_merge",
@@ -112,11 +114,22 @@ const MMA_NAMES: &[&str] =
 /// Cooperative-launch kernels; need `<cooperative_groups.h>`, so they share the
 /// bf16 module's include-path requirement.
 ///
-/// `slstm_fused_time` is deliberately absent: the forward exists only in the
-/// shape-specialized build (it holds its slice of `h` in a register array, which
-/// needs H at compile time), so it is reached through [`Kernels::specialized`] and
-/// this module's success is what tells the caller the specialized one will build.
-const COOP_NAMES: &[&str] = &["slstm_fused_time_bwd"];
+/// Both exist ONLY in shape-specialized builds — each keeps per-unit data in a
+/// register array whose size needs H at compile time — so these are reached through
+/// [`Kernels::specialized`], never through [`Kernels::get`]. The startup module is
+/// compiled at [`COOP_CANARY`] and its functions are thrown away: what it establishes
+/// is that the cooperative include path resolves AND that both kernels still compile,
+/// neither of which a module built without the shape defines would notice.
+const COOP_NAMES: &[&str] = &["slstm_fused_time", "slstm_fused_time_bwd"];
+
+/// The throwaway shape [`COOP_NAMES`] is compiled at to prove it still builds. Small
+/// enough to compile fast, and legal for both kernels' geometry contracts.
+const COOP_CANARY: &[(&str, usize)] = &[
+    ("SLSTM_H", 64),
+    ("SLSTM_B", 1),
+    ("SLSTM_NJ", 1),
+    ("SLSTM_TH", 64),
+];
 
 /// fp32 <-> bf16 casts. Need `<cuda_bf16.h>` only — a strictly smaller include
 /// requirement than [`COOP_NAMES`], hence their own module: a machine that cannot
@@ -200,16 +213,18 @@ pub struct Kernels {
     coop_includes: Option<Vec<String>>,
     /// Device arch, for the same reason.
     arch: (i32, i32),
-    /// Shape-specialized cooperative kernels, keyed by `(name, H, B)`.
+    /// Shape-specialized cooperative kernels, keyed by name and the `-D` shape they
+    /// were built at.
     ///
     /// The FlashRNN model (`flashrnn.py` emits `-DFLASHRNN_HIDDEN_SIZE=...`
-    /// `-DFLASHRNN_BATCH_SIZE=...` and rebuilds the module): with H and B known at
-    /// compile time the reduction gets a static trip count and the batch indexing
-    /// folds away. A miss costs one NVRTC compile (a few hundred ms); the backbone
-    /// runs one fixed shape, so it is paid once at startup and hit forever after.
+    /// `-DFLASHRNN_BATCH_SIZE=...` and rebuilds the module): with the shape known at
+    /// compile time the reductions get static trip counts, the per-unit slices become
+    /// register arrays and the batch indexing folds away. A miss costs one NVRTC
+    /// compile (a few hundred ms); the backbone runs one fixed shape, so it is paid
+    /// once at startup and hit forever after.
     ///
     /// `Mutex` because `Kernels` lives behind an `Arc` and this fills in lazily.
-    specialized: std::sync::Mutex<HashMap<(&'static str, usize, usize, bool), Option<CudaFunction>>>,
+    specialized: std::sync::Mutex<HashMap<SpecKey, Option<CudaFunction>>>,
     /// Shape-specialized fused mLSTM kernels, keyed by `(name, L, dqk, dhv, H)`.
     ///
     /// The reference (`nx-ai/mlstm_kernels`) passes every one of these as a Triton
@@ -219,6 +234,10 @@ pub struct Kernels {
     /// and the pad branches resolve away.
     mlstm_spec: std::sync::Mutex<HashMap<MlstmSpecKey, Option<CudaFunction>>>,
 }
+
+/// A specialized cooperative kernel: its name and the `-D<name>=<value>` shape
+/// constants it was compiled with, in the order the caller listed them.
+type SpecKey = (&'static str, Vec<(&'static str, usize)>);
 
 /// The shape constants a fused mLSTM kernel is built at. `kt`/`vt` are the head-dim
 /// slice widths and are 0 for the two kernels that do not tile them, so a ΔC build
@@ -364,12 +383,17 @@ impl Kernels {
                     .chain(extra.iter().map(|d| format!("-I{d}")))
                     .collect(),
             );
-            let mut compile_module = |define: &str, names: &[&'static str]| -> bool {
+            let mut compile_module = |define: &str,
+                                      shape: &[(&str, usize)],
+                                      names: &[&'static str],
+                                      keep: bool|
+             -> bool {
                 let mut options = vec![
                     format!("--gpu-architecture=compute_{major}{minor}"),
                     format!("-D{define}=1"),
                     format!("-I{inc}"),
                 ];
+                options.extend(shape.iter().map(|(k, v)| format!("-D{k}={v}")));
                 // The cooperative sLSTM kernels write the same slabs as the base
                 // module's eager ones, so they MUST be built at the same width.
                 if slab_bf16 {
@@ -395,7 +419,9 @@ impl Kernels {
                                 }
                             }
                         }
-                        funcs.extend(loaded);
+                        if keep {
+                            funcs.extend(loaded);
+                        }
                         true
                     }
                     Err(e) => {
@@ -404,8 +430,8 @@ impl Kernels {
                     }
                 }
             };
-            has_bf16 = compile_module("BF16_CAST", BF16_NAMES);
-            has_coop = compile_module("COOP_KERNELS", COOP_NAMES);
+            has_bf16 = compile_module("BF16_CAST", &[], BF16_NAMES, true);
+            has_coop = compile_module("COOP_KERNELS", COOP_CANARY, COOP_NAMES, false);
         }
 
         Ok(Self {
@@ -498,16 +524,14 @@ impl Kernels {
         &self,
         ctx: &Arc<CudaContext>,
         name: &'static str,
-        h: usize,
-        b: usize,
-        bf16: bool,
+        shape: &[(&'static str, usize)],
     ) -> Option<CudaFunction> {
         if std::env::var("SLSTM_NO_SPECIALIZE").is_ok() {
             return None;
         }
         let includes = self.coop_includes.as_ref()?;
         let mut cache = self.specialized.lock().ok()?;
-        let key = (name, h, b, bf16);
+        let key: SpecKey = (name, shape.to_vec());
         if let Some(hit) = cache.get(&key) {
             return hit.clone();
         }
@@ -515,12 +539,8 @@ impl Kernels {
         let mut options = vec![
             format!("--gpu-architecture=compute_{major}{minor}"),
             "-DCOOP_KERNELS=1".to_string(),
-            format!("-DSLSTM_H={h}"),
-            format!("-DSLSTM_B={b}"),
         ];
-        if bf16 {
-            options.push("-DFUSED_BF16=1".to_string());
-        }
+        options.extend(shape.iter().map(|(k, v)| format!("-D{k}={v}")));
         // Must match the slab width the rest of the backend was built at, or this
         // specialized kernel would read the saved slabs at the wrong stride.
         if self.slab_bf16 {
@@ -537,7 +557,7 @@ impl Kernels {
         let f = match built {
             Ok(f) => Some(f),
             Err(e) => {
-                    eprintln!("specialized {name} (H={h}, B={b}, bf16={bf16}) unavailable: {e}");
+                eprintln!("specialized {name} {shape:?} unavailable: {e}");
                 None
             }
         };

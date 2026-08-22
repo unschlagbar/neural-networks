@@ -37,10 +37,13 @@
 //!     word is a handful of steps, so there is no launch cost worth fusing away, and
 //!     the batch is wide enough that cuBLAS beats anything hand-written.
 //!
-//! Backward mirrors it: the per-step kernel writes the four gate deltas back into
-//! `g` (its forward contents are dead by then), the loop carries only the BPTT
-//! channels — `dh = dg[:, t, :]·Whᵀ` — and `dx`, `dWx`, `dWh` and the bias grads
+//! Backward mirrors it, on the same split: `slstm_fused_time_bwd` for a long
+//! sequence, two launches per timestep for a short one. Either way the gate deltas go
+//! back into `g` (its forward contents are dead by then) and the loop carries only the
+//! BPTT channels — `dh = dg[:, t, :]·Whᵀ` — so `dx`, `dWx`, `dWh` and the bias grads
 //! all fall out of three whole-sequence GEMMs plus one reduction *after* the loop.
+//! Those three GEMMs read the same gate deltas, so they narrow them once between them
+//! (`GemmBf16::run_slstm_backward`).
 //!
 //! The fused operands **are** the parameters of record: `wx [in, 4H]`,
 //! `whr [H, 4H]` and `bcat [4H]` are what the optimizer steps and what the grads
@@ -150,9 +153,6 @@ pub struct SLstm {
     /// fp32 SIMT kernel cuBLAS picks runs at 22 TFLOP/s, 39% of this card's fp32 peak
     /// and a small fraction of what the same matmul does in bf16.
     h_narrow: ops::SlabBuf,
-    /// `[1, N]` of ones: the bias gradient is the column sum of the gate deltas,
-    /// which cuBLAS reduces as a `ones · dgates` GEMM straight into `dbcat`.
-    ones: DTensor,
     // BPTT channels, [B, H].
     dh_bptt: DTensor,
     dc_bptt: DTensor,
@@ -195,15 +195,17 @@ pub struct SLstm {
     /// Where the post-cell norm's backward lands, so the loop reads a buffer this
     /// cell owns and reuses instead of allocating one per call.
     dy_buf: Option<DTensor>,
-    /// Scratch for widening a bf16 `h_prev` slab back to fp32 for the `dWh` GEMM
-    /// (cuBLAS has no bf16 operand here). Unused on the fp32 slab path.
+    /// Scratch for widening a bf16 `h_prev` slab back to fp32 for the `dWh` GEMM.
+    /// Only allocated when the kernels and the whole-sequence GEMMs were built at
+    /// different widths — normally that GEMM takes the slab as it stands.
     h_prev_f32: Option<DTensor>,
     batch: usize,
-    /// bf16 staging for the three **whole-sequence** GEMMs (`x·Wx`, `dg·Wxᵀ`,
-    /// `xᵀ·dg`). Those run once per call over `[N, ·]`, exactly like a `Linear`'s, and
-    /// were the last fp32 SIMT matmuls left on the profile. The recurrent `Wh` GEMMs
-    /// are deliberately NOT included: they run per timestep inside the loop, where the
-    /// staging would cost a cast per step, and the fused kernels own that path anyway.
+    /// bf16 staging for the **whole-sequence** GEMMs (`x·Wx` forward; `dg·Wxᵀ`,
+    /// `xᵀ·dg` and `h_prevᵀ·dg` backward). Those run once per call over `[N, ·]`,
+    /// exactly like a `Linear`'s, and were the last fp32 SIMT matmuls left on the
+    /// profile. The recurrent `Wh` GEMM is deliberately NOT included: it runs per
+    /// timestep inside the loop, where the staging would cost a cast per step, and the
+    /// fused kernel owns that path anyway.
     gemm_x: ops::GemmBf16,
     gemm_dx: ops::GemmBf16,
     /// Weight cache for the **per-timestep** recurrent GEMM `h_{t-1}·Whr`. Separate
@@ -435,7 +437,6 @@ impl SLstm {
             m_state: DTensor::zeros(gpu, &[0, 0]),
             gh: DTensor::zeros(gpu, &[0, 0]),
             h_narrow: ops::SlabBuf::new(gpu, &[0, 0]),
-            ones: DTensor::zeros(gpu, &[0, 0]),
             dh_bptt: DTensor::zeros(gpu, &[0, 0]),
             dc_bptt: DTensor::zeros(gpu, &[0, 0]),
             dn_bptt: DTensor::zeros(gpu, &[0, 0]),
@@ -877,7 +878,6 @@ impl SLstm {
                 fit_zeros(gpu, buf, &[b, h]);
             }
         }
-        fit_uninit(gpu, &mut self.gh, &[b, h4]);
 
         // The post-cell norm is the last thing forward applied, so it is the first
         // thing to undo: its `dx` is what the recurrence actually receives.
@@ -900,50 +900,53 @@ impl SLstm {
         // bias grads are three GEMMs and one reduction over it.
         let dg = g.reshaped(&[n, h4]);
         dx.reshape_to(&[n, inp]);
-        // `dx = dg·Wxᵀ` and `dWx = x_flatᵀ·dg` both read `dg`, so on the bf16 path they
-        // go through one `run_backward` and narrow it once. The gate grads land in the
-        // parameter layout directly, so `dWx` writes with beta = 1: cuBLAS does the
-        // accumulation across windows that the unpack kernel used to do by hand.
+        // `dx = dg·Wxᵀ`, `dWx = x_flatᵀ·dg` and `dWh = h_prevᵀ·dg` all read `dg`, so
+        // where the operands are narrow all three go through one call that casts it
+        // once. The gate grads land in the parameter layout directly, so `dWx`/`dWh`
+        // write with beta = 1: cuBLAS does the accumulation across windows that the
+        // unpack kernel used to do by hand.
+        slabs.h_prev.shrink_to(&[n, h]);
         let wx = &self.wx;
         let dwx = &mut self.dwx;
-        let gemm_dx = &mut self.gemm_dx;
-        phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || match &x_flat {
-            SlabBuf::Bf16(xb) => gemm_dx.run_backward_staged_x(gpu, xb, &dg, wx, dwx, dx),
-            SlabBuf::F32(xf) => {
-                ops::matmul_nt_into(gpu, &dg, wx, dx, 0.0);
-                ops::matmul_tn_into(gpu, xf, &dg, dwx, 1.0);
-            }
-        });
-        // dWh = h_prevᵀ · dg goes through cuBLAS, which needs an fp32 operand, so a
-        // bf16 `h_prev` slab is widened into reusable scratch first. The scratch is
-        // transient (one GEMM) while the slab it replaced was pinned across the whole
-        // forward AND backward, so this still gives memory back.
-        slabs.h_prev.shrink_to(&[n, h]);
         let dwhr = &mut self.dwhr;
+        let gemm_dx = &mut self.gemm_dx;
         let h_prev_f32 = &mut self.h_prev_f32;
-        phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || match &slabs.h_prev {
-            ops::SlabBuf::F32(t) => ops::matmul_tn_into(gpu, t, &dg, dwhr, 1.0),
-            ops::SlabBuf::Bf16(b16) => {
-                let mut scratch = take_uninit(gpu, h_prev_f32.take(), &[n, h]);
-                b16.load(gpu, &mut scratch);
-                ops::matmul_tn_into(gpu, &scratch, &dg, dwhr, 1.0);
-                *h_prev_f32 = Some(scratch);
-            }
-        });
+        phase::timed(
+            gpu,
+            phase::Bucket::SlstmGemmBwd,
+            || match (&x_flat, &slabs.h_prev) {
+                (SlabBuf::Bf16(xb), SlabBuf::Bf16(hb)) => {
+                    gemm_dx.run_slstm_backward(gpu, xb, hb, &dg, wx, dwx, dwhr, dx)
+                }
+                // Either the GEMMs or the kernels were built fp32, so `dWh` goes to
+                // cuBLAS wide — widening a narrow `h_prev` into reusable scratch first.
+                // The scratch is transient (one GEMM) while the slab is pinned across
+                // the whole forward and backward, so it still gives memory back.
+                (x, hp) => {
+                    match x {
+                        SlabBuf::Bf16(xb) => {
+                            gemm_dx.run_backward_staged_x(gpu, xb, &dg, wx, dwx, dx)
+                        }
+                        SlabBuf::F32(xf) => {
+                            ops::matmul_nt_into(gpu, &dg, wx, dx, 0.0);
+                            ops::matmul_tn_into(gpu, xf, &dg, dwx, 1.0);
+                        }
+                    }
+                    let mut scratch = take_uninit(gpu, h_prev_f32.take(), &[n, h]);
+                    let hf = hp.as_f32(gpu, &mut scratch);
+                    ops::matmul_tn_into(gpu, hf, &dg, dwhr, 1.0);
+                    *h_prev_f32 = Some(scratch);
+                }
+            },
+        );
         slabs.h_prev.shrink_to(&[b, t, h]);
 
-        // The bias gradient is the column sum of the gate deltas — a `ones · dg` GEMM,
-        // accumulating straight into the fused `dbcat` (viewed as the [1, 4H] row it
-        // is). Nothing to scatter afterwards.
-        fit_uninit(gpu, &mut self.ones, &[1, n]);
-        ops::fill(gpu, &mut self.ones, 1.0);
-        let mut dbcat =
-            std::mem::replace(&mut self.dbcat, DTensor::zeros(gpu, &[0])).reshaped(&[1, h4]);
-        let ones = &self.ones;
+        // The bias gradient is the column sum of the gate deltas, accumulating straight
+        // into the fused `dbcat`. Nothing to scatter afterwards.
+        let dbcat = &mut self.dbcat;
         phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || {
-            ops::matmul_nn_into(gpu, ones, &dg, &mut dbcat, 1.0);
+            ops::add_col_sum(gpu, dbcat, &dg);
         });
-        self.dbcat = dbcat.reshaped(&[h4]);
 
         // Give the buffers back at their original shapes so the next forward reuses
         // the same allocations.
@@ -987,9 +990,8 @@ impl SLstm {
         slabs: &SlstmSlabs,
         t: usize,
     ) {
-        // One cooperative launch for the whole reverse loop. `gh` doubles as the
-        // grid-visible [B, 4H] gate-delta scratch, which is exactly what the per-step
-        // path uses it for.
+        // One cooperative launch for the whole reverse loop. It carries the gate deltas
+        // through `g` itself, so it needs no scratch of its own.
         if t >= FUSED_MIN_T
             && self.force_fused_time.unwrap_or_else(fused_time_enabled)
             && ops::slstm_fused_time_bwd(
@@ -997,7 +999,6 @@ impl SLstm {
                 &self.whr,
                 dy,
                 g,
-                &mut self.gh,
                 &mut self.dh_bptt,
                 &mut self.dc_bptt,
                 &mut self.dn_bptt,
@@ -1018,6 +1019,11 @@ impl SLstm {
         slabs: &SlstmSlabs,
         t: usize,
     ) {
+        // The contiguous `[B, 4H]` gate-delta scratch only this path needs, fitted here
+        // rather than in `backward` because which path runs is not known until the
+        // fused one has been *tried* — it can decline at launch, not just at geometry.
+        let (b, h) = (self.dc_bptt.rows(), self.dc_bptt.cols());
+        fit_uninit(gpu, &mut self.gh, &[b, 4 * h]);
         for step in (0..t).rev() {
             ops::slstm_step_fused_bwd(
                 gpu,
@@ -1249,7 +1255,6 @@ impl SLstm {
             &self.n_state,
             &self.m_state,
             &self.gh,
-            &self.ones,
             &self.dh_bptt,
             &self.dc_bptt,
             &self.dn_bptt,
@@ -1689,17 +1694,14 @@ mod tests {
     /// point is that the kernel computes the same thing, not how it is selected.
     /// T is above `FUSED_MIN_T`, the length at which the cell actually selects it.
     ///
-    /// Tolerances follow the staging dtype: bf16 staging (the default — see
-    /// `ops::fused_bf16_enabled`) keeps an 8-bit mantissa on `Wh`, so agreement is
-    /// to ~1e-3 relative rather than fp32's ~1e-6. Asserting the fp32 bound against
-    /// the bf16 path is what made this test fail under `SLSTM_BF16=1`.
+    /// Both fused kernels stage `Wh` in bf16 (FlashRNN's `DTYPE_R`, with an fp32
+    /// accumulator), which keeps an 8-bit mantissa on the operand — so agreement with
+    /// the all-fp32 per-step path is to ~1e-2 relative, not fp32's ~1e-6.
     #[test]
     fn slstm_fused_time_matches_per_step() {
-        // B=1 is the backbone's shape, where the backward stages the `[B, 4H]` gate
-        // deltas in shared memory. The larger batches are the encoder/decoder's: there
-        // the staging does not fit, so the contraction reads them from global instead
-        // (`stage_dg = false` in `slstm_fused_time_bwd_geometry`). Both are the same
-        // arithmetic and both must match the per-step path.
+        // B=1 is the backbone's shape, where the backward gives each unit one warp;
+        // the larger batches are the encoder/decoder's, where its warps split the batch
+        // instead. Both are the same arithmetic and both must match the per-step path.
         for b in [1usize, 64, 256] {
             fused_time_matches_per_step_at(b);
         }
@@ -1745,9 +1747,9 @@ mod tests {
         fused.force_fused_time = Some(true);
         let got = fused.forward_alloc(&gpu, &dx).to_host(&gpu);
 
-        // bf16 staging costs ~3 decimal digits on the operand; fp32 staging is exact
-        // to reassociation only.
-        let rel_tol = if ops::fused_bf16_enabled() { 1e-2 } else { 1e-5 };
+        // bf16 staging costs ~3 decimal digits on the operand, and a T-loop
+        // accumulates several of them.
+        let rel_tol = 1e-2;
         assert_eq!(want.data.len(), got.data.len());
         for (i, (a, c)) in want.data.iter().zip(got.data.iter()).enumerate() {
             assert!(
@@ -1781,12 +1783,6 @@ mod tests {
         // that skips the degenerate slice at B=1 stops skipping it at B=256 while the
         // slice is just as degenerate — same ~1e-3 ratio to its siblings, same pure
         // cancellation noise.
-        // The fused backward's contraction walks each lane's columns four at a time, so
-        // the compiler contracts that body's multiply-adds differently from the per-step
-        // path's strided loop. Same column set, same order, different FMA fusion — the
-        // gap is ~1e-4 of the tensor's scale and does not grow with T, while the forward
-        // (untouched) stays at `rel_tol`.
-        let bwd_tol = if ops::fused_bf16_enabled() { rel_tol } else { 1e-3 };
         let close_rel = |dead: f32, want: &[f32], got: &[f32], what: &str| {
             let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
             if scale < dead {
@@ -1794,7 +1790,7 @@ mod tests {
             }
             for (i, (a, c)) in want.iter().zip(got).enumerate() {
                 assert!(
-                    (a - c).abs() <= bwd_tol * scale,
+                    (a - c).abs() <= rel_tol * scale,
                     "{what} diverged at {i} (B={b}): {a} vs {c} (scale {scale})"
                 );
             }

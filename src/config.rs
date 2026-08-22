@@ -170,7 +170,7 @@ pub const PARQUET_LANGUAGE_COLUMN: &str = "language";
 /// Corpus path. A `.parquet` extension selects the parquet reader (one row per
 /// document, column `text` — override with `PARQUET_TEXT_COLUMN`); anything else
 /// is read as plain text with `<|endoftext|>` document separators.
-pub const TRAIN_DATA: &str = "../../training_data/000_00003.parquet";
+pub const TRAIN_DATA: &str = "../../training_data/000_00004.parquet";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
 // Post-training (SFT / instruction tuning)

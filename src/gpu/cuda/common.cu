@@ -80,6 +80,49 @@ extern "C" __global__ void add_col_sum(float* db, const float* dy, const float* 
     if (threadIdx.y == 0 && o < n) db[o] += shcs[tid];
 }
 
+// `add_col_sum` with the row axis cut into `bands` of `band` rows, one band per
+// `blockIdx.y`, each writing its own `part[band, n]` row.
+//
+// The single-block form above owns a column tile and EVERY row of it, so its grid is
+// `ceil(n / 32)` blocks — 8 blocks at `[2045, 256]`, one at `[rows, 16]`. That reads
+// at a tenth of the machine's bandwidth: the work is there, the parallelism is not.
+// Banding puts the row axis back into the grid.
+//
+// Still not an atomicAdd: `band` is a function of the shape alone, so which rows a
+// band holds, the tree inside it, and the order `col_sum_merge` folds the bands in
+// are all fixed by the shape, and two runs of it agree bit for bit.
+extern "C" __global__ void col_sum_part(float* part, const float* dy, const float* mul,
+                                        int use_mul, int rows, int n, int band) {
+    extern __shared__ float shcs[];
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const int r0 = blockIdx.y * band;
+    const int r1 = min(r0 + band, rows);
+    float s = 0.0f;
+    if (o < n) {
+        for (int r = r0 + threadIdx.y; r < r1; r += blockDim.y) {
+            long i = (long)r * n + o;
+            s += use_mul ? dy[i] * mul[i] : dy[i];
+        }
+    }
+    shcs[tid] = s;
+    __syncthreads();
+    for (int half = blockDim.y >> 1; half > 0; half >>= 1) {
+        if (threadIdx.y < half) shcs[tid] += shcs[tid + half * blockDim.x];
+        __syncthreads();
+    }
+    if (threadIdx.y == 0 && o < n) part[(long)blockIdx.y * n + o] = shcs[tid];
+}
+
+// db[o] += sum of the bands `col_sum_part` wrote, in ascending band order.
+extern "C" __global__ void col_sum_merge(float* db, const float* part, int bands, int n) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= n) return;
+    float s = 0.0f;
+    for (int p = 0; p < bands; ++p) s += part[(long)p * n + o];
+    db[o] += s;
+}
+
 // out[r, :] = table[ids[r], :]. One thread per output element.
 extern "C" __global__ void embedding_gather(const float* table, const unsigned* ids,
                                             float* out, int dim, int rows) {

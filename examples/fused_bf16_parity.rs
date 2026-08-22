@@ -1,15 +1,13 @@
 //! Numeric parity of the bf16-staged time-fused sLSTM against the per-step loop,
 //! at the backbone's real width.
 //!
-//! There is no fp32 fused path to compare against — the forward stages bf16
-//! unconditionally, and the backward's fp32 slice needs more blocks at H=768 than the
-//! device has SMs — so the reference is the per-step loop, the path the cell falls
-//! back to. Reports max absolute and relative error on the
-//! output, on dx, and on every gate's weight gradient, rather than asserting a
-//! tolerance: the point is to see the size of the bf16 staging error, and decide
-//! whether it is mantissa noise or a bug.
+//! There is no fp32 fused path to compare against — both kernels stage `Wh` in bf16
+//! unconditionally — so the reference is the per-step loop, the path the cell falls
+//! back to. Reports max absolute and relative error on the output, on dx, and on every
+//! gate's weight gradient, rather than asserting a tolerance: the point is to see the
+//! size of the bf16 staging error, and decide whether it is mantissa noise or a bug.
 //!
-//!   SLSTM_BF16=1 cargo run --release --features cuda --example fused_bf16_parity
+//!   cargo run --release --features cuda --example fused_bf16_parity
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -30,7 +28,7 @@ fn main() {
     let t: usize = std::env::var("T").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
     let b = 1usize;
 
-    println!("H={h} T={t} B={b}, bf16 staging {}", ops::fused_bf16_enabled());
+    println!("H={h} T={t} B={b}");
     println!(
         "fwd geometry {:?}\nbwd geometry {:?}",
         ops::slstm_fused_time_geometry(&gpu, h, b),
