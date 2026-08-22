@@ -114,6 +114,11 @@ pub struct Gpu {
     /// Number of SMs. A cooperative launch's grid must be co-resident, so this is
     /// the ceiling on its block count — see `ops::slstm_fused_time_geometry`.
     pub sm_count: usize,
+    /// 32-bit registers one SM's file holds. Shared memory is not the only thing
+    /// that can keep a block off an SM entirely, and a cooperative launch that
+    /// cannot place one block deadlocks rather than running slowly — see
+    /// `ops::fused_fwd_threads_for`.
+    pub regs_per_sm: usize,
 }
 
 impl Gpu {
@@ -168,6 +173,9 @@ impl Gpu {
         let sm_count = context
             .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
             .map_err(|e| format!("querying SM count failed: {e:?}"))? as usize;
+        let regs_per_sm = context
+            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR)
+            .map_err(|e| format!("querying register file size failed: {e:?}"))? as usize;
         Ok(Self {
             context,
             stream,
@@ -176,6 +184,7 @@ impl Gpu {
             kernels: Arc::new(kernels),
             max_shared_optin,
             sm_count,
+            regs_per_sm,
         })
     }
 }

@@ -21,6 +21,7 @@ fn main() {
 fn main() {
     use std::time::Instant;
 
+    use neural_networks::config::{BACKBONE_CHUNK, CHAR_HIDDEN, WORD_HIDDEN};
     use neural_networks::gpu::{DTensor, Gpu, slstm::SLstm};
     use neural_networks::tensor::Tensor;
 
@@ -40,12 +41,27 @@ fn main() {
 
     // (label, B, T, H): a BACKBONE_CHUNK sweep at WORD_HIDDEN, then three
     // encoder/decoder groups at CHAR_HIDDEN with a word's length as T.
-    let shapes = [
-        ("backbone  B=1   T=512 H=768", 1, 512, 768),
-        ("encoder   B=512 T=4   H=256", 512, 4, 256),
-        ("encoder   B=256 T=8   H=256", 256, 8, 256),
-        ("decoder   B=128 T=16  H=256", 128, 16, 256),
+    let named = |kind: &str, b: usize, t: usize, h: usize| {
+        (format!("{kind:<9} B={b:<5}T={t:<5}H={h}"), b, t, h)
+    };
+    let default_shapes = vec![
+        named("backbone", 1, BACKBONE_CHUNK, WORD_HIDDEN),
+        named("encoder", 512, 4, CHAR_HIDDEN),
+        named("encoder", 256, 8, CHAR_HIDDEN),
+        named("decoder", 128, 16, CHAR_HIDDEN),
     ];
+    // `SLSTM_SHAPES=B,T,H[;B,T,H...]` replaces the table, for sweeping a width the
+    // config does not currently build.
+    let shapes: Vec<(String, usize, usize, usize)> = match std::env::var("SLSTM_SHAPES") {
+        Ok(spec) => spec
+            .split(';')
+            .map(|row| {
+                let n: Vec<usize> = row.split(',').map(|v| v.trim().parse().unwrap()).collect();
+                named("custom", n[0], n[1], n[2])
+            })
+            .collect(),
+        Err(_) => default_shapes,
+    };
 
     for (label, b, t, h) in shapes {
         let mut cell = SLstm::new_rand(&gpu, h, h);

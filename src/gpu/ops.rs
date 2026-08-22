@@ -505,6 +505,12 @@ thread_local! {
     /// different context is a stale device pointer.
     static FUSED_ALT: std::cell::RefCell<(Option<usize>, Option<DTensor>)> =
         const { std::cell::RefCell::new((None, None)) };
+
+    /// The fused forward's global `Wh` tail, bf16 packed into fp32 like [`FUSED_ALT`].
+    /// A block re-reads its share of it once per timestep, so it wants to stay put and
+    /// stay in L2 rather than be reallocated per launch.
+    static FUSED_TAIL: std::cell::RefCell<(Option<usize>, Option<DTensor>)> =
+        const { std::cell::RefCell::new((None, None)) };
 }
 
 /// Run `f` with a zeroed `[rows, cols]` scratch tensor, reallocated only on a shape
@@ -524,9 +530,41 @@ fn with_fused_alt<R>(gpu: &Gpu, rows: usize, cols: usize, f: impl FnOnce(&mut DT
     })
 }
 
+/// Run `f` with the fused forward's `Wh` tail scratch, `len` fp32 elements. The
+/// kernel fills it before its first `grid.sync()`, so the contents need not survive
+/// a call — only the allocation does.
+fn with_fused_tail<R>(gpu: &Gpu, len: usize, f: impl FnOnce(&mut DTensor) -> R) -> R {
+    FUSED_TAIL.with(|s| {
+        let mut s = s.borrow_mut();
+        let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
+        if s.0 != Some(tag) {
+            s.1 = None;
+            s.0 = Some(tag);
+        }
+        // Grown, never resized down: the kernel addresses the tail from compile-time
+        // constants and never reads past its own columns, so a buffer larger than
+        // this launch needs is simply slack — and the stack alternates widths (the
+        // backbone has a tail, the encoder and decoder do not), which an exact fit
+        // would turn into an allocate-and-zero on every phase change.
+        //
+        // One element even with no tail: the kernel takes the pointer either way, and
+        // a null argument is not something the launch builder can express.
+        let want = len.max(1);
+        if s.1.as_ref().map_or(true, |t| t.len() < want) {
+            s.1 = Some(DTensor::zeros(gpu, &[want]));
+        }
+        f(s.1.as_mut().unwrap())
+    })
+}
+
 /// Release the fused ping-pong scratch on this thread.
 pub fn clear_fused_alt() {
     FUSED_ALT.with(|s| {
+        let mut s = s.borrow_mut();
+        s.1 = None;
+        s.0 = None;
+    });
+    FUSED_TAIL.with(|s| {
         let mut s = s.borrow_mut();
         s.1 = None;
         s.0 = None;
@@ -2425,13 +2463,28 @@ fn fused_threads_override() -> Option<usize> {
     })
 }
 
-/// Threads the fused FORWARD runs a block at.
+/// Rows of `Wh` the fused forward stages in shared memory (`SLSTM_STAGED_ROWS`),
+/// capped by what actually fits. Lowering it moves rows into the global tail, which
+/// is how the cost of that tail is measured against the shared-memory it frees.
+fn fused_staged_rows_override() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("SLSTM_STAGED_ROWS").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0)
+    })
+}
+
+/// Threads the fused FORWARD asks for a block.
 ///
 /// Measured best at the backbone shape (H=768, B=1, 77 blocks), swept against the
 /// real step. The intuition that a narrow block would suit the pointwise phase —
 /// which fills only `B*nj` = 10 lanes there — is backwards: that phase is a short
 /// prologue, while the gate reduction that follows it is the whole cost, and the
 /// reduction scales with warps.
+///
+/// A ceiling, not the launch width: [`fused_fwd_threads_for`] narrows it to what the
+/// register file can place. The curve is flat over the top of its range — at H=1024
+/// the widths 576/640/704 measure 2.65/2.67/2.68 us per timestep — so the narrowing
+/// costs next to nothing where it bites.
 const FUSED_FWD_THREADS: usize = 768;
 
 /// Hardware ceiling on a block, and on the static `__shared__` a kernel may declare.
@@ -2449,40 +2502,40 @@ pub fn fused_hp(h: usize) -> usize {
 }
 
 /// Launch geometry for [`slstm_fused_time`]: `(blocks, threads, units_per_block,
-/// shared_bytes)`, or `None` when the shape does not fit the kernel's contract.
+/// staged_rows, shared_bytes)`, or `None` when the shape does not fit the kernel's
+/// contract.
 ///
 /// The constraint that drives everything is shared memory: each block stages a
-/// `[HP, 4*units]` bf16 slice of `Wh` plus a `[B, 4*units]` fp32 gate scratch, and
-/// the total must fit the device's opt-in limit. Blocks are then spread over as many
-/// SMs as the grid may use, and the whole grid must be co-resident — a cooperative
-/// launch deadlocks if it cannot be.
+/// `[4*units, staged_rows]` bf16 slice of `Wh` plus a `[B, 4*units]` fp32 gate
+/// scratch, and the total must fit the device's opt-in limit. Blocks are then spread
+/// over as many SMs as the grid may use, and the whole grid must be co-resident — a
+/// cooperative launch deadlocks if it cannot be.
+///
+/// Those two pull against each other above `H ≈ 1000`: co-residency caps the grid at
+/// one wave, which sets `units = ceil(H / SMs)` from below, while the opt-in limit
+/// caps `units * HP`. `staged_rows` is what gives: the block stages as many rows of
+/// its columns as fit and reads the rest from the global tail scratch (see
+/// `FUSED_RS` in the kernel). It equals `HP` — no tail, byte-identical to the
+/// all-shared kernel — wherever the whole slice fits.
 pub fn slstm_fused_time_geometry(
     gpu: &Gpu,
     h: usize,
     b: usize,
-) -> Option<(usize, usize, usize, usize)> {
+) -> Option<(usize, usize, usize, usize, usize)> {
     let hp = fused_hp(h);
     let threads = fused_threads_override().unwrap_or(FUSED_FWD_THREADS);
     // Leave a little headroom under the opt-in cap for the driver's own use.
     let smem_cap = gpu.max_shared_optin.saturating_sub(1024);
-    // Per hidden unit: four staged Wh columns of HP bf16 rows, and four fp32 gate
-    // accumulators per batch row. Storage is bf16 (FlashRNN's `DTYPE_R`), the
-    // accumulator stays fp32 — see the kernel.
-    let per_unit = hp * 4 * 2 + b * 4 * 4;
-    let max_units = smem_cap / per_unit;
-    if max_units == 0 {
-        return None; // one unit's slice does not fit: H is too large for this path
-    }
     // Spread over as many SMs as the grid may use, not as few blocks as possible.
     // The fewest-blocks choice minimises `grid.sync()` cost but leaves most of the
     // device idle, and the gate reduction (not the sync) is what dominates — so
-    // halving the parallelism costs far more than the extra sync saves.
-    let min_blocks = h.div_ceil(max_units);
-    let blocks = gpu.sm_count.max(min_blocks).min(h);
+    // halving the parallelism costs far more than the extra sync saves. One wave is
+    // the ceiling either way (co-residency), so this is simply as wide as it goes.
+    //
     // `SLSTM_BLOCKS` re-opens that tradeoff to measurement: it is a choice, not a
     // derived optimum, and it moves with H. Swept at H=768 (60 -> 10.57ms,
     // 77 -> 9.90ms, 84 -> 9.92ms): wider still wins, default stands.
-    let blocks = fused_blocks_override().unwrap_or(blocks).max(min_blocks).min(h);
+    let blocks = fused_blocks_override().unwrap_or(gpu.sm_count).min(h).max(1);
     let units_per_block = h.div_ceil(blocks);
     // Recompute: rounding the slice up may need fewer blocks than requested.
     let blocks = h.div_ceil(units_per_block);
@@ -2491,10 +2544,24 @@ pub fn slstm_fused_time_geometry(
     // the block if the default is too narrow for that; a shape that needs more than
     // a block can hold takes the per-step path instead.
     let threads = threads.max(b * units_per_block).next_multiple_of(32);
-    if threads > 1024 {
+    if threads > MAX_BLOCK_THREADS {
         return None;
     }
-    let shared_bytes = units_per_block * per_unit;
+    // Rows of the slice that fit in shared, in whole reduction passes — the loop
+    // reads FUSED_ROW_PAD rows per pass with no tail branch, so a partial pass is
+    // not a shape the kernel has.
+    let gate_scratch = b * 4 * 4 * units_per_block;
+    let per_row = units_per_block * 4 * 2;
+    let staged_rows = fused_staged_rows_override()
+        .unwrap_or(hp)
+        .min(smem_cap.saturating_sub(gate_scratch) / per_row)
+        .min(hp)
+        / FUSED_ROW_PAD
+        * FUSED_ROW_PAD;
+    if staged_rows == 0 {
+        return None; // not even one pass of the slice fits
+    }
+    let shared_bytes = staged_rows * per_row + gate_scratch;
     // A cooperative grid must be co-resident, and at this shared footprint an SM holds
     // one block — so more blocks than SMs cannot work. This is the cheap bound callers
     // can use as a predicate; `coop_grid_fits` asks the driver for the real one, which
@@ -2502,7 +2569,55 @@ pub fn slstm_fused_time_geometry(
     if shared_bytes > smem_cap || blocks > gpu.sm_count {
         return None;
     }
-    Some((blocks, threads, units_per_block, shared_bytes))
+    Some((blocks, threads, units_per_block, staged_rows, shared_bytes))
+}
+
+/// Elements of the fused forward's global `Wh` tail scratch, as fp32 (two bf16 to a
+/// float). Zero when the whole slice is staged in shared memory.
+pub fn fused_tail_len(h: usize, staged_rows: usize) -> usize {
+    4 * h * (fused_hp(h) - staged_rows) / 2
+}
+
+/// The fused forward's block width, narrowed until one block fits an SM.
+///
+/// [`FUSED_FWD_THREADS`] is a *preference* — the width the gate reduction measures
+/// best at — and the register file is what can refuse it. The kernel's per-thread
+/// demand grows with `H` (a lane's slice of `h` is `HP/32` fp32 registers), and past
+/// `H ≈ 900` the fitted 768-wide block needs more registers than an SM has: 90 regs
+/// x 768 threads = 69k against 64k at `H = 1024`. That is not slow, it is
+/// *unschedulable* — `occupancy_max_active_blocks_per_multiprocessor` returns 0 and
+/// the cooperative launch cannot place a single block, so the whole path declines and
+/// the caller silently takes the per-step loop at ~4x the cost per timestep.
+///
+/// Narrowing is the cheap half of that trade: the reduction loses warps, the kernel
+/// stays fused. Registers per thread do not change with the launch width, so the cap
+/// is exact arithmetic and the descending scan below is only there to absorb the
+/// driver's own allocation granularity.
+///
+/// Returns `None` when even the narrowest legal width cannot be placed — the block
+/// can never go below `b * units_per_block`, since the pointwise phase's ownership is
+/// one thread per (batch row, owned unit) and fixed for the whole T-loop.
+pub fn fused_fwd_threads_for(
+    gpu: &Gpu,
+    f: &cudarc::driver::CudaFunction,
+    threads: usize,
+    min_threads: usize,
+    blocks: usize,
+    shared: usize,
+) -> Option<usize> {
+    let regs = f
+        .get_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS)
+        .ok()
+        .filter(|&r| r > 0)? as usize;
+    let by_regs = gpu.regs_per_sm / regs / 32 * 32;
+    let mut w = threads.min(by_regs);
+    while w >= min_threads.max(32) {
+        if coop_grid_fits(gpu, f, blocks, w, shared) {
+            return Some(w);
+        }
+        w -= 32;
+    }
+    None
 }
 
 /// Whether the driver will schedule `blocks` of this kernel as a cooperative grid.
@@ -2687,7 +2802,7 @@ pub fn slstm_fused_time(
         return false;
     }
     let (b, h) = (c_state.rows(), c_state.cols());
-    let Some((blocks, threads, units_per_block, shared_bytes)) =
+    let Some((blocks, threads, units_per_block, staged_rows, shared_bytes)) =
         slstm_fused_time_geometry(gpu, h, b)
     else {
         return false;
@@ -2695,10 +2810,11 @@ pub fn slstm_fused_time(
     // Specialized build only — the kernel keeps its slice of `h` in a register array
     // sized by H, which a runtime H would put in local memory. Decline rather than
     // launch a slower shape-generic twin; the caller has the per-step loop.
-    let Some(f) = gpu
-        .kernels
-        .specialized(&gpu.context, "slstm_fused_time", &[("SLSTM_H", h), ("SLSTM_B", b)])
-    else {
+    let Some(f) = gpu.kernels.specialized(&gpu.context, "slstm_fused_time", &[
+        ("SLSTM_H", h),
+        ("SLSTM_B", b),
+        ("SLSTM_RS", staged_rows),
+    ]) else {
         return false;
     };
     // Opt into the larger shared-memory carve-out; without this the launch fails
@@ -2711,9 +2827,11 @@ pub fn slstm_fused_time(
         return false;
     }
     // After the opt-in, which is what decides how many blocks an SM can hold.
-    if !coop_grid_fits(gpu, &f, blocks, threads, shared_bytes) {
+    let Some(threads) =
+        fused_fwd_threads_for(gpu, &f, threads, b * units_per_block, blocks, shared_bytes)
+    else {
         return false;
-    }
+    };
     let cfg = LaunchConfig {
         grid_dim: (blocks as u32, 1, 1),
         block_dim: (threads as u32, 1, 1),
@@ -2722,37 +2840,42 @@ pub fn slstm_fused_time(
     let (t_i, upb_i, carry_i) = (t as i32, units_per_block as i32, i32::from(carry));
     // The kernel's `h` mirror: two [B, HP] bf16 planes packed into one fp32 [B, HP]
     // scratch (two bf16 to a float), ping-ponged so a block writing step t cannot
-    // race a block still reading step t-1.
+    // race a block still reading step t-1. `wtail` holds the rows of `Wh` that did
+    // not fit shared memory, in the same packing; it is empty at the widths where
+    // the whole slice is staged.
     with_fused_alt(gpu, b, fused_hp(h), |hmir| {
-        let mut lb = gpu.stream.launch_builder(&f);
-        lb.arg(&wh.buf).arg(&mut g.buf).arg(&bcat.buf);
-        push_slab!(lb, slabs.h_prev);
-        lb.arg(&mut c_state.buf)
-            .arg(&mut n_state.buf)
-            .arg(&mut m_state.buf)
-            .arg(&mut h_state.buf)
-            .arg(&mut hmir.buf)
-            .arg(&mut slabs.c_prev.buf)
-            .arg(&mut slabs.n_prev.buf);
-        push_slab!(lb, slabs.zt);
-        push_slab!(lb, slabs.ot);
-        lb.arg(&mut slabs.i_prime.buf)
-            .arg(&mut slabs.f_prime.buf)
-            .arg(&mut slabs.c.buf)
-            .arg(&mut slabs.n.buf)
-            .arg(&mut out.buf)
-            .arg(&t_i)
-            .arg(&upb_i)
-            .arg(&carry_i);
-        // SAFETY: the geometry above guarantees the grid is co-resident (a cooperative
-        // launch deadlocks otherwise) and that every block's shared slice fits.
-        match unsafe { lb.launch_cooperative(cfg) } {
-            Ok(_) => true,
-            Err(e) => {
-                eprintln!("slstm_fused_time: cooperative launch failed: {e:?}");
-                false
+        with_fused_tail(gpu, fused_tail_len(h, staged_rows), |wtail| {
+            let mut lb = gpu.stream.launch_builder(&f);
+            lb.arg(&wh.buf).arg(&mut g.buf).arg(&bcat.buf);
+            push_slab!(lb, slabs.h_prev);
+            lb.arg(&mut c_state.buf)
+                .arg(&mut n_state.buf)
+                .arg(&mut m_state.buf)
+                .arg(&mut h_state.buf)
+                .arg(&mut hmir.buf)
+                .arg(&mut wtail.buf)
+                .arg(&mut slabs.c_prev.buf)
+                .arg(&mut slabs.n_prev.buf);
+            push_slab!(lb, slabs.zt);
+            push_slab!(lb, slabs.ot);
+            lb.arg(&mut slabs.i_prime.buf)
+                .arg(&mut slabs.f_prime.buf)
+                .arg(&mut slabs.c.buf)
+                .arg(&mut slabs.n.buf)
+                .arg(&mut out.buf)
+                .arg(&t_i)
+                .arg(&upb_i)
+                .arg(&carry_i);
+            // SAFETY: the geometry above guarantees the grid is co-resident (a cooperative
+            // launch deadlocks otherwise) and that every block's shared slice fits.
+            match unsafe { lb.launch_cooperative(cfg) } {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("slstm_fused_time: cooperative launch failed: {e:?}");
+                    false
+                }
             }
-        }
+        })
     })
 }
 
@@ -3637,12 +3760,18 @@ pub fn mul_into(gpu: &Gpu, a: &DTensor, b: &DTensor, out: &mut DTensor) {
 /// Output tiles one `mlstm_fw_dC` block covers: the `[dhv, dqk]` state, in mma
 /// (16 x 8) units.
 fn dc_tiles(dqk: usize, dhv: usize) -> usize {
+    if let Some(w) = warps_pin("MLSTM_WARPS_DC") {
+        return w;
+    }
     (mma_pad(dhv, 16) / 16) * (mma_pad(dqk, 8) / 8)
 }
 
 /// Output tiles one FORWARD parallel block covers — the larger of the `[L, L]`
 /// decay block and the `[L, dhv-slice]` output, since one width serves both loops.
 fn fw_parallel_warps(l: usize, dhv: usize) -> usize {
+    if let Some(w) = warps_pin("MLSTM_WARPS_FW") {
+        return w;
+    }
     let lp = mma_pad(l, 16);
     let vt = mma_pad(mlstm_vt().min(mma_pad(dhv, 8)), 8);
     (lp / 16) * (lp / 8).max(vt / 8)
@@ -3663,8 +3792,11 @@ fn fw_parallel_warps(l: usize, dhv: usize) -> usize {
 /// One thread per element of the widest staged tile predicts both, where the tile
 /// count predicts neither.
 fn bw_parallel_warps(l: usize, dqk: usize, dhv: usize) -> usize {
+    if let Some(w) = warps_pin("MLSTM_WARPS_BW") {
+        return w;
+    }
     let lp = mma_pad(l, 16);
-    let kt = mma_pad(mlstm_kt(dqk).min(mma_pad(dqk, 16)), 16);
+    let kt = mma_pad(mlstm_kt().min(mma_pad(dqk, 16)), 16);
     let vt = mma_pad(mlstm_vt().min(mma_pad(dhv, 16)), 16);
     (lp * kt.max(vt)).div_ceil(32)
 }
@@ -3684,8 +3816,36 @@ fn bw_parallel_warps(l: usize, dqk: usize, dhv: usize) -> usize {
 /// loads across, and capped at [`FUSED_THREADS_PAR`].
 fn parallel_threads(warps: usize) -> u32 {
     const MIN_WARPS: usize = 4;
-    let max_warps = FUSED_THREADS_PAR as usize / 32;
+    let max_warps = fused_threads_par() as usize / 32;
     (warps.clamp(MIN_WARPS, max_warps) * 32) as u32
+}
+
+/// Warp-count pin for one parallel kernel, read from `var` once. The three warp
+/// rules below are fitted per shape, so a new head width is swept through these
+/// rather than guessed — see [`bw_parallel_warps`] for why the rules differ.
+fn warps_pin(var: &'static str) -> Option<usize> {
+    static PINS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, Option<usize>>>> =
+        std::sync::OnceLock::new();
+    let map = PINS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = map.lock().unwrap();
+    *map.entry(var).or_insert_with(|| {
+        std::env::var(var).ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 1)
+    })
+}
+
+/// [`FUSED_THREADS_PAR`], with `MLSTM_THREADS_PAR=<n>` honoured so the ceiling
+/// itself can be swept. Rounded down to a power of two — `bw_parallel`'s `dg`
+/// reduction halves the block width.
+fn fused_threads_par() -> u32 {
+    static PIN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PIN.get_or_init(|| {
+        std::env::var("MLSTM_THREADS_PAR")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| (32..=1024).contains(&n))
+            .map(|n| 1 << n.ilog2())
+            .unwrap_or(FUSED_THREADS_PAR)
+    })
 }
 
 /// Widest block a parallel kernel launches with.
@@ -3732,6 +3892,12 @@ pub const FUSED_MAX_L: usize = 32;
 /// than a compile error. A fixed cap, not a divisor of any head dim: widening `dqk`
 /// raises the kernel's trip count and leaves the footprint alone. A multiple of 16,
 /// the bf16 mma's contraction depth.
+///
+/// One width for every head dim. A wider slice at `dqk >= 128` used to measure
+/// better, but that was fitted before the backward moved to bf16 mma and became
+/// latency-bound; with the current kernels 32 wins at every width measured
+/// (B=1 T=1024 dqk=128 0.895 vs 0.999 ms, T=4096 3.55 vs 3.89, T=512 dqk=192
+/// 0.981 vs 1.036, dqk=256 1.554 vs 1.691).
 pub const MLSTM_KT: usize = 32;
 
 /// [`MLSTM_VT`], with `MLSTM_VT=<n>` honoured as a pin for a sweep. Rounded to the
@@ -3743,9 +3909,9 @@ pub fn mlstm_vt() -> usize {
     let pinned = *PIN.get_or_init(|| {
         std::env::var("MLSTM_VT").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 16)
     });
-    // 32 everywhere by default. A wide head measures slightly better on the dhv axis
-    // at 64 (dhv=128: 5.89 vs 6.34), but `mlstm_kt` already widens at that width and
-    // widening dqk is the better half of that trade.
+    // 32 everywhere by default. Swept against `dqk` at the shape the backbone runs
+    // (B=1, T=BACKBONE_CHUNK): at dhv=128 the four widths 16/32/64/96 measure
+    // 0.575/0.550/0.564/0.599 ms, so the ladder the dqk axis wanted has no twin here.
     mma_pad(pinned.unwrap_or(32), 16)
 }
 
@@ -3770,7 +3936,7 @@ pub const MLSTM_VT: usize = 64;
 /// than reinstate a second code path.
 pub const FUSED_MAX_HEAD: usize = 128;
 
-pub fn mlstm_kt(dqk: usize) -> usize {
+pub fn mlstm_kt() -> usize {
     static PIN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let pinned = *PIN.get_or_init(|| {
         std::env::var("MLSTM_KT").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 8)
@@ -3778,7 +3944,7 @@ pub fn mlstm_kt(dqk: usize) -> usize {
     // The forward's parallel kernel contracts 16 at a time (the bf16 mma's K), so
     // every slice width is a multiple of 16; the backward's contracts 8 and is happy
     // with any multiple of 16 too.
-    mma_pad(pinned.unwrap_or(if dqk >= 128 { 64 } else { MLSTM_KT }), 16)
+    mma_pad(pinned.unwrap_or(MLSTM_KT), 16)
 }
 
 /// What forward hands to backward. Everything here is `[BH, …]` head-major.
@@ -3865,7 +4031,7 @@ fn fused_smem(kind: &str, l: usize, dqk: usize, dhv: usize) -> usize {
         // no longer share a warp once the dqk contraction has its own slice loop.
         "fw_parallel" => {
             let (lp, kp, vp) = (mma_pad(l, 16), mma_pad(dqk, 16), mma_pad(dhv, 8));
-            let kt = mma_pad(mlstm_kt(dqk).min(kp), 16);
+            let kt = mma_pad(mlstm_kt().min(kp), 16);
             let vt = mma_pad(mlstm_vt().min(vp), 8);
             let (ls, la) = (lp + 1, vt + 1);
             let (lq, lv, ld) = (bf16_ld(kt), bf16_ld(vt), bf16_ld(lp));
@@ -3882,7 +4048,7 @@ fn fused_smem(kind: &str, l: usize, dqk: usize, dhv: usize) -> usize {
         // mma's K = 16 rather than its N = 8.
         "bw_parallel" => {
             let (lp, kp, vp) = (mma_pad(l, 16), mma_pad(dqk, 16), mma_pad(dhv, 16));
-            let kt = mma_pad(mlstm_kt(dqk).min(kp), 16);
+            let kt = mma_pad(mlstm_kt().min(kp), 16);
             let vt = mma_pad(mlstm_vt().min(vp), 16);
             let (ls, lv, lk) = (lp + 1, vt + 1, kt + 1);
             let (lqb, lvb, ldb) = (bf16_ld(kt), bf16_ld(vt), bf16_ld(lp));
@@ -4329,7 +4495,7 @@ pub fn mlstm_fused_fw(
         fused_smem("fw_parallel", l, dqk, dhv),
         super::kernels::MlstmSpec {
             l, dqk, dhv, h: st.h, threads: par_threads,
-            kt: mlstm_kt(dqk), vt: mlstm_vt(),
+            kt: mlstm_kt(), vt: mlstm_vt(),
         },
     );
     let mut lb = gpu.stream.launch_builder(&f);
@@ -4497,7 +4663,7 @@ pub fn mlstm_fused_bw(
         fused_smem("bw_parallel", l, dqk, dhv),
         super::kernels::MlstmSpec {
             l, dqk, dhv, h: st.h, threads: par_threads,
-            kt: mlstm_kt(dqk), vt: mlstm_vt(),
+            kt: mlstm_kt(), vt: mlstm_vt(),
         },
     );
     let mut lb = gpu.stream.launch_builder(&f);

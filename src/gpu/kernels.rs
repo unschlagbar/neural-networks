@@ -124,9 +124,14 @@ const COOP_NAMES: &[&str] = &["slstm_fused_time", "slstm_fused_time_bwd"];
 
 /// The throwaway shape [`COOP_NAMES`] is compiled at to prove it still builds. Small
 /// enough to compile fast, and legal for both kernels' geometry contracts.
+///
+/// `SLSTM_RS` is deliberately half of the forward's padded row count, not all of it:
+/// the partial-`Wh`-stage tail loop is `#if`-ed out at `RS == HP`, so a canary that
+/// stages everything would not compile the branch the wide widths take.
 const COOP_CANARY: &[(&str, usize)] = &[
-    ("SLSTM_H", 64),
+    ("SLSTM_H", 512),
     ("SLSTM_B", 1),
+    ("SLSTM_RS", 256),
     ("SLSTM_NJ", 1),
     ("SLSTM_TH", 64),
 ];

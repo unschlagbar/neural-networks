@@ -1703,18 +1703,22 @@ mod tests {
         // the larger batches are the encoder/decoder's, where its warps split the batch
         // instead. Both are the same arithmetic and both must match the per-step path.
         for b in [1usize, 64, 256] {
-            fused_time_matches_per_step_at(b);
+            fused_time_matches_per_step_at(b, 64);
         }
+        // A width whose `Wh` slice no longer fits shared memory, so the forward stages
+        // part of it and reads the rest from the global tail. Nothing below H ~ 1000
+        // reaches that branch — it is `#if`-ed out of every narrower build.
+        fused_time_matches_per_step_at(1, 1024);
     }
 
-    fn fused_time_matches_per_step_at(b: usize) {
+    fn fused_time_matches_per_step_at(b: usize, h: usize) {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
         if !gpu.kernels.has_coop {
             return; // cooperative kernels unavailable (no CUDA headers)
         }
-        let (t, h) = (64usize, 64usize);
+        let t = 64usize;
         if ops::slstm_fused_time_geometry(&gpu, h, b).is_none()
             || ops::slstm_fused_time_bwd_geometry(&gpu, h, b).is_none()
         {
@@ -1754,7 +1758,7 @@ mod tests {
         for (i, (a, c)) in want.data.iter().zip(got.data.iter()).enumerate() {
             assert!(
                 (a - c).abs() <= rel_tol * a.abs().max(1.0),
-                "fused vs per-step forward diverged at {i} (B={b}): {a} vs {c}"
+                "fused vs per-step forward diverged at {i} (B={b}, H={h}): {a} vs {c}"
             );
         }
 
@@ -1791,7 +1795,7 @@ mod tests {
             for (i, (a, c)) in want.iter().zip(got).enumerate() {
                 assert!(
                     (a - c).abs() <= rel_tol * scale,
-                    "{what} diverged at {i} (B={b}): {a} vs {c} (scale {scale})"
+                    "{what} diverged at {i} (B={b}, H={h}): {a} vs {c} (scale {scale})"
                 );
             }
         };

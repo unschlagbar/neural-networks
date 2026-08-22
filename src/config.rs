@@ -62,7 +62,7 @@ pub const TOP_P: f32 = 0.9;
 
 pub const CHAR_HIDDEN: usize = 256;
 pub const OUT_HIDDEN: usize = 256;
-pub const WORD_HIDDEN: usize = 768;
+pub const WORD_HIDDEN: usize = 1024;
 
 /// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).
 /// Bounds the logits and removes the cross-entropy incentive for unbounded
@@ -70,7 +70,7 @@ pub const WORD_HIDDEN: usize = 768;
 pub const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 32;
+pub const WORD_BLOCKS: usize = 24;
 
 /// Backbone sweep chunk length, in words. `0` disables chunking (one whole-sequence
 /// sweep, the pre-chunking behaviour).
@@ -170,7 +170,7 @@ pub const PARQUET_LANGUAGE_COLUMN: &str = "language";
 /// Corpus path. A `.parquet` extension selects the parquet reader (one row per
 /// document, column `text` — override with `PARQUET_TEXT_COLUMN`); anything else
 /// is read as plain text with `<|endoftext|>` document separators.
-pub const TRAIN_DATA: &str = "../../training_data/000_00004.parquet";
+pub const TRAIN_DATA: &str = "../../training_data/000_00000.parquet";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
 // Post-training (SFT / instruction tuning)

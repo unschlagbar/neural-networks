@@ -20,6 +20,7 @@ fn main() {
 fn main() {
     use std::time::Instant;
 
+    use neural_networks::config::{BACKBONE_CHUNK, OUT_HIDDEN, WORD_HIDDEN};
     use neural_networks::gpu::{DTensor, Gpu, mlstm::MLstm};
     use neural_networks::tensor::Tensor;
 
@@ -45,13 +46,26 @@ fn main() {
     // sequence, BACKBONE_CHUNK long, WORD_HIDDEN wide. The rest are the encoder's and
     // decoder's cell — CHAR_HIDDEN wide at 16 heads, so dqk = 16, over a batch of
     // words whose length is the sequence axis.
-    let shapes: &[(usize, usize, usize, usize)] = &[
-        (1, 512, 8, 96),
-        (1, 1024, 8, 96),
-        (512, 4, 16, 16),
-        (256, 8, 16, 16),
-        (128, 16, 16, 16),
+    let default_shapes: Vec<(usize, usize, usize, usize)> = vec![
+        (1, BACKBONE_CHUNK, 8, WORD_HIDDEN / 8),
+        (1, 2 * BACKBONE_CHUNK, 8, WORD_HIDDEN / 8),
+        (512, 4, 16, OUT_HIDDEN / 16),
+        (256, 8, 16, OUT_HIDDEN / 16),
+        (128, 16, 16, OUT_HIDDEN / 16),
     ];
+    // `MLSTM_SHAPES=B,T,H,dqk[;B,T,H,dqk...]` replaces the table — the rows stay
+    // interleaved inside a repeat, so two widths listed here are comparable.
+    let shapes: Vec<(usize, usize, usize, usize)> = match std::env::var("MLSTM_SHAPES") {
+        Ok(spec) => spec
+            .split(';')
+            .map(|row| {
+                let n: Vec<usize> = row.split(',').map(|v| v.trim().parse().unwrap()).collect();
+                (n[0], n[1], n[2], n[3])
+            })
+            .collect(),
+        Err(_) => default_shapes,
+    };
+    let shapes: &[(usize, usize, usize, usize)] = &shapes;
     let only: Option<usize> = std::env::var("MLSTM_BENCH_ONLY")
         .ok()
         .and_then(|v| v.parse().ok());
@@ -59,8 +73,14 @@ fn main() {
         Some(i) => vec![shapes[i]],
         None => shapes.to_vec(),
     };
-    let iters = 30;
-    let repeats = 3;
+    let env = |k: &str, d: usize| -> usize {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    // The SM clock ramps for the first few hundred iterations, so a short warmup
+    // measures the ramp. `MLSTM_BENCH_WARMUP` raises it when a shape is being swept.
+    let iters = env("MLSTM_BENCH_ITERS", 30);
+    let repeats = env("MLSTM_BENCH_REPEATS", 3);
+    let warmup = env("MLSTM_BENCH_WARMUP", 10);
 
     let mut cells: Vec<_> = shapes
         .iter()
@@ -75,7 +95,7 @@ fn main() {
         .collect();
 
     for (x, g, cell, y) in cells.iter_mut() {
-        for _ in 0..10 {
+        for _ in 0..warmup {
             cell.forward(&gpu, x, y);
             let _ = cell.backward_alloc(&gpu, g);
         }

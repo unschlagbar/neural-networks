@@ -1,8 +1,8 @@
 // Cooperative-launch sLSTM: the whole time loop in one grid-synchronising kernel.
 // Behind COOP_KERNELS; drags in libcu++ via <cooperative_groups.h>, so it has the
 // largest include requirement of any module. Both kernels exist only in their
-// shape-specialised builds — SLSTM_H / SLSTM_B for the forward, plus SLSTM_NJ /
-// SLSTM_TH for the backward (see Kernels::specialized).
+// shape-specialised builds — SLSTM_H / SLSTM_B / SLSTM_RS for the forward, plus
+// SLSTM_NJ / SLSTM_TH for the backward (see Kernels::specialized).
 
 #ifdef COOP_KERNELS
 #include <cooperative_groups.h>
@@ -51,7 +51,7 @@ union bf16x8 {
 // dependency between iterations, so there is nothing to unroll or size by it — and
 // here windows never cross a document border, so T varies per window and specializing
 // on it would mean an NVRTC compile per window length.
-#if defined(SLSTM_H) && defined(SLSTM_B)
+#if defined(SLSTM_H) && defined(SLSTM_B) && defined(SLSTM_RS)
 
 #define FUSED_H SLSTM_H
 #define FUSED_B SLSTM_B
@@ -65,6 +65,24 @@ union bf16x8 {
 #define FUSED_HP (((FUSED_H) + FUSED_RPP - 1) / FUSED_RPP * FUSED_RPP)
 #define FUSED_PASSES (FUSED_HP / FUSED_RPP)
 #define FUSED_HSLICE (FUSED_HP / 32)
+
+// Rows of its Wh columns a block keeps in SHARED memory; the remaining FUSED_TAIL
+// rows sit in a bf16 GLOBAL scratch in the same column-major layout and are re-read
+// once per timestep.
+//
+// Staging the whole matrix is what this kernel is for, and it holds while `8*H*H`
+// bytes fit the device's aggregate shared memory — 8.0 MB at H=1024 against 8.2 MB
+// on an 84-SM, 100 KB/SM part, which the per-block opt-in limit then rounds out of
+// reach: at 84 blocks a block owns ceil(H/84) units and needs 104 KB of the 99 KB it
+// may opt into. A partial stage keeps the fused path (~4x per timestep over the
+// per-step loop) instead of losing it to a 5% overshoot. The tail is re-read T times
+// off a working set of a couple of MB, so it comes out of L2, not HBM.
+//
+// FUSED_RS == FUSED_HP is the ordinary case and compiles the tail away entirely.
+#define FUSED_RS SLSTM_RS
+#define FUSED_TAIL (FUSED_HP - FUSED_RS)
+#define FUSED_SPASSES (FUSED_RS / FUSED_RPP)
+#define FUSED_TPASSES (FUSED_TAIL / FUSED_RPP)
 
 // Load a lane's slice of `src` (bf16, FUSED_HP-strided) into `dst` fp32 registers.
 __device__ __forceinline__ void fused_load_slice(float* dst, const __nv_bfloat16* src,
@@ -85,7 +103,7 @@ __device__ __forceinline__ void fused_load_slice(float* dst, const __nv_bfloat16
 extern "C" __global__ void slstm_fused_time(
         const float* __restrict__ wh, float* g, const float* __restrict__ bcat,
         slab_t* h_prev, float* c_state, float* n_state, float* m_state, float* h_state,
-        float* hmir, float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
+        float* hmir, float* wtail, float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
         float* i_prime, float* f_prime, float* c_out, float* n_out,
         float* out, int T, int units_per_block, int carry) {
     extern __shared__ __align__(16) float smem[];
@@ -103,9 +121,12 @@ extern "C" __global__ void slstm_fused_time(
     // Shared: this block's Wh columns, then the fp32 gate scratch the recurrence
     // consumes. The gate scratch stays wide — it is an accumulator.
     __nv_bfloat16* wsh = (__nv_bfloat16*)smem;
-    float* gacc = (float*)(wsh + (long long)ncol * FUSED_HP);
+    float* gacc = (float*)(wsh + (long long)ncol * FUSED_RS);
+    // The tail of every Wh column, indexed by the GLOBAL column so blocks never
+    // overlap. Unused, and never read, when FUSED_TAIL is zero.
+    __nv_bfloat16* wtl = (__nv_bfloat16*)wtail;
 
-    // Stage the Wh slice, once for all T, TRANSPOSED: wsh[c * HP + r], i.e. column-
+    // Stage the Wh slice, once for all T, TRANSPOSED: wsh[c * RS + r], i.e. column-
     // major so one column is contiguous and a lane's 8 rows are one 128-bit access.
     // Local column c in [0, 4*nj) maps to gate g = c / nj and unit j = j0 + c % nj,
     // i.e. global Wh column g * H + j. The traversal is row-major so the strided
@@ -114,9 +135,17 @@ extern "C" __global__ void slstm_fused_time(
     for (int i = threadIdx.x; i < FUSED_HP * ncol; i += blockDim.x) {
         int r = i / ncol, c = i - r * ncol;
         int gidx = c / nj, j = j0 + (c - gidx * nj);
-        wsh[(long long)c * FUSED_HP + r] =
+        __nv_bfloat16 v =
             (r < FUSED_H) ? __float2bfloat16(wh[(long long)r * H4 + gidx * FUSED_H + j])
                           : bzero;
+        if (r < FUSED_RS) {
+            wsh[(long long)c * FUSED_RS + r] = v;
+        }
+#if FUSED_TPASSES > 0
+        else {
+            wtl[(long long)(gidx * FUSED_H + j) * FUSED_TAIL + (r - FUSED_RS)] = v;
+        }
+#endif
     }
 
     // The bf16 mirror of h the reduction reads: TWO [B, HP] planes packed into the
@@ -198,10 +227,10 @@ extern "C" __global__ void slstm_fused_time(
             float hr[FUSED_HSLICE];
             fused_load_slice(hr, hb_cur + (long long)b * FUSED_HP, lane);
             for (int c = warp; c < ncol; c += warps) {
-                const __nv_bfloat16* wcol = wsh + (long long)c * FUSED_HP + lane * FUSED_RPL;
+                const __nv_bfloat16* wcol = wsh + (long long)c * FUSED_RS + lane * FUSED_RPL;
                 float acc = 0.0f;
                 #pragma unroll
-                for (int p = 0; p < FUSED_PASSES; ++p) {
+                for (int p = 0; p < FUSED_SPASSES; ++p) {
                     bf16x8 v;
                     v.raw = *(const int4*)(wcol + p * FUSED_RPP);
                     #pragma unroll
@@ -211,6 +240,26 @@ extern "C" __global__ void slstm_fused_time(
                         acc = fmaf(hr[p * FUSED_RPL + 2 * q + 1], f.y, acc);
                     }
                 }
+#if FUSED_TPASSES > 0
+                // Same access shape against the global tail: 128 bits per lane, one
+                // column contiguous. Read T times off a working set that stays in L2.
+                const int gidx_t = c / nj;
+                const __nv_bfloat16* wtc =
+                    wtl + (long long)(gidx_t * FUSED_H + j0 + (c - gidx_t * nj)) * FUSED_TAIL
+                        + lane * FUSED_RPL;
+                #pragma unroll
+                for (int p = 0; p < FUSED_TPASSES; ++p) {
+                    bf16x8 v;
+                    v.raw = *(const int4*)(wtc + p * FUSED_RPP);
+                    const int hb0 = (FUSED_SPASSES + p) * FUSED_RPL;
+                    #pragma unroll
+                    for (int q = 0; q < FUSED_RPL / 2; ++q) {
+                        float2 f = __bfloat1622float2(v.pair[q]);
+                        acc = fmaf(hr[hb0 + 2 * q], f.x, acc);
+                        acc = fmaf(hr[hb0 + 2 * q + 1], f.y, acc);
+                    }
+                }
+#endif
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
                 // Block-local staging: the pointwise phase below consumes these
@@ -268,7 +317,7 @@ extern "C" __global__ void slstm_fused_time(
     }
 }
 
-#endif // SLSTM_H && SLSTM_B
+#endif // SLSTM_H && SLSTM_B && SLSTM_RS
 
 // Time-fused sLSTM BACKWARD: the whole reverse T-loop in ONE cooperative launch,
 // the mirror of slstm_fused_time.

@@ -39,9 +39,8 @@ fn main() {
         print!("{:>6}", h);
         for b in bs {
             match ops::slstm_fused_time_geometry(&gpu, h, b) {
-                Some((blocks, _threads, cpb, smem)) => {
-                    let _ = cpb;
-                    print!("{:>12}", format!("{}bl/{}K", blocks, smem / 1024));
+                Some((blocks, _threads, _cpb, rows, smem)) => {
+                    print!("{:>12}", format!("{}bl/{}K/{}r", blocks, smem / 1024, rows));
                 }
                 None => print!("{:>12}", "DECLINE"),
             }
