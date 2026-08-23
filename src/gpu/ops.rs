@@ -442,10 +442,10 @@ pub fn matmul_bf16_bias_into(
 
 /// One bf16 copy of an activation that several layers read.
 ///
-/// mLSTM hands the same `xf` to six projections, and the same `xf` again to their six
-/// backwards. Each `Linear` owns a private [`GemmBf16`], so none can see the others'
-/// staged copy and the tensor is narrowed twelve times per cell. This holds the single
-/// narrowed copy; the layers take it through [`Linear::forward_staged`] and
+/// mLSTM hands the same `xf` to three projections, and the same `xf` again to their
+/// three backwards. Each `Linear` owns a private [`GemmBf16`], so none can see the
+/// others' staged copy and the tensor is narrowed six times per cell. This holds the
+/// single narrowed copy; the layers take it through [`Linear::forward_staged`] and
 /// [`Linear::backward_staged_x`].
 ///
 /// It is **scratch**, live only within one cell's forward or backward. Blocks run
@@ -1713,36 +1713,6 @@ pub fn softmax_cross_entropy(gpu: &Gpu, logits: &DTensor, targets: &[usize]) -> 
     (loss, dlogits)
 }
 
-/// One AdamW step of `param` from `grad`, updating moments `m`/`v` in place.
-/// `decay` toggles the decoupled weight-decay term. Mirrors `nn2::optim`.
-/// Most parameter tensors one batched AdamW launch can carry. Must match
-/// `ADAMW_BATCH_MAX` in `common.cu`.
-pub const ADAMW_BATCH_MAX: usize = 24;
-
-/// Kernel-argument twin of `AdamwBatch` in `common.cu`. Passed by value, so field
-/// order and types must match the `.cu` definition exactly.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct AdamwBatchArg {
-    param: [u64; ADAMW_BATCH_MAX],
-    grad: [u64; ADAMW_BATCH_MAX],
-    m: [u64; ADAMW_BATCH_MAX],
-    v: [u64; ADAMW_BATCH_MAX],
-    wd: [f32; ADAMW_BATCH_MAX],
-    off: [i32; ADAMW_BATCH_MAX + 1],
-    n: i32,
-}
-
-// SAFETY: plain-old-data — pointers and scalars — passed by value as a kernel
-// argument exactly as `cudarc` does for the scalar types.
-unsafe impl cudarc::driver::DeviceRepr for AdamwBatchArg {}
-
-/// `GPU_NO_ADAMW_BATCH=1` steps each parameter tensor with its own `adamw` launch.
-pub fn no_adamw_batch() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("GPU_NO_ADAMW_BATCH").is_ok_and(|v| v != "0"))
-}
-
 /// `MLSTM_HEAD_MAJOR=1` gathers q/k/v head-major before the fused kernels instead of
 /// striding over the projection output where it lies.
 ///
@@ -1755,151 +1725,11 @@ pub fn mlstm_head_major() -> bool {
     *ON.get_or_init(|| std::env::var("MLSTM_HEAD_MAJOR").is_ok_and(|v| v != "0"))
 }
 
-/// Collects AdamW updates and issues them a batch at a time.
+/// One AdamW step of `param` from `grad`, updating moments `m`/`v` in place.
+/// `decay` toggles the decoupled weight-decay term. Mirrors `nn2::optim`.
 ///
-/// One `adamw` launch per parameter tensor is ~11 us of mostly launch overhead for
-/// tensors far too small to fill the GPU. Layers push their tensors here instead and
-/// the model flushes once, turning hundreds of launches into a handful.
-///
-/// This holds raw device pointers rather than `&mut DTensor` because the tensors
-/// live in different layers all over the model, so no single `&mut` can span them.
-/// The contract the caller must keep: every queued tensor stays alive and is not
-/// reallocated until [`flush`](Self::flush), and no tensor is queued twice in a step
-/// (a duplicate would race with itself).
-///
-/// The pointer guards `device_ptr` returns are dropped immediately rather than held.
-/// Under `disable_event_tracking` (see `Gpu::new`) they are `SyncOnDrop::Record(None)`
-/// — a no-op — and the buffers are owned by the model for the whole step, so there is
-/// nothing for them to order.
-#[derive(Default)]
-pub struct AdamwQueue {
-    param: Vec<u64>,
-    grad: Vec<u64>,
-    m: Vec<u64>,
-    v: Vec<u64>,
-    wd: Vec<f32>,
-    len: Vec<usize>,
-}
-
-impl AdamwQueue {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Queue one tensor's update. `decay` follows the project convention: interior
-    /// projections decay, embeddings and logit heads do not.
-    pub fn push(
-        &mut self,
-        gpu: &Gpu,
-        param: &mut DTensor,
-        grad: &DTensor,
-        mm: &mut DTensor,
-        vv: &mut DTensor,
-        cfg: &AdamCfg,
-        decay: bool,
-    ) {
-        use cudarc::driver::{DevicePtr, DevicePtrMut};
-        let n = param.len();
-        debug_assert_eq!(grad.len(), n, "AdamwQueue: grad length != param length");
-        let (pp, _g0) = param.buf.device_ptr_mut(&gpu.stream);
-        let (pg, _g1) = grad.buf.device_ptr(&gpu.stream);
-        let (pm, _g2) = mm.buf.device_ptr_mut(&gpu.stream);
-        let (pv, _g3) = vv.buf.device_ptr_mut(&gpu.stream);
-        self.param.push(pp);
-        self.grad.push(pg);
-        self.m.push(pm);
-        self.v.push(pv);
-        self.wd.push(if decay { cfg.weight_decay } else { 0.0 });
-        self.len.push(n);
-    }
-
-    /// Issue every queued update, `ADAMW_BATCH_MAX` tensors per launch, then zero
-    /// every queued gradient.
-    ///
-    /// Zeroing belongs here, not at the push site: a queued update has not read the
-    /// gradient yet, so a layer that cleared its own grads at queue time would feed
-    /// zeros to the kernel. Doing it here makes that ordering impossible to get wrong
-    /// — and the memsets batch into the same pass.
-    pub fn flush(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        let bc1 = 1.0 - cfg.beta1.powi(cfg.t as i32);
-        let bc2 = 1.0 - cfg.beta2.powi(cfg.t as i32);
-        let (lr, b1, b2, eps) = (cfg.lr, cfg.beta1, cfg.beta2, cfg.eps);
-        let f = gpu.kernels.get("adamw_batch");
-
-        for chunk in (0..self.param.len())
-            .collect::<Vec<_>>()
-            .chunks(ADAMW_BATCH_MAX)
-        {
-            let mut a = AdamwBatchArg {
-                param: [0; ADAMW_BATCH_MAX],
-                grad: [0; ADAMW_BATCH_MAX],
-                m: [0; ADAMW_BATCH_MAX],
-                v: [0; ADAMW_BATCH_MAX],
-                wd: [0.0; ADAMW_BATCH_MAX],
-                off: [0; ADAMW_BATCH_MAX + 1],
-                n: chunk.len() as i32,
-            };
-            let mut total = 0usize;
-            for (slot, &i) in chunk.iter().enumerate() {
-                a.param[slot] = self.param[i];
-                a.grad[slot] = self.grad[i];
-                a.m[slot] = self.m[i];
-                a.v[slot] = self.v[i];
-                a.wd[slot] = self.wd[i];
-                a.off[slot] = total as i32;
-                total += self.len[i];
-            }
-            a.off[chunk.len()] = total as i32;
-            let total_i = total as i32;
-            let mut lb = gpu.stream.launch_builder(&f);
-            lb.arg(&a)
-                .arg(&lr)
-                .arg(&b1)
-                .arg(&b2)
-                .arg(&eps)
-                .arg(&bc1)
-                .arg(&bc2)
-                .arg(&total_i);
-            unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("adamw_batch");
-        }
-
-        // Clear the gradients now that every queued update has consumed them.
-        for (&g, &n) in self.grad.iter().zip(self.len.iter()) {
-            // SAFETY: `g` is a live device allocation of at least `n` floats (it was
-            // read from a `DTensor` of that length above and the caller guarantees it
-            // is still alive), and the memset is queued on the same stream as the
-            // launches that just read it, so it cannot run early.
-            unsafe {
-                let r = cudarc::driver::sys::cuMemsetD8Async(
-                    g,
-                    0,
-                    n * std::mem::size_of::<f32>(),
-                    gpu.stream.cu_stream(),
-                );
-                assert_eq!(
-                    r,
-                    cudarc::driver::sys::CUresult::CUDA_SUCCESS,
-                    "AdamwQueue: zeroing gradient failed: {r:?}"
-                );
-            }
-        }
-        self.clear();
-    }
-
-    fn clear(&mut self) {
-        self.param.clear();
-        self.grad.clear();
-        self.m.clear();
-        self.v.clear();
-        self.wd.clear();
-        self.len.clear();
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.param.is_empty()
-    }
-}
-
+/// Per tensor: a whole model steps its `ParamArena` in one launch instead (see
+/// `gpu::arena`), and this is what a standalone layer and the parity tests use.
 pub fn adamw(
     gpu: &Gpu,
     param: &mut DTensor,
@@ -4379,11 +4209,12 @@ impl MlstmShape {
 
 pub fn mlstm_fused_fw(
     gpu: &Gpu,
-    qh: &SlabBuf,  // [B*T, H*dqk]  bf16 storage (reference: matQ at DTYPE)
-    kh: &SlabBuf,  // [B*T, H*dqk]  bf16, already scaled by 1/√dqk
-    vh: &SlabBuf,  // [B*T, H*dhv]  bf16 (matV)
-    igh: &DTensor, // [B*T, H]      fp32: gate logit (reference pins vecI)
-    fgh: &DTensor, // [B*T, H]      fp32: gate logit (vecB is fp32 too)
+    // q ‖ k ‖ v, `[B*T, H*(2*dqk + dhv)]`, bf16 storage (reference: matQ/matK/matV at
+    // DTYPE, concatenated as its fused `qkv_opreact`). k carries the 1/√dqk already.
+    xh: &SlabBuf,
+    // ĩ ‖ f̃, `[B*T, 2*H]`, fp32: gate logits (the reference pins vecI/vecB to fp32
+    // too) from one `ifgate_preact` projection.
+    gates: &DTensor,
     l: usize,
     // State this call continues from, or `None` to start the recurrence at zero.
     carry_in: Option<&MlstmState>,
@@ -4431,8 +4262,7 @@ pub fn mlstm_fused_fw(
     let mut gvec = DTensor::uninit(gpu, &[bh, nc]);
     let f = gpu.kernels.get("mlstm_fw_gates");
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&fgh.buf)
-        .arg(&igh.buf)
+    lb.arg(&gates.buf)
         .arg(&mut fcb.buf)
         .arg(&mut avec.buf)
         .arg(&mut gvec.buf)
@@ -4465,8 +4295,7 @@ pub fn mlstm_fused_fw(
         },
     );
     let mut lb = gpu.stream.launch_builder(&f);
-    push_slab_ref!(lb, *kh);
-    push_slab_ref!(lb, *vh);
+    push_slab_ref!(lb, *xh);
     lb.arg(&avec.buf)
         .arg(&mut cst.buf)
         .arg(&mut nst.buf)
@@ -4499,10 +4328,8 @@ pub fn mlstm_fused_fw(
         },
     );
     let mut lb = gpu.stream.launch_builder(&f);
-    push_slab_ref!(lb, *qh);
-    push_slab_ref!(lb, *kh);
-    push_slab_ref!(lb, *vh);
-    lb.arg(&igh.buf)
+    push_slab_ref!(lb, *xh);
+    lb.arg(&gates.buf)
         .arg(&fcb.buf)
         .arg(&cst.buf)
         .arg(&nst.buf)
@@ -4539,18 +4366,15 @@ pub fn mlstm_fused_fw(
 /// Chunkwise backward: `mlstm_bw_dqn` → `mlstm_bw_dC` → `mlstm_state_scan` (REV) →
 /// `mlstm_bw_parallel` — the mirror of [`mlstm_fused_fw`], launch for launch.
 ///
-/// Returns `(dq, dk, dv, dig, dfg, dstate)` — the grads position-major like the
-/// inputs, plus the BPTT state to hand to the chunk on the left (see
-/// [`MlstmDState`]).
+/// Returns `(dqkv, dgates, dstate)` — the grads laid out exactly like the inputs
+/// they belong to, so each feeds its projection's backward whole, plus the BPTT
+/// state to hand to the chunk on the left (see [`MlstmDState`]).
 #[allow(clippy::too_many_arguments)]
 pub fn mlstm_fused_bw(
     gpu: &Gpu,
     sv: &MlstmFused,
-    qh: &SlabBuf,
-    kh: &SlabBuf,
-    vh: &SlabBuf,
-    igh: &DTensor,
-    fgh: &DTensor,
+    xh: &SlabBuf,
+    gates: &DTensor,
     // The incoming gradient is fp32: it is a transient, not a saved tensor, so
     // narrowing it would buy no memory. (The reference does cast matDeltaH to
     // DTYPE, but only to feed its tensor cores, which is where the kernels narrow
@@ -4560,7 +4384,7 @@ pub fn mlstm_fused_bw(
     // chunk (and for an unchunked call), where it is zero.
     carry_in: Option<&MlstmDState>,
     st: MlstmShape,
-) -> (DTensor, DTensor, DTensor, DTensor, DTensor, MlstmDState) {
+) -> (DTensor, DTensor, MlstmDState) {
     let (bh, t, dqk, dhv) = (st.b * st.h, st.t, st.dqk, st.dhv);
     let (l, nc) = (sv.l, sv.nc);
     let h_i = st.h as i32;
@@ -4622,7 +4446,7 @@ pub fn mlstm_fused_bw(
         },
     );
     let mut lb = gpu.stream.launch_builder(&f);
-    push_slab_ref!(lb, *qh);
+    push_slab_ref!(lb, *xh);
     lb.arg(&d_ytil.buf)
         .arg(&sv.psiv.buf)
         .arg(&dqnv.buf)
@@ -4647,14 +4471,12 @@ pub fn mlstm_fused_bw(
         state_scan(gpu, &mut dcst, &mut dnst, &sv.gvec, bh, nc, dqk, dhv, true);
     }
 
-    // Shaped as the kernel writes them — position-major, exactly as the projections
-    // laid out q/k/v — so the caller needs no scatter pass.
+    // Shaped as the kernel writes them — position-major and concatenated, exactly as
+    // the two projections laid out their outputs — so the caller needs neither a
+    // scatter pass nor a per-part backward.
     let n = st.b * t;
-    let mut dq = DTensor::uninit(gpu, &[n, st.h * dqk]);
-    let mut dk = DTensor::uninit(gpu, &[n, st.h * dqk]);
-    let mut dv = DTensor::uninit(gpu, &[n, st.h * dhv]);
-    let mut dig = DTensor::uninit(gpu, &[n, st.h]);
-    let mut dfg = DTensor::uninit(gpu, &[n, st.h]);
+    let mut dxh = DTensor::uninit(gpu, &[n, st.h * (2 * dqk + dhv)]);
+    let mut dgates = DTensor::uninit(gpu, &[n, 2 * st.h]);
 
     let par_threads = parallel_threads(bw_parallel_warps(l, dqk, dhv));
     let (f, smem) = fused_kernel_spec(
@@ -4667,11 +4489,8 @@ pub fn mlstm_fused_bw(
         },
     );
     let mut lb = gpu.stream.launch_builder(&f);
-    push_slab_ref!(lb, *qh);
-    push_slab_ref!(lb, *kh);
-    push_slab_ref!(lb, *vh);
-    lb.arg(&igh.buf)
-        .arg(&fgh.buf)
+    push_slab_ref!(lb, *xh);
+    lb.arg(&gates.buf)
         .arg(&sv.fcb.buf)
         .arg(&sv.cst.buf)
         .arg(&sv.nst.buf)
@@ -4682,11 +4501,8 @@ pub fn mlstm_fused_bw(
         .arg(&sv.psiv.buf)
         .arg(&dqnv.buf)
         .arg(&sv.msv.buf)
-        .arg(&mut dq.buf)
-        .arg(&mut dk.buf)
-        .arg(&mut dv.buf)
-        .arg(&mut dig.buf)
-        .arg(&mut dfg.buf)
+        .arg(&mut dxh.buf)
+        .arg(&mut dgates.buf)
         .arg(&t_i)
         .arg(&l_i)
         .arg(&nc_i)
@@ -4703,7 +4519,7 @@ pub fn mlstm_fused_bw(
         dc: read_state_slot_n(gpu, &dcst, bh, nc + 1, 0, dhv * dqk),
         dn: read_state_slot_n(gpu, &dnst, bh, nc + 1, 0, dqk),
     };
-    (dq, dk, dv, dig, dfg, dstate)
+    (dxh, dgates, dstate)
 }
 
 #[cfg(test)]
@@ -4715,89 +4531,6 @@ mod tests {
         assert_eq!(got.len(), want.len(), "length mismatch");
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
             assert!((g - w).abs() < 1e-3, "index {i}: gpu {g} vs cpu {w}");
-        }
-    }
-
-    /// A queued+flushed AdamW must leave params, moments and grads exactly where the
-    /// per-tensor `adamw` leaves them.
-    ///
-    /// Tensor sizes are deliberately uneven and the decay flags mixed, so the
-    /// kernel's per-slot offset search and per-slot `wd` are both exercised — a
-    /// kernel that used slot 0's `wd` for every slot would pass a uniform test.
-    #[test]
-    fn adamw_batch_matches_per_tensor_adamw() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        let sizes = [1usize, 17, 256, 1000, 4096];
-        let decays = [true, false, true, true, false];
-        let mk = |seed: f32, n: usize| {
-            let d: Vec<f32> = (0..n).map(|i| (i as f32 * 0.19 + seed).sin()).collect();
-            DTensor::from_host(&gpu, &Tensor::new(&[n], d))
-        };
-        // The second moment is a running mean of squares, so it is non-negative by
-        // construction; seeding it from `sin` would put `sqrt` on negative input.
-        let mk_v = |seed: f32, n: usize| {
-            let d: Vec<f32> = (0..n)
-                .map(|i| ((i as f32 * 0.19 + seed).sin()).abs())
-                .collect();
-            DTensor::from_host(&gpu, &Tensor::new(&[n], d))
-        };
-        // lr·wd must be large enough for a wrong per-slot `wd` to exceed the 1e-3
-        // comparison tolerance — at the production 1e-3/0.05 the decay term is 5e-5
-        // and a kernel using slot 0's `wd` everywhere would pass unnoticed.
-        let cfg = AdamCfg {
-            t: 3,
-            ..AdamCfg::new(0.5, 0.5)
-        };
-
-        let mut fast: Vec<_> = sizes
-            .iter()
-            .enumerate()
-            .map(|(k, &n)| {
-                (
-                    mk(k as f32, n),
-                    mk(k as f32 + 10.0, n),
-                    mk(k as f32 + 20.0, n),
-                    mk_v(k as f32 + 30.0, n),
-                )
-            })
-            .collect();
-        let mut slow: Vec<_> = sizes
-            .iter()
-            .enumerate()
-            .map(|(k, &n)| {
-                (
-                    mk(k as f32, n),
-                    mk(k as f32 + 10.0, n),
-                    mk(k as f32 + 20.0, n),
-                    mk_v(k as f32 + 30.0, n),
-                )
-            })
-            .collect();
-
-        let mut q = AdamwQueue::new();
-        for (i, (p, g, m, v)) in fast.iter_mut().enumerate() {
-            q.push(&gpu, p, g, m, v, &cfg, decays[i]);
-        }
-        q.flush(&gpu, &cfg);
-
-        for (i, (p, g, m, v)) in slow.iter_mut().enumerate() {
-            adamw(&gpu, p, g, m, v, &cfg, decays[i]);
-            g.zero_(&gpu);
-        }
-
-        for (i, ((pf, gf, mf, vf), (ps, gs, ms, vs))) in fast.iter().zip(slow.iter()).enumerate() {
-            assert_close(&pf.to_host(&gpu).data, &ps.to_host(&gpu).data);
-            assert_close(&mf.to_host(&gpu).data, &ms.to_host(&gpu).data);
-            assert_close(&vf.to_host(&gpu).data, &vs.to_host(&gpu).data);
-            // Both paths must leave the gradient zeroed.
-            let gd = gf.to_host(&gpu).data;
-            assert!(
-                gd.iter().all(|x| *x == 0.0),
-                "tensor {i}: queued grad not zeroed"
-            );
-            assert_close(&gd, &gs.to_host(&gpu).data);
         }
     }
 

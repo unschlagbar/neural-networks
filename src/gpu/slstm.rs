@@ -53,6 +53,7 @@
 //! never per step. Gate order stays z=0, i=1, f=2, o=3: the column blocks of the
 //! fused `[·, 4H]`, with the input rows above the recurrent rows in `[rows, H]`.
 
+use super::arena::{self, ParamKind, ParamSlot};
 use super::block::phase;
 use super::ops::{self, SlabBuf, SlstmSlabs};
 use super::rms_norm::RmsNorm;
@@ -1041,22 +1042,55 @@ impl SLstm {
         }
     }
 
-    /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
-    /// The post-cell norm's γ comes last, where the enclosing block used to emit it.
-    pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
+    /// Every parameter with its gradient and AdamW moments. The gate matrices decay,
+    /// the fused bias does not; the post-cell norm's γ comes last, where the enclosing
+    /// block used to emit it.
+    ///
+    /// AdamW is elementwise, so stepping the fused `[in, 4H]` / `[H, 4H]` operands is
+    /// numerically identical to stepping the four `[rows, H]` gate matrices they hold
+    /// — the decay split that matters is weights vs. bias, and that survives the
+    /// fusion because `bcat` is still its own tensor.
+    pub fn param_slots(&mut self) -> Vec<ParamSlot<'_>> {
         // The caller gets a mutable handle on `wx` (checkpoint load overwrites it), so
         // the cached bf16 copy must be assumed stale from here on.
         self.gemm_x.invalidate_w();
         self.gemm_dx.invalidate_w();
         self.gemm_h.invalidate_w();
-        let mut v = vec![&mut self.wx, &mut self.whr, &mut self.bcat];
-        v.extend(self.post_norm.params_mut());
+        let mut v = vec![
+            ParamSlot::new(
+                &mut self.wx,
+                &mut self.dwx,
+                &mut self.mwx,
+                &mut self.vwx,
+                ParamKind::Decay,
+            ),
+            ParamSlot::new(
+                &mut self.whr,
+                &mut self.dwhr,
+                &mut self.mwhr,
+                &mut self.vwhr,
+                ParamKind::Decay,
+            ),
+            ParamSlot::new(
+                &mut self.bcat,
+                &mut self.dbcat,
+                &mut self.mbcat,
+                &mut self.vbcat,
+                ParamKind::NoDecay,
+            ),
+        ];
+        v.extend(self.post_norm.param_slots());
         v
     }
 
+    /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
+    pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
+        self.param_slots().into_iter().map(|s| s.param).collect()
+    }
+
     /// Gradient accumulators, in the same order as `params_mut`. Diagnostic.
-    pub fn grads(&self) -> Vec<&DTensor> {
-        vec![&self.dwx, &self.dwhr, &self.dbcat, &self.post_norm.dgamma]
+    pub fn grads(&mut self) -> Vec<&DTensor> {
+        self.param_slots().into_iter().map(|s| &*s.grad).collect()
     }
 
     /// Forward-cache extremes of the last sweep: `(min |n|, max |c|, max |c/n|)`.
@@ -1277,60 +1311,10 @@ impl SLstm {
         self.post_norm.zero_grad(gpu);
     }
 
-    /// AdamW step: gate matrices decay, biases don't. Clears the grads.
-    ///
-    /// AdamW is elementwise, so stepping the fused `[in, 4H]` / `[H, 4H]` operands is
-    /// numerically identical to stepping the four `[rows, H]` gate matrices they hold
-    /// — the decay/no-decay split that actually matters is weights vs. bias, and that
-    /// survives the fusion because `bcat` is still its own tensor.
+    /// AdamW over this cell's own parameters, then clear the grads. A model steps
+    /// its whole `ParamArena` in one launch instead.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        self.step_q(gpu, cfg, None);
-    }
-
-    /// [`step`](Self::step), optionally queueing instead of launching.
-    pub fn step_q(&mut self, gpu: &Gpu, cfg: &AdamCfg, q: Option<&mut ops::AdamwQueue>) {
-        // `wx` is about to change, so the cached bf16 copy the whole-sequence GEMMs
-        // read is stale. Missing this shows up as training silently not learning.
-        self.gemm_x.invalidate_w();
-        self.gemm_dx.invalidate_w();
-        self.gemm_h.invalidate_w();
-        if let Some(q) = q {
-            q.push(gpu, &mut self.wx, &self.dwx, &mut self.mwx, &mut self.vwx, cfg, true);
-            q.push(gpu, &mut self.whr, &self.dwhr, &mut self.mwhr, &mut self.vwhr, cfg, true);
-            q.push(gpu, &mut self.bcat, &self.dbcat, &mut self.mbcat, &mut self.vbcat, cfg, false);
-            self.post_norm.step_q(gpu, cfg, Some(q));
-            return;
-        }
-        ops::adamw(
-            gpu,
-            &mut self.wx,
-            &self.dwx,
-            &mut self.mwx,
-            &mut self.vwx,
-            cfg,
-            true,
-        );
-        ops::adamw(
-            gpu,
-            &mut self.whr,
-            &self.dwhr,
-            &mut self.mwhr,
-            &mut self.vwhr,
-            cfg,
-            true,
-        );
-        ops::adamw(
-            gpu,
-            &mut self.bcat,
-            &self.dbcat,
-            &mut self.mbcat,
-            &mut self.vbcat,
-            cfg,
-            false,
-        );
-        // Before `zero_grad` below, which would otherwise clear dγ unstepped.
-        self.post_norm.step(gpu, cfg);
-        self.zero_grad(gpu);
+        arena::step_slots(gpu, &mut self.param_slots(), cfg);
     }
 }
 

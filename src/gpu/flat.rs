@@ -82,6 +82,7 @@ impl Flat {
                 // fp32: feeds the softmax/CE directly. See `gpu::lm`.
                 let mut h = Linear::from_parts(gpu, head_w, head_b);
                 h.set_fp32();
+                h.set_no_decay();
                 h
             },
             cap,
@@ -147,7 +148,7 @@ impl Flat {
             false,
         );
         self.dgamma.zero_(gpu);
-        self.head.step_wd(gpu, cfg, false);
+        self.head.step(gpu, cfg);
     }
 
     /// Convenience: one full train step, returning the mean CE loss.

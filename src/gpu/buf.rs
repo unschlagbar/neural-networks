@@ -334,6 +334,8 @@ impl Pool {
             self.lent > 0,
             "Pool::put of a buffer this pool never lent — see the note on `put`"
         );
+        // A parameter window would hand out the model's own weights as scratch.
+        debug_assert!(t.buf.is_owned(), "Pool::put of an arena window");
         self.lent = self.lent.saturating_sub(1);
         // File under the ALLOCATION size, not the shape it was last used at — a
         // buffer handed out shrunk still owns its full capacity.

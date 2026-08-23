@@ -59,7 +59,7 @@ const NAMES: &[&str] = &[
     "rms_norm_backward",
     "softmax_ce",
     "adamw",
-    "adamw_batch",
+    "adamw_arena",
     "concat_xh",
     "split_dxh",
     "slstm_cell_step",

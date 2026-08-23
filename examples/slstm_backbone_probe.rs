@@ -122,7 +122,7 @@ fn main() {
         if steps == 0 {
             let loss = model.forward_backward(&gpu, &tokens, &words);
             println!("loss {loss:.4}");
-            report(&model, &gpu);
+            report(&mut model, &gpu);
             continue;
         }
 
@@ -176,7 +176,7 @@ fn main() {
     }
 }
 
-fn report(model: &Hierarchical, gpu: &Gpu) {
+fn report(model: &mut Hierarchical, gpu: &Gpu) {
     for (i, gn) in model
         .grad_norms_by_block(gpu, "backbone")
         .iter()

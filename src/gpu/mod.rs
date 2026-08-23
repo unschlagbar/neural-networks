@@ -19,6 +19,7 @@ use cudarc::cublaslt::CudaBlasLT;
 use cudarc::cublas::sys::{cublasMath_t, cublasSetMathMode};
 use cudarc::driver::{CudaContext, CudaStream};
 
+pub mod arena;
 pub mod bf16;
 pub mod block;
 pub mod buf;
@@ -35,6 +36,7 @@ pub mod rms_norm;
 pub mod slstm;
 pub mod train;
 
+pub use arena::{ParamArena, ParamKind, ParamSlot};
 pub use bf16::{BTensor, Slab};
 pub use buf::{Buf, Pool};
 pub use dtensor::DTensor;
@@ -307,6 +309,28 @@ pub fn pool_used_mb() -> Option<f64> {
         .ok()?;
     }
     Some(v as f64 / (1024.0 * 1024.0))
+}
+
+/// Hand every cached-but-unused block in the async pool back to the driver.
+///
+/// The pool keeps freed blocks reserved for reuse, which is what makes it fast and
+/// what makes `mem_get_info` useless for capacity questions. That cache is normally
+/// harmless — but a process that drops one whole model and builds another (a probe
+/// sweeping window shapes, not the training loop) is asking for memory the pool is
+/// still sitting on, and the second allocation fails while the first model's cache
+/// is idle. Costs a synchronize: freeing is stream-ordered, so blocks only become
+/// trimmable once the queued frees have actually run.
+pub fn trim_pool(gpu: &Gpu) {
+    gpu.stream.synchronize().expect("sync before trim");
+    unsafe {
+        let Ok(dev) = cudarc::driver::result::device::get(0) else {
+            return;
+        };
+        let Ok(pool) = cudarc::driver::result::device::get_default_mem_pool(dev) else {
+            return;
+        };
+        let _ = cudarc::driver::result::mem_pool::trim_to(pool, 0);
+    }
 }
 
 #[cfg(test)]

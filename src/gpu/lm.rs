@@ -142,7 +142,7 @@ impl Lm {
             blk.step(gpu, cfg);
         }
         self.norm.step(gpu, cfg);
-        self.head.step_wd(gpu, cfg, false);
+        self.head.step(gpu, cfg);
     }
 
     /// One full training step; returns the mean CE loss.

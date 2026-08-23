@@ -1,5 +1,5 @@
-//! A device-resident tensor: the shape metadata of a host [`Tensor`] plus a
-//! `CudaSlice<f32>` living in GPU memory.
+//! A device-resident tensor: the shape metadata of a host [`Tensor`] plus a [`DBuf`]
+//! — an `f32` allocation in GPU memory, or a window into one.
 //!
 //! This is the "resident device buffer" of the bring-up plan. Rather than bolt
 //! a `CudaSlice` onto the host `Tensor` (which derives `Clone`/`PartialEq` and
@@ -8,7 +8,14 @@
 //! explicit `from_host` / `to_host` boundaries. Layers will hold `DTensor`s on
 //! the GPU path exactly where they hold `Tensor`s on the CPU path.
 
-use cudarc::driver::CudaSlice;
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+
+use cudarc::driver::{
+    CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceSlice, LaunchArgs, PushKernelArg,
+    SyncOnDrop, sys,
+};
 
 use super::Gpu;
 use crate::tensor::{MAX_RANK, Tensor};
@@ -63,12 +70,132 @@ pub mod ptr_probe {
     }
 }
 
+/// A device allocation, or a non-owning window into a larger one.
+///
+/// Every parameter lives in one contiguous [`ParamArena`](super::arena::ParamArena)
+/// and each layer holds a window into it, so a `DTensor`'s storage is not always its
+/// own. A window is a real `CudaSlice` at an offset inside the arena — freeing it
+/// would hand the driver an interior pointer, so `owned` decides what drop does.
+///
+/// Derefs to `CudaSlice<f32>` and carries the cudarc traits, so a window is passed
+/// to kernels, cuBLAS and the copy helpers exactly like an allocation.
+pub struct DBuf {
+    slice: ManuallyDrop<CudaSlice<f32>>,
+    owned: bool,
+}
+
+impl DBuf {
+    fn owned(slice: CudaSlice<f32>) -> Self {
+        Self {
+            slice: ManuallyDrop::new(slice),
+            owned: true,
+        }
+    }
+
+    /// A window of `len` elements at element offset `off` in `base`.
+    ///
+    /// The caller must keep `base` alive for as long as the window: the arena owns
+    /// the storage and outlives every layer that views it.
+    ///
+    /// Windows of one allocation are independent handles, so they carry no ordering
+    /// between them. That is exactly the contract `Gpu::new` already takes on with
+    /// `disable_event_tracking` — one stream, program order — and re-enabling cudarc's
+    /// event tracking would not extend to them.
+    fn window(gpu: &Gpu, base: &CudaSlice<f32>, off: usize, len: usize) -> Self {
+        assert!(
+            off + len <= base.len(),
+            "window {off}..{} exceeds the {} element arena",
+            off + len,
+            base.len()
+        );
+        let (p, _g) = base.device_ptr(&gpu.stream);
+        let at = p + (off * std::mem::size_of::<f32>()) as u64;
+        // SAFETY: `at` is inside a live allocation with `len` elements after it, and
+        // the arena keeps it mapped; `Drop` below never frees a window.
+        let slice = unsafe { gpu.stream.upgrade_device_ptr::<f32>(at, len) };
+        Self {
+            slice: ManuallyDrop::new(slice),
+            owned: false,
+        }
+    }
+
+    /// Whether this buffer owns its allocation (false for an arena window).
+    #[inline]
+    pub fn is_owned(&self) -> bool {
+        self.owned
+    }
+}
+
+impl Drop for DBuf {
+    fn drop(&mut self) {
+        // SAFETY: the only take, and the field is never read again.
+        let slice = unsafe { ManuallyDrop::take(&mut self.slice) };
+        if !self.owned {
+            // Gives up the handle without freeing what the arena owns.
+            let _ = slice.leak();
+        }
+    }
+}
+
+impl Deref for DBuf {
+    type Target = CudaSlice<f32>;
+    #[inline]
+    fn deref(&self) -> &CudaSlice<f32> {
+        &self.slice
+    }
+}
+
+impl DerefMut for DBuf {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut CudaSlice<f32> {
+        &mut self.slice
+    }
+}
+
+impl DeviceSlice<f32> for DBuf {
+    fn len(&self) -> usize {
+        self.slice.len()
+    }
+    fn stream(&self) -> &Arc<CudaStream> {
+        DeviceSlice::stream(&*self.slice)
+    }
+}
+
+impl DevicePtr<f32> for DBuf {
+    fn device_ptr<'a>(&'a self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
+        self.slice.device_ptr(stream)
+    }
+}
+
+impl DevicePtrMut<f32> for DBuf {
+    fn device_ptr_mut<'a>(
+        &'a mut self,
+        stream: &'a CudaStream,
+    ) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
+        self.slice.device_ptr_mut(stream)
+    }
+}
+
+unsafe impl<'a, 'b: 'a> PushKernelArg<&'b DBuf> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, arg: &'b DBuf) -> &mut Self {
+        PushKernelArg::arg(self, &*arg.slice)
+    }
+}
+
+unsafe impl<'a, 'b: 'a> PushKernelArg<&'b mut DBuf> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, arg: &'b mut DBuf) -> &mut Self {
+        PushKernelArg::arg(self, &mut *arg.slice)
+    }
+}
+
 /// A dense, row-major, contiguous `f32` tensor resident in device memory.
 /// Shape layout mirrors [`Tensor`]: only `shape[..rank]` are meaningful.
 pub struct DTensor {
     pub shape: [usize; MAX_RANK],
     pub rank: usize,
-    pub buf: CudaSlice<f32>,
+    pub buf: DBuf,
 }
 
 impl DTensor {
@@ -78,7 +205,7 @@ impl DTensor {
         Self {
             shape: t.shape,
             rank: t.rank,
-            buf,
+            buf: DBuf::owned(buf),
         }
     }
 
@@ -127,7 +254,27 @@ impl DTensor {
         Self {
             shape,
             rank: dims.len(),
-            buf,
+            buf: DBuf::owned(buf),
+        }
+    }
+
+    /// A tensor of shape `dims` viewing `base` from element offset `off`.
+    ///
+    /// Owns nothing: the storage stays the arena's, and this tensor's device address
+    /// is fixed for as long as the arena lives. See [`super::arena`].
+    pub fn view(gpu: &Gpu, base: &CudaSlice<f32>, off: usize, dims: &[usize]) -> Self {
+        assert!(
+            dims.len() <= MAX_RANK,
+            "rank {} exceeds MAX_RANK",
+            dims.len()
+        );
+        let n: usize = dims.iter().product();
+        let mut shape = [0usize; MAX_RANK];
+        shape[..dims.len()].copy_from_slice(dims);
+        Self {
+            shape,
+            rank: dims.len(),
+            buf: DBuf::window(gpu, base, off, n),
         }
     }
 
@@ -156,7 +303,7 @@ impl DTensor {
         Self {
             shape: self.shape,
             rank: self.rank,
-            buf,
+            buf: DBuf::owned(buf),
         }
     }
 

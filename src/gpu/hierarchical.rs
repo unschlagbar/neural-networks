@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::range::Range;
 
+use super::arena::{ParamArena, ParamKind, ParamSlot};
 use super::block::Block;
 use super::{DTensor, Gpu, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm};
 use crate::format::{Meta, ModelKind, Seen, Writer};
@@ -485,6 +486,12 @@ pub struct Hierarchical {
     pub dec_norm: RmsNorm,                   // HC — the only stage-level norm
     pub dec_head: Linear,                    // HC → vocab
 
+    /// Every parameter, gradient and AdamW moment in four contiguous allocations,
+    /// with each layer above holding windows into them, so every parameter has a
+    /// fixed device address. `None` only while a constructor is still assembling the
+    /// stack — see [`bind_params`](Self::bind_params) and [`super::arena`].
+    arena: Option<ParamArena>,
+
     /// Optimizer step count, persisted with the checkpoint so training resumes.
     pub step_count: usize,
     /// Cumulative chars/words this model has trained on (see `format::Seen`).
@@ -573,6 +580,16 @@ impl Flags {
 
 impl Hierarchical {
     pub fn new(gpu: &Gpu, cfg: ModelCfg) -> Self {
+        let mut model = Self::unbound(gpu, cfg);
+        model.bind_params(gpu);
+        model
+    }
+
+    /// The model with its parameters still in per-tensor allocations.
+    ///
+    /// Only [`load`](Self::load) uses this directly: it swaps whole layers in after
+    /// construction, so it must pack the arena once, afterwards.
+    fn unbound(gpu: &Gpu, cfg: ModelCfg) -> Self {
         let bb_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.bb_blocks)
             .map(|i| {
                 if i.is_multiple_of(8) {
@@ -632,8 +649,10 @@ impl Hierarchical {
                 // many, so keeping it wide costs almost nothing.
                 let mut h = Linear::new_rand(gpu, cfg.hc, cfg.vocab);
                 h.set_fp32();
+                head_optimizer_convention(&mut h);
                 h
             },
+            arena: None,
             step_count: 0,
             seen: Seen::default(),
             flags: Flags::from_env(),
@@ -645,6 +664,18 @@ impl Hierarchical {
         };
         model.enable_backbone_offload(gpu);
         model
+    }
+
+    /// Pack every parameter into one [`ParamArena`], leaving the layers holding
+    /// windows into it.
+    ///
+    /// Called from the constructors, before a forward has allocated anything: packing
+    /// holds one arena buffer alongside the tensors it is replacing, and doing it here
+    /// keeps that transient off the peak instead of stacking it on a window's
+    /// activations.
+    fn bind_params(&mut self, gpu: &Gpu) {
+        let arena = ParamArena::bind(gpu, self.param_slots());
+        self.arena = Some(arena);
     }
 
     /// Park the backbone blocks' saved activations on the host (unless
@@ -1421,21 +1452,34 @@ impl Hierarchical {
     /// Diagnostic for reproducibility: two runs of the same window against the same
     /// weights must produce the same list, and when they do not, this says which
     /// tensor moved. One host round-trip per tensor, so it belongs in a probe.
-    pub fn grad_signature(&self, gpu: &Gpu) -> Vec<(String, u64)> {
+    pub fn grad_signature(&mut self, gpu: &Gpu) -> Vec<(String, u64)> {
         fn hash(v: &[f32]) -> u64 {
             v.iter().fold(0xcbf29ce484222325u64, |h, x| {
                 (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3)
             })
         }
-        let mut out = Vec::new();
-        let mut push = |name: String, g: &DTensor| out.push((name, hash(&g.to_host(gpu).data)));
+        self.grad_values(gpu)
+            .into_iter()
+            .map(|(name, v)| (name, hash(&v)))
+            .collect()
+    }
+
+    /// Every accumulated gradient as host values, named by owner, in the same order
+    /// as [`grad_signature`](Self::grad_signature).
+    ///
+    /// Diagnostic: unlike the hashes this can be summed and compared numerically,
+    /// which is what a gradient-coverage check needs. One host round-trip per
+    /// tensor, so it belongs in a probe.
+    pub fn grad_values(&mut self, gpu: &Gpu) -> Vec<(String, Vec<f32>)> {
+        let mut out: Vec<(String, Vec<f32>)> = Vec::new();
+        let mut push = |name: String, g: &DTensor| out.push((name, g.to_host(gpu).data.to_vec()));
         push("table".into(), &self.dtable);
         for (stage, blocks) in [
-            ("enc", &self.encoder.blocks),
-            ("bb", &self.bb_blocks),
-            ("dec", &self.dec_blocks),
+            ("enc", &mut self.encoder.blocks),
+            ("bb", &mut self.bb_blocks),
+            ("dec", &mut self.dec_blocks),
         ] {
-            for (i, b) in blocks.iter().enumerate() {
+            for (i, b) in blocks.iter_mut().enumerate() {
                 for (j, g) in b.grads().iter().enumerate() {
                     push(format!("{stage}{i}.g{j}"), g);
                 }
@@ -1456,15 +1500,15 @@ impl Hierarchical {
     /// L2 norm of each block's accumulated gradient, for one stage ("encoder",
     /// "backbone", "decoder"). Diagnostic — one host round-trip per tensor, so this
     /// belongs in a probe, not a training loop.
-    pub fn grad_norms_by_block(&self, gpu: &Gpu, stage: &str) -> Vec<f32> {
+    pub fn grad_norms_by_block(&mut self, gpu: &Gpu, stage: &str) -> Vec<f32> {
         let blocks = match stage {
-            "encoder" => &self.encoder.blocks,
-            "backbone" => &self.bb_blocks,
-            "decoder" => &self.dec_blocks,
+            "encoder" => &mut self.encoder.blocks,
+            "backbone" => &mut self.bb_blocks,
+            "decoder" => &mut self.dec_blocks,
             other => panic!("grad_norms_by_block: unknown stage {other}"),
         };
         blocks
-            .iter()
+            .iter_mut()
             .map(|b| {
                 let sq: f32 = b
                     .grads()
@@ -1691,58 +1735,47 @@ impl Hierarchical {
         }
     }
 
-    /// AdamW across every stage. Tied table and the logit head are undecayed;
-    /// interior projections decay (matching the project's optimizer convention).
-    pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        // Every parameter tensor in the model queues its update and one flush issues
-        // them a batch at a time. Stepping eagerly is ~883 launches, most of them a
-        // single block (biases, norm scales), i.e. almost pure launch overhead.
-        // `GPU_NO_ADAMW_BATCH=1` restores the per-tensor path.
-        let mut queue = (!ops::no_adamw_batch()).then(ops::AdamwQueue::new);
-        let mut q = queue.as_mut();
-
-        match q.as_deref_mut() {
-            Some(q) => q.push(
-                gpu,
-                &mut self.table,
-                &self.dtable,
-                &mut self.m_tbl,
-                &mut self.v_tbl,
-                cfg,
-                false,
-            ),
-            None => {
-                ops::adamw(
-                    gpu,
-                    &mut self.table,
-                    &self.dtable,
-                    &mut self.m_tbl,
-                    &mut self.v_tbl,
-                    cfg,
-                    false,
-                );
-                self.dtable.zero_(gpu);
-            }
-        }
+    /// Every parameter with its gradient and AdamW moments, in stage order.
+    ///
+    /// The single enumeration of this model's parameters: the arena binds it, and
+    /// the checkpoint's `params_mut` / the diagnostics' `grads` read it back out.
+    pub fn param_slots(&mut self) -> Vec<ParamSlot<'_>> {
+        // The tied char table feeds the encoder's embedding and the decoder's char
+        // slots; like every embedding-like table it trains undecayed.
+        let mut v = vec![ParamSlot::new(
+            &mut self.table,
+            &mut self.dtable,
+            &mut self.m_tbl,
+            &mut self.v_tbl,
+            ParamKind::NoDecay,
+        )];
         for b in self.encoder.blocks.iter_mut() {
-            b.step_q(gpu, cfg, q.as_deref_mut());
+            v.extend(b.param_slots());
         }
-        self.bb_front.step_wd_q(gpu, cfg, true, q.as_deref_mut());
+        v.extend(self.bb_front.param_slots());
         for b in self.bb_blocks.iter_mut() {
-            b.step_q(gpu, cfg, q.as_deref_mut());
+            v.extend(b.param_slots());
         }
-        self.bb_back.step_wd_q(gpu, cfg, true, q.as_deref_mut());
+        v.extend(self.bb_back.param_slots());
         for b in self.dec_blocks.iter_mut() {
-            b.step_q(gpu, cfg, q.as_deref_mut());
+            v.extend(b.param_slots());
         }
-        self.dec_norm.step_q(gpu, cfg, q.as_deref_mut());
-        // Logit head: no weight decay and no bias (bias stays at its zero init) so
-        // it matches `nn::linear_no_bias` and exports faithfully to the HIER head.
-        self.dec_head
-            .step_w_only_q(gpu, cfg, false, q.as_deref_mut());
-        if let Some(q) = queue.as_mut() {
-            q.flush(gpu, cfg);
-        }
+        v.extend(self.dec_norm.param_slots());
+        v.extend(self.dec_head.param_slots());
+        v
+    }
+
+    /// AdamW across every stage: one launch over the parameter arena, one memset
+    /// over its gradients.
+    pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
+        // Walked for its side effect: handing out `&mut w` drops each layer's cached
+        // bf16 weight. Skipping it leaves every later forward reading the pre-step
+        // weight — training silently stops learning.
+        drop(self.param_slots());
+        self.arena
+            .as_mut()
+            .expect("parameters were never bound — see Hierarchical::bind_params")
+            .step(gpu, cfg);
         self.step_count += 1;
     }
 
@@ -1914,6 +1947,7 @@ impl Hierarchical {
                 &crate::tensor::Tensor::zeros(&[vocab]),
             );
             h.set_fp32();
+            head_optimizer_convention(&mut h);
             h
         };
         let cap = dl
@@ -1936,8 +1970,9 @@ impl Hierarchical {
         };
 
         // Build a fresh model (for the zeroed grads/moments), then swap in the
-        // loaded weight-bearing parts.
-        let mut model = Hierarchical::new(gpu, cfg);
+        // loaded weight-bearing parts. Unbound: the parameters that end up in the
+        // arena are the loaded ones, packed once below.
+        let mut model = Hierarchical::unbound(gpu, cfg);
         model.step_count = stacks.step;
         model.seen = stacks.seen;
         model.table = table;
@@ -1948,11 +1983,21 @@ impl Hierarchical {
         model.dec_blocks = dec_blocks;
         model.dec_norm = dec_norm;
         model.dec_head = dec_head;
-        // The loaded blocks replaced the ones `new` set up, so re-apply the offload
-        // opt-in to the stack that actually ends up in the model.
+        // The loaded blocks replaced the ones `unbound` set up, so the offload opt-in
+        // and the parameter arena both apply to the stack that ends up in the model.
         model.enable_backbone_offload(gpu);
+        model.bind_params(gpu);
         Ok(model)
     }
+}
+
+/// Put a `Linear` on the logit head's optimizer footing: undecayed (it is a logit
+/// head, not an interior projection) and with the bias frozen at its zero init, so
+/// the layer stays equivalent to `nn::LinearNoBias` and exports to the `HIER` head
+/// faithfully.
+fn head_optimizer_convention(head: &mut Linear) {
+    head.set_no_decay();
+    head.freeze_bias();
 }
 
 /// Upload an `nn::LinearLayer` (weights + bias) to a device `Linear`.
@@ -2310,7 +2355,7 @@ mod tests {
             // that carry it, and is diluted by the time it reaches the stages on
             // either side.
             let mut bb: Vec<f32> = Vec::new();
-            for blk in model.bb_blocks.iter() {
+            for blk in model.bb_blocks.iter_mut() {
                 for g in blk.grads() {
                     bb.extend_from_slice(&g.to_host(&gpu).data);
                 }

@@ -10,6 +10,7 @@
 //! moments and the saved forward input are all `DTensor`s, so a forward→backward→
 //! step cycle touches host memory only if the caller downloads a result.
 
+use super::arena::{self, ParamKind, ParamSlot};
 use super::{DTensor, Gpu, ops};
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
@@ -40,6 +41,11 @@ pub struct Linear {
     /// so forward and backward cannot disagree, and `false` for a layer that must
     /// stay exact (see `set_fp32`).
     bf16: bool,
+    /// Whether `w` is weight-decayed. True by default — an interior projection —
+    /// and cleared for an embedding-like table or a logit head (`set_no_decay`).
+    decay: bool,
+    /// Whether `b` is left at its init and never stepped (`freeze_bias`).
+    bias_frozen: bool,
 }
 
 impl Linear {
@@ -61,6 +67,8 @@ impl Linear {
             output,
             gemm: ops::GemmBf16::new(),
             bf16: ops::gemm_bf16_enabled(gpu),
+            decay: true,
+            bias_frozen: false,
         }
     }
 
@@ -98,6 +106,18 @@ impl Linear {
     /// test needs bit-comparable against the CPU reference.
     pub fn set_fp32(&mut self) {
         self.bf16 = false;
+    }
+
+    /// Take `w` off the weight-decay path, for an embedding-like table or a logit
+    /// head (the project's optimizer convention — see `gpu::arena::ParamKind`).
+    pub fn set_no_decay(&mut self) {
+        self.decay = false;
+    }
+
+    /// Never step `b`, leaving it at its zero init. Makes this layer equivalent to
+    /// `nn::LinearNBLayer`, so it exports to a no-bias head faithfully.
+    pub fn freeze_bias(&mut self) {
+        self.bias_frozen = true;
     }
 
     #[inline]
@@ -441,13 +461,36 @@ impl Linear {
         Self::from_parts(gpu, &cpu.w, &cpu.b)
     }
 
-    /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
+    /// Every parameter with its gradient and AdamW moments.
     ///
-    /// Hands out `&mut w`, so the cached bf16 weight is dropped here rather than at the
-    /// (untrackable) point the caller writes through it.
-    pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
+    /// Hands out `&mut w`, so the cached bf16 weight is dropped here rather than at
+    /// the (untrackable) point the caller writes through it.
+    pub fn param_slots(&mut self) -> Vec<ParamSlot<'_>> {
         self.gemm.invalidate_w();
-        vec![&mut self.w, &mut self.b]
+        let w_kind = if self.decay {
+            ParamKind::Decay
+        } else {
+            ParamKind::NoDecay
+        };
+        let b_kind = if self.bias_frozen {
+            ParamKind::Frozen
+        } else {
+            ParamKind::NoDecay
+        };
+        vec![
+            ParamSlot::new(&mut self.w, &mut self.dw, &mut self.mw, &mut self.vw, w_kind),
+            ParamSlot::new(&mut self.b, &mut self.db, &mut self.mb, &mut self.vb, b_kind),
+        ]
+    }
+
+    /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
+    pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
+        self.param_slots().into_iter().map(|s| s.param).collect()
+    }
+
+    /// Gradient accumulators, matching `params_mut`'s order. Diagnostic.
+    pub fn grads(&mut self) -> Vec<&DTensor> {
+        self.param_slots().into_iter().map(|s| &*s.grad).collect()
     }
 
     pub fn zero_grad(&mut self, gpu: &Gpu) {
@@ -456,112 +499,10 @@ impl Linear {
         self.db.zero_(gpu);
     }
 
-    /// AdamW step (weight decay on `w`, none on `b`), then clears the accumulators.
+    /// AdamW over this layer's own parameters, then clear the accumulators. A model
+    /// steps its whole `ParamArena` in one launch instead.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        self.step_wd(gpu, cfg, true);
-    }
-
-    /// AdamW step with explicit weight-decay control on `w` (pass `false` for an
-    /// undecayed logit head).
-    pub fn step_wd(&mut self, gpu: &Gpu, cfg: &AdamCfg, decay_w: bool) {
-        self.step_wd_q(gpu, cfg, decay_w, None);
-    }
-
-    /// [`step_wd`](Self::step_wd), optionally queueing the updates instead of
-    /// launching them. The grads are *not* cleared when queued — the caller must
-    /// zero them after flushing, since the kernel has not read them yet.
-    pub fn step_wd_q(
-        &mut self,
-        gpu: &Gpu,
-        cfg: &AdamCfg,
-        decay_w: bool,
-        q: Option<&mut ops::AdamwQueue>,
-    ) {
-        self.gemm.invalidate_w();
-        if let Some(q) = q {
-            q.push(
-                gpu,
-                &mut self.w,
-                &self.dw,
-                &mut self.mw,
-                &mut self.vw,
-                cfg,
-                decay_w,
-            );
-            q.push(
-                gpu,
-                &mut self.b,
-                &self.db,
-                &mut self.mb,
-                &mut self.vb,
-                cfg,
-                false,
-            );
-            return;
-        }
-        ops::adamw(
-            gpu,
-            &mut self.w,
-            &self.dw,
-            &mut self.mw,
-            &mut self.vw,
-            cfg,
-            decay_w,
-        );
-        ops::adamw(
-            gpu,
-            &mut self.b,
-            &self.db,
-            &mut self.mb,
-            &mut self.vb,
-            cfg,
-            false,
-        );
-        self.zero_grad(gpu);
-    }
-
-    /// AdamW step on `w` only, leaving `b` untouched; clears both grads. Used for
-    /// a bias-free head: `b` stays at its (zero) init so the layer is equivalent
-    /// to `nn::LinearNBLayer` and exports to the no-bias `HIER` head faithfully.
-    pub fn step_w_only(&mut self, gpu: &Gpu, cfg: &AdamCfg, decay_w: bool) {
-        self.step_w_only_q(gpu, cfg, decay_w, None);
-    }
-
-    /// [`step_w_only`](Self::step_w_only), optionally queueing instead of launching.
-    ///
-    /// `db` is zeroed here even on the queued path: the queue only clears gradients it
-    /// was given, and `b` is deliberately not stepped, so nothing else would clear it.
-    pub fn step_w_only_q(
-        &mut self,
-        gpu: &Gpu,
-        cfg: &AdamCfg,
-        decay_w: bool,
-        q: Option<&mut ops::AdamwQueue>,
-    ) {
-        self.gemm.invalidate_w();
-        if let Some(q) = q {
-            q.push(
-                gpu,
-                &mut self.w,
-                &self.dw,
-                &mut self.mw,
-                &mut self.vw,
-                cfg,
-                decay_w,
-            );
-            self.db.zero_(gpu);
-            return;
-        }
-        ops::adamw(
-            gpu,
-            &mut self.w,
-            &self.dw,
-            &mut self.mw,
-            &mut self.vw,
-            cfg,
-            decay_w,
-        );
-        self.zero_grad(gpu);
+        arena::step_slots(gpu, &mut self.param_slots(), cfg);
     }
 }
 
@@ -622,6 +563,7 @@ mod tests {
         let (b, i, o) = (4usize, 6usize, 5usize);
         let cpu = CpuLinear::new(i, o);
         let mut gl = Linear::from_parts(&gpu, &cpu.w, &cpu.b);
+        gl.freeze_bias();
         let hx = Tensor::random(&[b, i], 0.5);
         let x = DTensor::from_host(&gpu, &hx);
         let hdy = Tensor::random(&[b, o], 1.0);
@@ -639,10 +581,10 @@ mod tests {
             let _ = gl.backward_alloc(&gpu, &dy);
             let mut c = cfg;
             c.t = t;
-            // `step_w_only`, so the bias stays put: a step that also moved `b` would
-            // shift the output whether or not the cached weight was refreshed, and the
-            // test would pass with the invalidation removed.
-            gl.step_w_only(&gpu, &c, false);
+            // The bias is frozen (above), so a step moves `w` alone: one that also
+            // moved `b` would shift the output whether or not the cached weight was
+            // refreshed, and the test would pass with the invalidation removed.
+            gl.step(&gpu, &c);
 
             let w_after = gl.w.to_host(&gpu).data;
             let moved = w_before

@@ -7,6 +7,7 @@
 //! `group == size`. Scale, grad, moments and the saved `x̂`/`inv_rms` all live on
 //! the device.
 
+use super::arena::{self, ParamKind, ParamSlot};
 use super::ops::{self, GpuRmsForward};
 use super::{DTensor, Gpu};
 use crate::nn2::optim::AdamCfg;
@@ -133,6 +134,17 @@ impl RmsNorm {
     }
 
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
+    /// The norm scale with its gradient and AdamW moments. Never decayed.
+    pub fn param_slots(&mut self) -> Vec<ParamSlot<'_>> {
+        vec![ParamSlot::new(
+            &mut self.gamma,
+            &mut self.dgamma,
+            &mut self.m,
+            &mut self.v,
+            ParamKind::NoDecay,
+        )]
+    }
+
     pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
         vec![&mut self.gamma]
     }
@@ -177,25 +189,6 @@ impl RmsNorm {
 
     /// AdamW step (norm scale is never decayed). Clears the grad.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        self.step_q(gpu, cfg, None);
-    }
-
-    /// [`step`](Self::step), optionally queueing instead of launching. A queued grad
-    /// is cleared by [`AdamwQueue::flush`], not here.
-    pub fn step_q(&mut self, gpu: &Gpu, cfg: &AdamCfg, q: Option<&mut ops::AdamwQueue>) {
-        if let Some(q) = q {
-            q.push(gpu, &mut self.gamma, &self.dgamma, &mut self.m, &mut self.v, cfg, false);
-            return;
-        }
-        ops::adamw(
-            gpu,
-            &mut self.gamma,
-            &self.dgamma,
-            &mut self.m,
-            &mut self.v,
-            cfg,
-            false,
-        );
-        self.zero_grad(gpu);
+        arena::step_slots(gpu, &mut self.param_slots(), cfg);
     }
 }

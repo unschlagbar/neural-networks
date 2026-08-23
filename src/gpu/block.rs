@@ -17,7 +17,12 @@
 //! a generic GPU `Cell`.
 
 use super::{
-    Buf, DTensor, Gpu, Pool, linear::Linear, mlstm::MLstm, offload, ops, rms_norm::RmsNorm,
+    Buf, DTensor, Gpu, Pool,
+    arena::{self, ParamSlot},
+    linear::Linear,
+    mlstm::MLstm,
+    offload, ops,
+    rms_norm::RmsNorm,
     slstm::SLstm,
 };
 use crate::{
@@ -133,17 +138,21 @@ pub trait Cell {
     fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor);
     fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor);
     fn zero_grad(&mut self, gpu: &Gpu);
-    fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg);
-    /// [`step`](Self::step), optionally queueing the AdamW updates into one batched
-    /// launch instead of one per tensor. Default: ignore the queue and step eagerly,
-    /// so a cell that has not been converted still works.
-    fn step_q(&mut self, gpu: &Gpu, cfg: &AdamCfg, _q: Option<&mut ops::AdamwQueue>) {
-        self.step(gpu, cfg);
+    /// Every parameter with its gradient and AdamW moments, in a fixed order.
+    /// A model binds these into its [`ParamArena`](super::arena::ParamArena).
+    fn param_slots(&mut self) -> Vec<ParamSlot<'_>>;
+    /// AdamW over this cell alone, for a standalone cell and the parity tests.
+    fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
+        arena::step_slots(gpu, &mut self.param_slots(), cfg);
     }
     /// Learnable tensors in a fixed order (checkpoint save/load).
-    fn params_mut(&mut self) -> Vec<&mut DTensor>;
+    fn params_mut(&mut self) -> Vec<&mut DTensor> {
+        self.param_slots().into_iter().map(|s| s.param).collect()
+    }
     /// Gradient accumulators, matching `params_mut`'s order. Diagnostic.
-    fn grads(&self) -> Vec<&DTensor>;
+    fn grads(&mut self) -> Vec<&DTensor> {
+        self.param_slots().into_iter().map(|s| &*s.grad).collect()
+    }
     /// Forward-cache extremes, for cells that carry a stabilized normalizer.
     /// `None` when the cell has nothing of the sort. Diagnostic.
     fn state_extremes(&self, _gpu: &Gpu) -> Option<(f32, f32, f32)> {
@@ -214,17 +223,8 @@ impl Cell for SLstm {
     fn zero_grad(&mut self, gpu: &Gpu) {
         SLstm::zero_grad(self, gpu)
     }
-    fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        SLstm::step(self, gpu, cfg)
-    }
-    fn step_q(&mut self, gpu: &Gpu, cfg: &AdamCfg, q: Option<&mut ops::AdamwQueue>) {
-        SLstm::step_q(self, gpu, cfg, q)
-    }
-    fn params_mut(&mut self) -> Vec<&mut DTensor> {
-        SLstm::params_mut(self)
-    }
-    fn grads(&self) -> Vec<&DTensor> {
-        SLstm::grads(self)
+    fn param_slots(&mut self) -> Vec<ParamSlot<'_>> {
+        SLstm::param_slots(self)
     }
     fn state_extremes(&self, gpu: &Gpu) -> Option<(f32, f32, f32)> {
         SLstm::state_extremes(self, gpu)
@@ -308,16 +308,21 @@ pub trait BlockLike {
         dx
     }
     fn zero_grad(&mut self, gpu: &Gpu);
-    fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg);
-    /// [`step`](Self::step), optionally queueing the AdamW updates into one batched
-    /// launch. Default: step eagerly, ignoring the queue.
-    fn step_q(&mut self, gpu: &Gpu, cfg: &AdamCfg, _q: Option<&mut ops::AdamwQueue>) {
-        self.step(gpu, cfg);
+    /// Every parameter with its gradient and AdamW moments, in a fixed order.
+    /// A model binds these into its [`ParamArena`](super::arena::ParamArena).
+    fn param_slots(&mut self) -> Vec<ParamSlot<'_>>;
+    /// AdamW over this block alone, for a standalone block and the parity tests.
+    fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
+        arena::step_slots(gpu, &mut self.param_slots(), cfg);
     }
     /// Learnable tensors in a fixed order (checkpoint save/load).
-    fn params_mut(&mut self) -> Vec<&mut DTensor>;
+    fn params_mut(&mut self) -> Vec<&mut DTensor> {
+        self.param_slots().into_iter().map(|s| s.param).collect()
+    }
     /// Gradient accumulators, matching `params_mut`'s order. Diagnostic.
-    fn grads(&self) -> Vec<&DTensor>;
+    fn grads(&mut self) -> Vec<&DTensor> {
+        self.param_slots().into_iter().map(|s| &*s.grad).collect()
+    }
     /// The cell's forward-cache extremes. See [`Cell::state_extremes`].
     fn state_extremes(&self, gpu: &Gpu) -> Option<(f32, f32, f32)>;
     /// Park this block's FFN activations on the host between forward and backward.
@@ -367,17 +372,8 @@ impl<C: Cell> BlockLike for Block<C> {
     fn zero_grad(&mut self, gpu: &Gpu) {
         Block::zero_grad(self, gpu)
     }
-    fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        Block::step(self, gpu, cfg)
-    }
-    fn step_q(&mut self, gpu: &Gpu, cfg: &AdamCfg, q: Option<&mut ops::AdamwQueue>) {
-        Block::step_q(self, gpu, cfg, q)
-    }
-    fn params_mut(&mut self) -> Vec<&mut DTensor> {
-        Block::params_mut(self)
-    }
-    fn grads(&self) -> Vec<&DTensor> {
-        Block::grads(self)
+    fn param_slots(&mut self) -> Vec<ParamSlot<'_>> {
+        Block::param_slots(self)
     }
     fn state_extremes(&self, gpu: &Gpu) -> Option<(f32, f32, f32)> {
         self.cell.state_extremes(gpu)
@@ -1103,27 +1099,15 @@ impl<C: Cell> Block<C> {
         }
     }
 
-    /// Learnable tensors in a fixed order (checkpoint save/load).
-    pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
+    /// Every parameter with its gradient and AdamW moments, in a fixed order.
+    pub fn param_slots(&mut self) -> Vec<ParamSlot<'_>> {
         let mut v = Vec::new();
-        v.extend(self.pre_norm1.params_mut());
-        v.extend(self.cell.params_mut());
-        v.extend(self.pre_norm2.params_mut());
-        v.extend(self.lin_gate.params_mut());
-        v.extend(self.lin_value.params_mut());
-        v.extend(self.lin_down.params_mut());
-        v
-    }
-
-    /// Gradient accumulators, matching `params_mut`'s order. Diagnostic.
-    pub fn grads(&self) -> Vec<&DTensor> {
-        let mut v = vec![&self.pre_norm1.dgamma];
-        v.extend(self.cell.grads());
-        v.push(&self.pre_norm2.dgamma);
-        for l in [&self.lin_gate, &self.lin_value, &self.lin_down] {
-            v.push(&l.dw);
-            v.push(&l.db);
-        }
+        v.extend(self.pre_norm1.param_slots());
+        v.extend(self.cell.param_slots());
+        v.extend(self.pre_norm2.param_slots());
+        v.extend(self.lin_gate.param_slots());
+        v.extend(self.lin_value.param_slots());
+        v.extend(self.lin_down.param_slots());
         v
     }
 
@@ -1166,20 +1150,6 @@ impl<C: Cell> Block<C> {
         self.lin_down.zero_grad(gpu);
     }
 
-    /// AdamW step across every sub-layer.
-    pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
-        self.step_q(gpu, cfg, None);
-    }
-
-    /// [`step`](Self::step), optionally queueing instead of launching.
-    pub fn step_q(&mut self, gpu: &Gpu, cfg: &AdamCfg, mut q: Option<&mut ops::AdamwQueue>) {
-        self.pre_norm1.step_q(gpu, cfg, q.as_deref_mut());
-        self.cell.step_q(gpu, cfg, q.as_deref_mut());
-        self.pre_norm2.step_q(gpu, cfg, q.as_deref_mut());
-        self.lin_gate.step_wd_q(gpu, cfg, true, q.as_deref_mut());
-        self.lin_value.step_wd_q(gpu, cfg, true, q.as_deref_mut());
-        self.lin_down.step_wd_q(gpu, cfg, true, q.as_deref_mut());
-    }
 }
 
 /// Upload an `nn::LinearLayer` to the device.
