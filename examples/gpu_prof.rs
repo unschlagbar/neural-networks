@@ -18,7 +18,7 @@ fn main() {
     use neural_networks::gpu::block::{Block, BlockLike};
     use neural_networks::gpu::mlstm::MLstm;
     use neural_networks::gpu::slstm::SLstm;
-    use neural_networks::gpu::{DTensor, Gpu, ops};
+    use neural_networks::gpu::{GTensor, Gpu, ops};
 
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -87,8 +87,8 @@ fn main() {
 
     // Time a forward+backward over `iters` runs, synchronizing once at the end.
     let run = |name: &str, blocks: &mut Vec<Box<dyn BlockLike>>, b: usize, t: usize, h: usize| {
-        let x = DTensor::zeros(&gpu, &[b, t, h]);
-        let g = DTensor::zeros(&gpu, &[b, t, h]);
+        let x = GTensor::zeros(&gpu, &[b, t, h]);
+        let g = GTensor::zeros(&gpu, &[b, t, h]);
         // warmup
         for blk in blocks.iter_mut() {
             let _ = blk.forward_alloc(&gpu, &x);
@@ -129,11 +129,11 @@ fn main() {
     {
         let h = 512usize;
         let h4 = 4 * h;
-        let hs = DTensor::zeros(&gpu, &[1, h]);
-        let whr = DTensor::zeros(&gpu, &[h, h4]);
-        let whr_t = DTensor::zeros(&gpu, &[h4, h]);
-        let mut gh = DTensor::zeros(&gpu, &[1, h4]);
-        let mut dh = DTensor::zeros(&gpu, &[1, h]);
+        let hs = GTensor::zeros(&gpu, &[1, h]);
+        let whr = GTensor::zeros(&gpu, &[h, h4]);
+        let whr_t = GTensor::zeros(&gpu, &[h4, h]);
+        let mut gh = GTensor::zeros(&gpu, &[1, h4]);
+        let mut dh = GTensor::zeros(&gpu, &[1, h]);
         let iters = 2047;
         let t = gpu_time(&gpu, 10, iters, || {
             ops::matmul_nn_into(&gpu, &hs, &whr, &mut gh, 0.0)
@@ -163,7 +163,7 @@ fn main() {
         use neural_networks::gpu::ops::{SlabBuf, SlstmSlabs};
         let (b, t, h) = (1usize, 2047usize, 512usize);
         let h4 = 4 * h;
-        let slab = || DTensor::zeros(&gpu, &[b, t, h]);
+        let slab = || GTensor::zeros(&gpu, &[b, t, h]);
         // The plain-activation slabs follow the compiled kernels' width (bf16 unless
         // GPU_NO_BF16); the stabilizer-carrying ones are always fp32.
         let act = || SlabBuf::new(&gpu, &[b, t, h]);
@@ -178,20 +178,20 @@ fn main() {
             ot: act(),
             h_prev: act(),
         };
-        let mut g = DTensor::zeros(&gpu, &[b, t, h4]);
-        let mut gh = DTensor::zeros(&gpu, &[b, h4]);
-        let bcat = DTensor::zeros(&gpu, &[h4]);
+        let mut g = GTensor::zeros(&gpu, &[b, t, h4]);
+        let mut gh = GTensor::zeros(&gpu, &[b, h4]);
+        let bcat = GTensor::zeros(&gpu, &[h4]);
         let (mut cs, mut ns, mut ms, mut hs2) = (
-            DTensor::zeros(&gpu, &[b, h]),
-            DTensor::zeros(&gpu, &[b, h]),
-            DTensor::zeros(&gpu, &[b, h]),
-            DTensor::zeros(&gpu, &[b, h]),
+            GTensor::zeros(&gpu, &[b, h]),
+            GTensor::zeros(&gpu, &[b, h]),
+            GTensor::zeros(&gpu, &[b, h]),
+            GTensor::zeros(&gpu, &[b, h]),
         );
         let mut hn = ops::SlabBuf::new(&gpu, &[b, h]);
-        let (mut dc, mut dn) = (DTensor::zeros(&gpu, &[b, h]), DTensor::zeros(&gpu, &[b, h]));
-        let dhb = DTensor::zeros(&gpu, &[b, h]);
-        let mut out = DTensor::zeros(&gpu, &[b, t, h]);
-        let dy = DTensor::zeros(&gpu, &[b, t, h]);
+        let (mut dc, mut dn) = (GTensor::zeros(&gpu, &[b, h]), GTensor::zeros(&gpu, &[b, h]));
+        let dhb = GTensor::zeros(&gpu, &[b, h]);
+        let mut out = GTensor::zeros(&gpu, &[b, t, h]);
+        let dy = GTensor::zeros(&gpu, &[b, t, h]);
         let mut step = 0usize;
         let tf = gpu_time(&gpu, 10, t, || {
             ops::slstm_step_fused(
@@ -240,8 +240,8 @@ fn main() {
     // the surrounding norms/SwiGLU.
     {
         let mut cell = SLstm::new_rand(&gpu, wh, wh);
-        let x = DTensor::zeros(&gpu, &[1, words, wh]);
-        let g = DTensor::zeros(&gpu, &[1, words, wh]);
+        let x = GTensor::zeros(&gpu, &[1, words, wh]);
+        let g = GTensor::zeros(&gpu, &[1, words, wh]);
         let _ = cell.forward_alloc(&gpu, &x);
         let _ = cell.backward_alloc(&gpu, &g);
         gpu.stream.synchronize().unwrap();

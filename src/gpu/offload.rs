@@ -56,7 +56,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaEvent, CudaStream, PinnedHostSlice};
 
-use super::{BTensor, DTensor, Gpu};
+use super::{GTensor, Gpu};
 
 /// Where one chunk of a tensor's timeline lives while it is off the device.
 ///
@@ -89,7 +89,7 @@ pub struct OffloadRing {
     host: Vec<HostChunk>,
     /// Double buffer: `K` timesteps of device staging, alternating so a copy can
     /// drain from one half while compute fills the other.
-    dev: [DTensor; 2],
+    dev: [GTensor<f32>; 2],
     /// Copy stream, distinct from `gpu.stream` so transfers overlap compute.
     xfer: Arc<CudaStream>,
     /// Per-half "the copy out of this half has finished", so the next writer of that
@@ -135,8 +135,8 @@ impl OffloadRing {
         Ok(Self {
             host,
             dev: [
-                DTensor::uninit(gpu, &[k, per_step]),
-                DTensor::uninit(gpu, &[k, per_step]),
+                GTensor::uninit(gpu, &[k, per_step]),
+                GTensor::uninit(gpu, &[k, per_step]),
             ],
             xfer,
             drained: [None, None],
@@ -177,7 +177,7 @@ impl OffloadRing {
     /// the previous copy **out of** this half has finished. Without that wait, a
     /// forward two chunks ahead would overwrite data the transfer stream is still
     /// draining.
-    pub fn stage(&mut self, gpu: &Gpu, i: usize) -> &mut DTensor {
+    pub fn stage(&mut self, gpu: &Gpu, i: usize) -> &mut GTensor<f32> {
         let half = i % 2;
         if let Some(ev) = &self.drained[half] {
             gpu.stream.wait(ev).expect("offload: wait for drain");
@@ -240,7 +240,7 @@ impl OffloadRing {
     /// Issues the copy first if [`prefetch`](Self::prefetch) was not called for `i`
     /// (correct, just not overlapped). Waits on the compute stream until the fill has
     /// landed — the event that makes the returned tensor safe to read.
-    pub fn read(&mut self, gpu: &Gpu, i: usize) -> &DTensor {
+    pub fn read(&mut self, gpu: &Gpu, i: usize) -> &GTensor<f32> {
         let half = i % 2;
         if self.filled[half].is_none() {
             self.prefetch(gpu, i);
@@ -270,8 +270,8 @@ impl OffloadRing {
 /// footprint, and narrowing an fp32 one would silently break the stabilizer arithmetic
 /// that `gpu::bf16` deliberately keeps wide.
 pub enum Parked {
-    F32(DTensor),
-    Bf16(BTensor),
+    F32(GTensor<f32>),
+    Bf16(GTensor<u16>),
 }
 
 impl Parked {
@@ -363,7 +363,7 @@ impl Parked {
         match self {
             Parked::F32(t) => t.to_host(gpu),
             Parked::Bf16(t) => {
-                let mut wide = DTensor::uninit(gpu, t.dims());
+                let mut wide = GTensor::uninit(gpu, t.dims());
                 t.load(gpu, &mut wide);
                 wide.to_host(gpu)
             }
@@ -371,7 +371,7 @@ impl Parked {
     }
 
     /// Unwrap an fp32 tensor, panicking if this is a bf16 slab.
-    pub fn f32(self) -> DTensor {
+    pub fn f32(self) -> GTensor<f32> {
         match self {
             Parked::F32(t) => t,
             Parked::Bf16(_) => panic!("offload: expected an fp32 tensor, got a bf16 slab"),
@@ -379,7 +379,7 @@ impl Parked {
     }
 
     /// Unwrap a bf16 slab, panicking if this is an fp32 tensor.
-    pub fn bf16(self) -> BTensor {
+    pub fn bf16(self) -> GTensor<u16> {
         match self {
             Parked::Bf16(t) => t,
             Parked::F32(_) => panic!("offload: expected a bf16 slab, got an fp32 tensor"),
@@ -387,8 +387,8 @@ impl Parked {
     }
 }
 
-impl From<DTensor> for Parked {
-    fn from(t: DTensor) -> Self {
+impl From<GTensor<f32>> for Parked {
+    fn from(t: GTensor<f32>) -> Self {
         Parked::F32(t)
     }
 }
@@ -413,8 +413,8 @@ impl From<Parked> for super::ops::SlabBuf {
     }
 }
 
-impl From<BTensor> for Parked {
-    fn from(t: BTensor) -> Self {
+impl From<GTensor<u16>> for Parked {
+    fn from(t: GTensor<u16>) -> Self {
         Parked::Bf16(t)
     }
 }
@@ -860,9 +860,9 @@ impl HostPark {
             .iter()
             .map(|s| {
                 if s.bf16 {
-                    Parked::Bf16(BTensor::uninit(gpu, &s.dims))
+                    Parked::Bf16(GTensor::uninit(gpu, &s.dims))
                 } else {
-                    Parked::F32(DTensor::uninit(gpu, &s.dims))
+                    Parked::F32(GTensor::uninit(gpu, &s.dims))
                 }
             })
             .collect();
@@ -924,7 +924,7 @@ mod tests {
             &[t, per_step],
             (0..t * per_step).map(|i| i as f32 * 0.5).collect(),
         );
-        let src = DTensor::from_host(&gpu, &full);
+        let src = GTensor::from_host(&gpu, &full);
 
         for i in 0..ring.chunks() {
             let steps = ring.chunk_steps(i);
@@ -968,8 +968,8 @@ mod tests {
 
         // Something slow enough on the compute stream that the transfers must really
         // overlap it rather than trivially finishing first.
-        let busy = DTensor::zeros(&gpu, &[512, 512]);
-        let mut sink = DTensor::uninit(&gpu, &[512, 512]);
+        let busy = GTensor::zeros(&gpu, &[512, 512]);
+        let mut sink = GTensor::uninit(&gpu, &[512, 512]);
 
         for i in 0..ring.chunks() {
             let steps = ring.chunk_steps(i);
@@ -977,7 +977,7 @@ mod tests {
                 let stage = ring.stage(&gpu, i);
                 // Tag every element of the chunk with its chunk index.
                 let tag = Tensor::new(&[steps, per_step], vec![i as f32; steps * per_step]);
-                let host = DTensor::from_host(&gpu, &tag);
+                let host = GTensor::from_host(&gpu, &tag);
                 stage.copy_from(&gpu, &host);
             }
             ring.write(&gpu, i);
@@ -1015,7 +1015,7 @@ mod tests {
             Tensor::new(&[3, 11], (0..33).map(|i| -(i as f32)).collect()),
             Tensor::new(&[64], (0..64).map(|i| i as f32 * 1e-3).collect()),
         ];
-        let devs: Vec<DTensor> = hosts.iter().map(|t| DTensor::from_host(&gpu, t)).collect();
+        let devs: Vec<GTensor<f32>> = hosts.iter().map(|t| GTensor::from_host(&gpu, t)).collect();
 
         // `evict` takes ownership: the park holds the device tensors until its copy
         // lands, then frees them. `sync_parked` forces that here.
@@ -1047,8 +1047,8 @@ mod tests {
         // Values exactly representable in bf16, so the comparison is exact and the
         // test says something about the transfer rather than about rounding.
         let src = Tensor::new(&[8, 16], (0..128).map(|i| (i as f32 - 64.0) * 0.5).collect());
-        let mut slab = BTensor::uninit(&gpu, &[8, 16]);
-        slab.store(&gpu, &DTensor::from_host(&gpu, &src));
+        let mut slab = GTensor::uninit(&gpu, &[8, 16]);
+        slab.store(&gpu, &GTensor::from_host(&gpu, &src));
         let slab = Parked::Bf16(slab);
         let before = slab.to_host(&gpu).data;
 
@@ -1088,7 +1088,7 @@ mod tests {
             park.evict(
                 &gpu,
                 want.iter()
-                    .map(|t| Parked::from(DTensor::from_host(&gpu, t)))
+                    .map(|t| Parked::from(GTensor::from_host(&gpu, t)))
                     .collect(),
             );
             park.sync_parked();
@@ -1097,8 +1097,8 @@ mod tests {
         // The prefetching park starts its uploads well before it consumes them, with
         // unrelated compute in between — the training-path shape.
         early.prefetch(&gpu);
-        let busy = DTensor::zeros(&gpu, &[256, 256]);
-        let mut sink = DTensor::uninit(&gpu, &[256, 256]);
+        let busy = GTensor::zeros(&gpu, &[256, 256]);
+        let mut sink = GTensor::uninit(&gpu, &[256, 256]);
         super::super::ops::matmul_nn_into(&gpu, &busy, &busy, &mut sink, 0.0);
         // A second prefetch before consuming must be a harmless no-op.
         early.prefetch(&gpu);
@@ -1146,7 +1146,7 @@ mod tests {
                 let _ = park.restore(&gpu);
             }
             let t = Tensor::random(&[16 + i, 32], 1.0);
-            park.evict(&gpu, vec![DTensor::from_host(&gpu, &t).into()]);
+            park.evict(&gpu, vec![GTensor::from_host(&gpu, &t).into()]);
             park.sync_parked();
         }
         // One live generation of one slot, so the pool may hold SPARE_SLACK more.
@@ -1174,7 +1174,7 @@ mod tests {
         let mut park = HostPark::new(&gpu, InFlight::shared()).expect("park");
         let src = Tensor::random(&[16, 32], 1.0);
 
-        park.evict(&gpu, vec![DTensor::from_host(&gpu, &src).into()]);
+        park.evict(&gpu, vec![GTensor::from_host(&gpu, &src).into()]);
         park.sync_parked();
 
         // Each step evicts and restores once, as a real sweep does — the restore is
@@ -1182,7 +1182,7 @@ mod tests {
         let settled = park.allocs;
         for _ in 0..4 {
             let _ = park.restore(&gpu);
-            park.evict(&gpu, vec![DTensor::from_host(&gpu, &src).into()]);
+            park.evict(&gpu, vec![GTensor::from_host(&gpu, &src).into()]);
             park.sync_parked();
         }
         assert_eq!(
@@ -1199,14 +1199,14 @@ mod tests {
         let settled = park.allocs;
         for _ in 0..4 {
             let _ = park.restore(&gpu);
-            park.evict(&gpu, vec![DTensor::from_host(&gpu, &short).into()]);
+            park.evict(&gpu, vec![GTensor::from_host(&gpu, &short).into()]);
             park.sync_parked();
             let _ = park.restore(&gpu);
             park.evict(
                 &gpu,
                 vec![
-                    DTensor::from_host(&gpu, &pair).into(),
-                    DTensor::from_host(&gpu, &short).into(),
+                    GTensor::from_host(&gpu, &pair).into(),
+                    GTensor::from_host(&gpu, &short).into(),
                 ],
             );
             park.sync_parked();
@@ -1225,7 +1225,7 @@ mod tests {
         let _ = park.restore(&gpu);
         let (before, allocs) = (park.host_bytes(), park.allocs);
         let b = Tensor::random(&[16, 64], 1.0);
-        park.evict(&gpu, vec![DTensor::from_host(&gpu, &b).into()]);
+        park.evict(&gpu, vec![GTensor::from_host(&gpu, &b).into()]);
         park.sync_parked();
         assert_eq!(park.allocs, allocs + 1, "a larger shape must page-lock a new slot");
         assert_eq!(park.host_bytes() - before, 16 * 64 * 4, "and only that slot");
@@ -1256,7 +1256,7 @@ mod tests {
             // Forward: evict every chunk, all staying live at increasing depth.
             for s in &src {
                 let bufs = (0..bufs_per_evict)
-                    .map(|_| DTensor::from_host(&gpu, s).into())
+                    .map(|_| GTensor::from_host(&gpu, s).into())
                     .collect();
                 park.evict(&gpu, bufs);
             }

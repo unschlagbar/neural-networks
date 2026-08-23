@@ -21,7 +21,7 @@ fn main() {
     use std::time::Instant;
 
     use cudarc::driver::{LaunchConfig, PushKernelArg};
-    use neural_networks::gpu::{DTensor, Gpu, ops};
+    use neural_networks::gpu::{GTensor, Gpu, ops};
     use neural_networks::tensor::Tensor;
 
     let gpu = match Gpu::new() {
@@ -37,9 +37,9 @@ fn main() {
     let h4 = 4 * h;
 
     // The exact operands the backbone's sLSTM loop uses at B=1.
-    let hs = DTensor::from_host(&gpu, &Tensor::random(&[1, h], 0.5)); // h_{t-1}
-    let whr = DTensor::from_host(&gpu, &Tensor::random(&[h, h4], 0.05)); // recurrent W
-    let mut gh = DTensor::zeros(&gpu, &[1, h4]);
+    let hs = GTensor::from_host(&gpu, &Tensor::random(&[1, h], 0.5)); // h_{t-1}
+    let whr = GTensor::from_host(&gpu, &Tensor::random(&[h, h4], 0.05)); // recurrent W
+    let mut gh = GTensor::zeros(&gpu, &[1, h4]);
 
     println!("== host issue cost per launch, {N} launches each (B=1, H={h}) ==\n");
 
@@ -55,7 +55,7 @@ fn main() {
     // 2. A trivial elementwise kernel from our own module (`scale_`), standing in
     //    for the fused step kernel: same launch path (kernels.get + launch_builder),
     //    negligible GPU work, so what it measures is our per-launch host overhead.
-    let mut scratch = DTensor::zeros(&gpu, &[1, h4]);
+    let mut scratch = GTensor::zeros(&gpu, &[1, h4]);
     let t0 = Instant::now();
     for _ in 0..N {
         ops::scale_(&gpu, &mut scratch, 1.0);

@@ -32,7 +32,7 @@ fn main() {
 
     use cudarc::cublaslt::{MatmulShared, result, sys};
     use cudarc::driver::DevicePtr;
-    use neural_networks::gpu::{BTensor, DTensor, Gpu, ops};
+    use neural_networks::gpu::{GTensor, Gpu, ops};
     use neural_networks::tensor::Tensor;
 
     let gpu = match Gpu::new() {
@@ -62,25 +62,25 @@ fn main() {
         let x_h = Tensor::random(&[rows, input], 0.5);
         let dy_h = Tensor::random(&[rows, output], 0.5);
 
-        let x = DTensor::from_host(&gpu, &x_h);
-        let dy = DTensor::from_host(&gpu, &dy_h);
-        let mut x_b = BTensor::uninit(&gpu, &[rows, input]);
+        let x = GTensor::from_host(&gpu, &x_h);
+        let dy = GTensor::from_host(&gpu, &dy_h);
+        let mut x_b = GTensor::uninit(&gpu, &[rows, input]);
         x_b.store(&gpu, &x);
-        let mut dy_b = BTensor::uninit(&gpu, &[rows, output]);
+        let mut dy_b = GTensor::uninit(&gpu, &[rows, output]);
         dy_b.store(&gpu, &dy);
 
-        let dw = DTensor::zeros(&gpu, &[input, output]);
-        let mut db = DTensor::zeros(&gpu, &[output]);
-        let ws = DTensor::zeros(&gpu, &[1024 * 1024]); // cudarc keeps its own private
+        let dw = GTensor::zeros(&gpu, &[input, output]);
+        let mut db = GTensor::zeros(&gpu, &[output]);
+        let ws = GTensor::zeros(&gpu, &[1024 * 1024]); // cudarc keeps its own private
         let ws_size = ws.capacity() * 4;
 
         // Scoped so the `SyncOnDrop` guards release the borrows; the allocations
         // outlive them, so the raw pointers stay valid.
-        let ptr = |t: &DTensor| {
+        let ptr = |t: &GTensor<f32>| {
             let (p, _g) = t.buf.device_ptr(&gpu.stream);
             p
         };
-        let bptr = |t: &BTensor| {
+        let bptr = |t: &GTensor<u16>| {
             let (p, _g) = t.buf.device_ptr(&gpu.stream);
             p
         };
@@ -219,7 +219,7 @@ fn main() {
             .fold(0.0f32, f32::max);
 
         // The two kernels in use today, alone and together.
-        let mut dw_ref = DTensor::zeros(&gpu, &[input, output]);
+        let mut dw_ref = GTensor::zeros(&gpu, &[input, output]);
         let mut bench = |with_colsum: bool| {
             let mut go = || {
                 ops::matmul_bf16_into(&gpu, ops::MmForm::Tn, &x_b, &dy_b, &mut dw_ref, 1.0);

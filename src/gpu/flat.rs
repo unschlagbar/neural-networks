@@ -15,7 +15,7 @@
 //! train on undecayed Adam.
 
 use super::ops::{self, GpuRmsForward};
-use super::{DTensor, Gpu, linear::Linear};
+use super::{GTensor, Gpu, linear::Linear};
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
 
@@ -25,19 +25,19 @@ const EPS: f32 = 1e-6;
 
 pub struct Flat {
     // Embedding table + grad + Adam moments.
-    table: DTensor,
-    dtable: DTensor,
-    m_tbl: DTensor,
-    v_tbl: DTensor,
+    table: GTensor<f32>,
+    dtable: GTensor<f32>,
+    m_tbl: GTensor<f32>,
+    v_tbl: GTensor<f32>,
     dim: usize,
 
     lin1: Linear,
 
     // RMSNorm scale + grad + moments.
-    gamma: DTensor,
-    dgamma: DTensor,
-    m_g: DTensor,
-    v_g: DTensor,
+    gamma: GTensor<f32>,
+    dgamma: GTensor<f32>,
+    m_g: GTensor<f32>,
+    v_g: GTensor<f32>,
     hidden: usize,
 
     head: Linear,
@@ -46,7 +46,7 @@ pub struct Flat {
     // Per-forward caches for backward.
     ids: Vec<usize>,
     rms: Option<GpuRmsForward>,
-    logits: Option<DTensor>, // capped logits, for SoftCap backward
+    logits: Option<GTensor<f32>>, // capped logits, for SoftCap backward
 }
 
 impl Flat {
@@ -67,16 +67,16 @@ impl Flat {
         let (vocab, dim) = (table.rows(), table.cols());
         let hidden = gamma.len();
         Self {
-            table: DTensor::from_host(gpu, table),
-            dtable: DTensor::zeros(gpu, &[vocab, dim]),
-            m_tbl: DTensor::zeros(gpu, &[vocab, dim]),
-            v_tbl: DTensor::zeros(gpu, &[vocab, dim]),
+            table: GTensor::from_host(gpu, table),
+            dtable: GTensor::zeros(gpu, &[vocab, dim]),
+            m_tbl: GTensor::zeros(gpu, &[vocab, dim]),
+            v_tbl: GTensor::zeros(gpu, &[vocab, dim]),
             dim,
             lin1: Linear::from_parts(gpu, lin1_w, lin1_b),
-            gamma: DTensor::from_host(gpu, gamma),
-            dgamma: DTensor::zeros(gpu, &[hidden]),
-            m_g: DTensor::zeros(gpu, &[hidden]),
-            v_g: DTensor::zeros(gpu, &[hidden]),
+            gamma: GTensor::from_host(gpu, gamma),
+            dgamma: GTensor::zeros(gpu, &[hidden]),
+            m_g: GTensor::zeros(gpu, &[hidden]),
+            v_g: GTensor::zeros(gpu, &[hidden]),
             hidden,
             head: {
                 // fp32: feeds the softmax/CE directly. See `gpu::lm`.
@@ -93,7 +93,7 @@ impl Flat {
     }
 
     /// Forward to capped logits `[B, vocab]`. Caches everything backward needs.
-    pub fn forward(&mut self, gpu: &Gpu, ids: &[usize]) -> DTensor {
+    pub fn forward(&mut self, gpu: &Gpu, ids: &[usize]) -> GTensor<f32> {
         let e = ops::embedding_gather(gpu, &self.table, ids, self.dim);
         let h = self.lin1.forward_alloc(gpu, &e);
         let (rms_out, rms) = ops::rms_norm_forward(gpu, &h, &self.gamma, self.hidden, EPS);
@@ -107,7 +107,7 @@ impl Flat {
 
     /// Given `dlogits` from the fused CE, backprop through the whole stack,
     /// accumulating every parameter gradient.
-    pub fn backward(&mut self, gpu: &Gpu, dlogits: &DTensor) {
+    pub fn backward(&mut self, gpu: &Gpu, dlogits: &GTensor<f32>) {
         let logits = self.logits.as_ref().expect("forward before backward");
         let rms = self.rms.as_ref().expect("forward before backward");
         let d_pre = ops::softcap_backward(gpu, dlogits, logits, self.cap);

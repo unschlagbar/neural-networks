@@ -32,7 +32,7 @@ fn main() {
 fn main() {
     use std::time::Instant;
 
-    use neural_networks::gpu::{DTensor, Gpu, slstm::SLstm};
+    use neural_networks::gpu::{GTensor, Gpu, slstm::SLstm};
     use neural_networks::tensor::Tensor;
 
     let gpu = match Gpu::new() {
@@ -48,8 +48,8 @@ fn main() {
     // fwd+bwd each read Whr [H, 4H] once per timestep.
     let run = |b: usize, h: usize| -> (f64, f64) {
         let mut dev = SLstm::new_rand(&gpu, h, h);
-        let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 0.5));
-        let g = DTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 1.0));
+        let x = GTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 0.5));
+        let g = GTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 1.0));
         let iters = 10;
 
         for _ in 0..2 {

@@ -35,7 +35,7 @@ fn main() {
     let gpu = Gpu::new().expect("gpu");
 
     // The device's default async pool — what `cuMemAllocAsync` (and hence every
-    // `DTensor`) draws from.
+    // `GTensor<f32>`) draws from.
     let pool = unsafe {
         let dev = cudarc::driver::result::device::get(0).expect("device");
         cudarc::driver::result::device::get_default_mem_pool(dev).expect("pool")

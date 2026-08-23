@@ -6,7 +6,7 @@
 //! This is the stack the flat toy (`gpu::flat`) stood in for: it has an actual
 //! recurrent core. Everything — the embedding table, every block (norms, SwiGLU
 //! projections, recurrent cell), the final norm and the logit head, plus all
-//! gradients and AdamW moments — lives in `DTensor`s, so a whole
+//! gradients and AdamW moments — lives in `GTensor<f32>`s, so a whole
 //! forward → loss → backward → step cycle crosses PCIe only for the token ids in
 //! and the scalar loss out.
 //!
@@ -17,17 +17,18 @@
 //! The blocks are held as `Vec<Box<dyn BlockLike>>` because `Block<SLstm>` and
 //! `Block<MLstm>` are different concrete types.
 
-use super::{DTensor, Gpu, linear::Linear, ops, rms_norm::RmsNorm};
+use super::{GTensor, Gpu, linear::Linear, ops, rms_norm::RmsNorm};
+use crate::gpu::arena::TrainingCache;
 use crate::gpu::block::BlockLike;
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
 
 pub struct Lm {
     // Embedding table + grad + Adam moments.
-    table: DTensor,
-    dtable: DTensor,
-    m_tbl: DTensor,
-    v_tbl: DTensor,
+    table: GTensor<f32>,
+    dtable: GTensor<f32>,
+    m_tbl: GTensor<f32>,
+    v_tbl: GTensor<f32>,
 
     blocks: Vec<Box<dyn BlockLike>>,
     norm: RmsNorm,
@@ -37,8 +38,10 @@ pub struct Lm {
     hidden: usize,
     // Per-forward cache for backward.
     ids: Vec<usize>,
-    logits: Option<DTensor>, // capped logits, for the SoftCap backward
+    logits: Option<GTensor<f32>>, // capped logits, for the SoftCap backward
     seq: (usize, usize),     // (B, T)
+    /// Forward activations, owned so the buffers survive across calls.
+    cache: TrainingCache,
 }
 
 impl Lm {
@@ -57,10 +60,10 @@ impl Lm {
     ) -> Self {
         let (vocab, hidden) = (table.rows(), table.cols());
         Self {
-            table: DTensor::from_host(gpu, table),
-            dtable: DTensor::zeros(gpu, &[vocab, hidden]),
-            m_tbl: DTensor::zeros(gpu, &[vocab, hidden]),
-            v_tbl: DTensor::zeros(gpu, &[vocab, hidden]),
+            table: GTensor::from_host(gpu, table),
+            dtable: GTensor::zeros(gpu, &[vocab, hidden]),
+            m_tbl: GTensor::zeros(gpu, &[vocab, hidden]),
+            v_tbl: GTensor::zeros(gpu, &[vocab, hidden]),
             blocks,
             norm: RmsNorm::from_parts(gpu, gamma),
             head: {
@@ -78,20 +81,21 @@ impl Lm {
             ids: Vec::new(),
             logits: None,
             seq: (0, 0),
+            cache: TrainingCache::default(),
         }
     }
 
     /// Forward `B·T` token ids (row-major `[B, T]`) to capped logits `[B·T, vocab]`.
-    pub fn forward(&mut self, gpu: &Gpu, ids: &[usize], b: usize, t: usize) -> DTensor {
+    pub fn forward(&mut self, gpu: &Gpu, ids: &[usize], b: usize, t: usize) -> GTensor<f32> {
         let (n, h) = (b * t, self.hidden);
         assert_eq!(ids.len(), n, "Lm::forward — ids len != B·T");
 
         let e = ops::embedding_gather(gpu, &self.table, ids, h); // [N, H]
         let mut seq = e.reshaped(&[b, t, h]);
         // Blocks are H-in == H-out, so one spare buffer ping-pongs the whole stack.
-        let mut next = DTensor::uninit(gpu, &[b, t, h]);
+        let mut next = GTensor::uninit(gpu, &[b, t, h]);
         for blk in self.blocks.iter_mut() {
-            blk.forward(gpu, &seq, &mut next);
+            blk.forward(gpu, &seq, &mut next, &mut self.cache);
             std::mem::swap(&mut seq, &mut next);
         }
         let flat = seq.reshaped(&[n, h]);
@@ -106,7 +110,7 @@ impl Lm {
     }
 
     /// Backprop `dlogits` (from the fused CE) through the whole stack.
-    pub fn backward(&mut self, gpu: &Gpu, dlogits: &DTensor) {
+    pub fn backward(&mut self, gpu: &Gpu, dlogits: &GTensor<f32>) {
         let (b, t) = self.seq;
         let (n, h) = (b * t, self.hidden);
         let logits = self.logits.as_ref().expect("Lm::backward before forward");
@@ -116,7 +120,7 @@ impl Lm {
         let d_flat = self.norm.backward_alloc(gpu, &d_normed); // [N, H]
 
         let mut d_seq = d_flat.reshaped(&[b, t, h]);
-        let mut d_next = DTensor::uninit(gpu, &[b, t, h]);
+        let mut d_next = GTensor::uninit(gpu, &[b, t, h]);
         for blk in self.blocks.iter_mut().rev() {
             blk.backward(gpu, &d_seq, &mut d_next);
             std::mem::swap(&mut d_seq, &mut d_next);

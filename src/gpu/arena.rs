@@ -18,7 +18,7 @@
 
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
-use super::{DTensor, Gpu, ops};
+use super::{GTensor, Gpu, ops};
 use crate::nn2::optim::AdamCfg;
 
 /// How the optimizer treats a parameter.
@@ -37,19 +37,19 @@ pub enum ParamKind {
 
 /// One parameter with the three tensors AdamW keeps alongside it.
 pub struct ParamSlot<'a> {
-    pub param: &'a mut DTensor,
-    pub grad: &'a mut DTensor,
-    pub m: &'a mut DTensor,
-    pub v: &'a mut DTensor,
+    pub param: &'a mut GTensor<f32>,
+    pub grad: &'a mut GTensor<f32>,
+    pub m: &'a mut GTensor<f32>,
+    pub v: &'a mut GTensor<f32>,
     pub kind: ParamKind,
 }
 
 impl<'a> ParamSlot<'a> {
     pub fn new(
-        param: &'a mut DTensor,
-        grad: &'a mut DTensor,
-        m: &'a mut DTensor,
-        v: &'a mut DTensor,
+        param: &'a mut GTensor<f32>,
+        grad: &'a mut GTensor<f32>,
+        m: &'a mut GTensor<f32>,
+        v: &'a mut GTensor<f32>,
         kind: ParamKind,
     ) -> Self {
         Self {
@@ -62,7 +62,7 @@ impl<'a> ParamSlot<'a> {
     }
 
     /// The slot's tensors by arena buffer: 0 parameter, 1 gradient, 2 `m`, 3 `v`.
-    fn role_mut(&mut self, role: usize) -> &mut DTensor {
+    fn role_mut(&mut self, role: usize) -> &mut GTensor<f32> {
         match role {
             0 => self.param,
             1 => self.grad,
@@ -191,11 +191,20 @@ fn pack(gpu: &Gpu, slots: &mut [ParamSlot<'_>], total: usize, role: usize) -> Cu
         gpu.stream
             .memcpy_dtod(&t.buf.slice(..n), &mut base.slice_mut(off..off + n))
             .expect("arena copy");
-        let view = DTensor::view(gpu, &base, off, t.dims());
+        let view = GTensor::view(gpu, &base, off, t.dims());
         *t = view;
         off += n;
     }
     base
+}
+
+#[derive(Default)]
+pub struct TrainingCache {}
+
+impl TrainingCache {
+    pub fn new() -> Self {
+        Self {}
+    }
 }
 
 #[cfg(test)]
@@ -225,7 +234,7 @@ mod tests {
         ];
         let mk = |seed: f32, n: usize| {
             let d: Vec<f32> = (0..n).map(|i| (i as f32 * 0.19 + seed).sin()).collect();
-            DTensor::from_host(&gpu, &Tensor::new(&[n], d))
+            GTensor::from_host(&gpu, &Tensor::new(&[n], d))
         };
         // The second moment is a running mean of squares, so it is non-negative by
         // construction; seeding it from `sin` would put `sqrt` on negative input.
@@ -233,7 +242,7 @@ mod tests {
             let d: Vec<f32> = (0..n)
                 .map(|i| ((i as f32 * 0.19 + seed).sin()).abs())
                 .collect();
-            DTensor::from_host(&gpu, &Tensor::new(&[n], d))
+            GTensor::from_host(&gpu, &Tensor::new(&[n], d))
         };
         // lr·wd must be large enough for a wrong decay to exceed the comparison
         // tolerance — at the production 1e-3/0.05 the decay term is 5e-5 and an
@@ -244,20 +253,25 @@ mod tests {
         };
 
         // Two identical sets of (param, grad, m, v).
-        let build = || -> Vec<[DTensor; 4]> {
+        let build = || -> Vec<[GTensor<f32>; 4]> {
             sizes
                 .iter()
                 .enumerate()
                 .map(|(k, &n)| {
                     let k = k as f32;
-                    [mk(k, n), mk(k + 10.0, n), mk(k + 20.0, n), mk_v(k + 30.0, n)]
+                    [
+                        mk(k, n),
+                        mk(k + 10.0, n),
+                        mk(k + 20.0, n),
+                        mk_v(k + 30.0, n),
+                    ]
                 })
                 .collect()
         };
         let mut eager = build();
         let mut packed = build();
 
-        fn slots<'a>(ts: &'a mut [[DTensor; 4]], kinds: &[ParamKind]) -> Vec<ParamSlot<'a>> {
+        fn slots<'a>(ts: &'a mut [[GTensor<f32>; 4]], kinds: &[ParamKind]) -> Vec<ParamSlot<'a>> {
             ts.iter_mut()
                 .zip(kinds)
                 .map(|(t, &kind)| {
@@ -290,7 +304,7 @@ mod tests {
         }
 
         // Contiguous and in kind order, which is what makes the step one launch.
-        let addr = |t: &DTensor| {
+        let addr = |t: &GTensor<f32>| {
             use cudarc::driver::DevicePtr;
             t.buf.device_ptr(&gpu.stream).0
         };

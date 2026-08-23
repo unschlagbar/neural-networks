@@ -1,20 +1,24 @@
-//! A device-resident tensor: the shape metadata of a host [`Tensor`] plus a [`DBuf`]
-//! — an `f32` allocation in GPU memory, or a window into one.
+//! A device-resident tensor: the shape metadata of a host [`Tensor`] plus a [`GBuf`]
+//! — an allocation in GPU memory, or a window into one.
+//!
+//! [`GTensor`] is generic in the element width. `GTensor<f32>` is what every
+//! kernel and GEMM computes in; `GTensor<u16>` holds bf16, whose bits Rust has no
+//! native type for (see [`bf16`](super::bf16)).
 //!
 //! This is the "resident device buffer" of the bring-up plan. Rather than bolt
 //! a `CudaSlice` onto the host `Tensor` (which derives `Clone`/`PartialEq` and
-//! is used everywhere, incl. serialization), `DTensor` is a parallel type: data
+//! is used everywhere, incl. serialization), `GTensor` is a parallel type: data
 //! stays on the GPU across a chain of ops and only crosses the PCIe bus at the
-//! explicit `from_host` / `to_host` boundaries. Layers will hold `DTensor`s on
-//! the GPU path exactly where they hold `Tensor`s on the CPU path.
+//! explicit `from_host` / `to_host` boundaries. Layers hold `GTensor<f32>` on the
+//! GPU path exactly where they hold `Tensor` on the CPU path.
 
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceSlice, LaunchArgs, PushKernelArg,
-    SyncOnDrop, sys,
+    CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, DeviceSlice, LaunchArgs,
+    PushKernelArg, SyncOnDrop, ValidAsZeroBits, sys,
 };
 
 use super::Gpu;
@@ -37,7 +41,7 @@ pub mod ptr_probe {
         *ON.get_or_init(|| std::env::var("GPU_PTR_PROBE").is_ok_and(|v| v != "0"))
     }
 
-    pub fn record(gpu: &Gpu, buf: &CudaSlice<f32>) {
+    pub fn record<T>(gpu: &Gpu, buf: &CudaSlice<T>) {
         if !on() {
             return;
         }
@@ -73,19 +77,19 @@ pub mod ptr_probe {
 /// A device allocation, or a non-owning window into a larger one.
 ///
 /// Every parameter lives in one contiguous [`ParamArena`](super::arena::ParamArena)
-/// and each layer holds a window into it, so a `DTensor`'s storage is not always its
+/// and each layer holds a window into it, so a tensor's storage is not always its
 /// own. A window is a real `CudaSlice` at an offset inside the arena — freeing it
 /// would hand the driver an interior pointer, so `owned` decides what drop does.
 ///
-/// Derefs to `CudaSlice<f32>` and carries the cudarc traits, so a window is passed
+/// Derefs to `CudaSlice<T>` and carries the cudarc traits, so a window is passed
 /// to kernels, cuBLAS and the copy helpers exactly like an allocation.
-pub struct DBuf {
-    slice: ManuallyDrop<CudaSlice<f32>>,
+pub struct GBuf<T> {
+    slice: ManuallyDrop<CudaSlice<T>>,
     owned: bool,
 }
 
-impl DBuf {
-    fn owned(slice: CudaSlice<f32>) -> Self {
+impl<T> GBuf<T> {
+    fn owned(slice: CudaSlice<T>) -> Self {
         Self {
             slice: ManuallyDrop::new(slice),
             owned: true,
@@ -101,7 +105,7 @@ impl DBuf {
     /// between them. That is exactly the contract `Gpu::new` already takes on with
     /// `disable_event_tracking` — one stream, program order — and re-enabling cudarc's
     /// event tracking would not extend to them.
-    fn window(gpu: &Gpu, base: &CudaSlice<f32>, off: usize, len: usize) -> Self {
+    fn window(gpu: &Gpu, base: &CudaSlice<T>, off: usize, len: usize) -> Self {
         assert!(
             off + len <= base.len(),
             "window {off}..{} exceeds the {} element arena",
@@ -109,10 +113,10 @@ impl DBuf {
             base.len()
         );
         let (p, _g) = base.device_ptr(&gpu.stream);
-        let at = p + (off * std::mem::size_of::<f32>()) as u64;
+        let at = p + (off * std::mem::size_of::<T>()) as u64;
         // SAFETY: `at` is inside a live allocation with `len` elements after it, and
         // the arena keeps it mapped; `Drop` below never frees a window.
-        let slice = unsafe { gpu.stream.upgrade_device_ptr::<f32>(at, len) };
+        let slice = unsafe { gpu.stream.upgrade_device_ptr::<T>(at, len) };
         Self {
             slice: ManuallyDrop::new(slice),
             owned: false,
@@ -126,7 +130,7 @@ impl DBuf {
     }
 }
 
-impl Drop for DBuf {
+impl<T> Drop for GBuf<T> {
     fn drop(&mut self) {
         // SAFETY: the only take, and the field is never read again.
         let slice = unsafe { ManuallyDrop::take(&mut self.slice) };
@@ -137,22 +141,22 @@ impl Drop for DBuf {
     }
 }
 
-impl Deref for DBuf {
-    type Target = CudaSlice<f32>;
+impl<T> Deref for GBuf<T> {
+    type Target = CudaSlice<T>;
     #[inline]
-    fn deref(&self) -> &CudaSlice<f32> {
+    fn deref(&self) -> &CudaSlice<T> {
         &self.slice
     }
 }
 
-impl DerefMut for DBuf {
+impl<T> DerefMut for GBuf<T> {
     #[inline]
-    fn deref_mut(&mut self) -> &mut CudaSlice<f32> {
+    fn deref_mut(&mut self) -> &mut CudaSlice<T> {
         &mut self.slice
     }
 }
 
-impl DeviceSlice<f32> for DBuf {
+impl<T> DeviceSlice<T> for GBuf<T> {
     fn len(&self) -> usize {
         self.slice.len()
     }
@@ -161,13 +165,13 @@ impl DeviceSlice<f32> for DBuf {
     }
 }
 
-impl DevicePtr<f32> for DBuf {
+impl<T> DevicePtr<T> for GBuf<T> {
     fn device_ptr<'a>(&'a self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
         self.slice.device_ptr(stream)
     }
 }
 
-impl DevicePtrMut<f32> for DBuf {
+impl<T> DevicePtrMut<T> for GBuf<T> {
     fn device_ptr_mut<'a>(
         &'a mut self,
         stream: &'a CudaStream,
@@ -176,36 +180,42 @@ impl DevicePtrMut<f32> for DBuf {
     }
 }
 
-unsafe impl<'a, 'b: 'a> PushKernelArg<&'b DBuf> for LaunchArgs<'a> {
+unsafe impl<'a, 'b: 'a, T> PushKernelArg<&'b GBuf<T>> for LaunchArgs<'a> {
     #[inline(always)]
-    fn arg(&mut self, arg: &'b DBuf) -> &mut Self {
+    fn arg(&mut self, arg: &'b GBuf<T>) -> &mut Self {
         PushKernelArg::arg(self, &*arg.slice)
     }
 }
 
-unsafe impl<'a, 'b: 'a> PushKernelArg<&'b mut DBuf> for LaunchArgs<'a> {
+unsafe impl<'a, 'b: 'a, T> PushKernelArg<&'b mut GBuf<T>> for LaunchArgs<'a> {
     #[inline(always)]
-    fn arg(&mut self, arg: &'b mut DBuf) -> &mut Self {
+    fn arg(&mut self, arg: &'b mut GBuf<T>) -> &mut Self {
         PushKernelArg::arg(self, &mut *arg.slice)
     }
 }
 
-/// A dense, row-major, contiguous `f32` tensor resident in device memory.
+/// A dense, row-major, contiguous tensor of `T` resident in device memory.
 /// Shape layout mirrors [`Tensor`]: only `shape[..rank]` are meaningful.
-pub struct DTensor {
+///
+/// The element type is a parameter because the two widths the model stores differ
+/// only in it: `f32` is what everything computes in, `u16` is the bf16 storage slab.
+/// Shape handling, pooling, arena windows and reshaping are identical for both, so
+/// they are written once here; what genuinely differs — host round-trips, the cast
+/// kernels — lives in the per-width impls.
+pub struct GTensor<T> {
     pub shape: [usize; MAX_RANK],
     pub rank: usize,
-    pub buf: DBuf,
+    pub buf: GBuf<T>,
 }
 
-impl DTensor {
+impl GTensor<f32> {
     /// Upload a host tensor to the device (blocking H2D copy on the stream).
     pub fn from_host(gpu: &Gpu, t: &Tensor) -> Self {
         let buf = gpu.stream.clone_htod(&t.data).expect("H2D upload");
         Self {
             shape: t.shape,
             rank: t.rank,
-            buf: DBuf::owned(buf),
+            buf: GBuf::owned(buf),
         }
     }
 
@@ -226,7 +236,11 @@ impl DTensor {
             data,
         }
     }
+}
 
+/// The bound is what any stored width has to satisfy: allocatable by cudarc and
+/// zeroable by `memset`. `f32` and `u16` both are.
+impl<T: DeviceRepr + ValidAsZeroBits> GTensor<T> {
     /// Allocate a zeroed device tensor of the given shape.
     pub fn zeros(gpu: &Gpu, dims: &[usize]) -> Self {
         let mut t = Self::uninit(gpu, dims);
@@ -245,7 +259,7 @@ impl DTensor {
         );
         let n: usize = dims.iter().product();
         // SAFETY: contract above — every element is written before it is read.
-        let buf = unsafe { gpu.stream.alloc::<f32>(n) }.expect("device alloc");
+        let buf = unsafe { gpu.stream.alloc::<T>(n) }.expect("device alloc");
         if ptr_probe::on() {
             ptr_probe::record(gpu, &buf);
         }
@@ -254,7 +268,7 @@ impl DTensor {
         Self {
             shape,
             rank: dims.len(),
-            buf: DBuf::owned(buf),
+            buf: GBuf::owned(buf),
         }
     }
 
@@ -262,7 +276,7 @@ impl DTensor {
     ///
     /// Owns nothing: the storage stays the arena's, and this tensor's device address
     /// is fixed for as long as the arena lives. See [`super::arena`].
-    pub fn view(gpu: &Gpu, base: &CudaSlice<f32>, off: usize, dims: &[usize]) -> Self {
+    pub fn view(gpu: &Gpu, base: &CudaSlice<T>, off: usize, dims: &[usize]) -> Self {
         assert!(
             dims.len() <= MAX_RANK,
             "rank {} exceeds MAX_RANK",
@@ -274,7 +288,7 @@ impl DTensor {
         Self {
             shape,
             rank: dims.len(),
-            buf: DBuf::window(gpu, base, off, n),
+            buf: GBuf::window(gpu, base, off, n),
         }
     }
 
@@ -303,7 +317,7 @@ impl DTensor {
         Self {
             shape: self.shape,
             rank: self.rank,
-            buf: DBuf::owned(buf),
+            buf: GBuf::owned(buf),
         }
     }
 
@@ -315,7 +329,7 @@ impl DTensor {
     /// fail, or move slack that means nothing, the moment either side is pooled.
     ///
     /// [`shrink_to`]: Self::shrink_to
-    pub fn copy_from(&mut self, gpu: &Gpu, src: &DTensor) {
+    pub fn copy_from(&mut self, gpu: &Gpu, src: &Self) {
         let n = src.len();
         assert!(
             n <= self.capacity(),
@@ -349,7 +363,7 @@ impl DTensor {
     /// buffer (metadata-only, no copy).
     ///
     /// [`reshaped`](Self::reshaped) consumes `self`, which a layer-owned buffer
-    /// borrowed as `&mut DTensor` cannot give up. This is the in-place form, used
+    /// borrowed as `&mut GTensor<f32>` cannot give up. This is the in-place form, used
     /// where an owned buffer must be seen as `[B,T,H]` by one op and `[N,H]` by
     /// the next. Panics if the element count would change.
     pub fn reshape_to(&mut self, dims: &[usize]) {
@@ -437,7 +451,7 @@ impl DTensor {
     /// care whether the caller is holding `[B, T, H]` or the flat `[N, H]`.
     ///
     /// Metadata only, and borrowing: unlike [`reshaped`](Self::reshaped) it does not
-    /// consume the tensor, so a `&DTensor` argument can be viewed this way.
+    /// consume the tensor, so a `&GTensor<f32>` argument can be viewed this way.
     #[inline]
     pub fn as_2d(&self) -> (usize, usize) {
         assert!(self.rank >= 1, "as_2d(): rank 0");
@@ -456,7 +470,7 @@ mod tests {
             return;
         };
         let t = Tensor::random(&[7, 13], 1.0);
-        let d = DTensor::from_host(&gpu, &t);
+        let d = GTensor::from_host(&gpu, &t);
         let back = d.to_host(&gpu);
         assert_eq!(t, back, "round-trip through device memory changed the data");
     }

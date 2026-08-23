@@ -22,7 +22,8 @@ fn main() {
     use std::time::Instant;
 
     use neural_networks::config::{BACKBONE_CHUNK, CHAR_HIDDEN, WORD_HIDDEN};
-    use neural_networks::gpu::{DTensor, Gpu, slstm::SLstm};
+    use neural_networks::gpu::arena::TrainingCache;
+    use neural_networks::gpu::{GTensor, Gpu, slstm::SLstm};
     use neural_networks::tensor::Tensor;
 
     let env = |k: &str, d: usize| -> usize {
@@ -32,6 +33,8 @@ fn main() {
             .unwrap_or(d)
     };
     let (reps, iters) = (env("REPS", 5), env("ITERS", 20));
+
+    let mut cache = TrainingCache::new();
 
     let gpu = Gpu::new().expect("gpu");
     println!(
@@ -65,19 +68,19 @@ fn main() {
 
     for (label, b, t, h) in shapes {
         let mut cell = SLstm::new_rand(&gpu, h, h);
-        let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 0.5));
-        let mut y = DTensor::uninit(&gpu, &[b, t, h]);
+        let x = GTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 0.5));
+        let mut y = GTensor::uninit(&gpu, &[b, t, h]);
         let (mut best_wall, mut best_issue) = (f64::MAX, f64::MAX);
 
         for _ in 0..reps {
             for _ in 0..3 {
-                cell.forward(&gpu, &x, &mut y);
+                cell.forward(&gpu, &x, &mut y, &mut cache);
             }
             gpu.stream.synchronize().unwrap();
 
             let t0 = Instant::now();
             for _ in 0..iters {
-                cell.forward(&gpu, &x, &mut y);
+                cell.forward(&gpu, &x, &mut y, &mut cache);
             }
             let issue = t0.elapsed().as_secs_f64() / iters as f64;
             gpu.stream.synchronize().unwrap();

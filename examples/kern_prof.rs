@@ -99,5 +99,5 @@ fn main() {
         el,
         el * 1000.0 / steps as f64
     );
-    neural_networks::gpu::dtensor::ptr_probe::dump(warmup + steps);
+    neural_networks::gpu::gtensor::ptr_probe::dump(warmup + steps);
 }

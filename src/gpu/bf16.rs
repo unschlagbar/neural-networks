@@ -8,7 +8,7 @@
 //! which makes their *storage* precision a free parameter, independent of the
 //! precision the math runs at.
 //!
-//! A [`BTensor`] is such a slab held as bf16: same shape, half the bytes. Kernels
+//! A `GTensor<u16>` is such a slab held as bf16: same shape, half the bytes. Kernels
 //! that read one convert to fp32 on load and compute in fp32 exactly as before, so
 //! the arithmetic is unchanged and only the round-trip through global memory is
 //! narrowed.
@@ -106,10 +106,9 @@
 //! not shrink when blocks are freed — measure capacity (the largest window that
 //! fits) rather than reported usage.
 
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-use super::{DTensor, Gpu};
-use crate::tensor::MAX_RANK;
+use super::{GTensor, Gpu};
 
 /// Whether saved activations are stored as bf16. On unless `GPU_NO_BF16` is set.
 ///
@@ -126,34 +125,20 @@ pub fn active(gpu: &Gpu) -> bool {
     enabled() && gpu.kernels.has_bf16
 }
 
-/// A dense, row-major, contiguous **bf16** tensor in device memory.
-///
-/// Shape metadata mirrors [`DTensor`]; the buffer is `u16` because that is the
-/// storage width and Rust has no native bf16 — nothing on the host interprets
-/// these bits, they only travel between the cast kernels and the consumers.
-pub struct BTensor {
-    pub shape: [usize; MAX_RANK],
-    pub rank: usize,
-    pub buf: CudaSlice<u16>,
-}
-
-impl BTensor {
-    /// Allocate an **uninitialized** bf16 tensor. Like [`DTensor::uninit`], the
-    /// caller must write every element before reading it.
-    pub fn uninit(gpu: &Gpu, dims: &[usize]) -> Self {
-        assert!(dims.len() <= MAX_RANK, "rank {} exceeds MAX_RANK", dims.len());
-        let n: usize = dims.iter().product();
-        // SAFETY: same contract as `DTensor::uninit` — fully written before read.
-        let buf = unsafe { gpu.stream.alloc::<u16>(n) }.expect("bf16 device alloc");
-        let mut shape = [0usize; MAX_RANK];
-        shape[..dims.len()].copy_from_slice(dims);
-        Self { shape, rank: dims.len(), buf }
-    }
-
+/// The bf16 storage width: `u16`, because that is what bf16 occupies and Rust has no
+/// native type for it — nothing on the host interprets these bits, they only travel
+/// between the cast kernels and the consumers. Shape handling, pooling and arena
+/// windows are inherited from the generic [`GTensor`]; only the two casts below are
+/// specific to this width.
+impl GTensor<u16> {
     /// Narrow `src` into this tensor (fp32 -> bf16, round-to-nearest-even).
-    pub fn store(&mut self, gpu: &Gpu, src: &DTensor) {
+    pub fn store(&mut self, gpu: &Gpu, src: &GTensor<f32>) {
         let n = src.len();
-        assert!(n <= self.capacity(), "store: {n} elements into a {} buffer", self.capacity());
+        assert!(
+            n <= self.capacity(),
+            "store: {n} elements into a {} buffer",
+            self.capacity()
+        );
         let f = gpu.kernels.get("cast_f32_to_bf16");
         let n_i32 = n as i32;
         let mut b = gpu.stream.launch_builder(&f);
@@ -164,9 +149,13 @@ impl BTensor {
 
     /// Widen this tensor into `dst` (bf16 -> fp32, exact: every bf16 value is a
     /// representable fp32). `dst` is presented at this tensor's shape.
-    pub fn load(&self, gpu: &Gpu, dst: &mut DTensor) {
+    pub fn load(&self, gpu: &Gpu, dst: &mut GTensor<f32>) {
         let n = self.len();
-        assert!(n <= dst.capacity(), "load: {n} elements into a {} buffer", dst.capacity());
+        assert!(
+            n <= dst.capacity(),
+            "load: {n} elements into a {} buffer",
+            dst.capacity()
+        );
         dst.shrink_to(self.dims());
         let f = gpu.kernels.get("cast_bf16_to_f32");
         let n_i32 = n as i32;
@@ -175,45 +164,12 @@ impl BTensor {
         unsafe { b.launch(LaunchConfig::for_num_elems(n.div_ceil(4) as u32)) }
             .expect("cast from bf16");
     }
-
-    /// Present this tensor at `dims`, which must fit within its allocation — the
-    /// bf16 twin of [`DTensor::shrink_to`], with the same pooled-buffer rationale.
-    pub fn shrink_to(&mut self, dims: &[usize]) {
-        assert!(dims.len() <= MAX_RANK, "shrink rank {} exceeds MAX_RANK", dims.len());
-        let n: usize = dims.iter().product();
-        assert!(n <= self.buf.len(), "shrink_to {n} exceeds the {} allocated", self.buf.len());
-        self.shape = [0usize; MAX_RANK];
-        self.shape[..dims.len()].copy_from_slice(dims);
-        self.rank = dims.len();
-    }
-
-    #[inline]
-    pub fn dims(&self) -> &[usize] {
-        &self.shape[..self.rank]
-    }
-
-    /// Elements the current shape describes (not the allocation — see
-    /// [`capacity`](Self::capacity)).
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.shape[..self.rank].iter().product()
-    }
-
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.buf.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.buf.len() == 0
-    }
 }
 
 /// A saved activation slab, held as bf16 when that is available and fp32 when it
 /// is not.
 ///
-/// This is what a layer stores instead of a bare [`DTensor`]. The two variants are
+/// This is what a layer stores instead of a bare `GTensor<f32>`. The two variants are
 /// deliberately not a runtime choice per call: [`Slab::new`] picks once from
 /// [`active`], and forward and backward then agree by construction.
 ///
@@ -222,17 +178,17 @@ impl BTensor {
 /// caller-provided scratch buffer (bf16 variant). Consumers therefore need no
 /// knowledge of which is in play.
 pub enum Slab {
-    F32(DTensor),
-    Bf16(BTensor),
+    F32(GTensor<f32>),
+    Bf16(GTensor<u16>),
 }
 
 impl Slab {
     /// An uninitialized slab of the given shape, bf16 where available.
     pub fn new(gpu: &Gpu, dims: &[usize]) -> Self {
         if active(gpu) {
-            Slab::Bf16(BTensor::uninit(gpu, dims))
+            Slab::Bf16(GTensor::uninit(gpu, dims))
         } else {
-            Slab::F32(DTensor::uninit(gpu, dims))
+            Slab::F32(GTensor::uninit(gpu, dims))
         }
     }
 
@@ -282,7 +238,7 @@ impl Slab {
 
     /// Narrow `src` into this slab. For the fp32 variant this is a device copy; for
     /// bf16 it is the cast kernel.
-    pub fn store(&mut self, gpu: &Gpu, src: &DTensor) {
+    pub fn store(&mut self, gpu: &Gpu, src: &GTensor<f32>) {
         match self {
             Slab::F32(t) => t.copy_from(gpu, src),
             Slab::Bf16(t) => t.store(gpu, src),
@@ -299,7 +255,7 @@ impl Slab {
     /// `scratch` is only touched for the bf16 variant, where it receives the widened
     /// copy; the fp32 variant ignores it and returns the slab directly, so the
     /// no-bf16 path costs exactly what it did before this module existed.
-    pub fn get<'a>(&'a self, gpu: &Gpu, scratch: &'a mut DTensor) -> &'a DTensor {
+    pub fn get<'a>(&'a self, gpu: &Gpu, scratch: &'a mut GTensor<f32>) -> &'a GTensor<f32> {
         match self {
             Slab::F32(t) => t,
             Slab::Bf16(t) => {
@@ -329,10 +285,10 @@ mod tests {
             return;
         }
         let t = Tensor::random(&[64, 64], 3.0);
-        let d = DTensor::from_host(&gpu, &t);
-        let mut b = BTensor::uninit(&gpu, &[64, 64]);
+        let d = GTensor::from_host(&gpu, &t);
+        let mut b = GTensor::uninit(&gpu, &[64, 64]);
         b.store(&gpu, &d);
-        let mut back = DTensor::uninit(&gpu, &[64, 64]);
+        let mut back = GTensor::uninit(&gpu, &[64, 64]);
         b.load(&gpu, &mut back);
         let got = back.to_host(&gpu);
 
@@ -345,7 +301,10 @@ mod tests {
         }
         // bf16 stores 7 explicit mantissa bits (+1 implicit), so round-to-nearest
         // has a half-ulp bound of 2^-8 = 3.91e-3 relative.
-        assert!(worst < 3.91e-3, "bf16 round-trip relative error {worst} too large");
+        assert!(
+            worst < 3.91e-3,
+            "bf16 round-trip relative error {worst} too large"
+        );
         let mean_bias = signed / t.data.len() as f32;
         assert!(
             mean_bias.abs() < 1e-3,
@@ -367,10 +326,10 @@ mod tests {
         }
         for n in [1, 2, 3, 4, 5, 7, 8, 17, 63, 255, 257, 1023, 4097] {
             let t = Tensor::random(&[n], 3.0);
-            let d = DTensor::from_host(&gpu, &t);
-            let mut b = BTensor::uninit(&gpu, &[n]);
+            let d = GTensor::from_host(&gpu, &t);
+            let mut b = GTensor::uninit(&gpu, &[n]);
             b.store(&gpu, &d);
-            let mut back = DTensor::uninit(&gpu, &[n]);
+            let mut back = GTensor::uninit(&gpu, &[n]);
             b.load(&gpu, &mut back);
             let got = back.to_host(&gpu);
             for (i, (a, g)) in t.data.iter().zip(got.data.iter()).enumerate() {
@@ -391,8 +350,8 @@ mod tests {
             return;
         }
         let dims = [2, 512, 256];
-        let f32_bytes = Slab::F32(DTensor::uninit(&gpu, &dims)).bytes();
-        let bf_bytes = Slab::Bf16(BTensor::uninit(&gpu, &dims)).bytes();
+        let f32_bytes = Slab::F32(GTensor::uninit(&gpu, &dims)).bytes();
+        let bf_bytes = Slab::Bf16(GTensor::uninit(&gpu, &dims)).bytes();
         assert_eq!(f32_bytes, 2 * bf_bytes);
     }
 }

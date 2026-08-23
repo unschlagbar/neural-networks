@@ -10,14 +10,14 @@
 //!
 //! The norms and the SwiGLU MLP are position-wise and run on the flattened
 //! `[N, H]` view (`N = B·T`); only the recurrent `cell` sees the `[B, T, H]`
-//! sequence. Since a `DTensor` is contiguous row-major, the `[B,T,H] ↔ [N,H]`
-//! reshapes are metadata-only (`DTensor::reshaped`), no copy. The block composes
+//! sequence. Since a `GTensor<f32>` is contiguous row-major, the `[B,T,H] ↔ [N,H]`
+//! reshapes are metadata-only (`GTensor::reshaped`), no copy. The block composes
 //! the already-parity-tested `gpu::Linear` / `gpu::RmsNorm` sub-layers plus three
 //! small elementwise kernels (`add`, `swiglu_forward`, `swiglu_backward`) around
 //! a generic GPU `Cell`.
 
 use super::{
-    Buf, DTensor, Gpu, Pool,
+    Buf, GTensor, Gpu, Pool,
     arena::{self, ParamSlot},
     linear::Linear,
     mlstm::MLstm,
@@ -26,6 +26,7 @@ use super::{
     slstm::SLstm,
 };
 use crate::{
+    gpu::arena::TrainingCache,
     nn::{linear::LinearLayer, rms_norm::RMSNorm, slstm_block::SLSTMBlock},
     nn_layer::NnLayer,
     nn2::optim::AdamCfg,
@@ -135,8 +136,8 @@ pub mod phase {
 
 /// A recurrent cell operating on `[B, T, H]` device sequences (H in == H out).
 pub trait Cell {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor);
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor);
+    fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>, cache: &mut TrainingCache);
+    fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>);
     fn zero_grad(&mut self, gpu: &Gpu);
     /// Every parameter with its gradient and AdamW moments, in a fixed order.
     /// A model binds these into its [`ParamArena`](super::arena::ParamArena).
@@ -146,11 +147,11 @@ pub trait Cell {
         arena::step_slots(gpu, &mut self.param_slots(), cfg);
     }
     /// Learnable tensors in a fixed order (checkpoint save/load).
-    fn params_mut(&mut self) -> Vec<&mut DTensor> {
+    fn params_mut(&mut self) -> Vec<&mut GTensor<f32>> {
         self.param_slots().into_iter().map(|s| s.param).collect()
     }
     /// Gradient accumulators, matching `params_mut`'s order. Diagnostic.
-    fn grads(&mut self) -> Vec<&DTensor> {
+    fn grads(&mut self) -> Vec<&GTensor<f32>> {
         self.param_slots().into_iter().map(|s| &*s.grad).collect()
     }
     /// Forward-cache extremes, for cells that carry a stabilized normalizer.
@@ -214,10 +215,10 @@ pub trait Cell {
 }
 
 impl Cell for SLstm {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
-        SLstm::forward(self, gpu, x, out)
+    fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>, cache: &mut TrainingCache) {
+        SLstm::forward(self, gpu, x, out, cache)
     }
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+    fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
         SLstm::backward(self, gpu, dy, dx)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {
@@ -291,19 +292,19 @@ impl Cell for SLstm {
 /// sLSTM / mLSTM blocks) as `Vec<Box<dyn BlockLike>>`. `Block<C>` is generic over
 /// its cell, so the concrete types differ; this is the common interface.
 pub trait BlockLike {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor);
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor);
+    fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>, cache: &mut TrainingCache);
+    fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>);
     /// Forward into a freshly allocated `[B, T, H]`. Blocks are H-in == H-out, so
     /// the shape follows the input. For benchmarks and one-shot call sites; a
     /// training loop passes its own buffer to [`forward`](Self::forward).
-    fn forward_alloc(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
-        let mut y = DTensor::uninit(gpu, x.dims());
-        self.forward(gpu, x, &mut y);
+    fn forward_alloc(&mut self, gpu: &Gpu, x: &GTensor<f32>) -> GTensor<f32> {
+        let mut y = GTensor::uninit(gpu, x.dims());
+        self.forward(gpu, x, &mut y, &mut TrainingCache::new());
         y
     }
     /// Backward into a freshly allocated `dx`, shaped like `dy`.
-    fn backward_alloc(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
-        let mut dx = DTensor::uninit(gpu, dy.dims());
+    fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>) -> GTensor<f32> {
+        let mut dx = GTensor::uninit(gpu, dy.dims());
         self.backward(gpu, dy, &mut dx);
         dx
     }
@@ -316,11 +317,11 @@ pub trait BlockLike {
         arena::step_slots(gpu, &mut self.param_slots(), cfg);
     }
     /// Learnable tensors in a fixed order (checkpoint save/load).
-    fn params_mut(&mut self) -> Vec<&mut DTensor> {
+    fn params_mut(&mut self) -> Vec<&mut GTensor<f32>> {
         self.param_slots().into_iter().map(|s| s.param).collect()
     }
     /// Gradient accumulators, matching `params_mut`'s order. Diagnostic.
-    fn grads(&mut self) -> Vec<&DTensor> {
+    fn grads(&mut self) -> Vec<&GTensor<f32>> {
         self.param_slots().into_iter().map(|s| &*s.grad).collect()
     }
     /// The cell's forward-cache extremes. See [`Cell::state_extremes`].
@@ -363,10 +364,10 @@ pub trait BlockLike {
 }
 
 impl<C: Cell> BlockLike for Block<C> {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
-        Block::forward(self, gpu, x, out)
+    fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>, cache: &mut TrainingCache) {
+        Block::forward(self, gpu, x, out, cache)
     }
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+    fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
         Block::backward(self, gpu, dy, dx)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {
@@ -521,11 +522,11 @@ impl Act {
 /// Moving them out (rather than borrowing) is what lets the `Linear`s and the pool be
 /// borrowed mutably at the same time.
 struct FfnSaved {
-    gate_pre: DTensor,
-    gate_act: DTensor,
-    value: DTensor,
-    zn: DTensor,
-    mixed: DTensor,
+    gate_pre: GTensor<f32>,
+    gate_act: GTensor<f32>,
+    value: GTensor<f32>,
+    zn: GTensor<f32>,
+    mixed: GTensor<f32>,
     /// Whether these came from the owned `Buf`s and must go back into them.
     owned: bool,
 }
@@ -797,7 +798,7 @@ impl<C: Cell> Block<C> {
     }
 
     /// Forward over `[B, T, H]` → `y` `[B, T, H]`.
-    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
+    pub fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, y: &mut GTensor<f32>, cache: &mut TrainingCache) {
         assert_eq!(x.rank, 3, "Block::forward expects [B, T, H]");
         let (b, t, h) = (x.shape[0], x.shape[1], x.shape[2]);
         assert_eq!(h, self.hidden, "Block::forward — hidden mismatch");
@@ -856,7 +857,9 @@ impl<C: Cell> Block<C> {
         xn1.reshape_to(&[b, t, h]);
         let mut cell_out = a.pool.take(gpu, &[b, t, h]);
         let (cf, _cb) = self.cell.phase_buckets();
-        phase::timed(gpu, cf, || self.cell.forward(gpu, &xn1, &mut cell_out));
+        phase::timed(gpu, cf, || {
+            self.cell.forward(gpu, &xn1, &mut cell_out, cache)
+        });
         a.pool.put(xn1);
 
         // Downstream is position-wise [N, H].
@@ -984,7 +987,7 @@ impl<C: Cell> Block<C> {
     }
 
     /// Backward over `[B, T, H]` → `dx` `[B, T, H]`.
-    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+    pub fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
         let (b, t) = self.seq.pop().expect("Block::backward before forward");
         let (h, u) = (self.hidden, self.up);
         let n = b * t;
@@ -1149,7 +1152,6 @@ impl<C: Cell> Block<C> {
         self.lin_value.zero_grad(gpu);
         self.lin_down.zero_grad(gpu);
     }
-
 }
 
 /// Upload an `nn::LinearLayer` to the device.
@@ -1310,12 +1312,12 @@ mod tests {
 
         // Forward
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
+        let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x));
         assert_close_rel(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, rel(&gpu), "y");
 
         // Backward
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g));
         assert_close_rel(
             &dx_dev.to_host(&gpu).data,
             &dx_cpu.data,
@@ -1374,11 +1376,11 @@ mod tests {
         let g = Tensor::random(&[b, t, h], 1.0);
 
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
+        let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x));
         assert_close_rel(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, rel(&gpu), "y");
 
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g));
         assert_close_rel(
             &dx_dev.to_host(&gpu).data,
             &dx_cpu.data,
@@ -1436,8 +1438,8 @@ mod tests {
             if offload {
                 dev.enable_offload(gpu, offload::InFlight::shared());
             }
-            let y = dev.forward_alloc(gpu, &DTensor::from_host(gpu, x));
-            let dx = dev.backward_alloc(gpu, &DTensor::from_host(gpu, g));
+            let y = dev.forward_alloc(gpu, &GTensor::from_host(gpu, x));
+            let dx = dev.backward_alloc(gpu, &GTensor::from_host(gpu, g));
             // Gradients of the three FFN projections are the ones the parked buffers
             // feed, so they are the sharpest probe.
             let dw_down = dev.lin_down.dw.to_host(gpu).data;
@@ -1506,8 +1508,8 @@ mod tests {
             let (b, t) = (1 + step % 2, 3 + step); // shapes vary per step
             let x = Tensor::random(&[b, t, h], 0.5);
             let g = Tensor::random(&[b, t, h], 1.0);
-            let dx = DTensor::from_host(&gpu, &x);
-            let dg = DTensor::from_host(&gpu, &g);
+            let dx = GTensor::from_host(&gpu, &x);
+            let dg = GTensor::from_host(&gpu, &g);
 
             let y_r = resident.forward_alloc(&gpu, &dx).to_host(&gpu).data;
             let y_p = parked.forward_alloc(&gpu, &dx).to_host(&gpu).data;
@@ -1557,14 +1559,14 @@ mod tests {
             dev.set_carry(true);
             let mut ys = Vec::new();
             for x in &xs {
-                let dx = DTensor::from_host(&gpu, x);
+                let dx = GTensor::from_host(&gpu, x);
                 ys.push(dev.forward_alloc(&gpu, &dx).to_host(&gpu).data);
             }
             // Unwind right to left; the rightmost chunk starts with no incoming grad.
             dev.reset_bptt(&gpu);
             let mut dxs = Vec::new();
             for g in gs.iter().rev() {
-                let dg = DTensor::from_host(&gpu, g);
+                let dg = GTensor::from_host(&gpu, g);
                 dxs.push(dev.backward_alloc(&gpu, &dg).to_host(&gpu).data);
             }
             (ys, dxs, dev.lin_down.dw.to_host(&gpu).data)

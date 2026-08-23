@@ -209,7 +209,7 @@ pub struct Kernels {
     /// saved `zt`/`ot`/`h_prev` slabs are bf16 in global memory.
     ///
     /// **This is the authority the Rust side must allocate against**: the kernels
-    /// index those buffers at a compile-time width, so a `BTensor` where the kernel
+    /// index those buffers at a compile-time width, so a `GTensor<u16>` where the kernel
     /// expects `float` (or the reverse) is a silent out-of-bounds walk, not a type
     /// error. Every slab allocation reads this flag rather than the env var.
     pub slab_bf16: bool,

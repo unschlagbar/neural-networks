@@ -172,9 +172,9 @@ fn main() {
                     b,
                     match n {
                         12 => "sLSTM",
-                        // q/k/v and the two gate logits are one projection each, so
-                        // the cell holds four Linears, not seven.
-                        17 => "mLSTM",
+                        // q/k/v/o are one projection and the two gate logits another,
+                        // so the cell holds three Linears, not seven.
+                        15 => "mLSTM",
                         _ => "?",
                     },
                 )

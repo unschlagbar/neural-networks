@@ -31,28 +31,57 @@
 // `mlstm_state_scan` run in reverse, `mlstm_bw_parallel`. The last chunk may be
 // short and is masked by `len` everywhere.
 //
-// LAYOUT: q/k/v and the gate logits are POSITION-MAJOR `[B*T, H*W]` — the layout the
-// projections write — so element (b, h, t, c) sits at `((b*T + t)*H + h)*W + c`, and
-// `W` is `dqk` for q/k, `dhv` for v and the output, 1 for the gates. Feeding the
-// projection output straight in costs no reorg pass, and loads stay coalesced: the
-// fast axis `c` is contiguous, so a warp covers consecutive elements of one timestep.
+// LAYOUT: q/k/v/o and the two gate logits are POSITION-MAJOR and, within each of
+// those two groups, CONCATENATED into one tensor — the layout the two fused input
+// projections write. `qkvo` is `[B*T, H*(2*dqk + 2*dhv)]` with q, k, v and the
+// o-gate pre-activation occupying consecutive column blocks, `gates` is `[B*T, 2*H]`
+// with i before f. `ytil` is a tensor of its own, so it keeps the plain
+// `[B*T, H*dhv]` stride set.
+//
+// The concatenation is the reference's fused weight mode (nx-ai/xlstm,
+// `xlstm_large/model.py`): one `qkv_opreact` and one `ifgate_preact` instead of six
+// `nn.Linear`s, split with `tensor_split` on the way into the kernels. Here nothing
+// is split at all — the strides below address each part where the GEMM left it.
+//
+// Nothing in this file reads `o`; it rides the same tensor because it comes off the
+// same GEMM, and `ogate_fwd`/`ogate_bwd` address it with the same stride and
+// `MLSTM_OFF_O`.
 //
 // The reference (nx-ai/mlstm_kernels) passes str_matQK_B_NH / _S / _DHQK because
 // PyTorch hands it whatever layout the caller had. Here there is one producer and
 // one consumer, so the strides are derived from (B, H, T, dqk, dhv) below instead of
 // travelling as nine more kernel arguments.
+//
+// Loads stay coalesced: the fast axis `c` is still contiguous within a part, and only
+// the distance between timesteps changes (`H*dqk` -> the concatenated width).
 #define MLSTM_STRIDES_G                                                        \
-    const long sG_S = H, sG_H = 1, sG_B = (long)T * H;
+    const long sG_S = 2L * H, sG_B = (long)T * sG_S;
 #define MLSTM_STRIDES                                                          \
-    const long sQK_S = (long)H * dqk, sQK_H = dqk, sQK_B = (long)T * sQK_S;    \
-    const long sHV_S = (long)H * dhv, sHV_H = dhv, sHV_B = (long)T * sHV_S;    \
+    const long sX_S = (long)H * (2 * dqk + 2 * dhv), sX_B = (long)T * sX_S;    \
+    const long sY_S = (long)H * dhv, sY_H = dhv, sY_B = (long)T * sY_S;        \
     MLSTM_STRIDES_G
+
+// Column offset of each part within its concatenated tensor.
+#define MLSTM_OFF_K ((long)H * dqk)
+#define MLSTM_OFF_V (2L * (long)H * dqk)
+#define MLSTM_OFF_O (2L * (long)H * dqk + (long)H * dhv)
+#define MLSTM_OFF_IG (0L)
+#define MLSTM_OFF_FG ((long)H)
 
 // Base offset of the (b, h) a block owns, from its flat `bh = b*H + h`. Each tensor
 // group (q/k, v/h, gates) passes its own stride pair.
 __device__ __forceinline__ long bhBase(int bh, int H, long sB, long sH) {
     return (long)(bh / H) * sB + (long)(bh % H) * sH;
 }
+
+// Where head `bh % H` of each part starts. q/k are `dqk` apart per head, v `dhv`,
+// and the gates one element; the part's own column offset is added on top.
+#define Q_BASE(bh) (bhBase((bh), H, sX_B, (long)dqk))
+#define K_BASE(bh) (bhBase((bh), H, sX_B, (long)dqk) + MLSTM_OFF_K)
+#define V_BASE(bh) (bhBase((bh), H, sX_B, (long)dhv) + MLSTM_OFF_V)
+#define Y_BASE(bh) (bhBase((bh), H, sY_B, sY_H))
+#define IG_BASE(bh) (bhBase((bh), H, sG_B, 1L) + MLSTM_OFF_IG)
+#define FG_BASE(bh) (bhBase((bh), H, sG_B, 1L) + MLSTM_OFF_FG)
 
 // Sum across a warp, every lane left holding the total. The order is the shuffle
 // tree's, which the shape alone decides — unlike an atomic, whose order is the
@@ -134,13 +163,13 @@ __device__ __forceinline__ float warp_sum(float v) {
 // holding the last valid prefix — which is what `mlstm_bw_parallel` expects to find
 // in `fcb` there.
 extern "C" __global__ void mlstm_fw_gates(
-    const float* fg, const float* ig,
+    const float* gates,
     float* fcb, float* avec, float* gvec, float* mst,
     int T, int L, int NC, int CARRY, int H) {
     MLSTM_STRIDES_G
     const int bh = blockIdx.x, tid = threadIdx.x;
     const int lane = tid & 31, warp = tid >> 5, nwarps = blockDim.x >> 5;
-    const long gbase = bhBase(bh, H, sG_B, sG_H);
+    const long igbase = IG_BASE(bh), fgbase = FG_BASE(bh);
     const long kbase = (long)bh * NC;
     float* mrow = mst + (long)bh * (NC + 1);
 
@@ -150,13 +179,13 @@ extern "C" __global__ void mlstm_fw_gates(
 
     for (int k = warp; k < NC; k += nwarps) {
         const int c0 = k * L, len = min(L, T - c0);
-        float fc = (lane < len) ? log_sigmoid(fg[gbase + (long)(c0 + lane) * sG_S]) : 0.0f;
+        float fc = (lane < len) ? log_sigmoid(gates[fgbase + (long)(c0 + lane) * sG_S]) : 0.0f;
         for (int off = 1; off < 32; off <<= 1) {
             const float v = __shfl_up_sync(0xffffffffu, fc, off);
             if (lane >= off) fc += v;
         }
         const float fc_last = __shfl_sync(0xffffffffu, fc, len - 1);
-        const float igv = (lane < len) ? ig[gbase + (long)(c0 + lane) * sG_S] : 0.0f;
+        const float igv = (lane < len) ? gates[igbase + (long)(c0 + lane) * sG_S] : 0.0f;
         // Positions past `len` must contribute nothing to the contraction in
         // `mlstm_fw_dC`; -1e30 puts them at exactly zero once exponentiated below.
         const float d = (lane < len) ? (fc_last - fc + igv) : -1e30f;
@@ -413,7 +442,7 @@ __device__ __forceinline__ int mma_col(int i) { return (((threadIdx.x & 31) & 3)
 // which leaves K exactly the bf16 it already is in memory — as in the reference,
 // which casts its `matKbar` and lets the accumulation stay fp32.
 extern "C" __global__ void mlstm_fw_dC(
-    const slab_t* kk, const slab_t* vv, const float* avec,
+    const slab_t* qkv, const float* avec,
     float* cst, float* nst,
     MLSTM_SHAPE_ARGS) {
     MLSTM_SHAPE_BIND
@@ -434,8 +463,8 @@ extern "C" __global__ void mlstm_fw_dC(
     bf16s_t* sV = (bf16s_t*)(sA + L);                // [LP, LV]  V with `a` folded in
     bf16s_t* sK = sV + (long)LP * LV;                // [LP, LK]
 
-    const long qkB = bhBase(bh, H, sQK_B, sQK_H);
-    const long hvB = bhBase(bh, H, sHV_B, sHV_H);
+    const long kB = K_BASE(bh);
+    const long vB = V_BASE(bh);
     const float* ap = avec + ((long)bh * NC + k) * L;
     for (int j = tid; j < L; j += nthreads) sA[j] = ap[j];
     __syncthreads();
@@ -443,12 +472,12 @@ extern "C" __global__ void mlstm_fw_dC(
     for (int e = tid; e < LP * VP; e += nthreads) {
         const int j = e / VP, v = e - j * VP;
         sV[j * LV + v] = to_bf16((j < len && v < dhv)
-            ? sA[j] * slab_ld(vv, hvB + (long)(c0 + j) * sHV_S + v) : 0.0f);
+            ? sA[j] * slab_ld(qkv, vB + (long)(c0 + j) * sX_S + v) : 0.0f);
     }
     for (int e = tid; e < LP * KP; e += nthreads) {
         const int j = e / KP, q = e - j * KP;
         sK[j * LK + q] = to_bf16((j < len && q < dqk)
-            ? slab_ld(kk, qkB + (long)(c0 + j) * sQK_S + q) : 0.0f);
+            ? slab_ld(qkv, kB + (long)(c0 + j) * sX_S + q) : 0.0f);
     }
     __syncthreads();
 
@@ -512,7 +541,7 @@ extern "C" __global__ void mlstm_fw_dC(
 // out-of-range outputs are simply not written. `LP`/`KP`/`VP` are those padded
 // dims and must match `fused_smem("fw_parallel", ..)` on the host exactly.
 extern "C" __global__ void mlstm_fw_parallel(
-    const slab_t* qq, const slab_t* kk, const slab_t* vv, const float* ig, const float* fcb,
+    const slab_t* qkv, const float* gates, const float* fcb,
     const float* cst, const float* nst, const float* mst,
     slab_t* ytil, float* msv, float* psiv, float* qnv,
     MLSTM_SHAPE_ARGS) {
@@ -565,7 +594,7 @@ extern "C" __global__ void mlstm_fw_parallel(
 
     for (int j = tid; j < LP; j += nthreads) {
         sFc[j] = (j < L)   ? fcb[((long)bh * NC + k) * L + j] : 0.0f;
-        sIg[j] = (j < len) ? ig[bhBase(bh, H, sG_B, sG_H) + (long)(c0 + j) * sG_S]        : 0.0f;
+        sIg[j] = (j < len) ? gates[IG_BASE(bh) + (long)(c0 + j) * sG_S]                   : 0.0f;
         sQi[j] = 0.0f;
     }
     float m_prev = mst[(long)bh * (NC + 1) + k];
@@ -594,9 +623,9 @@ extern "C" __global__ void mlstm_fw_parallel(
         for (int e = tid; e < LP * KT; e += nthreads) {
             int t = e / KT, qs = e - t * KT, q = q0 + qs;
             int ok = (t < len) && (q < dqk);
-            long off = bhBase(bh, H, sQK_B, sQK_H) + (long)(c0 + t) * sQK_S + q;
-            sQ[t * LQ + qs] = to_bf16(ok ? slab_ld(qq, off) : 0.0f);
-            sK[t * LQ + qs] = to_bf16(ok ? slab_ld(kk, off) : 0.0f);
+            long off = Q_BASE(bh) + (long)(c0 + t) * sX_S + q;
+            sQ[t * LQ + qs] = to_bf16(ok ? slab_ld(qkv, off) : 0.0f);
+            sK[t * LQ + qs] = to_bf16(ok ? slab_ld(qkv, off + MLSTM_OFF_K) : 0.0f);
         }
         for (int e = tid; e < KT; e += nthreads) {
             int q = q0 + e;
@@ -661,7 +690,7 @@ extern "C" __global__ void mlstm_fw_parallel(
         for (int e = tid; e < LP * VT; e += nthreads) {
             int t = e / VT, vs = e - t * VT, v = v0 + vs;
             sV[t * LV + vs] = to_bf16(((t < len) && (v < dhv))
-                ? slab_ld(vv, bhBase(bh, H, sHV_B, sHV_H) + (long)(c0 + t) * sHV_S + v) : 0.0f);
+                ? slab_ld(qkv, V_BASE(bh) + (long)(c0 + t) * sX_S + v) : 0.0f);
         }
         __syncthreads();
 
@@ -689,7 +718,7 @@ extern "C" __global__ void mlstm_fw_parallel(
             for (int e = tid; e < LP * KT; e += nthreads) {
                 int t = e / KT, qs = e - t * KT, q = q0 + qs;
                 sQ[t * LQ + qs] = to_bf16(((t < len) && (q < dqk))
-                    ? slab_ld(qq, bhBase(bh, H, sQK_B, sQK_H) + (long)(c0 + t) * sQK_S + q) : 0.0f);
+                    ? slab_ld(qkv, Q_BASE(bh) + (long)(c0 + t) * sX_S + q) : 0.0f);
             }
             for (int e = tid; e < VT * KT; e += nthreads) {
                 int vs = e / KT, qs = e - vs * KT, v = v0 + vs, q = q0 + qs;
@@ -716,7 +745,7 @@ extern "C" __global__ void mlstm_fw_parallel(
         for (int e = tid; e < LP * VT; e += nthreads) {
             int t = e / VT, vs = e - t * VT, v = v0 + vs;
             if (t < len && v < dhv)
-                slab_st(ytil, bhBase(bh, H, sHV_B, sHV_H) + (long)(c0 + t) * sHV_S + v,
+                slab_st(ytil, Y_BASE(bh) + (long)(c0 + t) * sY_S + v,
                         sAcc[t * LA + vs] / fmaxf(fabsf(sQn[t]), expf(-sM[t])));
         }
     }
@@ -745,7 +774,7 @@ extern "C" __global__ void mlstm_fw_parallel(
 // d_num = dỹ/ψ, with `b` folded in while staging, which leaves Q exactly the bf16 it
 // already is in memory — as `mlstm_fw_dC` folds `a` into V and leaves K alone.
 extern "C" __global__ void mlstm_bw_dC(
-    const slab_t* qq, const float* dytil, const float* psiv, const float* dqnv,
+    const slab_t* qkv, const float* dytil, const float* psiv, const float* dqnv,
     const float* fcb, const float* mst, const float* msv,
     float* dcst, float* dnst,
     MLSTM_SHAPE_ARGS) {
@@ -768,8 +797,8 @@ extern "C" __global__ void mlstm_bw_dC(
     bf16s_t* sDN = (bf16s_t*)(sBD + L);              // [LP, LV]  d_num, `b` folded in
     bf16s_t* sQ = sDN + (long)LP * LV;               // [LP, LQ]
 
-    const long qkB = bhBase(bh, H, sQK_B, sQK_H);
-    const long hvB = bhBase(bh, H, sHV_B, sHV_H);
+    const long qB = Q_BASE(bh);
+    const long yB = Y_BASE(bh);
     const float m_prev = mst[(long)bh * (NC + 1) + k];
     for (int t = tid; t < len; t += nthreads) {
         const long gt = (long)bh * T + c0 + t;
@@ -789,14 +818,14 @@ extern "C" __global__ void mlstm_bw_dC(
     for (int e = tid; e < LP * KP; e += nthreads) {
         const int t = e / KP, q = e - t * KP;
         sQ[t * LQ + q] = to_bf16((t < len && q < dqk)
-            ? slab_ld(qq, qkB + (long)(c0 + t) * sQK_S + q) : 0.0f);
+            ? slab_ld(qkv, qB + (long)(c0 + t) * sX_S + q) : 0.0f);
     }
     __syncthreads();
 
     for (int e = tid; e < LP * VP; e += nthreads) {
         const int t = e / VP, v = e - t * VP;
         sDN[t * LV + v] = to_bf16((t < len && v < dhv)
-            ? sB[t] * dytil[hvB + (long)(c0 + t) * sHV_S + v] : 0.0f);
+            ? sB[t] * dytil[yB + (long)(c0 + t) * sY_S + v] : 0.0f);
     }
     __syncthreads();
 
@@ -857,12 +886,11 @@ extern "C" __global__ void mlstm_bw_dC(
 // Everything else — the dg reduction, the a/b/g -> (dfc, dig) fold, the reverse
 // cumsum tail — is elementwise or a scan and has no dot in it.
 extern "C" __global__ void mlstm_bw_parallel(
-    const slab_t* qq, const slab_t* kk, const slab_t* vv,
-    const float* ig, const float* fg, const float* fcb,
+    const slab_t* qkv, const float* gates, const float* fcb,
     const float* cst, const float* nst, const float* mst,
     const float* dcst, const float* dnst,
     const float* dytil, const float* psiv, const float* dqnv, const float* msv,
-    float* dq, float* dk, float* dv, float* dig, float* dfg,
+    float* dqkv, float* dgates,
     MLSTM_SHAPE_ARGS) {
     MLSTM_SHAPE_BIND
     (void)CARRY;
@@ -931,9 +959,9 @@ extern "C" __global__ void mlstm_bw_parallel(
         for (int e = tid; e < LP * KT; e += nthreads) {                               \
             int t = e / KT, q = e - t * KT;                                           \
             int ok = (t < len) && ((q0) + q < dqk);                                   \
-            long base = bhBase(bh, H, sQK_B, sQK_H) + (long)(c0 + t) * sQK_S + (q0) + q; \
-            sQ[t * LQb + q] = to_bf16(ok ? slab_ld(qq, base) : 0.0f);                 \
-            sK[t * LQb + q] = to_bf16(ok ? slab_ld(kk, base) : 0.0f);                 \
+            long base = Q_BASE(bh) + (long)(c0 + t) * sX_S + (q0) + q;                \
+            sQ[t * LQb + q] = to_bf16(ok ? slab_ld(qkv, base) : 0.0f);                \
+            sK[t * LQb + q] = to_bf16(ok ? slab_ld(qkv, base + MLSTM_OFF_K) : 0.0f);  \
         }
     // The (v0, q0) tile of one `[dhv, dqk]` state, narrowed. `slot` is k for the
     // forward state and k+1 for its gradient — which always exists, because
@@ -962,15 +990,16 @@ extern "C" __global__ void mlstm_bw_parallel(
         for (int e = tid; e < LP * VT; e += nthreads) {                               \
             int t = e / VT, vs = e - t * VT, v = (v0) + vs;                           \
             int ok = (t < len) && (v < dhv);                                          \
-            long gy = bhBase(bh, H, sHV_B, sHV_H) + (long)(c0 + t) * sHV_S + v;       \
-            sV[t * LVb + vs] = to_bf16(ok ? slab_ld(vv, gy) : 0.0f);                  \
+            long gv = V_BASE(bh) + (long)(c0 + t) * sX_S + v;                         \
+            long gy = Y_BASE(bh) + (long)(c0 + t) * sY_S + v;                         \
+            sV[t * LVb + vs] = to_bf16(ok ? slab_ld(qkv, gv) : 0.0f);                 \
             sDN[t * LVb + vs] = to_bf16(                                              \
                 ok ? dytil[gy] / psiv[(long)bh * T + c0 + t] : 0.0f);                 \
         }
 
     for (int j = tid; j < LP; j += nthreads) {
         sFc[j] = (j < L)   ? fcb[((long)bh * NC + k) * L + j] : 0.0f;
-        sIg[j] = (j < len) ? ig[bhBase(bh, H, sG_B, sG_H) + (long)(c0 + j) * sG_S]        : 0.0f;
+        sIg[j] = (j < len) ? gates[IG_BASE(bh) + (long)(c0 + j) * sG_S]                   : 0.0f;
         sM[j] = 0.0f; sB[j] = 0.0f; sA[j] = 0.0f; sDQn[j] = 0.0f;
         sDfc[j] = 0.0f; sDig[j] = 0.0f; sDa[j] = 0.0f; sDb[j] = 0.0f;
     }
@@ -1117,7 +1146,7 @@ extern "C" __global__ void mlstm_bw_parallel(
                 int v = v0 + vs;             // r is `j` for dv, `t` for db
                 if (r < len && v < dhv) {
                     float st = sSt[r * LV + vs];
-                    dv[bhBase(bh, H, sHV_B, sHV_H) + (long)(c0 + r) * sHV_S + v] = dnum[i] + sA[r] * st;
+                    dqkv[V_BASE(bh) + (long)(c0 + r) * sX_S + v] = dnum[i] + sA[r] * st;
                 }
             }
         }
@@ -1279,9 +1308,10 @@ extern "C" __global__ void mlstm_bw_parallel(
         for (int e = tid; e < LP * KT; e += nthreads) {
             int r = e / KT, qs = e - r * KT, q = kt * KT + qs;
             if (r < len && q < dqk) {
-                dq[bhBase(bh, H, sQK_B, sQK_H) + (long)(c0 + r) * sQK_S + q] =
+                long base = Q_BASE(bh) + (long)(c0 + r) * sX_S + q;
+                dqkv[base] =
                     sDqi[r * LK + qs] + sB[r] * (sDqx[r * LK + qs] + sDQn[r] * sN[qs]);
-                dk[bhBase(bh, H, sQK_B, sQK_H) + (long)(c0 + r) * sQK_S + q] =
+                dqkv[base + MLSTM_OFF_K] =
                     sDki[r * LK + qs] + sA[r] * sdN[qs];
             }
         }
@@ -1327,9 +1357,10 @@ extern "C" __global__ void mlstm_bw_parallel(
             if (lane + off < 32) acc += v;
         }
         if (lane < len) {
-            long gg = bhBase(bh, H, sG_B, sG_H) + (long)(c0 + lane) * sG_S;
-            dfg[gg] = acc * (1.0f - stable_sigmoid(fg[gg]));
-            dig[gg] = sDig[lane];
+            long gi = IG_BASE(bh) + (long)(c0 + lane) * sG_S;
+            long gf = FG_BASE(bh) + (long)(c0 + lane) * sG_S;
+            dgates[gf] = acc * (1.0f - stable_sigmoid(gates[gf]));
+            dgates[gi] = sDig[lane];
         }
     }
     #undef STAGE_QK

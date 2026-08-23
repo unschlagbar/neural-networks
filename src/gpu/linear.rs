@@ -7,26 +7,26 @@
 //! checks against `nn2::Linear` for forward, backward and one optimizer step.
 //!
 //! The whole layer lives on the GPU: weights, gradient accumulators, AdamW
-//! moments and the saved forward input are all `DTensor`s, so a forward→backward→
+//! moments and the saved forward input are all `GTensor<f32>`s, so a forward→backward→
 //! step cycle touches host memory only if the caller downloads a result.
 
 use super::arena::{self, ParamKind, ParamSlot};
-use super::{DTensor, Gpu, ops};
+use super::{GTensor, Gpu, ops};
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
 
 pub struct Linear {
-    pub w: DTensor, // [in, out]
-    pub b: DTensor, // [out]
-    pub dw: DTensor,
-    pub db: DTensor,
+    pub w: GTensor<f32>, // [in, out]
+    pub b: GTensor<f32>, // [out]
+    pub dw: GTensor<f32>,
+    pub db: GTensor<f32>,
     /// Saved forward input `[B, in]` (device copy) for the weight gradient.
-    x: DTensor,
+    x: GTensor<f32>,
     /// AdamW moments for `w` and `b`.
-    mw: DTensor,
-    vw: DTensor,
-    mb: DTensor,
-    vb: DTensor,
+    mw: GTensor<f32>,
+    vw: GTensor<f32>,
+    mb: GTensor<f32>,
+    vb: GTensor<f32>,
     input: usize,
     output: usize,
     /// bf16 staging for this layer's three GEMMs (see `ops::GemmBf16`). Holds the
@@ -54,15 +54,15 @@ impl Linear {
         let (input, output) = (w.rows(), w.cols());
         assert_eq!(b.len(), output, "Linear::from_parts — bias len != out");
         Self {
-            w: DTensor::from_host(gpu, w),
-            b: DTensor::from_host(gpu, b),
-            dw: DTensor::zeros(gpu, &[input, output]),
-            db: DTensor::zeros(gpu, &[output]),
-            x: DTensor::zeros(gpu, &[0, input]),
-            mw: DTensor::zeros(gpu, &[input, output]),
-            vw: DTensor::zeros(gpu, &[input, output]),
-            mb: DTensor::zeros(gpu, &[output]),
-            vb: DTensor::zeros(gpu, &[output]),
+            w: GTensor::from_host(gpu, w),
+            b: GTensor::from_host(gpu, b),
+            dw: GTensor::zeros(gpu, &[input, output]),
+            db: GTensor::zeros(gpu, &[output]),
+            x: GTensor::zeros(gpu, &[0, input]),
+            mw: GTensor::zeros(gpu, &[input, output]),
+            vw: GTensor::zeros(gpu, &[input, output]),
+            mb: GTensor::zeros(gpu, &[output]),
+            vb: GTensor::zeros(gpu, &[output]),
             input,
             output,
             gemm: ops::GemmBf16::new(),
@@ -95,7 +95,7 @@ impl Linear {
     /// **capacity** — so in a stack with varying window sizes they settle at the
     /// largest window ever seen.
     pub fn drop_saved_act(&mut self, gpu: &Gpu) {
-        self.x = DTensor::zeros(gpu, &[0, self.input]);
+        self.x = GTensor::zeros(gpu, &[0, self.input]);
         self.gemm.clear();
     }
 
@@ -136,7 +136,7 @@ impl Linear {
 
     /// `Y = X · W + b` into the caller's `y` `[B, out]`; `x` is `[B, in]`. Saves
     /// `x` for backward.
-    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
+    pub fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, y: &mut GTensor<f32>) {
         let b = x.rows();
         assert_eq!(
             x.cols(),
@@ -168,7 +168,7 @@ impl Linear {
     /// taken this path must not keep a stale `[N, in]` allocation resident. That frees
     /// at most once per layer — after the first shared forward `self.x` is already
     /// empty — so it is not an allocation on the steady-state path.
-    pub fn forward_shared(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
+    pub fn forward_shared(&mut self, gpu: &Gpu, x: &GTensor<f32>, y: &mut GTensor<f32>) {
         assert_eq!(
             x.cols(),
             self.input,
@@ -180,7 +180,7 @@ impl Linear {
             "Linear::forward_shared — output shape"
         );
         if !self.x.is_empty() {
-            self.x = DTensor::uninit(gpu, &[0, self.input]);
+            self.x = GTensor::uninit(gpu, &[0, self.input]);
         }
         self.forward_raw(gpu, x, y);
     }
@@ -192,9 +192,9 @@ impl Linear {
     pub fn forward_shared_resid(
         &mut self,
         gpu: &Gpu,
-        x: &DTensor,
-        resid: &DTensor,
-        y: &mut DTensor,
+        x: &GTensor<f32>,
+        resid: &GTensor<f32>,
+        y: &mut GTensor<f32>,
     ) {
         assert_eq!(
             x.cols(),
@@ -207,7 +207,7 @@ impl Linear {
             "Linear::forward_shared_resid — output shape"
         );
         if !self.x.is_empty() {
-            self.x = DTensor::uninit(gpu, &[0, self.input]);
+            self.x = GTensor::uninit(gpu, &[0, self.input]);
         }
         ops::broadcast_row_resid(gpu, y, resid, &self.b);
         if self.bf16 {
@@ -220,7 +220,7 @@ impl Linear {
     /// The GEMM half of forward, without the input-saving policy. Shared by
     /// [`forward`](Self::forward) and [`forward_shared`](Self::forward_shared) so the
     /// two cannot drift apart.
-    fn forward_raw(&mut self, gpu: &Gpu, x: &DTensor, y: &mut DTensor) {
+    fn forward_raw(&mut self, gpu: &Gpu, x: &GTensor<f32>, y: &mut GTensor<f32>) {
         // Seed each output row with the bias (fills y entirely, so uninit is safe),
         // then accumulate X·W on top (beta=1).
         ops::broadcast_row(gpu, y, &self.b);
@@ -238,9 +238,9 @@ impl Linear {
     pub fn forward_staged(
         &mut self,
         gpu: &Gpu,
-        x: &DTensor,
-        x_b: &super::BTensor,
-        out: &mut DTensor,
+        x: &GTensor<f32>,
+        x_b: &super::GTensor<u16>,
+        out: &mut GTensor<f32>,
     ) {
         assert_eq!(
             x.cols(),
@@ -253,7 +253,7 @@ impl Linear {
             "Linear::forward_staged — output shape"
         );
         if !self.x.is_empty() {
-            self.x = DTensor::uninit(gpu, &[0, self.input]);
+            self.x = GTensor::uninit(gpu, &[0, self.input]);
         }
         ops::broadcast_row(gpu, out, &self.b);
         if self.bf16 {
@@ -273,8 +273,8 @@ impl Linear {
     pub fn forward_staged_bf16(
         &mut self,
         gpu: &Gpu,
-        x_b: &super::BTensor,
-        out: &mut super::BTensor,
+        x_b: &super::GTensor<u16>,
+        out: &mut super::GTensor<u16>,
     ) {
         assert!(self.bf16, "Linear::forward_staged_bf16 — layer is fp32-pinned");
         assert_eq!(
@@ -283,7 +283,7 @@ impl Linear {
             "Linear::forward_staged_bf16 — output shape"
         );
         if !self.x.is_empty() {
-            self.x = DTensor::uninit(gpu, &[0, self.input]);
+            self.x = GTensor::uninit(gpu, &[0, self.input]);
         }
         self.gemm
             .run_staged_lhs_bias(gpu, x_b, &self.w, &self.b, out);
@@ -298,8 +298,8 @@ impl Linear {
     pub fn forward_staged_slab(
         &mut self,
         gpu: &Gpu,
-        x: &DTensor,
-        x_b: &super::BTensor,
+        x: &GTensor<f32>,
+        x_b: &super::GTensor<u16>,
         out: &mut ops::SlabBuf,
     ) {
         match out {
@@ -313,10 +313,10 @@ impl Linear {
     pub fn backward_staged_x(
         &mut self,
         gpu: &Gpu,
-        x: &DTensor,
-        x_b: &super::BTensor,
-        dy: &DTensor,
-        dx: &mut DTensor,
+        x: &GTensor<f32>,
+        x_b: &super::GTensor<u16>,
+        dy: &GTensor<f32>,
+        dx: &mut GTensor<f32>,
     ) {
         assert_eq!(
             dy.cols(),
@@ -344,30 +344,30 @@ impl Linear {
     /// The allocation-free [`forward`](Self::forward) is the one to use on a hot
     /// path; this exists for call sites that still compose by value (mLSTM's
     /// projection shell), where the output feeds straight into the next op.
-    pub fn forward_alloc(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
-        let mut y = DTensor::uninit(gpu, &[x.rows(), self.output]);
+    pub fn forward_alloc(&mut self, gpu: &Gpu, x: &GTensor<f32>) -> GTensor<f32> {
+        let mut y = GTensor::uninit(gpu, &[x.rows(), self.output]);
         self.forward(gpu, x, &mut y);
         y
     }
 
     /// Backward into a freshly allocated `dX` `[B, in]` — the by-value companion
     /// to [`backward`](Self::backward).
-    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
-        let mut dx = DTensor::uninit(gpu, &[dy.rows(), self.input]);
+    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>) -> GTensor<f32> {
+        let mut dx = GTensor::uninit(gpu, &[dy.rows(), self.input]);
         self.backward(gpu, dy, &mut dx);
         dx
     }
 
     /// [`backward_with_x`](Self::backward_with_x) into a freshly allocated `dX`.
-    pub fn backward_alloc_with_x(&mut self, gpu: &Gpu, x: &DTensor, dy: &DTensor) -> DTensor {
-        let mut dx = DTensor::uninit(gpu, &[dy.rows(), self.input]);
+    pub fn backward_alloc_with_x(&mut self, gpu: &Gpu, x: &GTensor<f32>, dy: &GTensor<f32>) -> GTensor<f32> {
+        let mut dx = GTensor::uninit(gpu, &[dy.rows(), self.input]);
         self.backward_with_x(gpu, x, dy, &mut dx);
         dx
     }
 
     /// Given `dY` `[B, out]`, accumulate `dW`/`db` and write `dX = dY · Wᵀ` into
     /// `dx` `[B, in]`.
-    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+    pub fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
         assert_eq!(
             self.x.rows(),
             dy.rows(),
@@ -391,7 +391,7 @@ impl Linear {
     /// summing over row blocks gives the identical result — splitting `N` is a
     /// reassociation, not a change of math. `dX = dY·Wᵀ` writes at `beta = 0`, which
     /// stays correct because each block owns disjoint rows of `dx`.
-    pub fn backward_with_x(&mut self, gpu: &Gpu, x: &DTensor, dy: &DTensor, dx: &mut DTensor) {
+    pub fn backward_with_x(&mut self, gpu: &Gpu, x: &GTensor<f32>, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
         assert_eq!(
             dy.cols(),
             self.output,
@@ -433,9 +433,9 @@ impl Linear {
         gpu: &Gpu,
         gemm: &mut ops::GemmBf16,
         bf16: bool,
-        x: &DTensor,
-        dy: &DTensor,
-        dw: &mut DTensor,
+        x: &GTensor<f32>,
+        dy: &GTensor<f32>,
+        dw: &mut GTensor<f32>,
     ) {
         if bf16 {
             gemm.run(gpu, ops::MmForm::Tn, x, dy, dw, 1.0);
@@ -446,7 +446,7 @@ impl Linear {
 
     /// `dX = dY · Wᵀ` (overwriting, `beta = 0`). cuBLAS transposes `W(in×out)`
     /// internally — no host transpose.
-    fn grad_x(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+    fn grad_x(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
         if self.bf16 {
             self.gemm.run_wb(gpu, ops::MmForm::Nt, dy, &self.w, dx, 0.0);
         } else {
@@ -484,12 +484,12 @@ impl Linear {
     }
 
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
-    pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
+    pub fn params_mut(&mut self) -> Vec<&mut GTensor<f32>> {
         self.param_slots().into_iter().map(|s| s.param).collect()
     }
 
     /// Gradient accumulators, matching `params_mut`'s order. Diagnostic.
-    pub fn grads(&mut self) -> Vec<&DTensor> {
+    pub fn grads(&mut self) -> Vec<&GTensor<f32>> {
         self.param_slots().into_iter().map(|s| &*s.grad).collect()
     }
 
@@ -565,9 +565,9 @@ mod tests {
         let mut gl = Linear::from_parts(&gpu, &cpu.w, &cpu.b);
         gl.freeze_bias();
         let hx = Tensor::random(&[b, i], 0.5);
-        let x = DTensor::from_host(&gpu, &hx);
+        let x = GTensor::from_host(&gpu, &hx);
         let hdy = Tensor::random(&[b, o], 1.0);
-        let dy = DTensor::from_host(&gpu, &hdy);
+        let dy = GTensor::from_host(&gpu, &hdy);
         let cfg = AdamCfg::new(1e-2, 0.0);
 
         // The observable is the forward recomputed from the *current* fp32 weight, not
@@ -627,12 +627,12 @@ mod tests {
 
         // Forward
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward_alloc(&gpu, &DTensor::from_host(&gpu, &x));
+        let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x));
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, tol(&gpu, 1e-3));
 
         // Backward
         let dx_cpu = cpu.backward(&dy);
-        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &dy));
+        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &dy));
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 1e-3));
         assert_close(&dev.dw.to_host(&gpu).data, &cpu.dw.data, tol(&gpu, 1e-3));
         assert_close(&dev.db.to_host(&gpu).data, &cpu.db.data, 1e-3);
@@ -659,8 +659,8 @@ mod tests {
         let (batch, input, output) = (12, 7, 5);
         let w = Tensor::xavier(input, output);
         let b = Tensor::random(&[output], 0.1);
-        let x = DTensor::from_host(&gpu, &Tensor::random(&[batch, input], 1.0));
-        let dy = DTensor::from_host(&gpu, &Tensor::random(&[batch, output], 1.0));
+        let x = GTensor::from_host(&gpu, &Tensor::random(&[batch, input], 1.0));
+        let dy = GTensor::from_host(&gpu, &Tensor::random(&[batch, output], 1.0));
 
         let mut saving = Linear::from_parts(&gpu, &w, &b);
         let mut shared = Linear::from_parts(&gpu, &w, &b);
@@ -676,7 +676,7 @@ mod tests {
         };
 
         let y_saving = saving.forward_alloc(&gpu, &x);
-        let mut y_shared = DTensor::uninit(&gpu, &[batch, output]);
+        let mut y_shared = GTensor::uninit(&gpu, &[batch, output]);
         shared.forward_shared(&gpu, &x, &mut y_shared);
         eq(
             &y_shared.to_host(&gpu).data,
@@ -689,7 +689,7 @@ mod tests {
         assert!(!saving.x.is_empty(), "forward should keep its input");
 
         let dx_saving = saving.backward_alloc(&gpu, &dy);
-        let mut dx_shared = DTensor::uninit(&gpu, &[batch, input]);
+        let mut dx_shared = GTensor::uninit(&gpu, &[batch, input]);
         shared.backward_with_x(&gpu, &x, &dy, &mut dx_shared);
 
         eq(
@@ -730,8 +730,8 @@ mod tests {
         let b = Tensor::random(&[output], 0.1);
         let x_h = Tensor::random(&[batch, input], 1.0);
         let dy_h = Tensor::random(&[batch, output], 1.0);
-        let x = DTensor::from_host(&gpu, &x_h);
-        let dy = DTensor::from_host(&gpu, &dy_h);
+        let x = GTensor::from_host(&gpu, &x_h);
+        let dy = GTensor::from_host(&gpu, &dy_h);
 
         let mut whole = Linear::from_parts(&gpu, &w, &b);
         let mut blocked = Linear::from_parts(&gpu, &w, &b);
@@ -753,8 +753,8 @@ mod tests {
             );
             let part = blocked.backward_alloc_with_x(
                 &gpu,
-                &DTensor::from_host(&gpu, &xb),
-                &DTensor::from_host(&gpu, &dyb),
+                &GTensor::from_host(&gpu, &xb),
+                &GTensor::from_host(&gpu, &dyb),
             );
             dx_blocked.extend_from_slice(&part.to_host(&gpu).data);
         }

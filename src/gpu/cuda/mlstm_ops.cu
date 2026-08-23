@@ -140,15 +140,26 @@ extern "C" __global__ void mul(float* out, const float* a, const float* b, int n
     if (i < n) out[i] = a[i] * b[i];
 }
 
-// o-gate activation and its product with yhat in one pass: o holds the raw
-// projection on entry and the squashed gate on exit, because `ogate_bwd` needs
-// the post-sigmoid value to form o(1-o). Separately these were a full-width
-// read-modify-write followed by a second read of the same buffer.
-extern "C" __global__ void ogate_fwd(float* o, const float* yhat, float* hconcat, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float g = stable_sigmoid(o[i]);
-    o[i] = g;
+// o-gate activation and its product with yhat in one pass.
+//
+// `o` is a column block of the fused q‖k‖v‖o projection output (`stride` apart per
+// row, starting at `off`), so this walks the `[rows, d]` logical shape and never
+// touches the rest of the tensor. `yhat` and `hconcat` are dense `[rows, d]`.
+//
+// The raw pre-activation is left in place rather than overwritten with σ(o):
+// `ogate_bwd` recomputes the sigmoid from it. Storing it back would cost a
+// full-width write here and a second rounding through the slab's width, and the
+// sigmoid is cheaper than either.
+//
+// One grid row per row of the `[rows, d]` shape, so the row index is `blockIdx.y`
+// and never a division: `d` is a runtime value, and `i / d` per element cost more
+// than the sigmoid.
+extern "C" __global__ void ogate_fwd(const slab_t* o, const float* yhat, float* hconcat,
+                                     int d, int stride, int off) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= d) return;
+    long long i = (long long)blockIdx.y * d + c;
+    float g = stable_sigmoid(slab_ld(o, (long long)blockIdx.y * stride + off + c));
     hconcat[i] = g * yhat[i];
 }
 
@@ -395,14 +406,21 @@ extern "C" __global__ void mlstm_chunk_ab_bwd_block(const float* db, const float
 }
 
 // mLSTM parallel-form backward
-// o-gate backward: hconcat = o ⊙ yhat with o = σ(o_pre).
-//   d_yhat = d_hconcat ⊙ o ;  do_pre = d_hconcat ⊙ yhat ⊙ o(1-o).
-extern "C" __global__ void ogate_bwd(const float* d_hconcat, const float* o, const float* yhat,
-                                     float* do_pre, float* d_yhat, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float dch = d_hconcat[i], oi = o[i];
-    do_pre[i] = dch * yhat[i] * oi * (1.0f - oi);
+// o-gate backward: hconcat = σ(o_pre) ⊙ yhat.
+//   d_yhat = d_hconcat ⊙ σ ;  do_pre = d_hconcat ⊙ yhat ⊙ σ(1-σ).
+//
+// `o` and `do_pre` are the same column block of the fused projection and of its
+// gradient, so both take `stride`/`off`; `d_yhat` is dense `[rows, d]`. The sigmoid
+// is recomputed here rather than read back from forward — see `ogate_fwd`.
+extern "C" __global__ void ogate_bwd(const float* d_hconcat, const slab_t* o, const float* yhat,
+                                     float* do_pre, float* d_yhat,
+                                     int d, int stride, int off) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= d) return;
+    long long i = (long long)blockIdx.y * d + c;
+    long long oi_idx = (long long)blockIdx.y * stride + off + c;
+    float dch = d_hconcat[i], oi = stable_sigmoid(slab_ld(o, oi_idx));
+    do_pre[oi_idx] = dch * yhat[i] * oi * (1.0f - oi);
     d_yhat[i] = dch * oi;
 }
 

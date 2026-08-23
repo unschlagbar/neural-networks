@@ -20,7 +20,8 @@ fn main() {
 
 #[cfg(feature = "cuda")]
 fn main() {
-    use neural_networks::gpu::{DTensor, Gpu, mlstm::MLstm};
+    use neural_networks::gpu::arena::TrainingCache;
+    use neural_networks::gpu::{GTensor, Gpu, mlstm::MLstm};
     use neural_networks::nn2::MLstm as CpuMLstm;
     use neural_networks::tensor::Tensor;
 
@@ -33,6 +34,8 @@ fn main() {
     let (b, d) = (1usize, heads * dqk);
     let inp = d;
     assert!(t % chunks == 0, "t must divide into chunks");
+
+    let mut cache = TrainingCache::new();
 
     let gpu = Gpu::new().expect("gpu");
     println!("t={t} chunks={chunks} b={b} inp={inp} d={d} heads={heads} dqk={dqk}");
@@ -119,7 +122,7 @@ fn main() {
             / scale as f64
     };
 
-    let run = |nchunk: usize| -> Vec<Vec<f32>> {
+    let mut run = |nchunk: usize| -> Vec<Vec<f32>> {
         let mut dev = MLstm::from_cpu(&gpu, &cpu);
         dev.zero_grad(&gpu);
         let step = t / nchunk;
@@ -127,15 +130,15 @@ fn main() {
         dev.reset_state(&gpu);
         let cut = |src: &Tensor, c: usize, w: usize| {
             let lo = c * step * w;
-            DTensor::from_host(
+            GTensor::from_host(
                 &gpu,
                 &Tensor::new(&[b, step, w], src.data[lo..lo + step * w].to_vec()),
             )
         };
         let mut ys = Vec::new();
         for c in 0..nchunk {
-            let mut y = DTensor::uninit(&gpu, &[b, step, d]);
-            dev.forward(&gpu, &cut(&x, c, inp), &mut y);
+            let mut y = GTensor::uninit(&gpu, &[b, step, d]);
+            dev.forward(&gpu, &cut(&x, c, inp), &mut y, &mut cache);
             ys.push(y.to_host(&gpu).data.to_vec());
         }
         dev.reset_bptt(&gpu);

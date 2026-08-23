@@ -16,7 +16,7 @@ fn main() {
 fn main() {
     use std::time::Instant;
 
-    use neural_networks::gpu::{DTensor, Gpu, ops};
+    use neural_networks::gpu::{GTensor, Gpu, ops};
     use neural_networks::tensor::Tensor;
 
     let gpu = match Gpu::new() {
@@ -53,9 +53,9 @@ fn main() {
     );
 
     for &(rows, n, use_mul, calls) in shapes {
-        let dy = DTensor::from_host(&gpu, &Tensor::random(&[rows, n], 0.5));
-        let mul = DTensor::from_host(&gpu, &Tensor::random(&[rows, n], 0.5));
-        let mut db = DTensor::zeros(&gpu, &[n]);
+        let dy = GTensor::from_host(&gpu, &Tensor::random(&[rows, n], 0.5));
+        let mul = GTensor::from_host(&gpu, &Tensor::random(&[rows, n], 0.5));
+        let mut db = GTensor::zeros(&gpu, &[n]);
 
         for _ in 0..30 {
             if use_mul {

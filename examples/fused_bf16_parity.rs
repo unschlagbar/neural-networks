@@ -16,7 +16,7 @@ fn main() {
 
 #[cfg(feature = "cuda")]
 fn main() {
-    use neural_networks::gpu::{DTensor, Gpu, ops, slstm::SLstm};
+    use neural_networks::gpu::{GTensor, Gpu, ops, slstm::SLstm};
     use neural_networks::tensor::Tensor;
 
     let gpu = Gpu::new().expect("gpu");
@@ -49,8 +49,8 @@ fn main() {
     let bi: Vec<Tensor> = (0..4)
         .map(|g| Tensor::random(&[h], 0.2 + g as f32 * 0.01))
         .collect();
-    let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 0.5));
-    let gy = DTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 0.7));
+    let x = GTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 0.5));
+    let gy = GTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 0.7));
 
     let build = |fused: bool| {
         let mut c = SLstm::from_parts(

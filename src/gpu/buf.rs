@@ -1,6 +1,6 @@
 //! Layer-owned device buffers: allocate once, reuse forever.
 //!
-//! Every GPU layer used to return its output as a freshly allocated `DTensor`,
+//! Every GPU layer used to return its output as a freshly allocated `GTensor<f32>`,
 //! so a training step allocated and freed hundreds of device buffers — one per
 //! op, per layer, per window. cudarc routes those through `cuMemAllocAsync` on a
 //! memory pool, so each one is cheap in isolation, but they are not free: they
@@ -29,7 +29,7 @@
 //! does anyway. Use [`Buf::get_zeroed`] when the buffer is accumulated into rather
 //! than overwritten.
 
-use super::{DTensor, Gpu};
+use super::{GTensor, Gpu};
 
 /// How much larger than the request a retained allocation may be before it is
 /// dropped and replaced with a right-sized one.
@@ -93,7 +93,7 @@ fn size_class(n: usize) -> usize {
 /// effect, a layer's output address stable across calls.
 #[derive(Default)]
 pub struct Buf {
-    slot: Option<DTensor>,
+    slot: Option<GTensor<f32>>,
 }
 
 impl Buf {
@@ -122,7 +122,7 @@ impl Buf {
     /// the right number of elements is reshaped in place (metadata only) rather
     /// than reallocated. That is what lets one owned buffer serve both the
     /// `[B, T, H]` and `[N, H]` views of the same activations without a copy.
-    pub fn get(&mut self, gpu: &Gpu, dims: &[usize]) -> &mut DTensor {
+    pub fn get(&mut self, gpu: &Gpu, dims: &[usize]) -> &mut GTensor<f32> {
         let n: usize = dims.iter().product();
         match &mut self.slot {
             // Reuse whenever the allocation is big enough, presenting it at the
@@ -136,7 +136,7 @@ impl Buf {
             // Allocate at the size class so the next window's slightly-different shape
             // reuses this allocation instead of replacing it. See `size_class`.
             _ => {
-                let mut t = DTensor::uninit(gpu, &[size_class(n)]);
+                let mut t = GTensor::uninit(gpu, &[size_class(n)]);
                 t.shrink_to(dims);
                 self.slot = Some(t);
             }
@@ -147,7 +147,7 @@ impl Buf {
     /// Like [`get`](Self::get) but zeroed, reusing the allocation when the shape
     /// matches (an in-place memset, no realloc). For buffers that are accumulated
     /// into rather than fully overwritten.
-    pub fn get_zeroed(&mut self, gpu: &Gpu, dims: &[usize]) -> &mut DTensor {
+    pub fn get_zeroed(&mut self, gpu: &Gpu, dims: &[usize]) -> &mut GTensor<f32> {
         let n: usize = dims.iter().product();
         match &mut self.slot {
             Some(t) if fits(t.capacity(), n) => {
@@ -155,7 +155,7 @@ impl Buf {
                 t.zero_(gpu);
             }
             _ => {
-                let mut t = DTensor::zeros(gpu, &[size_class(n)]);
+                let mut t = GTensor::zeros(gpu, &[size_class(n)]);
                 t.shrink_to(dims);
                 self.slot = Some(t);
             }
@@ -166,7 +166,7 @@ impl Buf {
     /// Copy `src` into this slot and return it. The shape follows `src`, so this
     /// is the owned-buffer replacement for `src.dup(gpu)` — same result, but
     /// reusing this layer's allocation instead of making a new one.
-    pub fn copy_of(&mut self, gpu: &Gpu, src: &DTensor) -> &mut DTensor {
+    pub fn copy_of(&mut self, gpu: &Gpu, src: &GTensor<f32>) -> &mut GTensor<f32> {
         let n = src.len();
         let dst = self.get(gpu, src.dims());
         // Slice both sides to the shape: either may be a pooled buffer with slack
@@ -179,12 +179,12 @@ impl Buf {
 
     /// The current contents, if this slot has ever been filled. Used by a
     /// backward that needs what the forward saved here.
-    pub fn as_ref(&self) -> Option<&DTensor> {
+    pub fn as_ref(&self) -> Option<&GTensor<f32>> {
         self.slot.as_ref()
     }
 
     /// The saved tensor, panicking with `what` if the forward never ran.
-    pub fn expect(&self, what: &str) -> &DTensor {
+    pub fn expect(&self, what: &str) -> &GTensor<f32> {
         self.slot.as_ref().expect(what)
     }
 
@@ -194,12 +194,12 @@ impl Buf {
     /// must be borrowed alongside other fields of the same struct, which a borrow of
     /// the whole slot would prevent. Pair with [`put`](Self::put) to give it back and
     /// keep the allocation for the next call.
-    pub fn take(&mut self) -> Option<DTensor> {
+    pub fn take(&mut self) -> Option<GTensor<f32>> {
         self.slot.take()
     }
 
     /// Put a tensor (back) into this slot, replacing any current one.
-    pub fn put(&mut self, t: DTensor) {
+    pub fn put(&mut self, t: GTensor<f32>) {
         self.slot = Some(t);
     }
 
@@ -238,7 +238,7 @@ impl Buf {
 pub struct Pool {
     /// Free buffers, grouped by element count. Small map: a layer touches a
     /// handful of distinct sizes, so a linear scan beats hashing.
-    free: Vec<(usize, Vec<DTensor>)>,
+    free: Vec<(usize, Vec<GTensor<f32>>)>,
     /// Buffers currently out on loan — see [`outstanding`](Self::outstanding).
     lent: usize,
 }
@@ -278,7 +278,7 @@ impl Pool {
     /// Contents are **undefined** — a recycled buffer still holds whatever the
     /// previous user left, and may be larger than asked for. Write the requested
     /// region in full before reading, or use [`take_zeroed`](Self::take_zeroed).
-    pub fn take(&mut self, gpu: &Gpu, dims: &[usize]) -> DTensor {
+    pub fn take(&mut self, gpu: &Gpu, dims: &[usize]) -> GTensor<f32> {
         self.lent += 1;
         let n: usize = dims.iter().product();
         // Best fit: the smallest buffer that still holds `n`. Picking the smallest
@@ -304,14 +304,14 @@ impl Pool {
         // asked-for shape. That is what makes the free list converge: the next window's
         // slightly-different shape rounds to the same class and reuses this buffer
         // instead of adding another entry. See `size_class`.
-        let mut t = DTensor::uninit(gpu, &[size_class(n)]);
+        let mut t = GTensor::uninit(gpu, &[size_class(n)]);
         t.shrink_to(dims);
         t
     }
 
     /// Like [`take`](Self::take) but zeroed, for a buffer that is accumulated
     /// into rather than fully overwritten.
-    pub fn take_zeroed(&mut self, gpu: &Gpu, dims: &[usize]) -> DTensor {
+    pub fn take_zeroed(&mut self, gpu: &Gpu, dims: &[usize]) -> GTensor<f32> {
         let mut t = self.take(gpu, dims);
         t.zero_(gpu);
         t
@@ -329,7 +329,7 @@ impl Pool {
     /// Oversized buffers are filed as usual; [`trim`](Self::trim) is what evicts them,
     /// because only the caller knows when a pass boundary has been reached and the
     /// free list can safely be pruned.
-    pub fn put(&mut self, t: DTensor) {
+    pub fn put(&mut self, t: GTensor<f32>) {
         debug_assert!(
             self.lent > 0,
             "Pool::put of a buffer this pool never lent — see the note on `put`"
@@ -469,7 +469,7 @@ impl Pool {
     /// counter never comes back down and [`assert_drained`](Self::assert_drained)
     /// fires on what is actually a deliberate hand-off. The buffer is simply
     /// returned to the caller, who now owns it.
-    pub fn detach(&mut self, t: DTensor) -> DTensor {
+    pub fn detach(&mut self, t: GTensor<f32>) -> GTensor<f32> {
         debug_assert!(
             self.lent > 0,
             "Pool::detach of a buffer this pool never lent"
@@ -479,7 +479,7 @@ impl Pool {
     }
 
     /// Return several buffers at once.
-    pub fn put_all<I: IntoIterator<Item = DTensor>>(&mut self, ts: I) {
+    pub fn put_all<I: IntoIterator<Item = GTensor<f32>>>(&mut self, ts: I) {
         for t in ts {
             self.put(t);
         }
@@ -493,7 +493,7 @@ impl Pool {
         &mut self,
         gpu: &Gpu,
         dims: &[usize],
-        f: impl FnOnce(&mut Self, &mut DTensor) -> R,
+        f: impl FnOnce(&mut Self, &mut GTensor<f32>) -> R,
     ) -> R {
         let mut t = self.take(gpu, dims);
         let r = f(self, &mut t);
@@ -558,7 +558,7 @@ mod tests {
             return;
         };
         use cudarc::driver::DevicePtr;
-        let addr = |t: &DTensor| t.buf.device_ptr(&gpu.stream).0;
+        let addr = |t: &GTensor<f32>| t.buf.device_ptr(&gpu.stream).0;
         let mut pool = Pool::new();
 
         let a = pool.take(&gpu, &[8, 16]);
@@ -663,7 +663,7 @@ mod tests {
             return;
         };
         use cudarc::driver::DevicePtr;
-        let addr = |t: &DTensor| t.buf.device_ptr(&gpu.stream).0;
+        let addr = |t: &GTensor<f32>| t.buf.device_ptr(&gpu.stream).0;
         let mut pool = Pool::new();
 
         let a = pool.take(&gpu, &[4, 32]);
@@ -700,7 +700,7 @@ mod tests {
         let mut buf = Buf::new();
 
         let t = buf.get_zeroed(&gpu, &[2, 3]);
-        let src = DTensor::from_host(&gpu, &crate::tensor::Tensor::new(&[2, 3], vec![1.0; 6]));
+        let src = GTensor::from_host(&gpu, &crate::tensor::Tensor::new(&[2, 3], vec![1.0; 6]));
         gpu.stream.memcpy_dtod(&src.buf, &mut t.buf).unwrap();
         assert_eq!(buf.expect("filled").to_host(&gpu).data, vec![1.0; 6]);
 

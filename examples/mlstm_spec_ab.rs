@@ -25,8 +25,12 @@ fn main() {
 fn main() {
     use std::time::Instant;
 
-    use neural_networks::gpu::{DTensor, Gpu, mlstm::MLstm};
+    use neural_networks::gpu::arena::TrainingCache;
+
+    use neural_networks::gpu::{GTensor, Gpu, mlstm::MLstm};
     use neural_networks::tensor::Tensor;
+
+    let mut cache = TrainingCache::new();
 
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -58,12 +62,12 @@ fn main() {
 
     for &dqk in &[32, 64] {
         let d = dqk * heads;
-        let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
-        let g = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
+        let x = GTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
+        let g = GTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
 
         // One cell per path: the specialized kernel is chosen inside the launch, so
         // the two differ only in the env var read at that point.
-        let run = |spec: bool| -> f64 {
+        let mut run = |spec: bool| -> f64 {
             // SAFETY: single-threaded, and the kernel cache keys on the flag's
             // effect (the compiled variant), not on the variable itself.
             unsafe {
@@ -74,15 +78,15 @@ fn main() {
                 }
             }
             let mut dev = MLstm::new_rand(&gpu, d, d, heads, dqk);
-            let mut y = DTensor::uninit(&gpu, &[b, t, d]);
+            let mut y = GTensor::uninit(&gpu, &[b, t, d]);
             for _ in 0..3 {
-                dev.forward(&gpu, &x, &mut y);
+                dev.forward(&gpu, &x, &mut y, &mut cache);
                 let _ = dev.backward_alloc(&gpu, &g);
             }
             gpu.stream.synchronize().unwrap();
             let t0 = Instant::now();
             for _ in 0..iters {
-                dev.forward(&gpu, &x, &mut y);
+                dev.forward(&gpu, &x, &mut y, &mut cache);
                 let _ = dev.backward_alloc(&gpu, &g);
             }
             gpu.stream.synchronize().unwrap();

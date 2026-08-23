@@ -17,16 +17,19 @@ fn main() {
 
 #[cfg(feature = "cuda")]
 fn main() {
-    use neural_networks::gpu::{DTensor, Gpu, mlstm::MLstm};
+    use neural_networks::gpu::arena::TrainingCache;
+    use neural_networks::gpu::{GTensor, Gpu, mlstm::MLstm};
     use neural_networks::tensor::Tensor;
+
+    let mut cache = TrainingCache::new();
 
     let gpu = Gpu::new().expect("gpu");
     let (b, t, heads, dqk) = (1usize, 512usize, 8usize, 96usize);
     let d = heads * dqk;
     let reps = 6;
 
-    let x = DTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, d], 0.5, 0xA1));
-    let g = DTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, d], 1.0, 0xA2));
+    let x = GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, d], 0.5, 0xA1));
+    let g = GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, d], 1.0, 0xA2));
     let mut cell = MLstm::new_rand(&gpu, d, d, heads, dqk);
     if std::env::var("OFFLOAD").is_ok() {
         cell.enable_offload(&gpu, neural_networks::gpu::offload::InFlight::shared());
@@ -50,8 +53,8 @@ fn main() {
     let mut bad = false;
     for r in 0..reps {
         cell.zero_grad(&gpu);
-        let mut y = DTensor::uninit(&gpu, &[b, t, d]);
-        cell.forward(&gpu, &x, &mut y);
+        let mut y = GTensor::uninit(&gpu, &[b, t, d]);
+        cell.forward(&gpu, &x, &mut y, &mut cache);
         let dx = cell.backward_alloc(&gpu, &g);
         let mut sig = vec![
             ("y", hash(&y.to_host(&gpu).data)),

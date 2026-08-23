@@ -23,13 +23,14 @@ pub mod arena;
 pub mod bf16;
 pub mod block;
 pub mod buf;
-pub mod dtensor;
 pub mod flat;
+pub mod gtensor;
 pub mod hierarchical;
 pub mod kernels;
 pub mod linear;
 pub mod lm;
 pub mod mlstm;
+pub mod nn_convert;
 pub mod offload;
 pub mod ops;
 pub mod rms_norm;
@@ -37,9 +38,9 @@ pub mod slstm;
 pub mod train;
 
 pub use arena::{ParamArena, ParamKind, ParamSlot};
-pub use bf16::{BTensor, Slab};
+pub use bf16::Slab;
 pub use buf::{Buf, Pool};
-pub use dtensor::DTensor;
+pub use gtensor::GTensor;
 pub use offload::OffloadRing;
 use kernels::Kernels;
 
@@ -47,14 +48,14 @@ use iron_oxide::collections::Matrix;
 
 /// Download a 2-D device tensor into an `iron_oxide` `Matrix` (row-major), used
 /// when exporting device weights into the CPU `nn` layer format for `HIER`.
-pub(crate) fn dt_matrix(gpu: &Gpu, t: &DTensor) -> Matrix {
+pub(crate) fn dt_matrix(gpu: &Gpu, t: &GTensor<f32>) -> Matrix {
     let h = t.to_host(gpu);
     let (rows, cols) = (h.dims()[0], h.dims()[1]);
     Matrix::from_vec(h.data, rows, cols)
 }
 
 /// Download a 1-D device tensor into a boxed slice.
-pub(crate) fn dt_vec(gpu: &Gpu, t: &DTensor) -> Box<[f32]> {
+pub(crate) fn dt_vec(gpu: &Gpu, t: &GTensor<f32>) -> Box<[f32]> {
     t.to_host(gpu).data.into_boxed_slice()
 }
 

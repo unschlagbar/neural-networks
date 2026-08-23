@@ -19,8 +19,12 @@ fn main() {
 fn main() {
     use std::time::Instant;
 
-    use neural_networks::gpu::{DTensor, Gpu, mlstm::MLstm};
+    use neural_networks::gpu::arena::TrainingCache;
+
+    use neural_networks::gpu::{GTensor, Gpu, mlstm::MLstm};
     use neural_networks::tensor::Tensor;
+
+    let mut cache = TrainingCache::new();
 
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -66,9 +70,9 @@ fn main() {
         .iter()
         .map(|&(b, t, h, dqk)| {
             let d = h * dqk;
-            let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
+            let x = GTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
             let cell = MLstm::new_rand(&gpu, d, d, h, dqk);
-            let y = DTensor::uninit(&gpu, &[b, t, d]);
+            let y = GTensor::uninit(&gpu, &[b, t, d]);
             (x, cell, y)
         })
         .collect();
@@ -76,7 +80,7 @@ fn main() {
     for (i, (x, cell, y)) in cells.iter_mut().enumerate() {
         let _ = i;
         for _ in 0..10 {
-            cell.forward(&gpu, x, y);
+            cell.forward(&gpu, x, y, &mut cache);
             cell.drop_saved();
         }
     }
@@ -88,7 +92,7 @@ fn main() {
             gpu.stream.synchronize().unwrap();
             let t0 = Instant::now();
             for _ in 0..iters {
-                cell.forward(&gpu, x, y);
+                cell.forward(&gpu, x, y, &mut cache);
                 cell.drop_saved();
             }
             gpu.stream.synchronize().unwrap();

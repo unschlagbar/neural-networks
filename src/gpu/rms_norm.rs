@@ -9,7 +9,7 @@
 
 use super::arena::{self, ParamKind, ParamSlot};
 use super::ops::{self, GpuRmsForward};
-use super::{DTensor, Gpu};
+use super::{GTensor, Gpu};
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
 
@@ -17,10 +17,10 @@ use crate::tensor::Tensor;
 const EPS: f32 = 1e-6;
 
 pub struct RmsNorm {
-    pub gamma: DTensor,  // [F]
-    pub dgamma: DTensor, // [F]
-    m: DTensor,
-    v: DTensor,
+    pub gamma: GTensor<f32>,  // [F]
+    pub dgamma: GTensor<f32>, // [F]
+    m: GTensor<f32>,
+    v: GTensor<f32>,
     size: usize,
     /// Normalization group width: `== size` for plain RMSNorm, `== dhv` for the
     /// head-wise variant (`F/group` independent groups per row, one γ slice each).
@@ -53,10 +53,10 @@ impl RmsNorm {
             "RmsNorm: size {size} not divisible by group {group}"
         );
         Self {
-            gamma: DTensor::from_host(gpu, gamma),
-            dgamma: DTensor::zeros(gpu, &[size]),
-            m: DTensor::zeros(gpu, &[size]),
-            v: DTensor::zeros(gpu, &[size]),
+            gamma: GTensor::from_host(gpu, gamma),
+            dgamma: GTensor::zeros(gpu, &[size]),
+            m: GTensor::zeros(gpu, &[size]),
+            v: GTensor::zeros(gpu, &[size]),
             size,
             group,
             fwd: None,
@@ -75,7 +75,7 @@ impl RmsNorm {
     ///
     /// `out` may alias `x` (the kernel reads each row before writing it), which
     /// is what lets a caller normalize a buffer in place.
-    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
+    pub fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>) {
         // Position-wise: any rank is accepted and folded to `[N, F]` over the last
         // axis, so a caller holding `[B, T, H]` need not reshape.
         let (b, f) = x.as_2d();
@@ -93,7 +93,7 @@ impl RmsNorm {
             Some(s) if s.x_hat.len() == b * f && s.inv_rms.len() == total_groups => {}
             _ => {
                 self.fwd = Some(GpuRmsForward {
-                    x_hat: DTensor::uninit(gpu, &[b, f]),
+                    x_hat: GTensor::uninit(gpu, &[b, f]),
                     inv_rms: gpu
                         .stream
                         .alloc_zeros::<f32>(total_groups)
@@ -108,21 +108,21 @@ impl RmsNorm {
 
     /// Forward into a freshly allocated `[B, F]` — the by-value companion to
     /// [`forward`](Self::forward), for call sites that still compose by value.
-    pub fn forward_alloc(&mut self, gpu: &Gpu, x: &DTensor) -> DTensor {
-        let mut out = DTensor::uninit(gpu, &[x.rows(), x.cols()]);
+    pub fn forward_alloc(&mut self, gpu: &Gpu, x: &GTensor<f32>) -> GTensor<f32> {
+        let mut out = GTensor::uninit(gpu, &[x.rows(), x.cols()]);
         self.forward(gpu, x, &mut out);
         out
     }
 
     /// Backward into a freshly allocated `dX` `[B, F]`.
-    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
-        let mut dx = DTensor::uninit(gpu, &[dy.rows(), dy.cols()]);
+    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>) -> GTensor<f32> {
+        let mut dx = GTensor::uninit(gpu, &[dy.rows(), dy.cols()]);
         self.backward(gpu, dy, &mut dx);
         dx
     }
 
     /// Given `dY` `[B, F]`, accumulate `dγ` and write `dX` `[B, F]` into `dx`.
-    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+    pub fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
         let (_, f) = dy.as_2d();
         assert_eq!(f, self.size, "RmsNorm::backward — width mismatch");
         let fwd = self.fwd.as_ref().expect("RmsNorm::backward before forward");
@@ -145,7 +145,7 @@ impl RmsNorm {
         )]
     }
 
-    pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
+    pub fn params_mut(&mut self) -> Vec<&mut GTensor<f32>> {
         vec![&mut self.gamma]
     }
 

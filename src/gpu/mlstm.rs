@@ -62,11 +62,11 @@
 
 use std::sync::OnceLock;
 
-use iron_oxide::collections::Matrix;
-
 use super::arena::{self, ParamSlot};
 use super::block::Cell;
-use super::{DTensor, Gpu, Pool, linear::Linear, ops, rms_norm::RmsNorm};
+use super::nn_convert::concat_cols;
+use super::{GTensor, Gpu, Pool, linear::Linear, ops, rms_norm::RmsNorm};
+use crate::gpu::arena::TrainingCache;
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
 
@@ -82,90 +82,52 @@ fn chunk_len() -> usize {
     })
 }
 
-/// Lay several `[rows, ·]` weight (or `[·]` bias) tensors side by side into the one
-/// matrix a fused projection holds. The inverse of [`split_cols`].
-fn concat_cols(parts: &[&Tensor]) -> Tensor {
-    let rows = if parts[0].dims().len() == 1 {
-        1
-    } else {
-        parts[0].dims()[0]
-    };
-    let cols: Vec<usize> = parts.iter().map(|p| p.data.len() / rows).collect();
-    let total: usize = cols.iter().sum();
-    let mut data = Vec::with_capacity(rows * total);
-    for r in 0..rows {
-        for (p, c) in parts.iter().zip(&cols) {
-            data.extend_from_slice(&p.data[r * c..(r + 1) * c]);
-        }
-    }
-    let dims: &[usize] = if parts[0].dims().len() == 1 {
-        &[total]
-    } else {
-        &[rows, total]
-    };
-    Tensor::new(dims, data)
-}
-
-/// Cut column block `[at, at + cols)` back out of a fused projection's matrix.
-fn split_cols(m: &Matrix, at: usize, cols: usize) -> Matrix {
-    let (rows, w) = (m.rows(), m.cols());
-    let src = m.as_slice();
-    let mut data = Vec::with_capacity(rows * cols);
-    for r in 0..rows {
-        data.extend_from_slice(&src[r * w + at..r * w + at + cols]);
-    }
-    Matrix::from_vec(data, rows, cols)
-}
-
 /// Forward intermediates of the **fused** path. Far smaller than `Saved`: the
 /// per-chunk `[BH, L, L]` decay matrices do not exist — backward rebuilds them in
 /// shared memory (see `ops::MlstmFused`).
 struct SavedFused {
     b: usize,
     t: usize,
-    /// The five large per-`N` tensors, `None` exactly while they are parked on the host.
+    /// The four large per-`N` tensors, `None` exactly while they are parked on the host.
     ///
     /// `Option` rather than a `parked: bool` flag: backward reads these through
     /// `expect`, so a missing `restore_saved` is a named panic at the use site instead
     /// of a silent read of a stale buffer. They are `Some` for the whole of a
     /// non-offloaded run.
     ///
-    /// The flat `[N, in]` input `xf` is shared by all three projections (see
-    /// `forward`) — held here rather than three times inside the `Linear`s.
-    xf: Option<DTensor>,
-    // `q ‖ k ‖ v` in bf16 storage, mirroring the reference's DTYPE tensors
-    // (matQ/matK/matV) concatenated as its fused `qkv_opreact` output.
+    /// The flat `[N, in]` input `xf` is shared by both projections (see `forward`) —
+    /// held here rather than twice inside the `Linear`s.
+    xf: Option<GTensor<f32>>,
+    // `q ‖ k ‖ v ‖ o` in bf16 storage, mirroring the reference's DTYPE tensors
+    // (matQ/matK/matV plus the o-gate pre-activation) concatenated as its fused
+    // `qkv_opreact` output. Holds the RAW `o`: `ogate_bwd` recomputes the sigmoid.
     xh: Option<ops::SlabBuf>,
     // fp32: `ĩ ‖ f̃`. The reference loads vecI/vecB `.to(tl.float32)` — they are
     // exponents feeding the stabilizer, where an absolute error becomes a
     // multiplicative one. See `gpu::bf16`.
     // Left resident when parking: 128 KB against the 4 MB tensors above, so moving it
     // would cost bookkeeping and PCIe for nothing.
-    gates: DTensor,
+    gates: GTensor<f32>,
     fused: ops::MlstmFused,
-    o: Option<DTensor>,
-    yhat: Option<DTensor>,
+    yhat: Option<GTensor<f32>>,
     /// `lin_out`'s input, kept here rather than as the projection's private copy so a
     /// chunked sweep's later chunk cannot overwrite it. Fed back via `backward_with_x`.
-    hconcat: Option<DTensor>,
+    hconcat: Option<GTensor<f32>>,
 }
 
 impl SavedFused {
     /// The parkable tensors, in the one order `evict`/`restore` both use.
     ///
     /// Panics if they are parked — every reader runs after `restore_saved`.
-    fn xf(&self) -> &DTensor {
+    fn xf(&self) -> &GTensor<f32> {
         self.xf.as_ref().expect("mLSTM: xf is parked on the host")
     }
-    fn o(&self) -> &DTensor {
-        self.o.as_ref().expect("mLSTM: o is parked on the host")
-    }
-    fn yhat(&self) -> &DTensor {
+    fn yhat(&self) -> &GTensor<f32> {
         self.yhat
             .as_ref()
             .expect("mLSTM: yhat is parked on the host")
     }
-    fn hconcat(&self) -> &DTensor {
+    fn hconcat(&self) -> &GTensor<f32> {
         self.hconcat
             .as_ref()
             .expect("mLSTM: hconcat is parked on the host")
@@ -173,13 +135,13 @@ impl SavedFused {
     fn xh(&self) -> &ops::SlabBuf {
         self.xh
             .as_ref()
-            .expect("mLSTM: q‖k‖v is parked on the host")
+            .expect("mLSTM: q‖k‖v‖o is parked on the host")
     }
 
     /// Device bytes held. Parked tensors count as zero — they are on the host, which
     /// is the whole point of parking them.
     fn retained_bytes(&self) -> usize {
-        let opt_f32: usize = [&self.xf, &self.o, &self.yhat, &self.hconcat]
+        let opt_f32: usize = [&self.xf, &self.yhat, &self.hconcat]
             .iter()
             .filter_map(|s| s.as_ref())
             .map(|t| t.capacity() * 4)
@@ -195,24 +157,25 @@ pub struct MLstm {
     pub heads: usize,
     pub dqk: usize,
     pub dhv: usize,
-    inv_sqrt_dqk: f32,
+    pub(super) inv_sqrt_dqk: f32,
     /// Chunk length (0 = single-chunk). Defaults to [`chunk_len`].
     chunk: usize,
 
     // Projections (in → ·) and the output projection (d → d). Bias, weight decay
     // and AdamW all handled by `Linear`, matching the CPU cell's conventions.
     //
-    // q/k/v are one projection of width `H*(2*dqk + dhv)` and the two gate logits
-    // one of width `2*H` — the reference's fused weight mode (nx-ai/xlstm,
-    // `xlstm_large/model.py`: `qkv_opreact` + `ifgate_preact`). The kernels address
-    // each part where the GEMM left it, so nothing is split apart afterwards. `o`
-    // stays on its own: it is the one part that must reach `ogate_fwd` as fp32,
-    // and q/k/v travel as a bf16 slab.
-    lin_qkv: Linear,
-    lin_o: Linear,
-    lin_gates: Linear,
-    lin_out: Linear,
-    headnorm: RmsNorm, // head-wise (group == dhv)
+    // Two projections, not six: `q ‖ k ‖ v ‖ o` of width `H*(2*dqk + 2*dhv)` and
+    // the two gate logits of width `2*H` — the reference's fused weight mode
+    // (nx-ai/xlstm, `xlstm_large/model.py`: `qkv_opreact` + `ifgate_preact`). The
+    // kernels address each part where the GEMM left it, so nothing is split apart
+    // afterwards.
+    //
+    // The gate logits keep a projection of their own because they must stay fp32
+    // (see `forward`), while `q ‖ k ‖ v ‖ o` lands in a bf16 slab.
+    pub(super) lin_qkvo: Linear,
+    pub(super) lin_gates: Linear,
+    pub(super) lin_out: Linear,
+    pub(super) headnorm: RmsNorm, // head-wise (group == dhv)
     /// Forward caches awaiting a backward, one per chunk in eviction order.
     ///
     /// A chunked sweep forwards every chunk before unwinding any, so chunk c's cache
@@ -282,12 +245,11 @@ impl MLstm {
             dhv,
             inv_sqrt_dqk,
             chunk: chunk_len(),
-            lin_qkv: Linear::from_parts(
+            lin_qkvo: Linear::from_parts(
                 gpu,
-                &concat_cols(&[wq, wk, wv]),
-                &concat_cols(&[bq, bk, bv]),
+                &concat_cols(&[wq, wk, wv, wo]),
+                &concat_cols(&[bq, bk, bv, bo]),
             ),
-            lin_o: Linear::from_parts(gpu, wo, bo),
             lin_gates: Linear::from_parts(gpu, &concat_cols(&[wi, wf]), &concat_cols(&[bi, bf])),
             lin_out: Linear::from_parts(gpu, w_out, b_out),
             headnorm: RmsNorm::from_parts_grouped(gpu, gamma, dhv),
@@ -305,84 +267,13 @@ impl MLstm {
         Self::from_cpu(gpu, &crate::nn2::MLstm::new(input_size, d, heads, dqk))
     }
 
-    /// Export this cell into the CPU `nn::MLSTMLayer` format. Used to write a
-    /// `HIER` checkpoint from a GPU model.
-    pub fn to_nn_cell(&self, gpu: &Gpu) -> crate::nn::mlstm::MLSTMLayer {
-        use super::{dt_matrix, dt_vec};
-        // Undo the 1/√dqk `from_parts` folded into wk/bk, so the checkpoint holds the
-        // same weights the CPU cell does.
-        let unfold_m = |m: iron_oxide::collections::Matrix| {
-            let (r, c) = (m.rows(), m.cols());
-            let d = m.as_slice().iter().map(|v| v / self.inv_sqrt_dqk).collect();
-            iron_oxide::collections::Matrix::from_vec(d, r, c)
-        };
-        let unfold_v =
-            |v: Box<[f32]>| -> Box<[f32]> { v.iter().map(|x| x / self.inv_sqrt_dqk).collect() };
-        let w_out = crate::nn::linear::LinearLayer::from_loaded(
-            self.d,
-            self.d,
-            dt_matrix(gpu, &self.lin_out.w),
-            dt_vec(gpu, &self.lin_out.b),
-        );
-        // The checkpoint format predates the fused projections and keeps the six
-        // matrices apart, so `q ‖ k ‖ v` and `ĩ ‖ f̃` are cut back into their parts.
-        let (wqk, h) = (self.heads * self.dqk, self.heads);
-        let (xw, xb) = (
-            dt_matrix(gpu, &self.lin_qkv.w),
-            dt_vec(gpu, &self.lin_qkv.b),
-        );
-        let (gw, gb) = (
-            dt_matrix(gpu, &self.lin_gates.w),
-            dt_vec(gpu, &self.lin_gates.b),
-        );
-        let cut_v = |v: &[f32], at: usize, n: usize| -> Box<[f32]> { v[at..at + n].into() };
-        crate::nn::mlstm::MLSTMLayer::from_loaded(
-            self.input_size,
-            self.d,
-            self.heads,
-            self.dqk,
-            split_cols(&xw, 0, wqk),
-            unfold_m(split_cols(&xw, wqk, wqk)),
-            split_cols(&xw, 2 * wqk, self.d),
-            dt_matrix(gpu, &self.lin_o.w),
-            split_cols(&gw, 0, h),
-            split_cols(&gw, h, h),
-            cut_v(&xb, 0, wqk),
-            unfold_v(cut_v(&xb, wqk, wqk)),
-            cut_v(&xb, 2 * wqk, self.d),
-            dt_vec(gpu, &self.lin_o.b),
-            cut_v(&gb, 0, h),
-            cut_v(&gb, h, h),
-            w_out,
-            dt_vec(gpu, &self.headnorm.gamma),
-        )
-    }
-
-    /// Rebuild a GPU cell from a CPU `nn::MLSTMLayer` (inverse of `to_nn_cell`).
-    pub fn from_nn_cell(gpu: &Gpu, c: &crate::nn::mlstm::MLSTMLayer) -> Self {
-        use super::{tensor_from_matrix as m, tensor_from_slice as v};
-        Self::from_parts(
-            gpu,
-            c.input_size,
-            c.hidden_size,
-            c.num_heads,
-            c.dqk,
-            &m(&c.wq),
-            &m(&c.wk),
-            &m(&c.wv),
-            &m(&c.wo),
-            &m(&c.wi),
-            &m(&c.wf),
-            &v(&c.bq),
-            &v(&c.bk),
-            &v(&c.bv),
-            &v(&c.bo),
-            &v(&c.bi),
-            &v(&c.bf),
-            &m(&c.w_out.weights),
-            &v(&c.w_out.biases),
-            &v(&c.head_norm.gamma),
-        )
+    /// Column where `o` starts in the fused `q ‖ k ‖ v ‖ o` projection.
+    ///
+    /// The kernels derive the same offset from `(H, dqk, dhv)` themselves
+    /// (`MLSTM_OFF_O`); the o-gate pair takes it as an argument because those two are
+    /// plain elementwise kernels with no shape specialization to fold it into.
+    fn o_off(&self) -> usize {
+        2 * self.heads * self.dqk + self.d
     }
 
     /// Upload a CPU cell (weights are copied; grads/moments start at zero).
@@ -442,7 +333,13 @@ impl MLstm {
     /// covering the whole sequence reduces to the single-chunk form.
     ///
     /// `out` is the caller's `[B, T, d]` buffer, written in place.
-    pub fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
+    pub fn forward(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        out: &mut GTensor<f32>,
+        cache: &mut TrainingCache,
+    ) {
         // Release the previous eviction before allocating anything here: freeing
         // returns memory to the CUDA allocator, which must not hand it back while a
         // copy is still reading it. See `InFlight::release`.
@@ -450,40 +347,45 @@ impl MLstm {
             park.release_previous();
         }
         assert_eq!(x.rank, 3, "MLstm::forward expects [B, T, in]");
-        let (b, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);
+        let (batch, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);
         assert_eq!(
             inp, self.input_size,
             "MLstm::forward — input width mismatch"
         );
-        let (d, h, dqk, dhv) = (self.d, self.heads, self.dqk, self.dhv);
-        assert_eq!(out.dims(), [b, t, d], "MLstm::forward — output shape");
-        let rows = b * t; // flattened [B, T] positions
-        let shape = ops::MlstmShape { b, h, t, dqk, dhv };
+        let dim = self.d;
+        assert_eq!(out.dims(), [batch, t, dim], "MLstm::forward — output shape");
+        let rows = batch * t;
+        let shape = ops::MlstmShape {
+            batch,
+            heads: self.heads,
+            t,
+            dqk: self.dqk,
+            dhv: self.dhv,
+        };
 
         // Backward needs this for every projection's dW, so it outlives the call and
         // is not pooled (`assert_drained` in `backward_alloc` wants the pool whole).
-        let mut xf = DTensor::uninit(gpu, &[rows, inp]);
+        let mut xf = GTensor::uninit(gpu, &[rows, inp]);
         xf.copy_from(gpu, x);
         let l = self.fused_chunk(gpu, t);
 
-        // Three projections, all off the same narrowed `xf`. `q ‖ k ‖ v` lands in one
-        // slab at the kernels' own width and stays exactly where the GEMM wrote it —
-        // the position-major, concatenated `[rows, H*(2*dqk+dhv)]` is what the fused
-        // kernels address. The gate logits share a projection of their own and stay
-        // fp32: they are exponents feeding the stabilizer, where an absolute error
-        // becomes a multiplicative one, and at `[rows, 2*H]` they are a factor of
-        // `dqk` smaller than q/k/v so narrowing would buy nothing.
+        // Two projections, both off the same narrowed `xf`. `q ‖ k ‖ v ‖ o` lands in
+        // one slab at the kernels' own width and stays exactly where the GEMM wrote
+        // it — the position-major, concatenated `[rows, H*(2*dqk+2*dhv)]` is what the
+        // fused kernels and `ogate_fwd` address. The gate logits keep a projection of
+        // their own so they can stay fp32: they are exponents feeding the stabilizer,
+        // where an absolute error becomes a multiplicative one, whereas `o` feeds a
+        // sigmoid, which is bounded and Lipschitz. At `[rows, 2*H]` they are a factor
+        // of `dqk` smaller than the slab, so narrowing them would buy nothing anyway.
         //
-        // All of these outlive the call — backward reads them — so none is pooled.
-        let mut xh = ops::SlabBuf::new(gpu, &[rows, self.lin_qkv.output_size()]);
-        let mut o = DTensor::uninit(gpu, &[rows, self.lin_o.output_size()]);
-        let mut gates = DTensor::uninit(gpu, &[rows, self.lin_gates.output_size()]);
+        // Both outlive the call — backward reads them — so neither is pooled.
+        let mut xh = ops::SlabBuf::new(gpu, &[rows, self.lin_qkvo.output_size()]);
+        let mut gates = GTensor::uninit(gpu, &[rows, self.lin_gates.output_size()]);
         ops::with_shared_lhs(gpu, &xf, |xf_b| {
-            self.lin_qkv.forward_staged_slab(gpu, &xf, xf_b, &mut xh);
-            self.lin_o.forward_staged(gpu, &xf, xf_b, &mut o);
+            self.lin_qkvo.forward_staged_slab(gpu, &xf, xf_b, &mut xh);
             self.lin_gates.forward_staged(gpu, &xf, xf_b, &mut gates);
         });
-        // k needs no rescale: 1/√dqk is folded into its columns of `lin_qkv`. `o` is
+        // k needs no rescale: 1/√dqk is folded into its columns of `lin_qkvo`. `o` is
         // squashed later, fused into the product that consumes it.
 
         // Carry the recurrent state in from the previous chunk when the surrounding
@@ -502,30 +404,29 @@ impl MLstm {
             shape,
         );
         if self.carry {
-            self.carry_state = Some(fused.final_state(gpu, shape.bh(), dhv, dqk));
+            self.carry_state = Some(fused.final_state(gpu, shape.bh(), self.dhv, self.dqk));
         }
         // `ytil` comes out `[rows, d]` already; the head norm only needs it widened.
-        let mut h_tilde = self.pool.take(gpu, &[rows, d]);
+        let mut h_tilde = self.pool.take(gpu, &[rows, dim]);
         let yt = fused.ytil.as_f32(gpu, &mut h_tilde);
-        let mut yhat = DTensor::uninit(gpu, &[rows, d]);
+        let mut yhat = GTensor::uninit(gpu, &[rows, dim]);
         self.headnorm.forward(gpu, yt, &mut yhat);
         self.pool.put(h_tilde);
         // `hconcat` is kept in the cache rather than pooled, and `lin_out` takes it
         // back through `backward_with_x`: a chunked sweep would otherwise have the
         // next chunk's forward overwrite the private copy `forward` saves.
-        let mut hconcat = DTensor::uninit(gpu, &[rows, d]);
-        ops::ogate_fwd(gpu, &mut o, &yhat, &mut hconcat);
-        out.reshape_to(&[rows, d]);
+        let mut hconcat = GTensor::uninit(gpu, &[rows, dim]);
+        ops::ogate_fwd(gpu, &xh, &yhat, &mut hconcat, self.o_off());
+        out.reshape_to(&[rows, dim]);
         self.lin_out.forward_shared(gpu, &hconcat, out);
-        out.reshape_to(&[b, t, d]);
+        out.reshape_to(&[batch, t, dim]);
         self.saved.push(SavedFused {
-            b,
+            b: batch,
             t,
             xf: Some(xf),
             xh: Some(xh),
             gates,
             fused,
-            o: Some(o),
             yhat: Some(yhat),
             hconcat: Some(hconcat),
         });
@@ -555,9 +456,8 @@ impl MLstm {
             gpu,
             vec![
                 Parked::from(sv.xf.take().expect("evict before restore: xf")),
-                Parked::from(sv.o.take().expect("evict before restore: o")),
                 Parked::from(sv.yhat.take().expect("evict before restore: yhat")),
-                Parked::from(sv.xh.take().expect("evict before restore: q‖k‖v")),
+                Parked::from(sv.xh.take().expect("evict before restore: q‖k‖v‖o")),
             ],
         );
     }
@@ -581,21 +481,20 @@ impl MLstm {
         let mut it = park.restore(gpu).into_iter();
         let mut next = |what: &str| it.next().expect(what);
         sv.xf = Some(next("parked xf").f32());
-        sv.o = Some(next("parked o").f32());
         sv.yhat = Some(next("parked yhat").f32());
-        sv.xh = Some(next("parked q‖k‖v").into());
+        sv.xh = Some(next("parked q‖k‖v‖o").into());
     }
 
     /// Device bytes held, split `(params, activations)`. Diagnostic — see
     /// [`Hierarchical::retained_report`](super::hierarchical::Hierarchical::retained_report).
     ///
-    /// Note the multiplier: this cell owns **four** [`Linear`]s, each with its own
+    /// Note the multiplier: this cell owns **three** [`Linear`]s, each with its own
     /// saved input and bf16 GEMM staging, plus a head-wise [`RmsNorm`] holding an
     /// `x̂` the width of the cell. `drop_saved_act` clears only `saved` — the
     /// per-`Linear` retention survives it.
     pub fn retained_bytes(&self) -> (usize, usize) {
         let (mut params, mut act) = (0, 0);
-        for l in [&self.lin_qkv, &self.lin_o, &self.lin_gates, &self.lin_out] {
+        for l in [&self.lin_qkvo, &self.lin_gates, &self.lin_out] {
             let (p, a) = l.retained_bytes();
             params += p;
             act += a;
@@ -645,7 +544,7 @@ impl MLstm {
     /// Retained activation bytes split `(saved_cache, other)`.
     ///
     /// `saved_cache` is what `drop_saved_act` releases. `other` is the pooled scratch
-    /// plus what the **four** projections and the head norm hold internally — their
+    /// plus what the **three** projections and the head norm hold internally — their
     /// saved inputs and bf16 GEMM staging — which no `drop_saved_act` reaches.
     pub fn act_split(&self) -> (usize, usize) {
         let saved = self.saved_bytes();
@@ -671,12 +570,7 @@ impl MLstm {
         // path, which is exactly what `Pool` exists to avoid. The window boundary
         // (`Hierarchical::trim_pools`) is where it gets sized down, against the largest
         // group that actually ran.
-        for l in [
-            &mut self.lin_qkv,
-            &mut self.lin_o,
-            &mut self.lin_gates,
-            &mut self.lin_out,
-        ] {
+        for l in [&mut self.lin_qkvo, &mut self.lin_gates, &mut self.lin_out] {
             l.drop_saved_act(gpu);
         }
         self.headnorm.drop_saved_act();
@@ -698,8 +592,8 @@ impl MLstm {
 
     /// Backward into a freshly allocated `dx` `[B, T, in]` — the by-value
     /// companion to [`backward`](Self::backward).
-    pub fn backward_alloc_dx(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
-        let mut dx = DTensor::uninit(gpu, &[dy.shape[0], dy.shape[1], self.input_size]);
+    pub fn backward_alloc_dx(&mut self, gpu: &Gpu, dy: &GTensor<f32>) -> GTensor<f32> {
+        let mut dx = GTensor::uninit(gpu, &[dy.shape[0], dy.shape[1], self.input_size]);
         self.backward(gpu, dy, &mut dx);
         dx
     }
@@ -709,12 +603,12 @@ impl MLstm {
     /// Chunks are swept in reverse, carrying `dC`/`dn` (the grad wrt the state a
     /// chunk hands to its successor) backwards the way forward carried `C`/`n`
     /// forwards — BPTT over chunks, with the parallel form inside each.
-    pub fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+    pub fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
         let out = self.backward_alloc(gpu, dy);
         dx.copy_from(gpu, &out);
     }
 
-    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &DTensor) -> DTensor {
+    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>) -> GTensor<f32> {
         self.pool.assert_drained("MLstm::backward");
         // Bring the parked activations back into the cache first, so everything below
         // reads them as if they had never left. No-op unless offload is enabled.
@@ -728,7 +622,7 @@ impl MLstm {
 
     /// Backward of the fused path: two kernels for the whole chunkwise core, with
     /// the same projection/head-norm/o-gate shell around it.
-    fn backward_fused(&mut self, gpu: &Gpu, dy: &DTensor, sv: SavedFused) -> DTensor {
+    fn backward_fused(&mut self, gpu: &Gpu, dy: &GTensor<f32>, sv: SavedFused) -> GTensor<f32> {
         let (d, h, dqk, dhv, inp) = (self.d, self.heads, self.dqk, self.dhv, self.input_size);
         let (b, t) = (sv.b, sv.t);
         let n = b * t;
@@ -741,7 +635,11 @@ impl MLstm {
         self.lin_out
             .backward_with_x(gpu, sv.hconcat(), &dy_flat, &mut d_hconcat);
         self.pool.put(dy_flat);
-        let (do_pre, d_yhat) = ops::ogate_bwd(gpu, &d_hconcat, sv.o(), sv.yhat());
+        // `dq‖dk‖dv‖do` is one buffer: `ogate_bwd` fills the `o` block here and
+        // `mlstm_fused_bw` the other three below, between them writing every column,
+        // so it comes in uninitialised and feeds `lin_qkvo`'s backward whole.
+        let mut dxh = GTensor::uninit(gpu, &[n, self.lin_qkvo.output_size()]);
+        let d_yhat = ops::ogate_bwd(gpu, &d_hconcat, sv.xh(), sv.yhat(), &mut dxh, self.o_off());
         self.pool.put(d_hconcat);
         // No gather: the kernels read `d_ytil` through the same position-major strides
         // they wrote `ytil` with, and the head norm's output is already in that layout.
@@ -754,18 +652,25 @@ impl MLstm {
 
         // Backward unwinds chunks right to left, so the carried BPTT state comes from
         // the chunk to the RIGHT — `None` on the rightmost (and on any unchunked call).
-        let (dxh, dgates, dstate) = ops::mlstm_fused_bw(
+        let (dgates, dstate) = ops::mlstm_fused_bw(
             gpu,
             &sv.fused,
             sv.xh(),
             &sv.gates,
+            &mut dxh,
             &d_ytil,
             if self.carry {
                 self.carry_dstate.as_ref()
             } else {
                 None
             },
-            ops::MlstmShape { b, h, t, dqk, dhv },
+            ops::MlstmShape {
+                batch: b,
+                heads: h,
+                t,
+                dqk,
+                dhv,
+            },
         );
         self.pool.put(d_ytil);
         if self.carry {
@@ -774,8 +679,8 @@ impl MLstm {
 
         // No scatter and no split: the kernel wrote `dq`/`dk`/`dv` into the one
         // `[N, H*(2*dqk+dhv)]` buffer through the same strides the projection wrote
-        // q/k/v with, so it feeds `lin_qkv`'s backward whole. `dk` needs no 1/√dqk
-        // either — the factor lives in `lin_qkv`'s k columns, so it is already in
+        // q/k/v with, so it feeds `lin_qkvo`'s backward whole. `dk` needs no 1/√dqk
+        // either — the factor lives in `lin_qkvo`'s k columns, so it is already in
         // their scale.
         //
         // dx is the sum of the three projection backwards, accumulated into one
@@ -784,22 +689,21 @@ impl MLstm {
         // All three read the one shared `sv.xf` (see `forward`), so they take
         // `backward_with_x` rather than each consulting a private saved copy.
         // `sv.xf` is narrowed once for all three, as in forward.
-        let mut acc = DTensor::uninit(gpu, &[n, inp]);
+        let mut acc = GTensor::uninit(gpu, &[n, inp]);
         let mut part = self.pool.take(gpu, &[n, inp]);
         ops::with_shared_lhs(gpu, sv.xf(), |xf_b| {
-            self.lin_qkv
+            self.lin_qkvo
                 .backward_staged_x(gpu, sv.xf(), xf_b, &dxh, &mut acc);
-            for (lin, grad) in [(&mut self.lin_o, &do_pre), (&mut self.lin_gates, &dgates)] {
-                lin.backward_staged_x(gpu, sv.xf(), xf_b, grad, &mut part);
-                ops::add_assign(gpu, &mut acc, &part);
-            }
+            self.lin_gates
+                .backward_staged_x(gpu, sv.xf(), xf_b, &dgates, &mut part);
+            ops::add_assign(gpu, &mut acc, &part);
         });
         // Only `part` came from the pool; `dxh`/`do_pre`/`dgates` were allocated by
         // the fused backward and by `ogate_bwd`, so they are dropped, not donated.
         // Handing the pool buffers it never lent would grow the free list every
         // window — a leak, not a cache.
         self.pool.put(part);
-        drop((dxh, do_pre, dgates));
+        drop((dxh, dgates));
         acc.reshaped(&[b, t, inp])
     }
 
@@ -808,12 +712,7 @@ impl MLstm {
     /// the sub-layers.
     pub fn param_slots(&mut self) -> Vec<ParamSlot<'_>> {
         let mut v = Vec::new();
-        for l in [
-            &mut self.lin_qkv,
-            &mut self.lin_o,
-            &mut self.lin_gates,
-            &mut self.lin_out,
-        ] {
+        for l in [&mut self.lin_qkvo, &mut self.lin_gates, &mut self.lin_out] {
             v.extend(l.param_slots());
         }
         v.extend(self.headnorm.param_slots());
@@ -821,22 +720,17 @@ impl MLstm {
     }
 
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
-    pub fn params_mut(&mut self) -> Vec<&mut DTensor> {
+    pub fn params_mut(&mut self) -> Vec<&mut GTensor<f32>> {
         self.param_slots().into_iter().map(|s| s.param).collect()
     }
 
     /// Gradient accumulators, in the same order as `params_mut`. Diagnostic.
-    pub fn grads(&mut self) -> Vec<&DTensor> {
+    pub fn grads(&mut self) -> Vec<&GTensor<f32>> {
         self.param_slots().into_iter().map(|s| &*s.grad).collect()
     }
 
     pub fn zero_grad(&mut self, gpu: &Gpu) {
-        for l in [
-            &mut self.lin_qkv,
-            &mut self.lin_o,
-            &mut self.lin_gates,
-            &mut self.lin_out,
-        ] {
+        for l in [&mut self.lin_qkvo, &mut self.lin_gates, &mut self.lin_out] {
             l.zero_grad(gpu);
         }
         self.headnorm.zero_grad(gpu);
@@ -850,10 +744,16 @@ impl MLstm {
 }
 
 impl Cell for MLstm {
-    fn forward(&mut self, gpu: &Gpu, x: &DTensor, out: &mut DTensor) {
-        MLstm::forward(self, gpu, x, out)
+    fn forward(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        out: &mut GTensor<f32>,
+        cache: &mut TrainingCache,
+    ) {
+        MLstm::forward(self, gpu, x, out, cache)
     }
-    fn backward(&mut self, gpu: &Gpu, dy: &DTensor, dx: &mut DTensor) {
+    fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
         MLstm::backward(self, gpu, dy, dx)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {
@@ -878,7 +778,7 @@ impl Cell for MLstm {
         self.pool.trim(rows * self.d);
     }
     fn drop_saved_act(&mut self) {
-        // The whole fused cache — qh/kh/vh slabs, o, yhat, xf and the `MlstmFused`
+        // The whole fused cache — the q‖k‖v slab, o, yhat, xf and the `MlstmFused`
         // internals. Safe to drop wholesale because the only caller re-forwards to
         // rebuild it (see `Block::drop_saved_act`).
         self.saved.clear();
@@ -952,36 +852,41 @@ mod tests {
     }
 
     /// Lay separate `[B, T, ·]` q/k/v out the way the fused projection writes them —
-    /// concatenated into `[B*T, H*(2*dqk + dhv)]`, with `H = 1` for these tests.
+    /// concatenated into `[B*T, H*(2*dqk + 2*dhv)]`, with `H = 1` for these tests.
+    ///
+    /// The trailing `o` block is zero-filled: nothing in the fused kernels reads it,
+    /// but it sets the row stride they address q/k/v through, so it has to be there.
     fn pack_qkv(
         gpu: &Gpu,
-        q: &DTensor,
-        k: &DTensor,
-        v: &DTensor,
+        q: &GTensor<f32>,
+        k: &GTensor<f32>,
+        v: &GTensor<f32>,
         bt: usize,
         dqk: usize,
         dhv: usize,
     ) -> ops::SlabBuf {
         let (qh, kh, vh) = (q.to_host(gpu), k.to_host(gpu), v.to_host(gpu));
-        let mut out = Vec::with_capacity(bt * (2 * dqk + dhv));
+        let w = 2 * dqk + 2 * dhv;
+        let mut out = Vec::with_capacity(bt * w);
         for r in 0..bt {
             out.extend_from_slice(&qh.data[r * dqk..(r + 1) * dqk]);
             out.extend_from_slice(&kh.data[r * dqk..(r + 1) * dqk]);
             out.extend_from_slice(&vh.data[r * dhv..(r + 1) * dhv]);
+            out.resize(out.len() + dhv, 0.0);
         }
-        let t = DTensor::from_host(gpu, &Tensor::new(&[bt, 2 * dqk + dhv], out));
+        let t = GTensor::from_host(gpu, &Tensor::new(&[bt, w], out));
         ops::SlabBuf::from_f32(gpu, t)
     }
 
     /// The gate twin of [`pack_qkv`]: `ĩ ‖ f̃` into `[B*T, 2*H]`, `H = 1`.
-    fn pack_gates(gpu: &Gpu, ig: &DTensor, fg: &DTensor, bt: usize) -> DTensor {
+    fn pack_gates(gpu: &Gpu, ig: &GTensor<f32>, fg: &GTensor<f32>, bt: usize) -> GTensor<f32> {
         let (ih, fh) = (ig.to_host(gpu), fg.to_host(gpu));
         let mut out = Vec::with_capacity(bt * 2);
         for r in 0..bt {
             out.push(ih.data[r]);
             out.push(fh.data[r]);
         }
-        DTensor::from_host(gpu, &Tensor::new(&[bt, 2], out))
+        GTensor::from_host(gpu, &Tensor::new(&[bt, 2], out))
     }
 
     /// The right check when two float orderings are compared: a per-element
@@ -1026,11 +931,10 @@ mod tests {
         let before = MLstm::new_rand(&gpu, inp, d, heads, dqk);
         let after = MLstm::from_nn_cell(&gpu, &before.to_nn_cell(&gpu));
         for (name, a, b) in [
-            ("qkv w", &before.lin_qkv.w, &after.lin_qkv.w),
-            ("qkv b", &before.lin_qkv.b, &after.lin_qkv.b),
+            ("qkvo w", &before.lin_qkvo.w, &after.lin_qkvo.w),
+            ("qkvo b", &before.lin_qkvo.b, &after.lin_qkvo.b),
             ("gates w", &before.lin_gates.w, &after.lin_gates.w),
             ("gates b", &before.lin_gates.b, &after.lin_gates.b),
-            ("o w", &before.lin_o.w, &after.lin_o.w),
             ("out w", &before.lin_out.w, &after.lin_out.w),
         ] {
             let (a, b) = (a.to_host(&gpu), b.to_host(&gpu));
@@ -1060,13 +964,18 @@ mod tests {
 
         // Forward
         let y_cpu = cpu.forward(&x);
-        let mut y_dev = DTensor::uninit(&gpu, &[b, t, d]);
-        dev.forward(&gpu, &DTensor::from_host(&gpu, &x), &mut y_dev);
+        let mut y_dev = GTensor::uninit(&gpu, &[b, t, d]);
+        dev.forward(
+            &gpu,
+            &GTensor::from_host(&gpu, &x),
+            &mut y_dev,
+            &mut TrainingCache::new(),
+        );
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, "y");
 
         // Backward
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g));
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 3e-3, "dx");
 
         // One AdamW step; compare representative updated parameters.
@@ -1075,8 +984,8 @@ mod tests {
         cpu.step(&cfg);
         dev.step(&gpu, &cfg);
         // (weights live in the Linear sub-layers; check q, v, out projections + γ)
-        let xw = dev.lin_qkv.w.to_host(&gpu).data;
-        let xwid = dev.lin_qkv.output_size();
+        let xw = dev.lin_qkvo.w.to_host(&gpu).data;
+        let xwid = dev.lin_qkvo.output_size();
         assert_close(
             &cols_of(&xw, xwid, 0, heads * dqk),
             &cpu.wq.data,
@@ -1131,15 +1040,15 @@ mod tests {
 
         let x = Tensor::random_seeded(&[b, t, inp], 0.5, 0xB3);
         let g = Tensor::random_seeded(&[b, t, d], 1.0, 0xB4);
-        let dx = DTensor::from_host(&gpu, &x);
-        let dg = DTensor::from_host(&gpu, &g);
+        let dx = GTensor::from_host(&gpu, &x);
+        let dg = GTensor::from_host(&gpu, &g);
 
         // Reference: one chunk over the whole sequence.
         let run = |chunk: usize| {
             let mut dev = MLstm::from_cpu(&gpu, &proto);
             dev.set_chunk(chunk);
-            let mut yt = DTensor::uninit(&gpu, &[b, t, d]);
-            dev.forward(&gpu, &dx, &mut yt);
+            let mut yt = GTensor::uninit(&gpu, &[b, t, d]);
+            dev.forward(&gpu, &dx, &mut yt, &mut TrainingCache::new());
             let y = yt.to_host(&gpu).data;
             let dxo = dev.backward_alloc(&gpu, &dg).to_host(&gpu).data;
             let mut cfg = AdamCfg::new(1e-3, 0.01);
@@ -1198,16 +1107,16 @@ mod tests {
         proto.wi = Tensor::random_seeded(&[inp, heads], 0.3, 0xA1);
         proto.wf = Tensor::random_seeded(&[inp, heads], 0.3, 0xA2);
 
-        let x = DTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, inp], 0.5, 0xA3));
-        let g = DTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, d], 1.0, 0xA4));
+        let x = GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, inp], 0.5, 0xA3));
+        let g = GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, d], 1.0, 0xA4));
 
         // `chunk` here selects the path, not just the blocking: 0 is the only value
         // the fused kernels decline, so it is the reference. See `fused_chunk`.
         let run = |chunk: usize| {
             let mut dev = MLstm::from_cpu(&gpu, &proto);
             dev.set_chunk(chunk);
-            let mut yt = DTensor::uninit(&gpu, &[b, t, d]);
-            dev.forward(&gpu, &x, &mut yt);
+            let mut yt = GTensor::uninit(&gpu, &[b, t, d]);
+            dev.forward(&gpu, &x, &mut yt, &mut TrainingCache::new());
             let y = yt.to_host(&gpu).data;
             let dx = dev.backward_alloc(&gpu, &g).to_host(&gpu).data;
             let mut cfg = AdamCfg::new(1e-3, 0.01);
@@ -1273,12 +1182,17 @@ mod tests {
         let g = Tensor::random_seeded(&[b, t, d], 1.0, 0xE4);
 
         let y_cpu = cpu.forward(&x);
-        let mut yt = DTensor::uninit(&gpu, &[b, t, d]);
-        dev.forward(&gpu, &DTensor::from_host(&gpu, &x), &mut yt);
+        let mut yt = GTensor::uninit(&gpu, &[b, t, d]);
+        dev.forward(
+            &gpu,
+            &GTensor::from_host(&gpu, &x),
+            &mut yt,
+            &mut TrainingCache::new(),
+        );
         assert_close_rel(&yt.to_host(&gpu).data, &y_cpu.data, 1e-2, "y");
 
         let dx_cpu = cpu.backward(&g);
-        let dx = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
+        let dx = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g));
         assert_close_rel(&dx.to_host(&gpu).data, &dx_cpu.data, 1e-2, "dx");
     }
 
@@ -1314,8 +1228,13 @@ mod tests {
         // relative bound is measuring the storage format, not the kernel. Sitting at
         // 5e-3 made this fail ~2 runs in 3 at 5.07e-3.
         let y_cpu = cpu.forward(&x);
-        let mut y_dev = DTensor::uninit(&gpu, &[b, t, d]);
-        dev.forward(&gpu, &DTensor::from_host(&gpu, &x), &mut y_dev);
+        let mut y_dev = GTensor::uninit(&gpu, &[b, t, d]);
+        dev.forward(
+            &gpu,
+            &GTensor::from_host(&gpu, &x),
+            &mut y_dev,
+            &mut TrainingCache::new(),
+        );
         assert_close_rel(&y_dev.to_host(&gpu).data, &y_cpu.data, 1e-2, "y");
 
         // dx is looser than y: it carries the bf16 q/k/v narrowing and the TF32 mma
@@ -1332,7 +1251,7 @@ mod tests {
         // a last-bit difference into a full-size one — 3.1e-2 here. `dx` is the
         // gradient check; a weight check on top of it only measures the optimizer.
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g));
         assert_close_rel(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 1e-2, "dx");
     }
 
@@ -1357,21 +1276,26 @@ mod tests {
         let g = Tensor::random(&[b, t, d], 1.0);
 
         let y_cpu = cpu.forward(&x);
-        let mut y_dev = DTensor::uninit(&gpu, &[b, t, d]);
-        dev.forward(&gpu, &DTensor::from_host(&gpu, &x), &mut y_dev);
+        let mut y_dev = GTensor::uninit(&gpu, &[b, t, d]);
+        dev.forward(
+            &gpu,
+            &GTensor::from_host(&gpu, &x),
+            &mut y_dev,
+            &mut TrainingCache::new(),
+        );
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, "y");
 
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward_alloc(&gpu, &DTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g));
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 3e-3, "dx");
 
         let mut cfg = AdamCfg::new(1e-3, 0.01);
         cfg.t = 1;
         cpu.step(&cfg);
         dev.step(&gpu, &cfg);
-        let xw = dev.lin_qkv.w.to_host(&gpu).data;
+        let xw = dev.lin_qkvo.w.to_host(&gpu).data;
         assert_close(
-            &cols_of(&xw, dev.lin_qkv.output_size(), 0, heads * dqk),
+            &cols_of(&xw, dev.lin_qkvo.output_size(), 0, heads * dqk),
             &cpu.wq.data,
             3e-3,
             "wq",
@@ -1410,7 +1334,7 @@ mod tests {
         let t: usize = parts.iter().sum();
 
         let mk = |dims: &[usize], seed: u64| {
-            DTensor::from_host(&gpu, &Tensor::random_seeded(dims, 0.5, seed))
+            GTensor::from_host(&gpu, &Tensor::random_seeded(dims, 0.5, seed))
         };
         let q = mk(&[bh, t, dqk], 0xC1);
         let k = mk(&[bh, t, dqk], 0xC2);
@@ -1419,7 +1343,7 @@ mod tests {
         let fg = mk(&[bh, t], 0xC5);
         // `ytil` is slab-typed; widen it to fp32 to compare.
         let ytil_host = |f: &ops::MlstmFused, n: usize| {
-            let mut scratch = DTensor::uninit(&gpu, &[n]);
+            let mut scratch = GTensor::uninit(&gpu, &[n]);
             f.ytil.as_f32(&gpu, &mut scratch).to_host(&gpu).data
         };
 
@@ -1431,8 +1355,8 @@ mod tests {
             l,
             None,
             ops::MlstmShape {
-                b: bh,
-                h: 1,
+                batch: bh,
+                heads: 1,
                 t,
                 dqk,
                 dhv,
@@ -1446,14 +1370,14 @@ mod tests {
         let mut off = 0;
         let mut per_chunk: Vec<Vec<f32>> = Vec::new();
         for &c in &parts {
-            let cut = |src: &DTensor, w: usize| {
+            let cut = |src: &GTensor<f32>, w: usize| {
                 let h = src.to_host(&gpu);
                 let mut out = Vec::with_capacity(bh * c * w);
                 for b in 0..bh {
                     let base = b * t * w + off * w;
                     out.extend_from_slice(&h.data[base..base + c * w]);
                 }
-                DTensor::from_host(&gpu, &Tensor::new(&[bh, c, w], out))
+                GTensor::from_host(&gpu, &Tensor::new(&[bh, c, w], out))
             };
             let (qc, kc, vc) = (cut(&q, dqk), cut(&k, dqk), cut(&v, dhv));
             let (igc, fgc) = (cut(&ig, 1), cut(&fg, 1));
@@ -1464,8 +1388,8 @@ mod tests {
                 l,
                 state.as_ref(),
                 ops::MlstmShape {
-                    b: bh,
-                    h: 1,
+                    batch: bh,
+                    heads: 1,
                     t: c,
                     dqk,
                     dhv,
@@ -1529,7 +1453,7 @@ mod tests {
                 let base = bb * t * w + c0 * w;
                 o.extend_from_slice(&src.data[base..base + len * w]);
             }
-            DTensor::from_host(&gpu, &Tensor::new(&[b, len, w], o))
+            GTensor::from_host(&gpu, &Tensor::new(&[b, len, w], o))
         };
 
         // Reference: one call over the whole sequence.
@@ -1537,10 +1461,15 @@ mod tests {
         // 6-step call is a single internal chunk, `is_last` is true for it either way,
         // and the CARRY path under test is never reached.
         let mut whole = MLstm::from_cpu(&gpu, &proto);
-        let mut y_whole = DTensor::uninit(&gpu, &[b, t, d]);
-        whole.forward(&gpu, &DTensor::from_host(&gpu, &x), &mut y_whole);
+        let mut y_whole = GTensor::uninit(&gpu, &[b, t, d]);
+        whole.forward(
+            &gpu,
+            &GTensor::from_host(&gpu, &x),
+            &mut y_whole,
+            &mut TrainingCache::new(),
+        );
         let want = whole
-            .backward_alloc(&gpu, &DTensor::from_host(&gpu, &g))
+            .backward_alloc(&gpu, &GTensor::from_host(&gpu, &g))
             .to_host(&gpu)
             .data
             .to_vec();
@@ -1566,8 +1495,13 @@ mod tests {
             part.set_carry(true);
             part.reset_state(&gpu);
             for &(c0, len) in &parts {
-                let mut y_part = DTensor::uninit(&gpu, &[b, len, d]);
-                part.forward(&gpu, &cut(&x, c0, len, inp), &mut y_part);
+                let mut y_part = GTensor::uninit(&gpu, &[b, len, d]);
+                part.forward(
+                    &gpu,
+                    &cut(&x, c0, len, inp),
+                    &mut y_part,
+                    &mut TrainingCache::new(),
+                );
             }
             // Backward unwinds right to left, starting with no gradient from the right.
             part.reset_bptt(&gpu);

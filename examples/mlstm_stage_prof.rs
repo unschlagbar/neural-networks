@@ -19,9 +19,13 @@ fn main() {
 fn main() {
     use std::time::Instant;
 
+    use neural_networks::gpu::arena::TrainingCache;
+
     use neural_networks::gpu::mlstm::MLstm;
-    use neural_networks::gpu::{DTensor, Gpu, ops};
+    use neural_networks::gpu::{GTensor, Gpu, ops};
     use neural_networks::tensor::Tensor;
+
+    let mut cache = TrainingCache::new();
 
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -56,8 +60,8 @@ fn main() {
         (n, d, d * 8 / 3, "swiglu up     [N,d]x[d,up]"),
         (n, d * 8 / 3, d, "swiglu down   [N,up]x[up,d]"),
     ] {
-        let a = DTensor::from_host(&gpu, &Tensor::random(&[m, k], 0.5));
-        let w = DTensor::from_host(&gpu, &Tensor::random(&[k, nn], 0.5));
+        let a = GTensor::from_host(&gpu, &Tensor::random(&[m, k], 0.5));
+        let w = GTensor::from_host(&gpu, &Tensor::random(&[k, nn], 0.5));
         let secs = timed(&gpu, 5, 50, || {
             let _ = ops::matmul(&gpu, &a, &w);
         });
@@ -72,12 +76,12 @@ fn main() {
     // The whole cell, forward and backward, at the shape the backbone runs it at.
     println!("\n== mLSTM cell (7 projections + chunk loop + tail) ==");
     let mut cell = MLstm::new_rand(&gpu, d, d, heads, dqk);
-    let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
-    let dy = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
+    let x = GTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
+    let dy = GTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
 
-    let mut y = DTensor::uninit(&gpu, &[b, t, d]);
+    let mut y = GTensor::uninit(&gpu, &[b, t, d]);
     let fwd = timed(&gpu, 2, 10, || {
-        cell.forward(&gpu, &x, &mut y);
+        cell.forward(&gpu, &x, &mut y, &mut cache);
         // backward must consume the cache the forward built, or it grows unboundedly
         let _ = cell.backward_alloc(&gpu, &dy);
     });
@@ -89,14 +93,14 @@ fn main() {
 
     // Forward alone, so the two halves can be separated.
     let f_only = timed(&gpu, 2, 10, || {
-        cell.forward(&gpu, &x, &mut y);
+        cell.forward(&gpu, &x, &mut y, &mut cache);
         let _ = cell.backward_alloc(&gpu, &dy);
     });
     let _ = f_only;
 
     // The 7 projections on their own: the FLOP-dominant part of the cell.
-    let xf = DTensor::from_host(&gpu, &Tensor::random(&[n, d], 0.5));
-    let wq = DTensor::from_host(&gpu, &Tensor::random(&[d, d], 0.5));
+    let xf = GTensor::from_host(&gpu, &Tensor::random(&[n, d], 0.5));
+    let wq = GTensor::from_host(&gpu, &Tensor::random(&[d, d], 0.5));
     let proj = timed(&gpu, 5, 20, || {
         for _ in 0..7 {
             let _ = ops::matmul(&gpu, &xf, &wq);
@@ -110,9 +114,9 @@ fn main() {
     let chunks = t.div_ceil(l);
     let bh = b * heads;
     let dhv = d / heads;
-    let qc = DTensor::from_host(&gpu, &Tensor::random(&[bh, l, dqk], 0.5));
-    let kc = DTensor::from_host(&gpu, &Tensor::random(&[bh, l, dqk], 0.5));
-    let vc = DTensor::from_host(&gpu, &Tensor::random(&[bh, l, dhv], 0.5));
+    let qc = GTensor::from_host(&gpu, &Tensor::random(&[bh, l, dqk], 0.5));
+    let kc = GTensor::from_host(&gpu, &Tensor::random(&[bh, l, dqk], 0.5));
+    let vc = GTensor::from_host(&gpu, &Tensor::random(&[bh, l, dhv], 0.5));
     let core = timed(&gpu, 2, 10, || {
         for _ in 0..chunks {
             let s = ops::matmul_batched_nt(&gpu, &qc, &kc); // [BH, L, L]
@@ -129,32 +133,31 @@ fn main() {
     // slow, this number says whether the kernels or their surroundings are at fault.
     println!("\n== fused chunkwise core alone (the 5 kernels) ==");
     let lf = ops::FUSED_MAX_L;
-    // q/k/v go in as slabs: the fused kernels read them at whatever width the
+    // q/k/v/o go in as one concatenated slab and the gate logits as one fp32 block —
+    // the layout the two fused projections write. The slab is at whatever width the
     // backend was compiled for (bf16 unless GPU_NO_BF16), so the profile matches
     // what the cell actually runs.
-    let qh = ops::SlabBuf::from_f32(
+    let xh = ops::SlabBuf::from_f32(
         &gpu,
-        DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dqk], 0.5)),
+        GTensor::from_host(&gpu, &Tensor::random(&[bh * t, 2 * dqk + 2 * dhv], 0.5)),
     );
-    let kh = ops::SlabBuf::from_f32(
-        &gpu,
-        DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dqk], 0.5)),
-    );
-    let vh = ops::SlabBuf::from_f32(
-        &gpu,
-        DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dhv], 0.5)),
-    );
-    let igh = DTensor::from_host(&gpu, &Tensor::random(&[bh, t], 0.5));
-    let fgh = DTensor::from_host(&gpu, &Tensor::random(&[bh, t], 0.5));
-    let dyt = DTensor::from_host(&gpu, &Tensor::random(&[bh, t, dhv], 1.0));
-    let stf = ops::MlstmShape { b: bh, h: 1, t, dqk, dhv };
+    let gates = GTensor::from_host(&gpu, &Tensor::random(&[bh * t, 2], 0.5));
+    let dyt = GTensor::from_host(&gpu, &Tensor::random(&[bh, t, dhv], 1.0));
+    let stf = ops::MlstmShape {
+        batch: bh,
+        heads: 1,
+        t,
+        dqk,
+        dhv,
+    };
 
     let f_fw = timed(&gpu, 3, 20, || {
-        let _ = ops::mlstm_fused_fw(&gpu, &qh, &kh, &vh, &igh, &fgh, lf, None, stf);
+        let _ = ops::mlstm_fused_fw(&gpu, &xh, &gates, lf, None, stf);
     });
+    let mut dxh = GTensor::uninit(&gpu, &[bh * t, 2 * dqk + 2 * dhv]);
     let f_all = timed(&gpu, 3, 20, || {
-        let sv = ops::mlstm_fused_fw(&gpu, &qh, &kh, &vh, &igh, &fgh, lf, None, stf);
-        let _ = ops::mlstm_fused_bw(&gpu, &sv, &qh, &kh, &vh, &igh, &fgh, &dyt, None, stf);
+        let sv = ops::mlstm_fused_fw(&gpu, &xh, &gates, lf, None, stf);
+        let _ = ops::mlstm_fused_bw(&gpu, &sv, &xh, &gates, &mut dxh, &dyt, None, stf);
     });
     println!("fused fwd only:      {:>7.2} ms", f_fw * 1e3);
     println!(

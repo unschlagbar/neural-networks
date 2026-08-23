@@ -16,13 +16,16 @@ fn main() {
 
 #[cfg(feature = "cuda")]
 fn main() {
-    use neural_networks::gpu::{DTensor, Gpu, mlstm::MLstm};
+    use neural_networks::gpu::arena::TrainingCache;
+    use neural_networks::gpu::{GTensor, Gpu, mlstm::MLstm};
     use neural_networks::tensor::Tensor;
 
     let mut args = std::env::args().skip(1);
     let t: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(512);
     let chunks: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
     assert!(t % chunks == 0, "t must divide into chunks");
+
+    let mut cache = TrainingCache::new();
 
     let gpu = Gpu::new().expect("gpu");
     let (b, heads, dqk) = (1usize, 8usize, 96usize);
@@ -37,7 +40,7 @@ fn main() {
     for (i, p) in cell.params_mut().into_iter().enumerate() {
         let dims: Vec<usize> = p.dims().to_vec();
         let w = Tensor::random_seeded(&dims, 0.05, 0x5EED + i as u64);
-        p.copy_from(&gpu, &DTensor::from_host(&gpu, &w));
+        p.copy_from(&gpu, &GTensor::from_host(&gpu, &w));
     }
 
     const NAMES: [&str; 16] = [
@@ -49,16 +52,16 @@ fn main() {
     cell.zero_grad(&gpu);
     let step = t / chunks;
     cell.set_carry(chunks > 1);
-    let part = |src: &Tensor, c: usize| -> DTensor {
+    let part = |src: &Tensor, c: usize| -> GTensor<f32> {
         let lo = c * step * d;
         let sl = Tensor::new(&[b, step, d], src.data[lo..lo + step * d].to_vec());
-        DTensor::from_host(&gpu, &sl)
+        GTensor::from_host(&gpu, &sl)
     };
     let mut ys = Vec::new();
     let mut dxs = Vec::new();
     for c in 0..chunks {
-        let mut y = DTensor::uninit(&gpu, &[b, step, d]);
-        cell.forward(&gpu, &part(&xh, c), &mut y);
+        let mut y = GTensor::uninit(&gpu, &[b, step, d]);
+        cell.forward(&gpu, &part(&xh, c), &mut y, &mut cache);
         ys.push(y);
     }
     for c in (0..chunks).rev() {

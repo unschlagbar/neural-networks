@@ -21,8 +21,11 @@ fn main() {
     use std::time::Instant;
 
     use neural_networks::config::{BACKBONE_CHUNK, OUT_HIDDEN, WORD_HIDDEN};
-    use neural_networks::gpu::{DTensor, Gpu, mlstm::MLstm};
+    use neural_networks::gpu::arena::TrainingCache;
+    use neural_networks::gpu::{GTensor, Gpu, mlstm::MLstm};
     use neural_networks::tensor::Tensor;
+
+    let mut cache = TrainingCache::new();
 
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -86,17 +89,17 @@ fn main() {
         .iter()
         .map(|&(b, t, h, dqk)| {
             let d = h * dqk;
-            let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
-            let g = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
+            let x = GTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
+            let g = GTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
             let cell = MLstm::new_rand(&gpu, d, d, h, dqk);
-            let y = DTensor::uninit(&gpu, &[b, t, d]);
+            let y = GTensor::uninit(&gpu, &[b, t, d]);
             (x, g, cell, y)
         })
         .collect();
 
     for (x, g, cell, y) in cells.iter_mut() {
         for _ in 0..warmup {
-            cell.forward(&gpu, x, y);
+            cell.forward(&gpu, x, y, &mut cache);
             let _ = cell.backward_alloc(&gpu, g);
         }
     }
@@ -111,7 +114,7 @@ fn main() {
             gpu.stream.synchronize().unwrap();
             let t0 = Instant::now();
             for _ in 0..iters {
-                cell.forward(&gpu, x, y);
+                cell.forward(&gpu, x, y, &mut cache);
                 cell.drop_saved();
             }
             gpu.stream.synchronize().unwrap();
@@ -120,7 +123,7 @@ fn main() {
             gpu.stream.synchronize().unwrap();
             let t0 = Instant::now();
             for _ in 0..iters {
-                cell.forward(&gpu, x, y);
+                cell.forward(&gpu, x, y, &mut cache);
                 let _ = cell.backward_alloc(&gpu, g);
             }
             gpu.stream.synchronize().unwrap();

@@ -4,7 +4,7 @@
 //!
 //! Measures the training-relevant number: compute throughput with operands
 //! already resident (weights/activations stay on the device across a step — the
-//! whole point of `DTensor`), so per-op host<->device transfer is excluded. One
+//! whole point of `GTensor<f32>`), so per-op host<->device transfer is excluded. One
 //! GEMM size is additionally reported *with* a full host round-trip to show why
 //! residency matters.
 //!
@@ -21,11 +21,15 @@ fn main() {
 fn main() {
     use std::time::Instant;
 
-    use neural_networks::gpu::{DTensor, Gpu, ops};
+    use neural_networks::gpu::arena::TrainingCache;
+
+    use neural_networks::gpu::{GTensor, Gpu, ops};
     use neural_networks::nn2::linear::Linear as CpuLinear;
     use neural_networks::nn2::optim::AdamCfg;
     use neural_networks::nn2::slstm::SLstm as CpuSLstm;
     use neural_networks::tensor::{Tensor, gemm};
+
+    let mut cache = TrainingCache::new();
 
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -94,9 +98,9 @@ fn main() {
             gemm::gemm_nn(m, k, n, &a.data, &b.data, &mut c.data, 0.0)
         });
 
-        let da = DTensor::from_host(&gpu, &a);
-        let db = DTensor::from_host(&gpu, &b);
-        let mut dc = DTensor::zeros(&gpu, &[m, n]);
+        let da = GTensor::from_host(&gpu, &a);
+        let db = GTensor::from_host(&gpu, &b);
+        let mut dc = GTensor::zeros(&gpu, &[m, n]);
         let gpu_s = gpu_time(&gpu, 3, iters, || {
             ops::matmul_nn_into(&gpu, &da, &db, &mut dc, 0.0)
         });
@@ -120,16 +124,16 @@ fn main() {
         let a = Tensor::random(&[m, k], 1.0);
         let b = Tensor::random(&[k, n], 1.0);
         let iters = 30;
-        let da = DTensor::from_host(&gpu, &a);
-        let db = DTensor::from_host(&gpu, &b);
-        let mut dc = DTensor::zeros(&gpu, &[m, n]);
+        let da = GTensor::from_host(&gpu, &a);
+        let db = GTensor::from_host(&gpu, &b);
+        let mut dc = GTensor::zeros(&gpu, &[m, n]);
         let resident = gpu_time(&gpu, 3, iters, || {
             ops::matmul_nn_into(&gpu, &da, &db, &mut dc, 0.0)
         });
         // With a full host round-trip each call, sync is implicit in to_host.
         let with_xfer = cpu_time(3, iters, || {
-            let da = DTensor::from_host(&gpu, &a);
-            let db = DTensor::from_host(&gpu, &b);
+            let da = GTensor::from_host(&gpu, &a);
+            let db = GTensor::from_host(&gpu, &b);
             let c = ops::matmul(&gpu, &da, &db);
             let _ = c.to_host(&gpu);
         });
@@ -164,8 +168,8 @@ fn main() {
         });
 
         let mut dev = neural_networks::gpu::linear::Linear::from_parts(&gpu, &w, &bias);
-        let dx_in = DTensor::from_host(&gpu, &x);
-        let ddy = DTensor::from_host(&gpu, &dy);
+        let dx_in = GTensor::from_host(&gpu, &x);
+        let ddy = GTensor::from_host(&gpu, &dy);
         let gpu_s = gpu_time(&gpu, 3, iters, || {
             let _y = dev.forward_alloc(&gpu, &dx_in);
             let _dx = dev.backward_alloc(&gpu, &ddy);
@@ -215,8 +219,8 @@ fn main() {
             &gpu, h, h, &cpu.wz, &cpu.wi, &cpu.wf, &cpu.wo, &cpu.bz, &cpu.bi, &cpu.bf, &cpu.bo,
             None,
         );
-        let dx_in = DTensor::from_host(&gpu, &x);
-        let ddy = DTensor::from_host(&gpu, &dy);
+        let dx_in = GTensor::from_host(&gpu, &x);
+        let ddy = GTensor::from_host(&gpu, &dy);
         let gpu_s = gpu_time(&gpu, GPU_WARMUP, GPU_ITERS, || {
             let _y = dev.forward_alloc(&gpu, &dx_in);
             let _dx = dev.backward_alloc(&gpu, &ddy);
@@ -273,11 +277,11 @@ fn main() {
             &gpu, d, d, heads, dqk, &cpu.wq, &cpu.wk, &cpu.wv, &cpu.wo, &cpu.wi, &cpu.wf, &cpu.bq,
             &cpu.bk, &cpu.bv, &cpu.bo, &cpu.bi, &cpu.bf, &cpu.w_out, &cpu.b_out, &cpu.gamma,
         );
-        let dx_in = DTensor::from_host(&gpu, &x);
-        let ddy = DTensor::from_host(&gpu, &dy);
-        let mut y_dev = DTensor::uninit(&gpu, &[b, t, d]);
+        let dx_in = GTensor::from_host(&gpu, &x);
+        let ddy = GTensor::from_host(&gpu, &dy);
+        let mut y_dev = GTensor::uninit(&gpu, &[b, t, d]);
         let gpu_s = gpu_time(&gpu, GPU_WARMUP, GPU_ITERS, || {
-            dev.forward(&gpu, &dx_in, &mut y_dev);
+            dev.forward(&gpu, &dx_in, &mut y_dev, &mut cache);
             let _dx = dev.backward_alloc(&gpu, &ddy);
             dev.step(&gpu, &cfg);
         });

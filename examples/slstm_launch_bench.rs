@@ -35,7 +35,7 @@ fn main() {
 fn main() {
     use std::time::Instant;
 
-    use neural_networks::gpu::{DTensor, Gpu, slstm::SLstm};
+    use neural_networks::gpu::{GTensor, Gpu, slstm::SLstm};
     use neural_networks::tensor::Tensor;
 
     let gpu = match Gpu::new() {
@@ -57,8 +57,8 @@ fn main() {
 
     for &t in &[64, 128, 256, 512, 1024] {
         let mut dev = SLstm::new_rand(&gpu, d, d);
-        let x = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
-        let g = DTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
+        let x = GTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 0.5));
+        let g = GTensor::from_host(&gpu, &Tensor::random(&[b, t, d], 1.0));
 
         let iters = if t <= 256 { 30 } else { 10 };
         let warmup = (iters / 5).max(2);
