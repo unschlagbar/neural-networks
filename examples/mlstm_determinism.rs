@@ -37,8 +37,8 @@ fn main() {
     }
     // Positional labels for `grads()`, so a mismatch names something.
     const GRAD_NAMES: [&str; 16] = [
-        "dWq", "dbq", "dWk", "dbk", "dWv", "dbv", "dWo", "dbo", "dWi", "dbi", "dWf",
-        "dbf", "dWout", "dbout", "dgamma", "d?",
+        "dWq", "dbq", "dWk", "dbk", "dWv", "dbv", "dWo", "dbo", "dWi", "dbi", "dWf", "dbf",
+        "dWout", "dbout", "dgamma", "d?",
     ];
 
     // Sum of bits, not of values: a reordered fp32 sum would hide behind a float
@@ -63,7 +63,10 @@ fn main() {
         // `grads()` is the cell's own order: the seven projections' dW/db, then the
         // head norm's dγ.
         for (i, gr) in cell.grads().iter().enumerate() {
-            sig.push((GRAD_NAMES[i.min(GRAD_NAMES.len() - 1)], hash(&gr.to_host(&gpu).data)));
+            sig.push((
+                GRAD_NAMES[i.min(GRAD_NAMES.len() - 1)],
+                hash(&gr.to_host(&gpu).data),
+            ));
         }
         match &first {
             None => {
@@ -82,7 +85,14 @@ fn main() {
             }
         }
     }
-    println!("\n{}", if bad { "NONDETERMINISTIC" } else { "DETERMINISTIC" });
+    println!(
+        "\n{}",
+        if bad {
+            "NONDETERMINISTIC"
+        } else {
+            "DETERMINISTIC"
+        }
+    );
     if bad {
         std::process::exit(1);
     }

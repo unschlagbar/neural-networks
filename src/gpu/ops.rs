@@ -12,7 +12,7 @@
 
 use cudarc::cublas::sys::cublasOperation_t::{CUBLAS_OP_N, CUBLAS_OP_T};
 use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig};
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaView, LaunchConfig, PushKernelArg};
 
 use super::{GTensor, Gpu};
 use crate::nn2::optim::AdamCfg;
@@ -33,157 +33,17 @@ pub fn upload_ids_u32(gpu: &Gpu, ids: &[u32]) -> CudaSlice<u32> {
     gpu.stream.clone_htod(ids).expect("upload ids")
 }
 
-/// A reusable staging buffer that uploads several id lists in **one** transfer.
-///
-/// The per-window index bookkeeping (which row is a `[W]` step, which slot is a char,
-/// the CE targets and mask) is a handful of small `u32` lists. Sending each with its
-/// own [`upload_ids_u32`] costs one device allocation and one *blocking* H2D apiece —
-/// `memcpy_htod` from a pageable host slice is synchronous, so the compute stream
-/// stalls on every one. The decoder issues six per length group, the encoder two, and
-/// both run again in backward: ~30 stalls per window, for ~100 KB of data.
-///
-/// This packs the lists back-to-back into one pinned host buffer, does a single async
-/// copy into one device buffer, and hands back views. Pinned + async means the copy
-/// also overlaps whatever compute is already queued instead of blocking on it.
-///
-/// The buffers are reused across calls, so a steady training loop neither allocates
-/// nor page-locks after the first window.
-///
-/// # Reuse hazard
-///
-/// The H2D is **async**, so the host and device buffers are still being read after
-/// `upload` returns. A single set of buffers would therefore be overwritten by the
-/// next group while the previous group's copy — and the kernels reading its device
-/// views — were still outstanding: the ids silently become the *next* group's, which
-/// showed up as training diverging (loss 2.6 → 69) rather than as an error.
-///
-/// Rotating slots alone does **not** fix this, which is the trap: it only buys
-/// `ID_SLOTS - 1` iterations of slack, and the CPU runs arbitrarily far ahead of the
-/// device inside a loop over groups. What makes it safe is the per-slot event — the
-/// CPU blocks on the previous copy out of that slot before refilling it. The extra
-/// slots exist only so that wait is almost never reached.
-///
-/// `get` borrows `&self` so the views cannot outlive the next `upload`, which the
-/// borrow checker enforces.
-///
-/// Staging slots. The per-slot event is what makes reuse safe; the slot count only
-/// affects how often the CPU reaches that wait. Measured at 2, 4 and 64 slots: no
-/// difference in step time, so the wait is essentially never hit in practice and
-/// two slots is enough.
-const ID_SLOTS: usize = 2;
-
-pub struct IdBatch {
-    host: [Option<cudarc::driver::PinnedHostSlice<u32>>; ID_SLOTS],
-    dev: [Option<CudaSlice<u32>>; ID_SLOTS],
-    /// Which slot the last `upload` wrote, and which `get` therefore reads.
-    cur: usize,
-    /// Completion of each half's H2D copy.
-    ///
-    /// The copy is async and reads the *pinned host* buffer, but the refill at the
-    /// top of `upload` is a plain CPU write. Rotating slots alone only buys
-    /// `ID_SLOTS - 1` iterations of slack, and the CPU runs arbitrarily far ahead of
-    /// the device inside a loop over groups, so it laps the rotation and overwrites
-    /// bytes a queued copy has not read yet. That is silent, nondeterministic
-    /// corruption of the ids, not a crash.
-    copied: [Option<cudarc::driver::CudaEvent>; ID_SLOTS],
-    /// `(offset, len)` of each list in this batch, in element units.
-    spans: Vec<(usize, usize)>,
-}
-
-impl Default for IdBatch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl IdBatch {
-    pub const fn new() -> Self {
-        Self {
-            host: [const { None }; ID_SLOTS],
-            dev: [const { None }; ID_SLOTS],
-            copied: [const { None }; ID_SLOTS],
-            cur: 0,
-            spans: Vec::new(),
-        }
-    }
-
-    /// Pack `lists` into one upload. Returns immediately; the copy is queued on
-    /// `gpu.stream`, so the views are safe for any kernel launched after this.
-    ///
-    /// Views are indexed by position in `lists` — see [`get`](Self::get).
-    pub fn upload(&mut self, gpu: &Gpu, lists: &[&[u32]]) {
-        self.spans.clear();
-        let mut total = 0;
-        for l in lists {
-            self.spans.push((total, l.len()));
-            total += l.len();
-        }
-        if total == 0 {
-            return;
-        }
-
-        // Grow the staging buffers only when this batch does not fit. Element counts
-        // vary window to window, so an exact fit would reallocate constantly — and
-        // page-locking is far too expensive to do per window.
-        // Alternate halves so this upload never overwrites buffers the previous
-        // one's copy (or the kernels reading its views) may still be using.
-        self.cur = (self.cur + 1) % ID_SLOTS;
-        let half = self.cur;
-
-        // Block until this half's previous copy has actually read the pinned buffer.
-        // A device-side `stream.wait` would not do: the racing write below is the
-        // CPU's, and the CPU is what has to be held back.
-        if let Some(ev) = &self.copied[half] {
-            ev.synchronize().expect("IdBatch: wait for prior H2D");
-        }
-
-        let need = total;
-        if self.host[half].as_ref().is_none_or(|h| h.len() < need) {
-            // SAFETY: uninitialised pinned memory, fully written below before the copy
-            // reads it (only `spans` worth is ever copied out).
-            self.host[half] = Some(
-                unsafe { gpu.context.alloc_pinned::<u32>(need) }.expect("IdBatch: pinned alloc"),
-            );
-        }
-        if self.dev[half].as_ref().is_none_or(|d| d.len() < need) {
-            // SAFETY: every element read downstream lies in a span written by the copy.
-            self.dev[half] =
-                Some(unsafe { gpu.stream.alloc::<u32>(need) }.expect("IdBatch: alloc"));
-        }
-
-        let host = self.host[half].as_mut().expect("just filled");
-        let dst = host.as_mut_slice().expect("pinned host slice");
-        for (l, (off, len)) in lists.iter().zip(&self.spans) {
-            dst[*off..*off + *len].copy_from_slice(l);
-        }
-        // Copy only the used prefix: the pinned buffer is sized to the largest batch
-        // seen, and the tail holds a previous window's ids.
-        let dev = self.dev[half].as_mut().expect("just filled");
-        gpu.stream
-            .memcpy_htod(&dst[..need], &mut dev.slice_mut(..need))
-            .expect("IdBatch: H2D");
-        self.copied[half] = Some(
-            gpu.stream
-                .record_event(super::host_wait_event_flags())
-                .expect("IdBatch: record H2D completion"),
-        );
-    }
-
-    /// The `i`-th uploaded list, as a device view.
-    pub fn get(&self, i: usize) -> cudarc::driver::CudaView<'_, u32> {
-        let (off, len) = self.spans[i];
-        self.dev[self.cur]
-            .as_ref()
-            .expect("IdBatch::get before upload")
-            .slice(off..off + len)
-    }
-}
-
 /// `C = A · B + beta·C` for row-major `A(M×K)`, `B(K×N)`, writing into an
 /// existing `C(M×N)`. `beta = 0` overwrites, `beta = 1` accumulates (bias-seeded
 /// forward). Uses cuBLAS via the operand-swap trick: cuBLAS computes column-major
 /// `Cᵀ(N×M) = Bᵀ·Aᵀ`, which is exactly our row-major `C` in memory.
-pub fn matmul_nn_into(gpu: &Gpu, a: &GTensor<f32>, b: &GTensor<f32>, c: &mut GTensor<f32>, beta: f32) {
+pub fn matmul_nn_into(
+    gpu: &Gpu,
+    a: &GTensor<f32>,
+    b: &GTensor<f32>,
+    c: &mut GTensor<f32>,
+    beta: f32,
+) {
     let (m, ka) = (a.rows(), a.cols());
     let (kb, n) = (b.rows(), b.cols());
     assert_eq!(ka, kb, "matmul: inner dims {ka} != {kb}");
@@ -205,7 +65,13 @@ pub fn matmul_nn_into(gpu: &Gpu, a: &GTensor<f32>, b: &GTensor<f32>, c: &mut GTe
 
 /// `C = A · Bᵀ + beta·C` for row-major `A(M×K)`, `B(N×K)` → `C(M×N)`. The
 /// input-gradient form (`dX = dY · Wᵀ`).
-pub fn matmul_nt_into(gpu: &Gpu, a: &GTensor<f32>, b: &GTensor<f32>, c: &mut GTensor<f32>, beta: f32) {
+pub fn matmul_nt_into(
+    gpu: &Gpu,
+    a: &GTensor<f32>,
+    b: &GTensor<f32>,
+    c: &mut GTensor<f32>,
+    beta: f32,
+) {
     let (m, ka) = (a.rows(), a.cols());
     let (n, kb) = (b.rows(), b.cols());
     assert_eq!(ka, kb, "matmul_nt: inner dims {ka} != {kb}");
@@ -227,7 +93,13 @@ pub fn matmul_nt_into(gpu: &Gpu, a: &GTensor<f32>, b: &GTensor<f32>, c: &mut GTe
 
 /// `C = Aᵀ · B + beta·C` for row-major `A(K×M)`, `B(K×N)` → `C(M×N)`. The
 /// weight-gradient form (`dW += Xᵀ · dY`, used with `beta = 1`).
-pub fn matmul_tn_into(gpu: &Gpu, a: &GTensor<f32>, b: &GTensor<f32>, c: &mut GTensor<f32>, beta: f32) {
+pub fn matmul_tn_into(
+    gpu: &Gpu,
+    a: &GTensor<f32>,
+    b: &GTensor<f32>,
+    c: &mut GTensor<f32>,
+    beta: f32,
+) {
     let (ka, m) = (a.rows(), a.cols());
     let (kb, n) = (b.rows(), b.cols());
     assert_eq!(ka, kb, "matmul_tn: outer dims {ka} != {kb}");
@@ -486,7 +358,11 @@ thread_local! {
 ///
 /// The closure form is what keeps this sound: the borrow cannot outlive the call, so
 /// nothing can hold the buffer across a point where another cell would restage it.
-pub fn with_shared_lhs<R>(gpu: &Gpu, src: &GTensor<f32>, f: impl FnOnce(&super::GTensor<u16>) -> R) -> R {
+pub fn with_shared_lhs<R>(
+    gpu: &Gpu,
+    src: &GTensor<f32>,
+    f: impl FnOnce(&super::GTensor<u16>) -> R,
+) -> R {
     SHARED_LHS.with(|s| {
         let mut s = s.borrow_mut();
         let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
@@ -524,7 +400,12 @@ thread_local! {
 
 /// Run `f` with a zeroed `[rows, cols]` scratch tensor, reallocated only on a shape
 /// or context change.
-fn with_fused_alt<R>(gpu: &Gpu, rows: usize, cols: usize, f: impl FnOnce(&mut GTensor<f32>) -> R) -> R {
+fn with_fused_alt<R>(
+    gpu: &Gpu,
+    rows: usize,
+    cols: usize,
+    f: impl FnOnce(&mut GTensor<f32>) -> R,
+) -> R {
     FUSED_ALT.with(|s| {
         let mut s = s.borrow_mut();
         let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
@@ -1244,7 +1125,12 @@ pub fn broadcast_row(gpu: &Gpu, out: &mut GTensor<f32>, bias: &GTensor<f32>) {
 /// [`broadcast_row`] with a residual folded in: `out = resid + bias`, so a projection
 /// feeding a residual seeds its output with the sum and the trailing add needs no
 /// kernel. `resid` and `out` may not alias.
-pub fn broadcast_row_resid(gpu: &Gpu, out: &mut GTensor<f32>, resid: &GTensor<f32>, bias: &GTensor<f32>) {
+pub fn broadcast_row_resid(
+    gpu: &Gpu,
+    out: &mut GTensor<f32>,
+    resid: &GTensor<f32>,
+    bias: &GTensor<f32>,
+) {
     let (rows, n) = (out.rows(), out.cols());
     assert_eq!(
         resid.dims(),
@@ -1416,7 +1302,12 @@ thread_local! {
 /// Run `f` with a `[bands, n]` scratch, reallocated only when it is too small or the
 /// context changed. Contents are undefined on entry — `col_sum_part` writes every
 /// element it later reads.
-fn with_col_sum_part<R>(gpu: &Gpu, bands: usize, n: usize, f: impl FnOnce(&mut GTensor<f32>) -> R) -> R {
+fn with_col_sum_part<R>(
+    gpu: &Gpu,
+    bands: usize,
+    n: usize,
+    f: impl FnOnce(&mut GTensor<f32>) -> R,
+) -> R {
     COL_SUM_PART.with(|s| {
         let mut s = s.borrow_mut();
         let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
@@ -1443,7 +1334,12 @@ pub fn clear_col_sum_part() {
 
 /// Gather rows of `table` (`[vocab, dim]`) by `ids` into a `[ids.len(), dim]`
 /// tensor.
-pub fn embedding_gather(gpu: &Gpu, table: &GTensor<f32>, ids: &[usize], dim: usize) -> GTensor<f32> {
+pub fn embedding_gather(
+    gpu: &Gpu,
+    table: &GTensor<f32>,
+    ids: &[usize],
+    dim: usize,
+) -> GTensor<f32> {
     embedding_gather_u32(gpu, table, &upload_ids(gpu, ids).slice(..), ids.len(), dim)
 }
 
@@ -1452,12 +1348,32 @@ pub fn embedding_gather(gpu: &Gpu, table: &GTensor<f32>, ids: &[usize], dim: usi
 pub fn embedding_gather_u32(
     gpu: &Gpu,
     table: &GTensor<f32>,
-    dids: &cudarc::driver::CudaView<'_, u32>,
+    dids: &CudaView<'_, u32>,
     rows: usize,
     dim: usize,
 ) -> GTensor<f32> {
-    let (dim_i, rows_i) = (dim as i32, rows as i32);
     let mut out = GTensor::uninit(gpu, &[rows, dim]);
+    embedding_gather_u32_into(gpu, &mut out, table, dids, rows, dim);
+    out
+}
+
+/// [`embedding_gather_u32`] into a caller-owned `out`, which must already be at
+/// least `[rows, dim]`. Lets a reused buffer take the gather instead of a fresh
+/// allocation per call.
+pub fn embedding_gather_u32_into(
+    gpu: &Gpu,
+    out: &mut GTensor<f32>,
+    table: &GTensor<f32>,
+    dids: &CudaView<'_, u32>,
+    rows: usize,
+    dim: usize,
+) {
+    assert!(
+        rows * dim <= out.capacity(),
+        "embedding_gather: {rows}x{dim} exceeds the {} allocated",
+        out.capacity()
+    );
+    let (dim_i, rows_i) = (dim as i32, rows as i32);
     let f = gpu.kernels.get("embedding_gather");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&table.buf)
@@ -1467,7 +1383,6 @@ pub fn embedding_gather_u32(
         .arg(&rows_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems((rows * dim) as u32)) }
         .expect("embedding_gather");
-    out
 }
 
 /// Scatter-add: `dtable[ids[r]] += dy[r]`, deterministically (ids may repeat).
@@ -1492,7 +1407,7 @@ pub fn embedding_scatter_add(
 pub fn embedding_scatter_add_u32(
     gpu: &Gpu,
     dtable: &mut GTensor<f32>,
-    dids: &cudarc::driver::CudaView<'_, u32>,
+    dids: &CudaView<'_, u32>,
     rows: usize,
     dy: &GTensor<f32>,
     dim: usize,
@@ -1703,7 +1618,11 @@ pub fn rms_norm_backward_into(
 
 /// Fused softmax + cross-entropy. Returns `(mean_loss, dlogits)` with
 /// `dlogits = (softmax − onehot) / B`, matching `nn2::loss`.
-pub fn softmax_cross_entropy(gpu: &Gpu, logits: &GTensor<f32>, targets: &[usize]) -> (f32, GTensor<f32>) {
+pub fn softmax_cross_entropy(
+    gpu: &Gpu,
+    logits: &GTensor<f32>,
+    targets: &[usize],
+) -> (f32, GTensor<f32>) {
     let (b, c) = (logits.rows(), logits.cols());
     assert_eq!(
         targets.len(),
@@ -1786,7 +1705,13 @@ pub fn adamw(
 
 /// Build `xh = concat(x[:, t, :], h_state)` into `xh` (`[B, rows]`), reading the
 /// timestep-`t` slice of `x` (`[B, T, inp]`) and the recurrent state (`[B, H]`).
-pub fn concat_xh(gpu: &Gpu, xh: &mut GTensor<f32>, x: &GTensor<f32>, h_state: &GTensor<f32>, t: usize) {
+pub fn concat_xh(
+    gpu: &Gpu,
+    xh: &mut GTensor<f32>,
+    x: &GTensor<f32>,
+    h_state: &GTensor<f32>,
+    t: usize,
+) {
     let (b, rows) = (xh.rows(), xh.cols());
     let h = h_state.cols();
     let inp = rows - h;
@@ -1808,7 +1733,13 @@ pub fn concat_xh(gpu: &Gpu, xh: &mut GTensor<f32>, x: &GTensor<f32>, h_state: &G
 
 /// Split `dxh` (`[B, rows]`) into `dx[:, t, :]` (first `inp` cols) and `dh_bptt`
 /// (`[B, H]`, last `H` cols). `dx` is `[B, T, inp]`.
-pub fn split_dxh(gpu: &Gpu, dxh: &GTensor<f32>, dx: &mut GTensor<f32>, dh_bptt: &mut GTensor<f32>, t: usize) {
+pub fn split_dxh(
+    gpu: &Gpu,
+    dxh: &GTensor<f32>,
+    dx: &mut GTensor<f32>,
+    dh_bptt: &mut GTensor<f32>,
+    t: usize,
+) {
     let (b, rows) = (dxh.rows(), dxh.cols());
     let h = dh_bptt.cols();
     let inp = rows - h;
@@ -2836,7 +2767,11 @@ pub fn add_into(gpu: &Gpu, a: &GTensor<f32>, b: &GTensor<f32>, out: &mut GTensor
 }
 
 /// SwiGLU forward: returns `(gate_act = SiLU(gate_pre), mixed = gate_act ⊙ value)`.
-pub fn swiglu_forward(gpu: &Gpu, gate_pre: &GTensor<f32>, value: &GTensor<f32>) -> (GTensor<f32>, GTensor<f32>) {
+pub fn swiglu_forward(
+    gpu: &Gpu,
+    gate_pre: &GTensor<f32>,
+    value: &GTensor<f32>,
+) -> (GTensor<f32>, GTensor<f32>) {
     let mut gate_act = GTensor::uninit(gpu, gate_pre.dims());
     let mut mixed = GTensor::uninit(gpu, gate_pre.dims());
     swiglu_forward_into(gpu, gate_pre, value, &mut gate_act, &mut mixed);
@@ -3250,7 +3185,13 @@ fn unslice_t_inner(
 }
 
 /// `out[r] += Σ_w x[r,w]·y[r,w]` for `[R, W]` operands (`out` is `[R]`).
-pub fn row_dot_add(gpu: &Gpu, out: &mut GTensor<f32>, x: &GTensor<f32>, y: &GTensor<f32>, w: usize) {
+pub fn row_dot_add(
+    gpu: &Gpu,
+    out: &mut GTensor<f32>,
+    x: &GTensor<f32>,
+    y: &GTensor<f32>,
+    w: usize,
+) {
     let r = out.len();
     assert_eq!(x.len(), r * w, "row_dot_add: x length mismatch");
     assert_eq!(y.len(), r * w, "row_dot_add: y length mismatch");
@@ -3353,7 +3294,7 @@ pub fn scatter_rows_u32(
     gpu: &Gpu,
     dst: &mut GTensor<f32>,
     src: &GTensor<f32>,
-    ids: &cudarc::driver::CudaView<'_, u32>,
+    ids: &CudaView<'_, u32>,
 ) {
     let dim = src.cols();
     let rows = src.rows();
@@ -3366,6 +3307,90 @@ pub fn scatter_rows_u32(
         .arg(&dim_i)
         .arg(&rows_i);
     unsafe { lb.launch(LaunchConfig::for_num_elems((rows * dim) as u32)) }.expect("scatter_rows");
+}
+
+/// `dst[dst_ids[i]] = src[src_ids[i]]` for `rows` rows of `dim` floats — a gather and a
+/// scatter in one pass, with no temporary between them.
+pub fn route_rows_u32(
+    gpu: &Gpu,
+    dst: &mut GTensor<f32>,
+    src: &GTensor<f32>,
+    src_ids: &CudaView<'_, u32>,
+    dst_ids: &CudaView<'_, u32>,
+    rows: usize,
+) {
+    let dim = src.cols();
+    assert_eq!(dim, dst.cols(), "route_rows: width {dim} != {}", dst.cols());
+    let (dim_i, rows_i) = (dim as i32, rows as i32);
+    let f = gpu.kernels.get("route_rows");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut dst.buf)
+        .arg(&src.buf)
+        .arg(src_ids)
+        .arg(dst_ids)
+        .arg(&dim_i)
+        .arg(&rows_i);
+    unsafe { lb.launch(LaunchConfig::for_num_elems((rows * dim) as u32)) }.expect("route_rows");
+}
+
+/// `dst[ids[i]] = src[i * stride + offset]` — the rectangle-to-window half of a
+/// readout. A group holds one word length, so the rectangle side needs no id table.
+pub fn pack_rows_u32(
+    gpu: &Gpu,
+    dst: &mut GTensor<f32>,
+    src: &GTensor<f32>,
+    ids: &cudarc::driver::CudaView<'_, u32>,
+    stride: usize,
+    offset: usize,
+    rows: usize,
+) {
+    strided_rows(gpu, "pack_rows", dst, src, ids, stride, offset, rows);
+}
+
+/// `dst[i * stride + offset] = src[ids[i]]` — the window-to-rectangle direction of
+/// [`pack_rows_u32`].
+pub fn unpack_rows_u32(
+    gpu: &Gpu,
+    dst: &mut GTensor<f32>,
+    src: &GTensor<f32>,
+    ids: &cudarc::driver::CudaView<'_, u32>,
+    stride: usize,
+    offset: usize,
+    rows: usize,
+) {
+    strided_rows(gpu, "unpack_rows", dst, src, ids, stride, offset, rows);
+}
+
+/// Both strided readouts take the same arguments and differ only in which side the
+/// id table addresses, so the launch is written once.
+fn strided_rows(
+    gpu: &Gpu,
+    kernel: &str,
+    dst: &mut GTensor<f32>,
+    src: &GTensor<f32>,
+    ids: &cudarc::driver::CudaView<'_, u32>,
+    stride: usize,
+    offset: usize,
+    rows: usize,
+) {
+    let dim = src.cols();
+    assert_eq!(dim, dst.cols(), "{kernel}: width {dim} != {}", dst.cols());
+    assert!(
+        offset < stride,
+        "{kernel}: offset {offset} outside stride {stride}"
+    );
+    let (stride_i, offset_i) = (stride as i32, offset as i32);
+    let (dim_i, rows_i) = (dim as i32, rows as i32);
+    let f = gpu.kernels.get(kernel);
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut dst.buf)
+        .arg(&src.buf)
+        .arg(ids)
+        .arg(&stride_i)
+        .arg(&offset_i)
+        .arg(&dim_i)
+        .arg(&rows_i);
+    unsafe { lb.launch(LaunchConfig::for_num_elems((rows * dim) as u32)) }.expect("strided rows");
 }
 
 /// Masked softmax cross-entropy (the hierarchical decode loss). `mask[r] == false`
@@ -3407,8 +3432,8 @@ pub fn masked_softmax_cross_entropy_scaled(
 pub fn masked_softmax_cross_entropy_u32(
     gpu: &Gpu,
     logits: &GTensor<f32>,
-    dtargets: &cudarc::driver::CudaView<'_, u32>,
-    dmask: &cudarc::driver::CudaView<'_, u32>,
+    dtargets: &CudaView<'_, u32>,
+    dmask: &CudaView<'_, u32>,
     inv: f32,
 ) -> (f32, GTensor<f32>) {
     let (loss, dlogits) = masked_softmax_ce_u32_into(gpu, logits, dtargets, dmask, inv, None);
@@ -3426,8 +3451,8 @@ pub fn masked_softmax_cross_entropy_u32(
 pub fn masked_softmax_ce_u32_into(
     gpu: &Gpu,
     logits: &GTensor<f32>,
-    dtargets: &cudarc::driver::CudaView<'_, u32>,
-    dmask: &cudarc::driver::CudaView<'_, u32>,
+    dtargets: &CudaView<'_, u32>,
+    dmask: &CudaView<'_, u32>,
     inv: f32,
     acc: Option<&mut CudaSlice<f32>>,
 ) -> (f32, GTensor<f32>) {
@@ -3604,7 +3629,13 @@ pub fn mul(gpu: &Gpu, a: &GTensor<f32>, b: &GTensor<f32>) -> GTensor<f32> {
 /// o-gate forward: `hconcat = σ(o) ⊙ yhat`, reading `o` out of the fused
 /// `q‖k‖v‖o` projection output at `o_off`. The pre-activation is left as the GEMM
 /// wrote it — [`ogate_bwd`] recomputes σ rather than reading it back.
-pub fn ogate_fwd(gpu: &Gpu, xh: &SlabBuf, yhat: &GTensor<f32>, hconcat: &mut GTensor<f32>, o_off: usize) {
+pub fn ogate_fwd(
+    gpu: &Gpu,
+    xh: &SlabBuf,
+    yhat: &GTensor<f32>,
+    hconcat: &mut GTensor<f32>,
+    o_off: usize,
+) {
     assert_eq!(
         yhat.len(),
         hconcat.len(),
@@ -3849,15 +3880,15 @@ pub fn mlstm_kt() -> usize {
 pub struct MlstmFused {
     pub l: usize,
     pub nc: usize,
-    pub ytil: SlabBuf, // [BH, T, dhv]  bf16 storage (reference: matHout at DTYPE)
-    cst: GTensor<f32>,      // [BH, NC+1, dhv, dqk]  state entering each chunk
-    nst: GTensor<f32>,      // [BH, NC+1, dqk]
-    mst: GTensor<f32>,      // [BH, NC+1]
-    fcb: GTensor<f32>,      // [BH, NC, L]  chunk-local cumulative log-forget
-    gvec: GTensor<f32>,     // [BH, NC]     per-chunk state decay, for both scan directions
-    msv: GTensor<f32>,      // [BH, T]      per-row stabilizer
-    psiv: GTensor<f32>,     // [BH, T]
-    qnv: GTensor<f32>,      // [BH, T]
+    pub ytil: SlabBuf,  // [BH, T, dhv]  bf16 storage (reference: matHout at DTYPE)
+    cst: GTensor<f32>,  // [BH, NC+1, dhv, dqk]  state entering each chunk
+    nst: GTensor<f32>,  // [BH, NC+1, dqk]
+    mst: GTensor<f32>,  // [BH, NC+1]
+    fcb: GTensor<f32>,  // [BH, NC, L]  chunk-local cumulative log-forget
+    gvec: GTensor<f32>, // [BH, NC]     per-chunk state decay, for both scan directions
+    msv: GTensor<f32>,  // [BH, T]      per-row stabilizer
+    psiv: GTensor<f32>, // [BH, T]
+    qnv: GTensor<f32>,  // [BH, T]
 }
 
 impl MlstmFused {
@@ -4805,94 +4836,6 @@ mod tests {
             for (g, w) in got.iter().zip(want.iter()) {
                 assert_close(&g.to_host(&gpu).data, &w.to_host(&gpu).data);
             }
-        }
-    }
-
-    /// Consecutive `IdBatch` uploads must not corrupt each other's ids.
-    ///
-    /// The uploads are async, so a batch whose buffers are reused too early has its
-    /// ids replaced by a later batch's — no error, just wrong gathers.
-    ///
-    /// **This test does not reproduce that failure.** Single-buffering `IdBatch`
-    /// diverges real training deterministically (char loss 2.6 -> 69 within ~10 steps)
-    /// while this test still passes, at every group count and contention level tried.
-    /// The reuse window evidently needs the real workload's queue depth. It is kept as
-    /// a guard on the packing and offset arithmetic, which it does cover; the
-    /// double-buffering it cannot see is pinned only by that training run, so treat
-    /// `IdBatch` as a place where a green suite is not sufficient evidence.
-    #[test]
-    fn id_batch_uploads_do_not_clobber_each_other() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        // A table whose row `i` is all `i`, so a gathered row names the id that
-        // fetched it and a stale id is obvious.
-        let rows = 64;
-        let table = GTensor::from_host(
-            &gpu,
-            &Tensor::new(
-                &[rows, 4],
-                (0..rows).flat_map(|i| [i as f32; 4]).collect::<Vec<_>>(),
-            ),
-        );
-
-        let mut batch = IdBatch::new();
-        let mut got = Vec::new();
-        // Distinct id lists of *differing* lengths, so the staging buffers resize
-        // mid-sequence — the case where a naive implementation reallocates under an
-        // in-flight copy.
-        let groups: Vec<Vec<u32>> = (0..8)
-            .map(|g| {
-                (0..(3 + g * 5))
-                    .map(|i| ((g * 7 + i) % rows) as u32)
-                    .collect()
-            })
-            .collect();
-
-        // Something slow between the upload and the gather, so the copy for group
-        // `g+1` is issued while group `g`'s gather is still queued — the interleaving
-        // that real training produces and that a bare upload/gather pair does not.
-        let busy = GTensor::zeros(&gpu, &[512, 512]);
-        let mut sink = GTensor::uninit(&gpu, &[512, 512]);
-
-        for ids in &groups {
-            batch.upload(&gpu, &[ids]);
-            matmul_nn_into(&gpu, &busy, &busy, &mut sink, 0.0);
-            // Gather, keeping the result on the device — no sync here, so an unsound
-            // reuse has every chance to show.
-            let out = embedding_gather_u32(&gpu, &table, &batch.get(0), ids.len(), 4);
-            got.push(out);
-        }
-
-        for (ids, out) in groups.iter().zip(&got) {
-            let host = out.to_host(&gpu).data;
-            for (row, &id) in ids.iter().enumerate() {
-                assert_eq!(
-                    host[row * 4],
-                    id as f32,
-                    "row {row} gathered id {} instead of {id} — a later upload clobbered it",
-                    host[row * 4]
-                );
-            }
-        }
-    }
-
-    /// Several lists in one batch must come back at their own offsets.
-    #[test]
-    fn id_batch_packs_multiple_lists() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        let mut batch = IdBatch::new();
-        let a: Vec<u32> = vec![5, 1, 9];
-        let b: Vec<u32> = vec![7, 7];
-        let c: Vec<u32> = vec![0, 3, 2, 8];
-        batch.upload(&gpu, &[&a, &b, &c]);
-
-        for (i, want) in [&a, &b, &c].iter().enumerate() {
-            let view = batch.get(i);
-            let host = gpu.stream.clone_dtoh(&view).expect("dtoh");
-            assert_eq!(&host, *want, "list {i} came back wrong");
         }
     }
 

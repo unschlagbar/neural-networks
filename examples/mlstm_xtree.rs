@@ -44,10 +44,15 @@ fn main() {
     }
 
     const NAMES: [&str; 16] = [
-        "dWq", "dbq", "dWk", "dbk", "dWv", "dbv", "dWo", "dbo", "dWi", "dbi", "dWf",
-        "dbf", "dWout", "dbout", "dgamma", "d?",
+        "dWq", "dbq", "dWk", "dbk", "dWv", "dbv", "dWo", "dbo", "dWi", "dbi", "dWf", "dbf",
+        "dWout", "dbout", "dgamma", "d?",
     ];
-    let l2 = |v: &[f32]| -> f64 { v.iter().map(|&a| (a as f64) * (a as f64)).sum::<f64>().sqrt() };
+    let l2 = |v: &[f32]| -> f64 {
+        v.iter()
+            .map(|&a| (a as f64) * (a as f64))
+            .sum::<f64>()
+            .sqrt()
+    };
 
     cell.zero_grad(&gpu);
     let step = t / chunks;
@@ -69,11 +74,23 @@ fn main() {
     }
 
     println!("t={t} chunks={chunks} d={d} heads={heads} dqk={dqk}");
-    let ynorm: f64 = ys.iter().map(|y| l2(&y.to_host(&gpu).data).powi(2)).sum::<f64>().sqrt();
-    let dxnorm: f64 = dxs.iter().map(|v| l2(&v.to_host(&gpu).data).powi(2)).sum::<f64>().sqrt();
+    let ynorm: f64 = ys
+        .iter()
+        .map(|y| l2(&y.to_host(&gpu).data).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let dxnorm: f64 = dxs
+        .iter()
+        .map(|v| l2(&v.to_host(&gpu).data).powi(2))
+        .sum::<f64>()
+        .sqrt();
     println!("{:>7} {:.9e}", "y", ynorm);
     println!("{:>7} {:.9e}", "dx", dxnorm);
     for (i, gr) in cell.grads().iter().enumerate() {
-        println!("{:>7} {:.9e}", NAMES[i.min(NAMES.len() - 1)], l2(&gr.to_host(&gpu).data));
+        println!(
+            "{:>7} {:.9e}",
+            NAMES[i.min(NAMES.len() - 1)],
+            l2(&gr.to_host(&gpu).data)
+        );
     }
 }

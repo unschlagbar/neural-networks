@@ -248,7 +248,11 @@ mod tests {
         // enabled, so the loss lands within bf16's precision of the CPU's, not
         // fp32's. The logit head itself stays fp32 (see `Flat::from_parts`), so this
         // is the projections' contribution only.
-        let loss_tol = if ops::gemm_bf16_enabled(&gpu) { 5e-3 } else { 1e-4 };
+        let loss_tol = if ops::gemm_bf16_enabled(&gpu) {
+            5e-3
+        } else {
+            1e-4
+        };
         assert!(
             (cpu_loss - gpu_loss).abs() < loss_tol,
             "loss: cpu {cpu_loss} vs gpu {gpu_loss} (tolerance {loss_tol:.0e})"
@@ -262,7 +266,11 @@ mod tests {
         // `kernels.rs`.) `table` and `gamma` are unaffected — the embedding gather
         // and the norm never go through a bf16 GEMM — but they share the helper, so
         // the widening is applied uniformly and the tight bound is kept for fp32.
-        let ptol = if ops::gemm_bf16_enabled(&gpu) { 2e-3 } else { 1e-5 };
+        let ptol = if ops::gemm_bf16_enabled(&gpu) {
+            2e-3
+        } else {
+            1e-5
+        };
         assert_close(
             &dev.table.to_host(&gpu).data,
             &c_emb.table.data,

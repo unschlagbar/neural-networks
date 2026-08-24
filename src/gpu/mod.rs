@@ -15,8 +15,8 @@
 use std::sync::Arc;
 
 use cudarc::cublas::CudaBlas;
-use cudarc::cublaslt::CudaBlasLT;
 use cudarc::cublas::sys::{cublasMath_t, cublasSetMathMode};
+use cudarc::cublaslt::CudaBlasLT;
 use cudarc::driver::{CudaContext, CudaStream};
 
 pub mod arena;
@@ -36,13 +36,14 @@ pub mod ops;
 pub mod rms_norm;
 pub mod slstm;
 pub mod train;
+pub mod word_groups;
 
 pub use arena::{ParamArena, ParamKind, ParamSlot};
 pub use bf16::Slab;
 pub use buf::{Buf, Pool};
 pub use gtensor::GTensor;
-pub use offload::OffloadRing;
 use kernels::Kernels;
+pub use offload::OffloadRing;
 
 use iron_oxide::collections::Matrix;
 
@@ -165,8 +166,8 @@ impl Gpu {
         let blas =
             CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS init failed: {e:?}"))?;
         set_tf32(&blas)?;
-        let blas_lt = CudaBlasLT::new(stream.clone())
-            .map_err(|e| format!("cuBLASLt init failed: {e:?}"))?;
+        let blas_lt =
+            CudaBlasLT::new(stream.clone()).map_err(|e| format!("cuBLASLt init failed: {e:?}"))?;
         let kernels = Kernels::load(&context)?;
         let max_shared_optin = context
             .attribute(
@@ -174,8 +175,11 @@ impl Gpu {
             )
             .map_err(|e| format!("querying max shared memory failed: {e:?}"))? as usize;
         let sm_count = context
-            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
-            .map_err(|e| format!("querying SM count failed: {e:?}"))? as usize;
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .map_err(|e| format!("querying SM count failed: {e:?}"))?
+            as usize;
         let regs_per_sm = context
             .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR)
             .map_err(|e| format!("querying register file size failed: {e:?}"))? as usize;

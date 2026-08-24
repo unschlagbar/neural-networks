@@ -96,19 +96,25 @@ pub const WORD_BLOCKS: usize = 24;
 pub const BACKBONE_CHUNK: usize = 512;
 
 /// Largest encoder/decoder group, in rows (`words_in_group × tmax`). `0` disables the
-/// cap (one group per length bucket, the pre-cap behaviour).
+/// cap (one group per word length, the pre-cap behaviour).
 ///
-/// The encoder and decoder run length-bucketed groups strictly one after another, and a
-/// group's activations die before the next one starts — so the resident set is one
-/// group, not the window. But a bucket holds *every* word of that length in the window,
+/// The encoder and decoder run length-grouped rectangles strictly one after another, and
+/// a group's activations die before the next one starts — so the resident set is one
+/// group, not the window. But a group holds *every* word of that length in the window,
 /// so the largest group grows with the window and every buffer in the stage sizes to it
-/// (`trim_pools`). Measured 66 -> 264 MB (encoder) and 80 -> 322 MB (decoder) going from
-/// 512 to 2048 words.
+/// (`trim_pools`), and pooled buffers never shrink: one unusual window raises the floor
+/// for the whole run.
 ///
-/// Splitting an oversized bucket into several same-shape sub-groups bounds that at the
-/// cap instead. It changes no arithmetic: the groups were already independent — each is
-/// its own rectangle, and the per-group grads accumulate — so a split is a pure batching
+/// Splitting an oversized group into several equal sub-groups bounds that at the cap
+/// instead. It changes no arithmetic: the groups were already independent — each is its
+/// own rectangle, and the per-group grads accumulate — so a split is a pure batching
 /// choice, exactly like `BACKBONE_CHUNK` on the backbone.
+///
+/// Exact-length grouping already keeps the typical peak near this value (measured over
+/// 4096-word windows of Rust source and Markdown: largest group 2500-3310 rows, so the
+/// cap fires on 2-4 of ~16 lengths). What it still bounds is the worst case — a corpus
+/// of uniform word length puts all `WORDS_PER_SEQ` words in one group, 69632 rows at the
+/// current settings, several GB the run would then carry forever.
 ///
 /// Sized so the rectangle still fills the device: too small and the stage becomes
 /// launch-bound at batch 1 per word, which costs far more than the memory is worth.
@@ -170,7 +176,7 @@ pub const PARQUET_LANGUAGE_COLUMN: &str = "language";
 /// Corpus path. A `.parquet` extension selects the parquet reader (one row per
 /// document, column `text` — override with `PARQUET_TEXT_COLUMN`); anything else
 /// is read as plain text with `<|endoftext|>` document separators.
-pub const TRAIN_DATA: &str = "../../training_data/000_00000.parquet";
+pub const TRAIN_DATA: &str = "../../training_data/000_00001.parquet";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
 // Post-training (SFT / instruction tuning)

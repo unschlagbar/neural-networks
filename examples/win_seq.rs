@@ -55,7 +55,11 @@ fn main() {
             spans.push((s..tokens.len()).into());
         }
         let loss = model.forward_backward(&gpu, &tokens, &spans);
-        println!("[{i}] {:>6} words, {:>7} tokens -> loss {loss:.6}", spans.len(), tokens.len());
+        println!(
+            "[{i}] {:>6} words, {:>7} tokens -> loss {loss:.6}",
+            spans.len(),
+            tokens.len()
+        );
     }
     // Accumulated gradient norms after the whole sequence. Grads are never stepped, so
     // two runs over the same sizes are comparing the same quantity.

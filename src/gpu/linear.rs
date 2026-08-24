@@ -276,7 +276,10 @@ impl Linear {
         x_b: &super::GTensor<u16>,
         out: &mut super::GTensor<u16>,
     ) {
-        assert!(self.bf16, "Linear::forward_staged_bf16 — layer is fp32-pinned");
+        assert!(
+            self.bf16,
+            "Linear::forward_staged_bf16 — layer is fp32-pinned"
+        );
         assert_eq!(
             out.dims(),
             [x_b.dims()[0], self.output],
@@ -359,7 +362,12 @@ impl Linear {
     }
 
     /// [`backward_with_x`](Self::backward_with_x) into a freshly allocated `dX`.
-    pub fn backward_alloc_with_x(&mut self, gpu: &Gpu, x: &GTensor<f32>, dy: &GTensor<f32>) -> GTensor<f32> {
+    pub fn backward_alloc_with_x(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        dy: &GTensor<f32>,
+    ) -> GTensor<f32> {
         let mut dx = GTensor::uninit(gpu, &[dy.rows(), self.input]);
         self.backward_with_x(gpu, x, dy, &mut dx);
         dx
@@ -391,7 +399,13 @@ impl Linear {
     /// summing over row blocks gives the identical result — splitting `N` is a
     /// reassociation, not a change of math. `dX = dY·Wᵀ` writes at `beta = 0`, which
     /// stays correct because each block owns disjoint rows of `dx`.
-    pub fn backward_with_x(&mut self, gpu: &Gpu, x: &GTensor<f32>, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
+    pub fn backward_with_x(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        dy: &GTensor<f32>,
+        dx: &mut GTensor<f32>,
+    ) {
         assert_eq!(
             dy.cols(),
             self.output,
@@ -478,8 +492,20 @@ impl Linear {
             ParamKind::NoDecay
         };
         vec![
-            ParamSlot::new(&mut self.w, &mut self.dw, &mut self.mw, &mut self.vw, w_kind),
-            ParamSlot::new(&mut self.b, &mut self.db, &mut self.mb, &mut self.vb, b_kind),
+            ParamSlot::new(
+                &mut self.w,
+                &mut self.dw,
+                &mut self.mw,
+                &mut self.vw,
+                w_kind,
+            ),
+            ParamSlot::new(
+                &mut self.b,
+                &mut self.db,
+                &mut self.mb,
+                &mut self.vb,
+                b_kind,
+            ),
         ]
     }
 

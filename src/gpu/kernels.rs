@@ -42,7 +42,6 @@ const SRC: &str = concat!(
     include_str!("cuda/mlstm_fused.cu"),
 );
 
-
 /// Names of every kernel in [`SRC`], loaded into [`Kernels`].
 const NAMES: &[&str] = &[
     "softcap_forward",
@@ -101,15 +100,21 @@ const NAMES: &[&str] = &[
     "mlstm_state_scan",
     "mlstm_bw_dqn",
     "scatter_rows",
+    "route_rows",
+    "pack_rows",
+    "unpack_rows",
     "masked_softmax_ce",
     "masked_softmax_ce_block",
 ];
 
 /// Kernels compiled with `MMA_TF32` against the real device arch — the ones that
 /// issue `mma.sync`, which does not exist at NVRTC's default target.
-const MMA_NAMES: &[&str] =
-    &["mlstm_fw_dC", "mlstm_fw_parallel", "mlstm_bw_dC", "mlstm_bw_parallel"];
-
+const MMA_NAMES: &[&str] = &[
+    "mlstm_fw_dC",
+    "mlstm_fw_parallel",
+    "mlstm_bw_dC",
+    "mlstm_bw_parallel",
+];
 
 /// Cooperative-launch kernels; need `<cooperative_groups.h>`, so they share the
 /// bf16 module's include-path requirement.
@@ -162,9 +167,13 @@ fn cuda_include_dir() -> Option<String> {
         roots.push(format!("{path}/include"));
     }
     roots.extend(
-        ["/opt/cuda/include", "/usr/local/cuda/include", "/usr/include"]
-            .iter()
-            .map(|s| s.to_string()),
+        [
+            "/opt/cuda/include",
+            "/usr/local/cuda/include",
+            "/usr/include",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
     );
     roots
         .into_iter()
@@ -312,7 +321,10 @@ impl Kernels {
                 options.push(format!("-I{inc}"));
                 options.extend(extra_include_dirs(inc).iter().map(|d| format!("-I{d}")));
             }
-            CompileOptions { options, ..Default::default() }
+            CompileOptions {
+                options,
+                ..Default::default()
+            }
         };
 
         // Try bf16 first, fall back to fp32 if NVRTC cannot build it. `slab_bf16`
@@ -475,7 +487,15 @@ impl Kernels {
             return hit.clone();
         }
         let (major, minor) = self.arch;
-        let MlstmSpec { l, dqk, dhv, h, threads, kt, vt } = spec;
+        let MlstmSpec {
+            l,
+            dqk,
+            dhv,
+            h,
+            threads,
+            kt,
+            vt,
+        } = spec;
         let mut options = vec![
             format!("--gpu-architecture=compute_{major}{minor}"),
             "-DMMA_TF32=1".to_string(),
@@ -500,10 +520,13 @@ impl Kernels {
                 options.extend(extra_include_dirs(&inc).iter().map(|d| format!("-I{d}")));
             }
         }
-        let built = compile_ptx_with_opts(SRC, CompileOptions {
-            options,
-            ..Default::default()
-        })
+        let built = compile_ptx_with_opts(
+            SRC,
+            CompileOptions {
+                options,
+                ..Default::default()
+            },
+        )
         .map_err(|e| format!("{e:?}"))
         .and_then(|ptx| ctx.load_module(ptx).map_err(|e| format!("{e:?}")))
         .and_then(|m| m.load_function(name).map_err(|e| format!("{e:?}")));
@@ -552,10 +575,13 @@ impl Kernels {
             options.push("-DSLAB_BF16=1".to_string());
         }
         options.extend(includes.iter().cloned());
-        let built = compile_ptx_with_opts(SRC, CompileOptions {
-            options,
-            ..Default::default()
-        })
+        let built = compile_ptx_with_opts(
+            SRC,
+            CompileOptions {
+                options,
+                ..Default::default()
+            },
+        )
         .map_err(|e| format!("{e:?}"))
         .and_then(|ptx| ctx.load_module(ptx).map_err(|e| format!("{e:?}")))
         .and_then(|m| m.load_function(name).map_err(|e| format!("{e:?}")));

@@ -58,7 +58,10 @@ fn main() {
 
     println!("== fused mLSTM: specialized vs generic, B={b} T={t} heads={heads} ==");
     println!("interleaved, {rounds} rounds x {iters} iters");
-    println!("MLSTM_TV = {}\n", std::env::var("MLSTM_TV").unwrap_or_else(|_| "unset (built-in default)".into()));
+    println!(
+        "MLSTM_TV = {}\n",
+        std::env::var("MLSTM_TV").unwrap_or_else(|_| "unset (built-in default)".into())
+    );
 
     for &dqk in &[32, 64] {
         let d = dqk * heads;
@@ -94,14 +97,24 @@ fn main() {
         };
 
         println!("-- dqk = dhv = {dqk} (d = {d}) --");
-        println!("{:>6} {:>12} {:>12} {:>9} {:>10}", "round", "spec ms", "generic ms", "ratio", "clocks.sm");
+        println!(
+            "{:>6} {:>12} {:>12} {:>9} {:>10}",
+            "round", "spec ms", "generic ms", "ratio", "clocks.sm"
+        );
         let (mut sum_s, mut sum_g) = (0.0, 0.0);
         for r in 0..rounds {
             let s = run(true);
             let gm = run(false);
             sum_s += s;
             sum_g += gm;
-            println!("{:>6} {:>12.2} {:>12.2} {:>9.3} {:>10}", r, s, gm, gm / s, sm_clock());
+            println!(
+                "{:>6} {:>12.2} {:>12.2} {:>9.3} {:>10}",
+                r,
+                s,
+                gm,
+                gm / s,
+                sm_clock()
+            );
         }
         println!(
             "{:>6} {:>12.2} {:>12.2} {:>9.3}\n",

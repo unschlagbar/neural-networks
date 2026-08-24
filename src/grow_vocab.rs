@@ -27,9 +27,9 @@ use std::io;
 use iron_oxide::collections::Matrix;
 
 use crate::{
+    format::{Meta, ModelKind, Writer},
     hierarchical::HierStacks,
     nn::{embedding::EmbeddingLayer, linear_nb::LinearNBLayer, soft_cap::SoftCapLayer},
-    format::{Meta, ModelKind, Writer},
     tokenizer_utf8::Utf8Tokenizer,
 };
 
@@ -154,9 +154,7 @@ pub fn grow_checkpoint(in_path: &str, out_path: &str, new_vocab: usize) -> io::R
     .section("char2_model", &char2_model.layers)
     .save(out_path)?;
 
-    println!(
-        "grew vocab {old_vocab} → {new_vocab}: '{in_path}' → '{out_path}'  (step {step})"
-    );
+    println!("grew vocab {old_vocab} → {new_vocab}: '{in_path}' → '{out_path}'  (step {step})");
     Ok(())
 }
 
@@ -240,15 +238,26 @@ mod tests {
         let hc = 8;
         let wh = 8;
 
-        let encoder = SequentialBuilder::new(old_vocab).embedding(hc).rms_norm().build();
-        let word_model = SequentialBuilder::new(hc).rms_norm().linear(wh).linear(hc).build();
+        let encoder = SequentialBuilder::new(old_vocab)
+            .embedding(hc)
+            .rms_norm()
+            .build();
+        let word_model = SequentialBuilder::new(hc)
+            .rms_norm()
+            .linear(wh)
+            .linear(hc)
+            .build();
         let char2_model = SequentialBuilder::new(hc)
             .rms_norm()
             .linear_no_bias(old_vocab)
             .soft_cap(30.0)
             .build();
         let model = crate::hierarchical::Hierarchical::new(
-            encoder, char2_model, word_model, old_vocab, tok,
+            encoder,
+            char2_model,
+            word_model,
+            old_vocab,
+            tok,
         );
         let dir = std::env::temp_dir();
         let src = dir.join("grow_src.model");

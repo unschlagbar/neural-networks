@@ -24,8 +24,14 @@ fn main() {
         eprintln!("no cooperative kernels");
         return;
     }
-    let h: usize = std::env::var("H").ok().and_then(|v| v.parse().ok()).unwrap_or(768);
-    let t: usize = std::env::var("T").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let h: usize = std::env::var("H")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(768);
+    let t: usize = std::env::var("T")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
     let b = 1usize;
 
     println!("H={h} T={t} B={b}");
@@ -80,7 +86,11 @@ fn main() {
         println!(
             "{name:<10} max|err| {maxabs:>12.3e}   scale {scale:>10.3e}   rel {:>10.3e}{}",
             maxabs / scale,
-            if nonfinite > 0 { format!("   NON-FINITE {nonfinite}") } else { String::new() }
+            if nonfinite > 0 {
+                format!("   NON-FINITE {nonfinite}")
+            } else {
+                String::new()
+            }
         );
     };
     println!();
@@ -94,5 +104,7 @@ fn main() {
         let c = fg[i].to_host(&gpu).data.to_vec();
         report(name, &a, &c);
     }
-    println!("\nbf16 has an 8-bit mantissa: ~4e-3 relative is the noise floor of the\nstaged operand, and error accumulated over T recurrent steps sits above it.");
+    println!(
+        "\nbf16 has an 8-bit mantissa: ~4e-3 relative is the noise floor of the\nstaged operand, and error accumulated over T recurrent steps sits above it."
+    );
 }

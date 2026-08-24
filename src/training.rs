@@ -9,7 +9,8 @@ use crate::{
     batches::ChunkedWordDataSet,
     config::{
         BATCH_SIZE, CHUNK_BYTES, DECAY_WINDOWS, EPOCHS, LOG_EVERY, LR, MAX_WINDOW_TOKENS, MIN_LR,
-        MIN_WORDS_PER_SEQ, SAVE_EVERY, SEQ_LEN, TRAIN_DATA, VAL_DATA, WARMUP_WINDOWS, WORDS_PER_SEQ,
+        MIN_WORDS_PER_SEQ, SAVE_EVERY, SEQ_LEN, TRAIN_DATA, VAL_DATA, WARMUP_WINDOWS,
+        WORDS_PER_SEQ,
     },
     hierarchical::{BackboneMode, Hierarchical},
     model::{build_hierarchical_model, build_normal_model},
@@ -226,7 +227,10 @@ pub fn train_sft(model_path: &str) {
 
     let mut model = match Hierarchical::load(model_path, tokenizer) {
         Ok(m) => {
-            println!("Loaded hierarchical model from '{model_path}' (step {}).", m.step);
+            println!(
+                "Loaded hierarchical model from '{model_path}' (step {}).",
+                m.step
+            );
             println!("Trained on so far:");
             print!("{}", m.seen.report());
             m

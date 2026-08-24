@@ -639,7 +639,13 @@ impl SLstm {
     /// The recurrence starts from zero unless [`set_carry`](Self::set_carry) says this
     /// call continues the previous one's sequence, and the whole state stays
     /// device-resident across the T-loop either way.
-    pub fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, y: &mut GTensor<f32>, cache: &mut TrainingCache) {
+    pub fn forward(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        y: &mut GTensor<f32>,
+        cache: &mut TrainingCache,
+    ) {
         // Release the previous eviction before allocating anything here: freeing
         // returns memory to the CUDA allocator, which must not hand it back while a
         // copy is still reading it. See `InFlight::release`.
@@ -988,7 +994,14 @@ impl SLstm {
     }
 
     /// The backward time loop — time-fused on the same terms as [`Self::fwd_loop`].
-    fn bwd_loop(&mut self, gpu: &Gpu, dy: &GTensor<f32>, g: &mut GTensor<f32>, slabs: &SlstmSlabs, t: usize) {
+    fn bwd_loop(
+        &mut self,
+        gpu: &Gpu,
+        dy: &GTensor<f32>,
+        g: &mut GTensor<f32>,
+        slabs: &SlstmSlabs,
+        t: usize,
+    ) {
         // One cooperative launch for the whole reverse loop. It carries the gate deltas
         // through `g` itself, so it needs no scratch of its own.
         if t >= FUSED_MIN_T

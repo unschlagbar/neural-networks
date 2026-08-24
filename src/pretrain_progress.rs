@@ -233,7 +233,10 @@ mod tests {
         save(&path, &p).unwrap();
 
         // Same corpus and step resumes exactly.
-        assert_eq!(resume_or_fresh(&path, "data/000_00001.parquet", 100_000, 1), p);
+        assert_eq!(
+            resume_or_fresh(&path, "data/000_00001.parquet", 100_000, 1),
+            p
+        );
         // The next parquet starts at window 0, not at 100k.
         let fresh = resume_or_fresh(&path, "data/000_00002.parquet", 100_000, 1);
         assert!(fresh.is_fresh());

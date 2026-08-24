@@ -27,7 +27,6 @@
 //! Weights only; the AdamW moments are not persisted, so a resumed run restarts
 //! them.
 
-use std::collections::BTreeMap;
 use std::range::Range;
 use std::time::Instant;
 use std::{io, mem};
@@ -36,7 +35,9 @@ use cudarc::driver::CudaSlice;
 
 use super::arena::{ParamArena, ParamKind, ParamSlot};
 use super::block::Block;
+use super::word_groups::{DecoderGroups, EncoderGroups, GroupIds};
 use super::{GTensor, Gpu, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm};
+use crate::config::{GROUP_MAX_ROWS, WORDS_PER_SEQ};
 use crate::format::{Meta, ModelKind, Seen, Writer};
 use crate::gpu::arena::TrainingCache;
 use crate::gpu::block::BlockLike;
@@ -110,100 +111,6 @@ impl WordEncoder {
                 .collect(),
         }
     }
-}
-
-/// Partition word indices into length groups, so each group can run as a dense
-/// `[words, tmax]` rectangle instead of every word being padded to the longest
-/// word in the whole window.
-///
-/// Words are bucketed by `len.next_power_of_two()`: within a bucket the padding
-/// is at most 2x (usually far less, since `tmax` is the bucket's ACTUAL longest
-/// word, not the bucket's upper bound), and a 1..=16-byte word range collapses to
-/// ~5 buckets. Exact-length buckets would remove padding entirely but would fire
-/// ~17 rectangles of a few hundred rows each, and this backend is bound by cuBLAS
-/// parallelism rather than launch count — small matrices would lose more than the
-/// padding costs.
-/// `no_group` (from `GPU_NO_GROUP=1`) puts every word in one group — one rectangle
-/// per window, the A/B baseline for benchmarking and what
-/// `grouping_matches_single_rectangle` checks the grouped path against.
-///
-/// Writes into `out`, reusing the inner `Vec`s across windows: a window fires
-/// this twice (encoder + decoder) and a training run fires it forever, so the
-/// bucket allocations are worth keeping.
-fn group_by_len(lens: &[usize], no_group: bool, cap: usize, out: &mut Vec<Vec<usize>>) {
-    for g in out.iter_mut() {
-        g.clear();
-    }
-    if no_group {
-        out.resize_with(1, Vec::new);
-        out[0].extend(0..lens.len());
-        return;
-    }
-    // Bucket key -> slot in `out`. The keys are collected first so the groups keep
-    // the BTreeMap's ascending-length order: group order decides the order the
-    // per-group losses are summed and the grads are scattered, and this stays
-    // bit-identical to the version that returned `buckets.into_values()`.
-    let mut slot: BTreeMap<usize, usize> = Default::default();
-    for &l in lens {
-        slot.insert(l.max(1).next_power_of_two(), 0);
-    }
-    let used = slot.len();
-    for (i, v) in slot.values_mut().enumerate() {
-        *v = i;
-    }
-    while out.len() < used {
-        out.push(Vec::new());
-    }
-    for (w, &l) in lens.iter().enumerate() {
-        out[slot[&l.max(1).next_power_of_two()]].push(w);
-    }
-    let used = split_oversized_groups(lens, out, used, cap);
-    out.truncate(used);
-}
-
-/// Cap each group at [`config::GROUP_MAX_ROWS`] rows, splitting oversized ones into
-/// same-shape pieces. Returns the new group count.
-///
-/// A bucket holds every word of its length in the window, so it grows with the window
-/// and the whole stage's buffers size to the largest one. The groups already run one
-/// after another with independent activations and accumulating grads, so cutting one in
-/// two is a pure batching choice — no arithmetic changes, which is what
-/// `grouping_matches_single_rectangle` and `group_cap_matches_uncapped` pin.
-///
-/// Rows are `words × tmax` and `tmax` is fixed by the bucket, so the cap converts to a
-/// word count per piece. `GROUP_MAX_ROWS == 0` disables the split.
-fn split_oversized_groups(
-    lens: &[usize],
-    out: &mut Vec<Vec<usize>>,
-    used: usize,
-    cap: usize,
-) -> usize {
-    if cap == 0 {
-        return used;
-    }
-    let mut n = used;
-    for g in 0..used {
-        // `tmax` is the bucket's actual longest word, matching `enc_group_rows`.
-        let tmax = out[g].iter().map(|&w| lens[w]).max().unwrap_or(0).max(1);
-        // +1 for the encoder's virtual `[W]` step, so the bound matches the rectangle
-        // the stage actually runs.
-        let per_piece = (cap / (tmax + 1)).max(1);
-        if out[g].len() <= per_piece {
-            continue;
-        }
-        // Move the tail into fresh groups, keeping the first piece in place so the
-        // ascending-length group order (which fixes grad scatter order) is preserved.
-        let tail: Vec<usize> = out[g].split_off(per_piece);
-        for piece in tail.chunks(per_piece) {
-            if n == out.len() {
-                out.push(Vec::new());
-            }
-            out[n].clear();
-            out[n].extend_from_slice(piece);
-            n += 1;
-        }
-    }
-    n
 }
 
 /// Whether the backbone sweep is chunked over the word axis.
@@ -302,80 +209,83 @@ fn concat_rows(gpu: &Gpu, parts: &[GTensor<f32>], rows: usize, width: usize) -> 
     out
 }
 
-/// Per-window host-side scratch, owned by the model so a training run allocates
-/// it once instead of once per window. Everything here is index bookkeeping fed
-/// to the gather/scatter/CE kernels; the ids are built as `u32` (what the
-/// kernels take) so uploading them does not need a narrowing copy.
-#[derive(Default)]
-struct Scratch {
-    enc_lens: Vec<usize>,
-    dec_lens: Vec<usize>,
-    enc_groups: Vec<Vec<usize>>,
-    dec_groups: Vec<Vec<usize>>,
-    /// `enc_layout[g]` is group `g`'s id rectangle + readout rows + `tmax`,
-    /// built once in the encoder forward and reused by the encoder backward's
-    /// re-forward (the two passes want byte-identical rectangles).
-    enc_layout: Vec<EncGroup>,
-    /// Decoder per-group buffers, cleared and refilled for each group.
-    grp_ids: Vec<u32>,
-    o_rows: Vec<u32>,
-    char_rows: Vec<u32>,
-    char_ids: Vec<u32>,
-    targets: Vec<u32>,
-    mask: Vec<u32>,
+/// Upload slots of an encoder group, in the order [`Hierarchical::encoder_forward`]
+/// packs them.
+mod enc_id {
+    pub const IDS: usize = 0;
+    pub const WORDS: usize = 1;
 }
 
-/// Refill `sc`'s per-group decoder index buffers for group `g` (see [`Scratch`]).
-///
-/// Six lists, all addressing the group's `[n_g, tmax]` rectangle: word slot per group
-/// row (`grp_ids`), the row holding each word's injected context (`o_rows`), the rows
-/// fed by a previous char and the char feeding them (`char_rows` / `char_ids`), and the
-/// CE `targets` / `mask`. A masked (prompt) word is still fed forward so its state and
-/// the tied-table char grads are produced, but its slots get CE mask 0 — no loss, no
-/// logit gradient from a prompt token.
-fn fill_decoder_group_ids(
-    tokens: &[usize],
-    words: &[Range<usize>],
-    g: usize,
-    tmax: usize,
-    rows: usize,
-    w_token: usize,
-    word_on: &impl Fn(usize) -> bool,
-    sc: &mut Scratch,
-) {
-    sc.o_rows.clear();
-    sc.char_rows.clear();
-    sc.char_ids.clear();
-    sc.targets.clear();
-    sc.targets.resize(rows, 0);
-    sc.mask.clear();
-    sc.mask.resize(rows, 0);
-    sc.grp_ids.clear();
-    for (i, &w) in sc.dec_groups[g].iter().enumerate() {
-        let m = sc.dec_lens[w];
-        let s = words[w + 1].start;
-        let on = word_on(w) as u32;
-        sc.grp_ids.push(w as u32);
-        sc.o_rows.push((i * tmax) as u32);
-        for k in 1..=m {
-            sc.char_rows.push((i * tmax + k) as u32);
-            sc.char_ids.push(tokens[s + k - 1] as u32);
+/// Upload slots of a decoder group, in the order [`Hierarchical::decode_groups`] packs
+/// them.
+mod dec_id {
+    pub const WORDS: usize = 0;
+    pub const CHAR_ROWS: usize = 1;
+    pub const CHAR_IDS: usize = 2;
+    pub const TARGETS: usize = 3;
+    pub const MASK: usize = 4;
+}
+
+/// Per-window state owned by the model so a training run allocates it once instead of
+/// once per window: the word grouping (see [`super::word_groups`]) and the encoder's
+/// output buffer.
+struct Scratch {
+    enc: EncoderGroups,
+    dec: DecoderGroups,
+    /// Every word's encoder output, one row per word — allocated at the largest window
+    /// (`WORDS_PER_SEQ`) and presented at the current one's `dw`. Rewritten in full
+    /// each window, so it is never cleared between them.
+    word_embeds: GTensor<f32>,
+    /// The encoder stack's ping-pong pair for the group currently running: one holds
+    /// the block's input, the other its output, and they swap after every block.
+    /// Presented at that group's `[n_g, tmax, HC]`.
+    enc_h: GTensor<f32>,
+    enc_h_next: GTensor<f32>,
+    /// The same pair for the backward sweep's deltas.
+    enc_d: GTensor<f32>,
+    enc_d_next: GTensor<f32>,
+}
+
+impl Scratch {
+    fn new(gpu: &Gpu, hc: usize) -> Self {
+        // The four encoder buffers are sized to the largest rectangle the row cap
+        // allows; an uncapped run grows them once (`fit`) and then holds that size.
+        let rect = [GROUP_MAX_ROWS, hc];
+        Self {
+            enc: EncoderGroups::new(),
+            dec: DecoderGroups::new(),
+            // Uninit: a window rewrites every row it presents before reading one.
+            word_embeds: GTensor::uninit(gpu, &[WORDS_PER_SEQ, hc]),
+            enc_h: GTensor::uninit(gpu, &rect),
+            enc_h_next: GTensor::uninit(gpu, &rect),
+            enc_d: GTensor::uninit(gpu, &rect),
+            enc_d_next: GTensor::uninit(gpu, &rect),
         }
-        for k in 0..m {
-            sc.targets[i * tmax + k] = tokens[s + k] as u32;
-            sc.mask[i * tmax + k] = on;
-        }
-        sc.targets[i * tmax + m] = w_token as u32;
-        sc.mask[i * tmax + m] = on;
+    }
+
+    /// Device bytes this holds for the whole run, independent of the window.
+    fn fixed_bytes(&self) -> usize {
+        [
+            &self.word_embeds,
+            &self.enc_h,
+            &self.enc_h_next,
+            &self.enc_d,
+            &self.enc_d_next,
+        ]
+        .iter()
+        .map(|t| t.capacity() * size_of::<f32>())
+        .sum()
     }
 }
 
-/// One encoder group's `[words, tmax]` id rectangle and `[W]`-step readout rows.
-#[derive(Default)]
-struct EncGroup {
-    ids: Vec<u32>,
-    readout: Vec<u32>,
-    tmax: usize,
+/// Present a reused buffer at `dims`, reallocating only if it does not fit. The
+/// contents are not preserved — every caller overwrites what it presents.
+fn fit(gpu: &Gpu, t: &mut GTensor<f32>, dims: &[usize]) {
+    if dims.iter().product::<usize>() > t.capacity() {
+        *t = GTensor::uninit(gpu, dims);
+    } else {
+        t.shrink_to(dims);
+    }
 }
 
 /// Per-phase stopwatch for a window, silent unless `GPU_PROF` or `GPU_MEM` is set.
@@ -386,6 +296,9 @@ struct PhaseTimer {
     prof: bool,
     mem: bool,
     t0: Instant,
+    /// Spans that occur more than once per window (the decoder runs one length group
+    /// at a time, forward and backward interleaved), summed and printed once.
+    acc: Vec<(&'static str, std::time::Duration)>,
 }
 
 impl PhaseTimer {
@@ -394,12 +307,34 @@ impl PhaseTimer {
             prof: flags.prof,
             mem: flags.mem,
             t0: Instant::now(),
+            acc: Vec::new(),
         }
     }
 
     /// Restart the clock at the top of a window.
     fn reset(&mut self) {
         self.t0 = Instant::now();
+    }
+
+    /// Attribute the span since the last mark to `name` without printing it yet.
+    fn accum(&mut self, gpu: &Gpu, name: &'static str) {
+        if !(self.prof || self.mem) {
+            return;
+        }
+        gpu.stream.synchronize().expect("sync");
+        let dt = self.t0.elapsed();
+        match self.acc.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, d)) => *d += dt,
+            None => self.acc.push((name, dt)),
+        }
+        self.t0 = Instant::now();
+    }
+
+    /// Print and clear everything [`accum`](Self::accum) has collected.
+    fn flush(&mut self) {
+        for (name, dt) in std::mem::take(&mut self.acc) {
+            println!("  {name:<22} {dt:>8.1?}");
+        }
     }
 
     fn mark(&mut self, gpu: &Gpu, name: &str) {
@@ -436,35 +371,6 @@ struct BackboneFwd {
     back_in: Vec<GTensor<f32>>,
     /// Rows of the largest chunk — what the backbone's pool has to hold.
     rows_max: usize,
-}
-
-/// Fill `out` with the `[words, tmax]` id rectangle for one encoder group, plus
-/// each word's `[W]`-step row (where `e_w` is read out) and the group's `tmax`.
-///
-/// Padding slots stay at id 0 — they are masked out of the readout, and the
-/// buffers are cleared and refilled rather than reallocated per window.
-fn enc_group_rows(
-    tokens: &[usize],
-    words: &[Range<usize>],
-    grp: &[usize],
-    enc_lens: &[usize],
-    w_token: usize,
-    out: &mut EncGroup,
-) {
-    let tmax = grp.iter().map(|&w| enc_lens[w]).max().unwrap() + 1;
-    out.tmax = tmax;
-    out.ids.clear();
-    out.ids.resize(grp.len() * tmax, 0);
-    out.readout.clear();
-    for (i, &w) in grp.iter().enumerate() {
-        let s = words[w].start;
-        let len = enc_lens[w];
-        for k in 0..len {
-            out.ids[i * tmax + k] = tokens[s + k] as u32;
-        }
-        out.ids[i * tmax + len] = w_token as u32;
-        out.readout.push((i * tmax + len) as u32);
-    }
 }
 
 pub struct Hierarchical {
@@ -514,14 +420,15 @@ pub struct Hierarchical {
 
     /// Per-phase wall-clock timer, reset at the top of every window.
     timer: PhaseTimer,
-    /// Reused host-side index buffers (see [`Scratch`]).
-    scratch: Scratch,
+    /// Reused host-side word grouping (see [`Scratch`]). Taken for the duration of a
+    /// window so the stage methods can borrow it beside `&mut self`.
+    scratch: Option<Scratch>,
     /// Forward activations of the current window, owned by the model so its buffers
     /// survive across windows instead of being rebuilt every step (see [`Scratch`]).
     cache: TrainingCache,
     /// Staging for the per-group index lists, so each group's ids go up in one
     /// pinned async transfer rather than one blocking transfer per list.
-    ids: ops::IdBatch,
+    ids: GroupIds,
     /// Device accumulator for the decode loss, summed across the window's groups and
     /// read back once at the end of the step.
     ///
@@ -567,8 +474,6 @@ struct Flags {
     prof: bool,
     /// `GPU_MEM=1` — device memory in use after each phase.
     mem: bool,
-    /// `GPU_NO_GROUP=1` — one rectangle per window instead of length groups.
-    no_group: bool,
     /// Park the backbone's saved activations in host memory between forward and
     /// backward, trading (overlapped) PCIe for device memory. **On by default**;
     /// `GPU_NO_OFFLOAD=1` forces the all-resident path.
@@ -586,7 +491,6 @@ impl Flags {
         Self {
             prof: std::env::var("GPU_PROF").is_ok(),
             mem: std::env::var("GPU_MEM").is_ok(),
-            no_group: std::env::var("GPU_NO_GROUP").is_ok(),
             offload: std::env::var("GPU_NO_OFFLOAD").is_err(),
         }
     }
@@ -672,9 +576,9 @@ impl Hierarchical {
             seen: Seen::default(),
             timer: PhaseTimer::new(&flags),
             flags,
-            scratch: Scratch::default(),
+            scratch: None,
             cache: TrainingCache::default(),
-            ids: ops::IdBatch::new(),
+            ids: GroupIds::new(gpu),
             loss_acc: None,
             last_word_loss: 0.0,
             last_rows: 0,
@@ -785,24 +689,39 @@ impl Hierarchical {
 
         let dw = words.len() - 1; // decoded words: word 0 is encode-only
         self.timer.reset();
+        self.timer.mark(gpu, "drain prev step");
         if self.flags.mem {
             self.log_window_shape(tokens, words);
         }
 
-        let mut sc = mem::take(&mut self.scratch);
+        let hc = self.cfg.hc;
+        let mut sc = self.scratch.take().unwrap_or_else(|| {
+            let sc = Scratch::new(gpu, hc);
+            if self.flags.mem {
+                let mib = |b: usize| b as f64 / (1 << 20) as f64;
+                println!(
+                    "  fixed scratch: word embeds {:.2} MiB, group ids {:.2} MiB \
+                     (+{:.2} MiB pinned host)",
+                    mib(sc.fixed_bytes()),
+                    mib(GroupIds::BYTES_PER_SIDE),
+                    mib(GroupIds::BYTES_PER_SIDE),
+                );
+            }
+            sc
+        });
         let mut cache = mem::take(&mut self.cache);
 
-        let (e_w, enc_rows) = self.encoder_forward(gpu, tokens, words, &mut sc, &mut cache);
-        let bb = self.backbone_forward(gpu, &e_w, dw, &mut cache);
+        let enc_rows = self.encoder_forward(gpu, tokens, words, &mut sc, &mut cache);
+        let bb = self.backbone_forward(gpu, &sc.word_embeds, dw, &mut cache);
 
         let bb_rows_max = bb.rows_max;
         let (loss, d_o, dec_rows_max) =
             self.decode_groups(gpu, tokens, words, word_loss, &bb.o, &mut sc, &mut cache);
 
-        let d_e_w = self.backbone_backward(gpu, bb, &d_o, dw);
-        self.encoder_backward(gpu, &d_e_w, &mut sc, &mut cache);
+        let d_word_embeds = self.backbone_backward(gpu, bb, &d_o, dw);
+        self.encoder_backward(gpu, &d_word_embeds, &mut sc, &mut cache);
 
-        self.scratch = sc;
+        self.scratch = Some(sc);
         self.cache = cache;
 
         // Release pooled scratch far larger than this window needed.
@@ -821,7 +740,7 @@ impl Hierarchical {
             hist[(w.end - w.start).min(hist.len() - 1)] += 1;
         }
         let widest = hist.iter().rposition(|&c| c > 0).unwrap_or(0);
-        let buckets = hist.iter().filter(|&&c| c > 0).count();
+        let lengths = hist.iter().filter(|&&c| c > 0).count();
         // Pool free-list shape alongside the shape of the window that produced it:
         // `mem_get_info` cannot separate live memory from allocator cache, and a
         // climbing size count is the signal that the free list is accumulating one
@@ -830,104 +749,62 @@ impl Hierarchical {
         let sizes: usize = ps.iter().map(|(_, s, _)| s).sum();
         let bufs: usize = ps.iter().map(|(_, _, b)| b).sum();
         println!(
-            "  window: {} words, {} tokens, longest {widest}, {buckets} buckets  \
+            "  window: {} words, {} tokens, longest {widest}, {lengths} lengths  \
              | pool {sizes} sizes / {bufs} bufs",
             words.len(),
             tokens.len()
         );
     }
 
-    /// Group the words by length and fill `sc.enc_layout` with each group's id
-    /// rectangle, returning the group count.
-    ///
-    /// Words are batched as `[words, tmax]` rectangles, and `tmax` is set by the
-    /// LONGEST word — so one 16-byte word would pad every 2-byte word out to 17 steps
-    /// (~4.5x wasted rows on Rust source, in both FLOPs and VRAM). One dense rectangle
-    /// per length group instead: the padding collapses to within-group slack, and each
-    /// group is still a clean rectangle, which the mLSTM's per-word `[T, T]` attention
-    /// requires.
-    ///
-    /// The rectangles are built once here, not once per direction: the encoder BACKWARD
-    /// re-forwards each group (activation checkpointing) and needs byte-identical ids.
-    fn plan_encoder_groups(
-        &self,
-        tokens: &[usize],
-        words: &[Range<usize>],
-        sc: &mut Scratch,
-    ) -> usize {
-        let dw = words.len() - 1;
-        sc.enc_lens.clear();
-        sc.enc_lens
-            .extend((0..dw).map(|w| words[w].end - words[w].start));
-        group_by_len(
-            &sc.enc_lens,
-            self.flags.no_group,
-            self.group_cap(),
-            &mut sc.enc_groups,
-        );
-
-        let n_groups = sc.enc_groups.len();
-        if sc.enc_layout.len() < n_groups {
-            sc.enc_layout.resize_with(n_groups, EncGroup::default);
-        }
-        for g in 0..n_groups {
-            enc_group_rows(
-                tokens,
-                words,
-                &sc.enc_groups[g],
-                &sc.enc_lens,
-                self.cfg.w_token,
-                &mut sc.enc_layout[g],
-            );
-        }
-        n_groups
-    }
-
+    /// Largest rectangle this model allows before a length run is split.
     fn group_cap(&self) -> usize {
-        static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-        let env = *ENV.get_or_init(|| {
-            std::env::var("GPU_GROUP_CAP")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-        });
-        self.group_cap
-            .or(env)
-            .unwrap_or(crate::config::GROUP_MAX_ROWS)
+        self.group_cap.unwrap_or(GROUP_MAX_ROWS)
     }
 
-    /// Run one encoder group's rectangle through the block stack, leaving the result
-    /// in the returned `[n_g * tmax, HC]` tensor. The ids must already be uploaded:
-    /// slot 0 of `self.ids` is the group's id rectangle.
+    /// Run one encoder group's rectangle through the block stack, leaving the result in
+    /// `sc.enc_h` at `[rows, HC]`. The group's id rectangle must already be uploaded to
+    /// [`enc_id::IDS`].
     fn encoder_stack_forward(
         &mut self,
         gpu: &Gpu,
+        sc: &mut Scratch,
         n_g: usize,
         tmax: usize,
-        ids: usize,
+        rows: usize,
         cache: &mut TrainingCache,
-    ) -> GTensor<f32> {
+    ) {
         let hc = self.cfg.hc;
-        let embedded = ops::embedding_gather_u32(gpu, &self.table, &self.ids.get(0), ids, hc);
-        let mut h = embedded.reshaped(&[n_g, tmax, hc]);
-        // Blocks are H-in == H-out, so one spare buffer ping-pongs the stack.
-        let mut next = GTensor::uninit(gpu, &[n_g, tmax, hc]);
+        // Blocks are H-in == H-out, so one spare buffer ping-pongs the stack. Swapping
+        // the buffers themselves keeps the live activations in `enc_h` after every
+        // block, so the caller always finds the result there.
+        fit(gpu, &mut sc.enc_h, &[n_g, tmax, hc]);
+        fit(gpu, &mut sc.enc_h_next, &[n_g, tmax, hc]);
+        ops::embedding_gather_u32_into(
+            gpu,
+            &mut sc.enc_h,
+            &self.table,
+            &self.ids.list(enc_id::IDS),
+            rows,
+            hc,
+        );
         for blk in self.encoder.blocks.iter_mut() {
-            blk.forward(gpu, &h, &mut next, cache);
-            mem::swap(&mut h, &mut next);
+            blk.forward(gpu, &sc.enc_h, &mut sc.enc_h_next, cache);
+            mem::swap(&mut sc.enc_h, &mut sc.enc_h_next);
         }
-        h.reshaped(&[n_g * tmax, hc])
+        sc.enc_h.reshape_to(&[rows, hc]);
     }
 
-    /// PHASE 1 — encode every word to its `e_w`, one dense rectangle per length group.
+    /// PHASE 1 — encode every word, one dense rectangle per length group, into
+    /// `sc.word_embeds` (`[dw, HC]`, one row per word).
     ///
-    /// Returns `e_w` (`[dw, HC]`, one row per word) and the largest group's row count.
-    /// The latter bounds the encoder's pool: groups run one after another and a group's
-    /// activations die before the next starts, so only one group is ever resident — but
+    /// Returns the largest group's row count, which bounds the encoder's pool: groups
+    /// run one after another and a group's activations die before the next starts, so
+    /// only one group is ever resident — but
     /// each group has its own `[n_g, tmax]` shape and every `Buf`/`Linear::x` inside the
     /// stack resizes to whatever it is handed, so reuse is by capacity and the largest
     /// shape is what the pool has to hold. A block runs its recurrence along `T`, so
-    /// `tmax` is fixed by the bucket and only `n_g` could be padded — which is why this
-    /// is a bound for the trim, not a uniform shape.
+    /// `tmax` is fixed by the group's word length and only the word count varies —
+    /// which is why this is a bound for the trim, not a uniform shape.
     fn encoder_forward(
         &mut self,
         gpu: &Gpu,
@@ -935,32 +812,38 @@ impl Hierarchical {
         words: &[Range<usize>],
         sc: &mut Scratch,
         cache: &mut TrainingCache,
-    ) -> (GTensor<f32>, usize) {
+    ) -> usize {
         let hc = self.cfg.hc;
         let dw = words.len() - 1;
-        let n_groups = self.plan_encoder_groups(tokens, words, sc);
-        let enc_rows = (0..n_groups)
-            .map(|g| sc.enc_groups[g].len() * sc.enc_layout[g].tmax)
-            .max()
-            .unwrap_or(0);
+        sc.enc
+            .build(tokens, words, self.cfg.w_token, self.group_cap());
+        let enc_rows = sc.enc.rows_max();
 
-        let mut e_w = GTensor::zeros(gpu, &[dw, hc]);
-        for g in 0..n_groups {
-            let (n_g, tmax, ids, readout) = {
-                let lay = &sc.enc_layout[g];
-                // Both id lists in one pinned async upload instead of two blocking ones.
-                self.ids.upload(gpu, &[&lay.ids, &lay.readout]);
-                (
-                    sc.enc_groups[g].len(),
-                    lay.tmax,
-                    lay.ids.len(),
-                    lay.readout.len(),
-                )
+        self.timer.accum(gpu, "  enc plan (host)");
+
+        let covered: usize = (0..sc.enc.len()).map(|g| sc.enc.group(g).n_words()).sum();
+        assert_eq!(covered, dw, "encoder groups cover {covered} of {dw} words");
+        sc.word_embeds.shrink_to(&[dw, hc]);
+
+        for g in 0..sc.enc.len() {
+            let (n_words, tmax, rows) = {
+                let grp = sc.enc.group(g);
+                self.ids.upload(gpu, &[grp.ids, grp.words]);
+                (grp.n_words(), grp.tmax, grp.rows())
             };
-            let h_flat = self.encoder_stack_forward(gpu, n_g, tmax, ids, cache);
-            // e_w = each word's [W]-step row, scattered back to its window slot.
-            let e_w_grp = ops::embedding_gather_u32(gpu, &h_flat, &self.ids.get(1), readout, hc);
-            ops::scatter_rows(gpu, &mut e_w, &e_w_grp, &sc.enc_groups[g]);
+            self.timer.accum(gpu, "  enc upload");
+            self.encoder_stack_forward(gpu, sc, n_words, tmax, rows, cache);
+            self.timer.accum(gpu, "  enc stack fwd");
+            // Each word's [W]-step row, moved to its window slot.
+            ops::pack_rows_u32(
+                gpu,
+                &mut sc.word_embeds,
+                &sc.enc_h,
+                &self.ids.list(enc_id::WORDS),
+                tmax,
+                tmax - 1,
+                n_words,
+            );
             // This group's forward cache is dead: the encoder backward re-forwards each
             // group to rebuild it (activation checkpointing), so nothing will ever read
             // what was just saved.
@@ -974,9 +857,11 @@ impl Hierarchical {
                 blk.drop_all_act(gpu);
             }
         }
+        self.timer.accum(gpu, "  enc readout/free");
+        self.timer.flush();
         self.timer.mark(gpu, "encoder fwd");
-        hash_dbg(gpu, "e_w", &e_w);
-        (e_w, enc_rows)
+        hash_dbg(gpu, "word_embeds", &sc.word_embeds);
+        enc_rows
     }
 
     /// The word axis split into the spans the backbone sweeps, and whether that is
@@ -1006,12 +891,12 @@ impl Hierarchical {
     fn backbone_forward(
         &mut self,
         gpu: &Gpu,
-        e_w: &GTensor<f32>,
+        word_embeds: &GTensor<f32>,
         dw: usize,
         cache: &mut TrainingCache,
     ) -> BackboneFwd {
         let (hc, wh) = (self.cfg.hc, self.cfg.wh);
-        let bb_in = self.bb_front.forward_alloc(gpu, e_w); // [dw, WH]
+        let bb_in = self.bb_front.forward_alloc(gpu, word_embeds); // [dw, WH]
         let spans = self.backbone_spans(dw);
         let rows_max = spans.iter().map(|&(_, len)| len).max().unwrap_or(0);
 
@@ -1082,25 +967,15 @@ impl Hierarchical {
     ) -> (f32, GTensor<f32>, usize) {
         let hc = self.cfg.hc;
         let dw = words.len() - 1;
-        sc.dec_lens.clear();
-        sc.dec_lens
-            .extend((0..dw).map(|w| words[w + 1].end - words[w + 1].start));
-        group_by_len(
-            &sc.dec_lens,
-            self.flags.no_group,
-            self.group_cap(),
-            &mut sc.dec_groups,
-        );
+        let word_on = |w: usize| word_loss.is_none_or(|m| m[w]);
+        sc.dec
+            .build(tokens, words, self.cfg.w_token, &word_on, self.group_cap());
 
-        // Every group scales by the WINDOW's valid-row count, so the summed loss and
+        // Every group scales by the WINDOW's scored-row count, so the summed loss and
         // grads match what one big rectangle would have produced. Under SFT masking
         // only the response words' rows count, so the normalizer (and the reported
         // loss) is the number of *unmasked* rows — the mean CE over response tokens.
-        let word_on = |w: usize| word_loss.is_none_or(|m| m[w]);
-        let valid_rows: usize = (0..dw)
-            .filter(|&w| word_on(w))
-            .map(|w| sc.dec_lens[w] + 1)
-            .sum();
+        let (valid_rows, scored_words) = sc.dec.scored();
         let inv = 1.0 / (valid_rows.max(1) as f32);
 
         // Zero the device loss accumulator for this window. Each group adds its own
@@ -1113,47 +988,44 @@ impl Hierarchical {
 
         let mut d_o = GTensor::zeros(gpu, &[dw, hc]);
         let mut dec_rows_max = 0usize;
-        for g in 0..sc.dec_groups.len() {
-            let n_g = sc.dec_groups[g].len();
-            let tmax = sc.dec_groups[g]
-                .iter()
-                .map(|&w| sc.dec_lens[w] + 1)
-                .max()
-                .unwrap();
-            let rows = n_g * tmax;
+        for g in 0..sc.dec.len() {
+            let (n_words, tmax, rows, n_chars) = {
+                let grp = sc.dec.group(g);
+                // All six id lists in one pinned async upload. Six separate
+                // `upload_ids_u32` calls would be six device allocations and six
+                // *blocking* H2Ds — `memcpy_htod` from a pageable slice is
+                // synchronous, so each one stalls the compute stream, and this runs
+                // once per length group.
+                self.ids.upload(
+                    gpu,
+                    &[
+                        grp.word_ids,
+                        grp.char_rows,
+                        grp.char_ids,
+                        grp.targets,
+                        grp.mask,
+                    ],
+                );
+                (grp.n_words(), grp.tmax, grp.rows(), grp.n_chars())
+            };
             dec_rows_max = dec_rows_max.max(rows);
-            fill_decoder_group_ids(tokens, words, g, tmax, rows, self.cfg.w_token, &word_on, sc);
-
-            // All six id lists in one pinned async upload. Six separate
-            // `upload_ids_u32` calls would be six device allocations and six
-            // *blocking* H2Ds — `memcpy_htod` from a pageable slice is synchronous, so
-            // each one stalls the compute stream, and this runs once per length group.
-            self.ids.upload(
-                gpu,
-                &[
-                    &sc.grp_ids,
-                    &sc.o_rows,
-                    &sc.char_rows,
-                    &sc.char_ids,
-                    &sc.targets,
-                    &sc.mask,
-                ],
-            );
-            let n_chars = sc.char_rows.len();
-            let dec_in = self.build_decoder_input(gpu, o, n_g, rows, n_chars);
-            let capped = self.decoder_stack_forward(gpu, dec_in, n_g, tmax, rows, cache);
+            let dec_in = self.build_decoder_input(gpu, o, n_words, tmax, rows, n_chars);
+            let capped = self.decoder_stack_forward(gpu, dec_in, n_words, tmax, rows, cache);
 
             let (_, d_capped) = ops::masked_softmax_ce_u32_into(
                 gpu,
                 &capped,
-                &self.ids.get(4),
-                &self.ids.get(5),
+                &self.ids.list(dec_id::TARGETS),
+                &self.ids.list(dec_id::MASK),
                 inv,
                 Some(&mut acc),
             );
 
-            let d_dec_in = self.decoder_stack_backward(gpu, &d_capped, &capped, n_g, tmax, rows);
-            self.scatter_decoder_grads(gpu, &d_dec_in, &mut d_o, n_g, n_chars);
+            self.timer.accum(gpu, "decoder fwd");
+
+            let d_dec_in =
+                self.decoder_stack_backward(gpu, &d_capped, &capped, n_words, tmax, rows);
+            self.scatter_decoder_grads(gpu, &d_dec_in, &mut d_o, n_words, tmax, n_chars);
 
             // This group is completely finished — forward AND backward — so nothing
             // here will be read again. Release the whole activation set rather than
@@ -1166,6 +1038,7 @@ impl Hierarchical {
             for blk in self.dec_blocks.iter_mut() {
                 blk.drop_all_act(gpu);
             }
+            self.timer.accum(gpu, "decoder bwd");
         }
         // One readback for the whole window, outside the group loop. Blocking here is
         // fine — the decode phase is over — where per-group it stalled the pipeline.
@@ -1174,10 +1047,10 @@ impl Hierarchical {
         // Per-word NLL from the same total: `loss` is the row sum over `valid_rows`,
         // so scaling by rows/words re-averages it over words instead. Both counts are
         // already on the host, so the second metric costs no device work.
-        let scored_words = (0..dw).filter(|&w| word_on(w)).count();
         self.last_word_loss = loss * (valid_rows as f32) / (scored_words.max(1) as f32);
         self.last_rows = valid_rows;
-        self.timer.mark(gpu, "decoder fwd + bwd");
+        self.timer.accum(gpu, "decoder loss readback");
+        self.timer.flush();
         (loss, d_o, dec_rows_max)
     }
 
@@ -1188,15 +1061,29 @@ impl Hierarchical {
         gpu: &Gpu,
         o: &GTensor<f32>,
         n_g: usize,
+        tmax: usize,
         rows: usize,
         n_chars: usize,
     ) -> GTensor<f32> {
         let hc = self.cfg.hc;
-        let o_grp = ops::embedding_gather_u32(gpu, o, &self.ids.get(0), n_g, hc);
         let mut dec_in = GTensor::zeros(gpu, &[rows, hc]);
-        ops::scatter_rows_u32(gpu, &mut dec_in, &o_grp, &self.ids.get(1));
-        let char_vecs = ops::embedding_gather_u32(gpu, &self.table, &self.ids.get(3), n_chars, hc);
-        ops::scatter_rows_u32(gpu, &mut dec_in, &char_vecs, &self.ids.get(2));
+        ops::unpack_rows_u32(
+            gpu,
+            &mut dec_in,
+            o,
+            &self.ids.list(dec_id::WORDS),
+            tmax,
+            0,
+            n_g,
+        );
+        ops::route_rows_u32(
+            gpu,
+            &mut dec_in,
+            &self.table,
+            &self.ids.list(dec_id::CHAR_IDS),
+            &self.ids.list(dec_id::CHAR_ROWS),
+            n_chars,
+        );
         dec_in
     }
 
@@ -1255,23 +1142,38 @@ impl Hierarchical {
         d_dec_in: &GTensor<f32>,
         d_o: &mut GTensor<f32>,
         n_g: usize,
+        tmax: usize,
         n_chars: usize,
     ) {
         let hc = self.cfg.hc;
-        let d_o_grp = ops::embedding_gather_u32(gpu, d_dec_in, &self.ids.get(1), n_g, hc);
-        ops::scatter_rows_u32(gpu, d_o, &d_o_grp, &self.ids.get(0));
-        let d_char = ops::embedding_gather_u32(gpu, d_dec_in, &self.ids.get(2), n_chars, hc);
+        ops::pack_rows_u32(
+            gpu,
+            d_o,
+            d_dec_in,
+            &self.ids.list(dec_id::WORDS),
+            tmax,
+            0,
+            n_g,
+        );
+        let d_char = ops::embedding_gather_u32(
+            gpu,
+            d_dec_in,
+            &self.ids.list(dec_id::CHAR_ROWS),
+            n_chars,
+            hc,
+        );
         ops::embedding_scatter_add_u32(
             gpu,
             &mut self.dtable,
-            &self.ids.get(3),
+            &self.ids.list(dec_id::CHAR_IDS),
             n_chars,
             &d_char,
             hc,
         );
     }
 
-    /// PHASE 4 — unwind the backbone, returning `d_e_w` for the encoder backward.
+    /// PHASE 4 — unwind the backbone, returning the word-embedding gradient for the
+    /// encoder backward.
     ///
     /// Chunks unwind right to left, the mirror of the forward's left-to-right, so the
     /// BPTT state each cell carries flows backwards across the same borders the forward
@@ -1333,9 +1235,9 @@ impl Hierarchical {
         } else {
             concat_rows(gpu, &d_parts, dw, wh)
         };
-        let d_e_w = self.bb_front.backward_alloc(gpu, &d_hb_all); // [dw, HC]
+        let d_word_embeds = self.bb_front.backward_alloc(gpu, &d_hb_all); // [dw, HC]
         self.timer.mark(gpu, "backbone bwd");
-        d_e_w
+        d_word_embeds
     }
 
     /// `bb_back`'s backward over all chunks, returning the `[dw, WH]` gradient at the
@@ -1398,40 +1300,46 @@ impl Hierarchical {
     fn encoder_backward(
         &mut self,
         gpu: &Gpu,
-        d_e_w: &GTensor<f32>,
+        d_word_embeds: &GTensor<f32>,
         sc: &mut Scratch,
         cache: &mut TrainingCache,
     ) {
         let hc = self.cfg.hc;
-        for g in 0..sc.enc_groups.len() {
-            let (n_g, tmax, ids) = {
-                let lay = &sc.enc_layout[g];
+        for g in 0..sc.enc.len() {
+            let (n_words, tmax, rows) = {
+                let grp = sc.enc.group(g);
                 // This group's three id lists in one pinned async upload.
-                sc.grp_ids.clear();
-                sc.grp_ids
-                    .extend(sc.enc_groups[g].iter().map(|&w| w as u32));
-                self.ids.upload(gpu, &[&lay.ids, &lay.readout, &sc.grp_ids]);
-                (sc.enc_groups[g].len(), lay.tmax, lay.ids.len())
+                self.ids.upload(gpu, &[grp.ids, grp.words]);
+                (grp.n_words(), grp.tmax, grp.rows())
             };
-            drop(self.encoder_stack_forward(gpu, n_g, tmax, ids, cache));
+            self.encoder_stack_forward(gpu, sc, n_words, tmax, rows, cache);
 
-            // Scatter this group's d_e_w onto its [W]-step rows, rest zero.
-            let d_e_w_grp = ops::embedding_gather_u32(gpu, d_e_w, &self.ids.get(2), n_g, hc);
-            let mut d_h = GTensor::zeros(gpu, &[n_g * tmax, hc]);
-            ops::scatter_rows_u32(gpu, &mut d_h, &d_e_w_grp, &self.ids.get(1));
-            let mut d_h = d_h.reshaped(&[n_g, tmax, hc]);
-            let mut d_h_next = GTensor::uninit(gpu, &[n_g, tmax, hc]);
+            // This group's word-embedding grad onto its [W]-step rows; zeros elsewhere,
+            // since no other timestep reached the loss.
+            fit(gpu, &mut sc.enc_d, &[rows, hc]);
+            fit(gpu, &mut sc.enc_d_next, &[n_words, tmax, hc]);
+            sc.enc_d.zero_(gpu);
+            ops::unpack_rows_u32(
+                gpu,
+                &mut sc.enc_d,
+                d_word_embeds,
+                &self.ids.list(enc_id::WORDS),
+                tmax,
+                tmax - 1,
+                n_words,
+            );
+            sc.enc_d.reshape_to(&[n_words, tmax, hc]);
             for blk in self.encoder.blocks.iter_mut().rev() {
-                blk.backward(gpu, &d_h, &mut d_h_next);
-                mem::swap(&mut d_h, &mut d_h_next);
+                blk.backward(gpu, &sc.enc_d, &mut sc.enc_d_next);
+                mem::swap(&mut sc.enc_d, &mut sc.enc_d_next);
             }
-            let d_embedded = d_h.reshaped(&[n_g * tmax, hc]);
+            sc.enc_d.reshape_to(&[rows, hc]);
             ops::embedding_scatter_add_u32(
                 gpu,
                 &mut self.dtable,
-                &self.ids.get(0),
-                ids,
-                &d_embedded,
+                &self.ids.list(enc_id::IDS),
+                rows,
+                &sc.enc_d,
                 hc,
             );
             for blk in self.encoder.blocks.iter_mut() {
@@ -2093,9 +2001,9 @@ mod tests {
 
     /// The same window, run twice, must give bit-identical losses.
     ///
-    /// The grouped encoder/decoder fires one `IdBatch::upload` per group, and the
+    /// The grouped encoder/decoder fires one `GroupIds::upload` per group, and the
     /// H2D out of its pinned staging buffer is async. Rotating slots alone only
-    /// buys `ID_SLOTS - 1` iterations of slack, so with enough groups the CPU laps
+    /// buys `SLOTS - 1` iterations of slack, so with enough groups the CPU laps
     /// the device and refills a buffer whose copy has not been read yet — the ids
     /// silently become another group's. It is invisible in a small window:
     /// `grouping_matches_single_rectangle` uses 5 words and never reproduced it,
@@ -2106,7 +2014,7 @@ mod tests {
     /// The widths below are the real model's, and they have to be: the race needs
     /// enough queued device work per group for the CPU to lap it, and at this
     /// suite's usual toy sizes (hc=16, wh=24) it does not reproduce at any word
-    /// count. Verified to fail with the event wait in `IdBatch::upload` removed.
+    /// count. Verified to fail with the event wait in `GroupIds::upload` removed.
     #[test]
     fn repeated_forward_backward_is_deterministic() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -2204,89 +2112,6 @@ mod tests {
             "word_loss {word_loss} != {expect} (char {char_loss}, {rows} rows, {} words)",
             decoded.len()
         );
-    }
-
-    /// Splitting a window into length groups is a pure batching change: it must
-    /// give the same loss AND the same gradients as one padded rectangle. Words of
-    /// four different lengths here, so the grouped path really does fire several
-    /// rectangles (1, 2, 4 and 8-step groups) instead of one.
-    ///
-    /// The two runs are compared through a full optimizer step: identical weights
-    /// afterwards means the reduced grads agreed, not just the loss.
-    #[test]
-    fn grouping_matches_single_rectangle() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        let cfg = ModelCfg {
-            vocab: 12,
-            hc: 16,
-            wh: 24,
-            enc_blocks: 2,
-            bb_blocks: 2,
-            dec_blocks: 2,
-            heads: 2,
-            dqk: 8,
-            w_token: 11,
-            cap: 30.0,
-        };
-        // Word lengths 1, 3, 2, 6, 4 — four distinct power-of-two buckets.
-        let tokens: Vec<usize> = (0..16).map(|i| 1 + i % 9).collect();
-        let words = vec![
-            Range { start: 0, end: 1 },
-            Range { start: 1, end: 4 },
-            Range { start: 4, end: 6 },
-            Range { start: 6, end: 12 },
-            Range { start: 12, end: 16 },
-        ];
-
-        let run = |grouped: bool| -> (f32, Vec<f32>) {
-            // SAFETY-adjacent: tests in this binary run in threads. The flag is
-            // read once when the model below is constructed, so it must be set
-            // BEFORE `new`/`load` — not merely before `forward_backward`.
-            if grouped {
-                unsafe { std::env::remove_var("GPU_NO_GROUP") };
-            } else {
-                unsafe { std::env::set_var("GPU_NO_GROUP", "1") };
-            }
-            let mut model = Hierarchical::new(&gpu, cfg);
-            // Same starting weights for both runs.
-            let seed = std::env::temp_dir().join("gpu_group_seed.hier");
-            let seed = seed.to_str().unwrap();
-            if grouped {
-                model.save(&gpu, seed, &[]).expect("save seed");
-            } else {
-                model = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
-            }
-            let loss = model.forward_backward(&gpu, &tokens, &words);
-            let mut opt = AdamCfg::new(1e-2, 0.0);
-            opt.t += 1;
-            model.step(&gpu, &opt); // folds every stage's grads into the weights
-            let w: Vec<f32> = model.table.to_host(&gpu).data.to_vec();
-            (loss, w)
-        };
-
-        let (loss_grouped, w_grouped) = run(true);
-        let (loss_single, w_single) = run(false);
-        unsafe { std::env::remove_var("GPU_NO_GROUP") };
-
-        // Splitting a bucket changes only which rows share a rectangle, so the two legs
-        // agree to reassociation. The sLSTM's fused path stages `Wh` in bf16, and the
-        // two groupings then reduce the recurrence in a different order at 8-bit
-        // mantissas — hence 1e-3 rather than fp32's 1e-5. A real batching bug (a row in
-        // the wrong rectangle, a grad dropped on a split) moves these by orders of
-        // magnitude, not by 1e-5.
-        let tol = 1e-3;
-        assert!(
-            (loss_grouped - loss_single).abs() < tol,
-            "grouped loss {loss_grouped} != single-rectangle loss {loss_single}"
-        );
-        for (i, (a, b)) in w_grouped.iter().zip(&w_single).enumerate() {
-            assert!(
-                (a - b).abs() < tol,
-                "post-step weight {i} diverged: grouped {a} vs single {b}"
-            );
-        }
     }
 
     /// Chunking the backbone's word axis is a pure memory change: the recurrent state
@@ -2513,11 +2338,11 @@ mod tests {
         check(&front_c, &front_u, "bb_front");
     }
 
-    /// Capping a group's rows is a pure batching change: splitting one length bucket
+    /// Capping a group's rows is a pure batching change: splitting one length group
     /// into several same-shape rectangles must give the same loss AND the same
     /// gradients as running it whole.
     ///
-    /// The cap exists because a bucket holds every word of its length in the window, so
+    /// The cap exists because a group holds every word of its length in the window, so
     /// it grows with the window and the whole stage's buffers size to it. This is what
     /// says the split is free — the groups were already independent.
     #[test]
@@ -2537,7 +2362,7 @@ mod tests {
             w_token: 11,
             cap: 30.0,
         };
-        // 24 words of one length, so they land in ONE bucket and the cap really splits
+        // 24 words of one length, so they land in ONE group and the cap really splits
         // it rather than the lengths doing the work.
         let tokens: Vec<usize> = (0..48).map(|i| 1 + i % 9).collect();
         let words: Vec<Range<usize>> = (0..24)
@@ -2566,7 +2391,7 @@ mod tests {
         };
 
         let (loss_whole, g_whole) = run(0); // uncapped: one group
-        let (loss_split, g_split) = run(9); // forces several pieces per bucket
+        let (loss_split, g_split) = run(9); // forces several pieces per group
 
         assert!(
             (loss_whole - loss_split).abs() < 1e-5,

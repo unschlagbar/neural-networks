@@ -13,8 +13,13 @@ use neural_networks::config::{
 use neural_networks::tokenizer_utf8::Utf8Tokenizer;
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| TRAIN_DATA.to_string());
-    let max_chunks: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(3);
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| TRAIN_DATA.to_string());
+    let max_chunks: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
 
     let mut ds = ChunkedWordDataSet::open(
         Utf8Tokenizer::new(),
@@ -47,7 +52,10 @@ fn main() {
     println!("{total} windows scanned");
     for (spans, n) in hist.iter().enumerate().skip(1) {
         if *n > 0 {
-            println!("  {spans:>2} span(s): {n:>7}  ({:.1}%)", 100.0 * *n as f64 / total as f64);
+            println!(
+                "  {spans:>2} span(s): {n:>7}  ({:.1}%)",
+                100.0 * *n as f64 / total as f64
+            );
         }
     }
     println!(

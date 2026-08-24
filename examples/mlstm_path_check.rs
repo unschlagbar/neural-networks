@@ -22,8 +22,15 @@ fn main() {
         }
     };
     let limit = gpu.max_shared_optin;
-    println!("max_shared_optin = {} B ({:.1} KB)", limit, limit as f64 / 1024.0);
-    println!("{:>12} {:>6} {:>14} {:>14} {:>10}", "WORD_HIDDEN", "dqk", "fw_par smem", "bw_par smem", "fits");
+    println!(
+        "max_shared_optin = {} B ({:.1} KB)",
+        limit,
+        limit as f64 / 1024.0
+    );
+    println!(
+        "{:>12} {:>6} {:>14} {:>14} {:>10}",
+        "WORD_HIDDEN", "dqk", "fw_par smem", "bw_par smem", "fits"
+    );
 
     for hidden in [512usize, 768, 1024, 2048, 4096] {
         let heads = 8;

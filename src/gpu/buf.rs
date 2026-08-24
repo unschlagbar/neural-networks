@@ -361,7 +361,8 @@ impl Pool {
     /// 16.5 GB and aborted.
     pub fn trim(&mut self, want: usize) {
         let cap = want.saturating_mul(RETAIN_SLACK);
-        self.free.retain(|(size, bufs)| *size <= cap && !bufs.is_empty());
+        self.free
+            .retain(|(size, bufs)| *size <= cap && !bufs.is_empty());
         // At most one spare per size class. A class holding several buffers means
         // several were live at once *within* a pass — but the next pass re-takes them
         // one at a time, so the extras are dead weight until then, and at the
@@ -504,10 +505,7 @@ impl Pool {
     /// Total elements currently held on the free list — the pool's retained
     /// memory, in f32s. For tests and memory reporting.
     pub fn pooled_elems(&self) -> usize {
-        self.free
-            .iter()
-            .map(|(size, bufs)| size * bufs.len())
-            .sum()
+        self.free.iter().map(|(size, bufs)| size * bufs.len()).sum()
     }
 
     /// Drop every pooled buffer, releasing the memory.
@@ -618,7 +616,11 @@ mod tests {
 
         // 8 is 512x smaller: reusing the 4096 buffer would pin it forever.
         let small = pool.take(&gpu, &[8]);
-        assert_eq!(small.capacity(), 8, "a tiny request took the oversized buffer");
+        assert_eq!(
+            small.capacity(),
+            8,
+            "a tiny request took the oversized buffer"
+        );
         pool.put(small);
 
         // `trim` at a pass boundary then releases the buffer nothing can use.
@@ -688,7 +690,11 @@ mod tests {
                 assert_eq!(t.len(), 64);
             });
         }
-        assert_eq!(pool.pooled_elems(), 64, "scoped temporaries must not stack up");
+        assert_eq!(
+            pool.pooled_elems(),
+            64,
+            "scoped temporaries must not stack up"
+        );
     }
 
     /// `get` preserves contents on reuse (callers overwrite); `get_zeroed` clears.
@@ -707,6 +713,9 @@ mod tests {
         // Same shape via `get`: the allocation is reused, so the data survives.
         assert_eq!(buf.get(&gpu, &[2, 3]).to_host(&gpu).data, vec![1.0; 6]);
         // `get_zeroed` memsets it in place.
-        assert_eq!(buf.get_zeroed(&gpu, &[2, 3]).to_host(&gpu).data, vec![0.0; 6]);
+        assert_eq!(
+            buf.get_zeroed(&gpu, &[2, 3]).to_host(&gpu).data,
+            vec![0.0; 6]
+        );
     }
 }

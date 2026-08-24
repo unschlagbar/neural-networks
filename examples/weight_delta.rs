@@ -37,9 +37,15 @@ fn main() {
         collect(stage, sa, sb, &mut rows);
     }
     rows.sort_by(|x: &Row, y: &Row| y.rel.total_cmp(&x.rel));
-    println!("{:<44} {:>10} {:>12} {:>12}", "tensor", "rel |d|", "mean a", "mean b");
+    println!(
+        "{:<44} {:>10} {:>12} {:>12}",
+        "tensor", "rel |d|", "mean a", "mean b"
+    );
     for r in rows.iter().take(40) {
-        println!("{:<44} {:>10.4} {:>12.5} {:>12.5}", r.name, r.rel, r.mean_a, r.mean_b);
+        println!(
+            "{:<44} {:>10.4} {:>12.5} {:>12.5}",
+            r.name, r.rel, r.mean_a, r.mean_b
+        );
     }
 }
 
@@ -51,14 +57,23 @@ struct Row {
 }
 
 fn resolve(name: &str) -> String {
-    if Path::new(name).is_file() { name.to_string() } else { format!("models/{name}") }
+    if Path::new(name).is_file() {
+        name.to_string()
+    } else {
+        format!("models/{name}")
+    }
 }
 
 fn collect(stage: &str, a: &Sequential, b: &Sequential, out: &mut Vec<Row>) {
     for (i, (la, lb)) in a.layers.iter().zip(&b.layers).enumerate() {
         let mut push = |what: &str, x: &[f32], y: &[f32]| {
             let na: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
-            let d: f32 = x.iter().zip(y).map(|(p, q)| (q - p) * (q - p)).sum::<f32>().sqrt();
+            let d: f32 = x
+                .iter()
+                .zip(y)
+                .map(|(p, q)| (q - p) * (q - p))
+                .sum::<f32>()
+                .sqrt();
             out.push(Row {
                 name: format!("{stage}[{i}] {what}"),
                 rel: if na > 0.0 { d / na } else { d },
@@ -67,49 +82,84 @@ fn collect(stage: &str, a: &Sequential, b: &Sequential, out: &mut Vec<Row>) {
             });
         };
         let (aa, ab) = (la.as_any(), lb.as_any());
-        if let (Some(p), Some(q)) =
-            (aa.downcast_ref::<EmbeddingLayer>(), ab.downcast_ref::<EmbeddingLayer>())
-        {
+        if let (Some(p), Some(q)) = (
+            aa.downcast_ref::<EmbeddingLayer>(),
+            ab.downcast_ref::<EmbeddingLayer>(),
+        ) {
             push("Embedding.W", p.weights.as_slice(), q.weights.as_slice());
-        } else if let (Some(p), Some(q)) =
-            (aa.downcast_ref::<LinearNBLayer>(), ab.downcast_ref::<LinearNBLayer>())
-        {
+        } else if let (Some(p), Some(q)) = (
+            aa.downcast_ref::<LinearNBLayer>(),
+            ab.downcast_ref::<LinearNBLayer>(),
+        ) {
             push("LinearNoBias.W", p.weights.as_slice(), q.weights.as_slice());
-        } else if let (Some(p), Some(q)) =
-            (aa.downcast_ref::<LinearLayer>(), ab.downcast_ref::<LinearLayer>())
-        {
+        } else if let (Some(p), Some(q)) = (
+            aa.downcast_ref::<LinearLayer>(),
+            ab.downcast_ref::<LinearLayer>(),
+        ) {
             push("Linear.W", p.weights.as_slice(), q.weights.as_slice());
             push("Linear.b", &p.biases, &q.biases);
         } else if let (Some(p), Some(q)) =
             (aa.downcast_ref::<RMSNorm>(), ab.downcast_ref::<RMSNorm>())
         {
             push("RMSNorm.gamma", &p.gamma, &q.gamma);
-        } else if let (Some(p), Some(q)) =
-            (aa.downcast_ref::<SLSTMBlock>(), ab.downcast_ref::<SLSTMBlock>())
-        {
+        } else if let (Some(p), Some(q)) = (
+            aa.downcast_ref::<SLSTMBlock>(),
+            ab.downcast_ref::<SLSTMBlock>(),
+        ) {
             push("pre_norm1.gamma", &p.pre_norm1.gamma, &q.pre_norm1.gamma);
             slstm(&mut push, &p.cell, &q.cell);
-            push("post_cell_norm.gamma", &p.post_cell_norm.gamma, &q.post_cell_norm.gamma);
+            push(
+                "post_cell_norm.gamma",
+                &p.post_cell_norm.gamma,
+                &q.post_cell_norm.gamma,
+            );
             push("pre_norm2.gamma", &p.pre_norm2.gamma, &q.pre_norm2.gamma);
-            push("lin_gate.W", p.lin_gate.weights.as_slice(), q.lin_gate.weights.as_slice());
-            push("lin_value.W", p.lin_value.weights.as_slice(), q.lin_value.weights.as_slice());
-            push("lin_down.W", p.lin_down.weights.as_slice(), q.lin_down.weights.as_slice());
-        } else if let (Some(p), Some(q)) =
-            (aa.downcast_ref::<MLSTMBlock>(), ab.downcast_ref::<MLSTMBlock>())
-        {
+            push(
+                "lin_gate.W",
+                p.lin_gate.weights.as_slice(),
+                q.lin_gate.weights.as_slice(),
+            );
+            push(
+                "lin_value.W",
+                p.lin_value.weights.as_slice(),
+                q.lin_value.weights.as_slice(),
+            );
+            push(
+                "lin_down.W",
+                p.lin_down.weights.as_slice(),
+                q.lin_down.weights.as_slice(),
+            );
+        } else if let (Some(p), Some(q)) = (
+            aa.downcast_ref::<MLSTMBlock>(),
+            ab.downcast_ref::<MLSTMBlock>(),
+        ) {
             push("pre_norm1.gamma", &p.pre_norm1.gamma, &q.pre_norm1.gamma);
             mlstm(&mut push, &p.cell, &q.cell);
             push("pre_norm2.gamma", &p.pre_norm2.gamma, &q.pre_norm2.gamma);
-            push("lin_gate.W", p.lin_gate.weights.as_slice(), q.lin_gate.weights.as_slice());
-            push("lin_value.W", p.lin_value.weights.as_slice(), q.lin_value.weights.as_slice());
-            push("lin_down.W", p.lin_down.weights.as_slice(), q.lin_down.weights.as_slice());
-        } else if let (Some(p), Some(q)) =
-            (aa.downcast_ref::<SLSTMLayer>(), ab.downcast_ref::<SLSTMLayer>())
-        {
+            push(
+                "lin_gate.W",
+                p.lin_gate.weights.as_slice(),
+                q.lin_gate.weights.as_slice(),
+            );
+            push(
+                "lin_value.W",
+                p.lin_value.weights.as_slice(),
+                q.lin_value.weights.as_slice(),
+            );
+            push(
+                "lin_down.W",
+                p.lin_down.weights.as_slice(),
+                q.lin_down.weights.as_slice(),
+            );
+        } else if let (Some(p), Some(q)) = (
+            aa.downcast_ref::<SLSTMLayer>(),
+            ab.downcast_ref::<SLSTMLayer>(),
+        ) {
             slstm(&mut push, p, q);
-        } else if let (Some(p), Some(q)) =
-            (aa.downcast_ref::<MLSTMLayer>(), ab.downcast_ref::<MLSTMLayer>())
-        {
+        } else if let (Some(p), Some(q)) = (
+            aa.downcast_ref::<MLSTMLayer>(),
+            ab.downcast_ref::<MLSTMLayer>(),
+        ) {
             mlstm(&mut push, p, q);
         }
     }
@@ -139,5 +189,9 @@ fn mlstm(push: &mut impl FnMut(&str, &[f32], &[f32]), a: &MLSTMLayer, b: &MLSTML
     push("mLSTM.bo", &a.bo, &b.bo);
     push("mLSTM.bi", &a.bi, &b.bi);
     push("mLSTM.bf", &a.bf, &b.bf);
-    push("mLSTM.head_norm.gamma", &a.head_norm.gamma, &b.head_norm.gamma);
+    push(
+        "mLSTM.head_norm.gamma",
+        &a.head_norm.gamma,
+        &b.head_norm.gamma,
+    );
 }

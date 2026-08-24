@@ -23,7 +23,10 @@ fn main() {
         }
     };
 
-    println!("SMs: {}   max shared opt-in: {} B", gpu.sm_count, gpu.max_shared_optin);
+    println!(
+        "SMs: {}   max shared opt-in: {} B",
+        gpu.sm_count, gpu.max_shared_optin
+    );
     println!();
 
     let hs = [256usize, 384, 512, 768, 1024];

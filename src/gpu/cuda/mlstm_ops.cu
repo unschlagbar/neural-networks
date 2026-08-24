@@ -305,6 +305,39 @@ extern "C" __global__ void scatter_rows(float* dst, const float* src, const unsi
     dst[(long)row_ids[r] * dim + c] = src[i];
 }
 
+// dst[dst_ids[i], :] = src[src_ids[i], :] — the encoder readout, where neither side is
+// contiguous: rows are picked out of a `[words, tmax]` rectangle and land in window
+// order. Doing it as gather-then-scatter would round-trip `rows * dim` floats through
+// a temporary.
+extern "C" __global__ void route_rows(float* dst, const float* src, const unsigned* src_ids,
+                                      const unsigned* dst_ids, int dim, int rows) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * dim) return;
+    int r = i / dim, c = i % dim;
+    dst[(long)dst_ids[r] * dim + c] = src[(long)src_ids[r] * dim + c];
+}
+
+// The rectangle side of a readout is affine: groups hold one word length, so word i's
+// slot `offset` is row `i * stride + offset`. Only the window side needs a table.
+//
+// pack: rectangle -> window. dst[ids[i], :] = src[i * stride + offset, :]
+extern "C" __global__ void pack_rows(float* dst, const float* src, const unsigned* ids,
+                                     int stride, int offset, int dim, int rows) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * dim) return;
+    int r = i / dim, c = i % dim;
+    dst[(long)ids[r] * dim + c] = src[(long)(r * stride + offset) * dim + c];
+}
+
+// unpack: window -> rectangle. dst[i * stride + offset, :] = src[ids[i], :]
+extern "C" __global__ void unpack_rows(float* dst, const float* src, const unsigned* ids,
+                                       int stride, int offset, int dim, int rows) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * dim) return;
+    int r = i / dim, c = i % dim;
+    dst[(long)(r * stride + offset) * dim + c] = src[(long)ids[r] * dim + c];
+}
+
 // Masked softmax cross-entropy (the hierarchical decode loss). Rows with mask==0
 // are padding: zero grad, zero loss. `inv` = 1/num_valid (computed host-side), so
 // the caller's loss is sum(row_loss)*inv and dlogits = (p − onehot)*inv.

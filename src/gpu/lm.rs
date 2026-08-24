@@ -39,7 +39,7 @@ pub struct Lm {
     // Per-forward cache for backward.
     ids: Vec<usize>,
     logits: Option<GTensor<f32>>, // capped logits, for the SoftCap backward
-    seq: (usize, usize),     // (B, T)
+    seq: (usize, usize),          // (B, T)
     /// Forward activations, owned so the buffers survive across calls.
     cache: TrainingCache,
 }

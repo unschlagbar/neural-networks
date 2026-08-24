@@ -45,7 +45,10 @@ fn main() {
         w_token: neural_networks::tokenizer_utf8::W_TOKEN as usize,
         cap: 30.0,
     };
-    assert_eq!(CHAR_HIDDEN, OUT_HIDDEN, "decoder ties the encoder char table");
+    assert_eq!(
+        CHAR_HIDDEN, OUT_HIDDEN,
+        "decoder ties the encoder char table"
+    );
 
     let mut tokens = Vec::with_capacity(words * 6);
     let mut spans: Vec<std::range::Range<usize>> = Vec::with_capacity(words);
@@ -66,11 +69,17 @@ fn main() {
         }
         spans.push((s..tokens.len()).into());
     }
-    println!("window: {} words, {} tokens, {steps} steps", spans.len(), tokens.len());
+    println!(
+        "window: {} words, {} tokens, {steps} steps",
+        spans.len(),
+        tokens.len()
+    );
 
     let seed = std::env::temp_dir().join("train_determinism_seed.hier");
     let seed = seed.to_str().unwrap();
-    Hierarchical::new(&gpu, cfg).save(&gpu, seed, &[]).expect("save seed");
+    Hierarchical::new(&gpu, cfg)
+        .save(&gpu, seed, &[])
+        .expect("save seed");
 
     let run = || -> Vec<f32> {
         let mut model = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
@@ -104,24 +113,40 @@ fn main() {
             }
         }
         if bad.is_empty() {
-            println!("gradients: all {} tensors bit-identical over {GRAD_REPS} reps", s0.len());
+            println!(
+                "gradients: all {} tensors bit-identical over {GRAD_REPS} reps",
+                s0.len()
+            );
         } else {
             let show: Vec<&str> = bad.iter().take(12).map(|s| s.as_str()).collect();
-            println!("gradients: {}/{} unstable, e.g. {:?}", bad.len(), s0.len(), show);
+            println!(
+                "gradients: {}/{} unstable, e.g. {:?}",
+                bad.len(),
+                s0.len(),
+                show
+            );
         }
     }
 
     let a = run();
     let b = run();
     for (i, (x, y)) in a.iter().zip(&b).enumerate() {
-        let tag = if x.to_bits() == y.to_bits() { "" } else { "  <-- DIFFERS" };
+        let tag = if x.to_bits() == y.to_bits() {
+            ""
+        } else {
+            "  <-- DIFFERS"
+        };
         println!("  step {i}: {x:.9} / {y:.9}{tag}");
     }
     let same = a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits());
     let fell = a.last().is_some_and(|&l| l < a[0]);
     println!(
         "\n{}   loss {} ({:.6} -> {:.6})",
-        if same { "DETERMINISTIC" } else { "NONDETERMINISTIC" },
+        if same {
+            "DETERMINISTIC"
+        } else {
+            "NONDETERMINISTIC"
+        },
         if fell { "fell" } else { "ROSE" },
         a[0],
         a[a.len() - 1],

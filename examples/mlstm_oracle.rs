@@ -65,7 +65,10 @@ fn main() {
     cpu.wi = seeded(&[inp, heads], gate / (inp as f32).sqrt());
     cpu.wf = seeded(&[inp, heads], gate / (inp as f32).sqrt());
     cpu.bi = seeded(&[heads], gate);
-    cpu.bf = Tensor::new(&[heads], (0..heads).map(|h| 4.0 + h as f32 / heads as f32).collect());
+    cpu.bf = Tensor::new(
+        &[heads],
+        (0..heads).map(|h| 4.0 + h as f32 / heads as f32).collect(),
+    );
 
     let x = Tensor::random_seeded(&[b, t, inp], 0.5, 0xA1);
     let g = Tensor::random_seeded(&[b, t, d], 1.0, 0xA2);
@@ -151,7 +154,10 @@ fn main() {
                 .to_vec();
         }
         if std::env::var("PERCHUNK").is_ok() {
-            eprintln!("  (per-chunk y first element: {:?})", ys.iter().map(|c| c[0]).collect::<Vec<_>>());
+            eprintln!(
+                "  (per-chunk y first element: {:?})",
+                ys.iter().map(|c| c[0]).collect::<Vec<_>>()
+            );
         }
         let mut out = vec![ys.concat(), dxs.concat()];
         for gr in dev.grads() {
@@ -211,7 +217,12 @@ fn main() {
     };
     println!(
         "{:>8}  {:>11} {:>11}  {:>10} {:>10}  {:>12}",
-        "tensor", "relerr wh", format!("relerr x{chunks}"), "bias wh", format!("bias x{chunks}"), "1-corr wh"
+        "tensor",
+        "relerr wh",
+        format!("relerr x{chunks}"),
+        "bias wh",
+        format!("bias x{chunks}"),
+        "1-corr wh"
     );
     let mut worst = (0.0f64, "");
     for (i, (name, w, sc)) in want.iter().enumerate() {

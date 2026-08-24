@@ -44,16 +44,37 @@ fn main() {
     let mut model = Hierarchical::new(&gpu, cfg);
     let mut opt = AdamCfg::new(3e-4, 0.01);
 
+    // A real file when given one, else uniform 4-char words. The length spread decides
+    // how many rectangles the encoder and decoder run, and the synthetic window is one
+    // length — it cannot show anything that scales per group.
     let n_words = 1024;
     let mut tokens = Vec::new();
     let mut words: Vec<std::range::Range<usize>> = Vec::new();
-    for w in 0..n_words {
-        let start = tokens.len();
-        for c in 0..4 {
-            tokens.push((w * 7 + c * 13) % 256);
+    match std::env::args().nth(1) {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path).expect("read source");
+            let ids = neural_networks::tokenizer_utf8::Utf8Tokenizer::new().to_tokens(&text);
+            let mut start = 0usize;
+            for e in neural_networks::segment::word_ends(&ids) {
+                words.push((start..e as usize).into());
+                start = e as usize;
+                if words.len() == n_words {
+                    break;
+                }
+            }
+            tokens = ids[..start].iter().map(|&t| t as usize).collect();
         }
-        words.push((start..tokens.len()).into());
+        None => {
+            for w in 0..n_words {
+                let start = tokens.len();
+                for c in 0..4 {
+                    tokens.push((w * 7 + c * 13) % 256);
+                }
+                words.push((start..tokens.len()).into());
+            }
+        }
     }
+    println!("window: {} words, {} tokens", words.len(), tokens.len());
 
     // Warm up (allocations, lazy kernel specialization) with recording off.
     phase::set_recording(false);

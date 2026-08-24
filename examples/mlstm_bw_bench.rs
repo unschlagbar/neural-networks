@@ -77,7 +77,10 @@ fn main() {
         None => shapes.to_vec(),
     };
     let env = |k: &str, d: usize| -> usize {
-        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
     };
     // The SM clock ramps for the first few hundred iterations, so a short warmup
     // measures the ramp. `MLSTM_BENCH_WARMUP` raises it when a shape is being swept.

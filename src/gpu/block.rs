@@ -136,7 +136,13 @@ pub mod phase {
 
 /// A recurrent cell operating on `[B, T, H]` device sequences (H in == H out).
 pub trait Cell {
-    fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>, cache: &mut TrainingCache);
+    fn forward(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        out: &mut GTensor<f32>,
+        cache: &mut TrainingCache,
+    );
     fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>);
     fn zero_grad(&mut self, gpu: &Gpu);
     /// Every parameter with its gradient and AdamW moments, in a fixed order.
@@ -215,7 +221,13 @@ pub trait Cell {
 }
 
 impl Cell for SLstm {
-    fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>, cache: &mut TrainingCache) {
+    fn forward(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        out: &mut GTensor<f32>,
+        cache: &mut TrainingCache,
+    ) {
         SLstm::forward(self, gpu, x, out, cache)
     }
     fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
@@ -292,7 +304,13 @@ impl Cell for SLstm {
 /// sLSTM / mLSTM blocks) as `Vec<Box<dyn BlockLike>>`. `Block<C>` is generic over
 /// its cell, so the concrete types differ; this is the common interface.
 pub trait BlockLike {
-    fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>, cache: &mut TrainingCache);
+    fn forward(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        out: &mut GTensor<f32>,
+        cache: &mut TrainingCache,
+    );
     fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>);
     /// Forward into a freshly allocated `[B, T, H]`. Blocks are H-in == H-out, so
     /// the shape follows the input. For benchmarks and one-shot call sites; a
@@ -364,7 +382,13 @@ pub trait BlockLike {
 }
 
 impl<C: Cell> BlockLike for Block<C> {
-    fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>, cache: &mut TrainingCache) {
+    fn forward(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        out: &mut GTensor<f32>,
+        cache: &mut TrainingCache,
+    ) {
         Block::forward(self, gpu, x, out, cache)
     }
     fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
@@ -798,7 +822,13 @@ impl<C: Cell> Block<C> {
     }
 
     /// Forward over `[B, T, H]` → `y` `[B, T, H]`.
-    pub fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, y: &mut GTensor<f32>, cache: &mut TrainingCache) {
+    pub fn forward(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        y: &mut GTensor<f32>,
+        cache: &mut TrainingCache,
+    ) {
         assert_eq!(x.rank, 3, "Block::forward expects [B, T, H]");
         let (b, t, h) = (x.shape[0], x.shape[1], x.shape[2]);
         assert_eq!(h, self.hidden, "Block::forward — hidden mismatch");

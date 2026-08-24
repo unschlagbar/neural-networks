@@ -39,7 +39,10 @@ fn main() {
 
     let gpu = Gpu::new().expect("gpu");
     let tok = Utf8Tokenizer::new();
-    assert_eq!(CHAR_HIDDEN, OUT_HIDDEN, "decoder ties the encoder char table");
+    assert_eq!(
+        CHAR_HIDDEN, OUT_HIDDEN,
+        "decoder ties the encoder char table"
+    );
     // Encoder/decoder width and dqk are kept at the production values — those pick
     // which mLSTM path a stage takes. The backbone is narrowed and shortened, so
     // its sLSTM geometry (and with it the fused-time decision) is NOT production's.
@@ -63,10 +66,28 @@ fn main() {
     let shapes: Vec<Shape> = if full {
         vec![
             ("uniform-short", BACKBONE_CHUNK / 2, |_| 3, None, None),
-            ("uniform-max", BACKBONE_CHUNK / 2, |_| MAX_WORD_BYTES, None, None),
-            ("fanned", BACKBONE_CHUNK, |w| 1 + w % MAX_WORD_BYTES, None, None),
+            (
+                "uniform-max",
+                BACKBONE_CHUNK / 2,
+                |_| MAX_WORD_BYTES,
+                None,
+                None,
+            ),
+            (
+                "fanned",
+                BACKBONE_CHUNK,
+                |w| 1 + w % MAX_WORD_BYTES,
+                None,
+                None,
+            ),
             ("ragged-odd", BACKBONE_CHUNK * 2 + 37, ragged, None, None),
-            ("bimodal-wide", 4400, |w| if w % 2 == 0 { 2 } else { 11 }, None, None),
+            (
+                "bimodal-wide",
+                4400,
+                |w| if w % 2 == 0 { 2 } else { 11 },
+                None,
+                None,
+            ),
         ]
     } else {
         vec![
@@ -79,7 +100,13 @@ fn main() {
             // ragged, and a word count that is not a multiple of the chunk
             ("ragged-chunked", 133, ragged, Some(32), None),
             // two heavy buckets, each split into sub-groups by the row cap
-            ("bimodal-split", 96, |w| if w % 2 == 0 { 2 } else { 11 }, Some(64), Some(32)),
+            (
+                "bimodal-split",
+                96,
+                |w| if w % 2 == 0 { 2 } else { 11 },
+                Some(64),
+                Some(32),
+            ),
         ]
     };
 
@@ -100,7 +127,13 @@ fn main() {
         (tokens, spans)
     };
 
-    let windows: Vec<(&str, Vec<usize>, Vec<Range<usize>>, Option<usize>, Option<usize>)> = shapes
+    let windows: Vec<(
+        &str,
+        Vec<usize>,
+        Vec<Range<usize>>,
+        Option<usize>,
+        Option<usize>,
+    )> = shapes
         .iter()
         .map(|(name, words, len, chunk, cap)| {
             let (t, s) = build(*words, *len);
@@ -110,7 +143,9 @@ fn main() {
 
     let seed = std::env::temp_dir().join("window_determinism_seed.hier");
     let seed = seed.to_str().unwrap();
-    Hierarchical::new(&gpu, cfg).save(&gpu, seed, &[]).expect("save seed");
+    Hierarchical::new(&gpu, cfg)
+        .save(&gpu, seed, &[])
+        .expect("save seed");
     let fresh = |chunk, cap| {
         let mut m = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
         m.set_bb_chunk(chunk);
@@ -143,7 +178,10 @@ fn main() {
         }
     }
 
-    println!("reps {reps}, {} model\n", if full { "production" } else { "small" });
+    println!(
+        "reps {reps}, {} model\n",
+        if full { "production" } else { "small" }
+    );
     let mut any_bad = false;
 
     for (name, tokens, spans, chunk, cap) in &windows {
@@ -207,7 +245,11 @@ fn main() {
     let b = run();
     println!();
     for (i, ((x, y), w)) in a.iter().zip(&b).zip(&windows).enumerate() {
-        let tag = if x.to_bits() == y.to_bits() { "" } else { "  <-- DIFFERS" };
+        let tag = if x.to_bits() == y.to_bits() {
+            ""
+        } else {
+            "  <-- DIFFERS"
+        };
         println!("  step {i} {:<15}{x:.9} / {y:.9}{tag}", w.0);
     }
     let same = a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits());

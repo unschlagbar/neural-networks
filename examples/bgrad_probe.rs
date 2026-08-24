@@ -127,8 +127,16 @@ fn main() {
                 result::set_matmul_desc_attribute(desc, attr, p, sz).expect("desc attr");
             };
             use sys::cublasLtMatmulDescAttributes_t as A;
-            set(A::CUBLASLT_MATMUL_DESC_TRANSA, (&op_n) as *const _ as *const _, 4);
-            set(A::CUBLASLT_MATMUL_DESC_TRANSB, (&op_t) as *const _ as *const _, 4);
+            set(
+                A::CUBLASLT_MATMUL_DESC_TRANSA,
+                (&op_n) as *const _ as *const _,
+                4,
+            );
+            set(
+                A::CUBLASLT_MATMUL_DESC_TRANSB,
+                (&op_t) as *const _ as *const _,
+                4,
+            );
             if bgrad {
                 // Reduce A over k into a vector of D's row count (= out) — exactly db.
                 let epi = sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BGRADA;

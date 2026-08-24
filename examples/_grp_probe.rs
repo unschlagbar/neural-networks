@@ -19,7 +19,7 @@ fn main() {
     let lens: Vec<usize> = (0..dw).map(|w| words[w].end - words[w].start).collect();
     let mut hist: std::collections::BTreeMap<usize, usize> = Default::default();
     for &l in &lens {
-        *hist.entry(l.max(1).next_power_of_two()).or_insert(0) += 1;
+        *hist.entry(l.max(1)).or_insert(0) += 1;
     }
     println!("tokens={} words={} dw={}", ids.len(), n, dw);
     let cap = neural_networks::config::GROUP_MAX_ROWS;
@@ -28,7 +28,7 @@ fn main() {
         let tmax = *k;
         let per = (cap / (tmax + 1)).max(1);
         let pieces = c.div_ceil(per);
-        println!("  bucket len<={k:3}  words={c:5}  per_piece={per:5}  pieces={pieces}");
+        println!("  len={k:3}  words={c:5}  per_piece={per:5}  pieces={pieces}");
         groups += pieces;
     }
     println!("total encoder groups ~= {groups}");

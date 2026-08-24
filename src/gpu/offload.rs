@@ -323,8 +323,7 @@ impl Parked {
                 // SAFETY: `f32` and `u16` are both plain data with no invalid bit
                 // patterns, and n f32 cover exactly 2n u16 with identical alignment
                 // requirements met (f32 is 4-aligned, hence 2-aligned).
-                let view = unsafe { src.transmute::<u16>(n * 2) }
-                    .expect("offload: f32->u16 view");
+                let view = unsafe { src.transmute::<u16>(n * 2) }.expect("offload: f32->u16 view");
                 xfer.memcpy_dtoh(&view, dst)
             }
         }
@@ -346,8 +345,8 @@ impl Parked {
                 let n = t.len();
                 let mut dst = t.buf.slice_mut(..n);
                 // SAFETY: as in `copy_to_host` — same bytes, same element count.
-                let mut view = unsafe { dst.transmute_mut::<u16>(n * 2) }
-                    .expect("offload: f32->u16 view");
+                let mut view =
+                    unsafe { dst.transmute_mut::<u16>(n * 2) }.expect("offload: f32->u16 view");
                 xfer.memcpy_htod(src, &mut view)
             }
         }
@@ -502,7 +501,6 @@ pub struct HostPark {
     #[cfg(test)]
     allocs: usize,
 }
-
 
 /// Headroom above a park's observed peak demand, in slots.
 ///
@@ -720,8 +718,11 @@ impl HostPark {
         // owns" — the spare pool is what the bound below limits, so counting it here
         // makes the bound track its own growth and it can never bind. The pool then
         // never releases a slot, and every capacity miss page-locks one more for good.
-        let live_slots: usize =
-            self.gens[..depth].iter().map(|g| g.slots.len()).sum::<usize>() + bufs.len();
+        let live_slots: usize = self.gens[..depth]
+            .iter()
+            .map(|g| g.slots.len())
+            .sum::<usize>()
+            + bufs.len();
         self.peak_slots = self.peak_slots.max(live_slots);
 
         // Reclaim the generations this eviction displaces *first*, so their slots are
@@ -1046,7 +1047,10 @@ mod tests {
         };
         // Values exactly representable in bf16, so the comparison is exact and the
         // test says something about the transfer rather than about rounding.
-        let src = Tensor::new(&[8, 16], (0..128).map(|i| (i as f32 - 64.0) * 0.5).collect());
+        let src = Tensor::new(
+            &[8, 16],
+            (0..128).map(|i| (i as f32 - 64.0) * 0.5).collect(),
+        );
         let mut slab = GTensor::uninit(&gpu, &[8, 16]);
         slab.store(&gpu, &GTensor::from_host(&gpu, &src));
         let slab = Parked::Bf16(slab);
@@ -1064,7 +1068,11 @@ mod tests {
             matches!(back[0], Parked::Bf16(_)),
             "a bf16 slab came back as something else"
         );
-        assert_eq!(back[0].to_host(&gpu).data, before, "bf16 round trip changed bits");
+        assert_eq!(
+            back[0].to_host(&gpu).data,
+            before,
+            "bf16 round trip changed bits"
+        );
     }
 
     /// A prefetched restore must return exactly what an un-prefetched one does.
@@ -1077,10 +1085,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        let want = [
-            Tensor::random(&[9, 7], 1.0),
-            Tensor::random(&[4, 16], 1.0),
-        ];
+        let want = [Tensor::random(&[9, 7], 1.0), Tensor::random(&[4, 16], 1.0)];
 
         let mut direct = HostPark::new(&gpu, InFlight::shared()).expect("park");
         let mut early = HostPark::new(&gpu, InFlight::shared()).expect("park");
@@ -1227,8 +1232,16 @@ mod tests {
         let b = Tensor::random(&[16, 64], 1.0);
         park.evict(&gpu, vec![GTensor::from_host(&gpu, &b).into()]);
         park.sync_parked();
-        assert_eq!(park.allocs, allocs + 1, "a larger shape must page-lock a new slot");
-        assert_eq!(park.host_bytes() - before, 16 * 64 * 4, "and only that slot");
+        assert_eq!(
+            park.allocs,
+            allocs + 1,
+            "a larger shape must page-lock a new slot"
+        );
+        assert_eq!(
+            park.host_bytes() - before,
+            16 * 64 * 4,
+            "and only that slot"
+        );
     }
 
     /// A chunked sweep holds one generation per chunk, so a park's peak slot demand

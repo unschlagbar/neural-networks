@@ -58,7 +58,9 @@ fn main() {
     ];
     // `MLSTM_BENCH_ONLY=<row>` narrows the table to one shape, which is what a
     // profiler run wants — otherwise every kernel statistic mixes all four.
-    let only: Option<usize> = std::env::var("MLSTM_BENCH_ONLY").ok().and_then(|v| v.parse().ok());
+    let only: Option<usize> = std::env::var("MLSTM_BENCH_ONLY")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let shapes: Vec<(usize, usize, usize, usize)> = match only {
         Some(i) => vec![shapes[i]],
         None => shapes.to_vec(),
@@ -86,7 +88,10 @@ fn main() {
     }
     gpu.stream.synchronize().unwrap();
 
-    println!("{:>3} {:>5} {:>4} {:>4} {:>10} {:>9}", "B", "T", "H", "dqk", "ms/fwd", "clocks");
+    println!(
+        "{:>3} {:>5} {:>4} {:>4} {:>10} {:>9}",
+        "B", "T", "H", "dqk", "ms/fwd", "clocks"
+    );
     for _ in 0..repeats {
         for (&(b, t, h, dqk), (x, cell, y)) in shapes.iter().zip(cells.iter_mut()) {
             gpu.stream.synchronize().unwrap();

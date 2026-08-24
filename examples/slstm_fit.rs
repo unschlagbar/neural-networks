@@ -40,8 +40,15 @@ fn main() {
     );
 
     let widths: Vec<usize> = {
-        let a: Vec<usize> = std::env::args().skip(1).filter_map(|s| s.parse().ok()).collect();
-        if a.is_empty() { vec![256, 512, 768, 896, 1024, 1280] } else { a }
+        let a: Vec<usize> = std::env::args()
+            .skip(1)
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if a.is_empty() {
+            vec![256, 512, 768, 896, 1024, 1280]
+        } else {
+            a
+        }
     };
     let b = 1;
     println!(

@@ -47,7 +47,10 @@ pub mod ptr_probe {
         }
         use cudarc::driver::DevicePtr;
         let (p, _g) = buf.device_ptr(&gpu.stream);
-        SEQ.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap().push(p);
+        SEQ.get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .push(p);
     }
 
     /// Split the recorded addresses into `steps` equal parts and report, for each

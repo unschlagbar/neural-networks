@@ -58,7 +58,10 @@ fn main() {
 
     let gpu = Gpu::new().expect("gpu");
     let tok = Utf8Tokenizer::new();
-    assert_eq!(CHAR_HIDDEN, OUT_HIDDEN, "decoder ties the encoder char table");
+    assert_eq!(
+        CHAR_HIDDEN, OUT_HIDDEN,
+        "decoder ties the encoder char table"
+    );
     let cfg = ModelCfg {
         vocab: tok.vocab_size(),
         hc: CHAR_HIDDEN,
@@ -82,7 +85,13 @@ fn main() {
         vec![
             ("one-chunk", BACKBONE_CHUNK / 2, ragged, None, None),
             ("ragged-odd", BACKBONE_CHUNK * 2 + 37, ragged, None, None),
-            ("bimodal-wide", 4400, |w| if w % 2 == 0 { 2 } else { 11 }, None, None),
+            (
+                "bimodal-wide",
+                4400,
+                |w| if w % 2 == 0 { 2 } else { 11 },
+                None,
+                None,
+            ),
         ]
     } else {
         vec![
@@ -93,7 +102,13 @@ fn main() {
             // several backbone chunks, word count not a multiple of the chunk
             ("ragged-4chunk", 133, ragged, Some(32), None),
             // chunked backbone AND buckets split by the row cap: everything at once
-            ("bimodal-split", 96, |w| if w % 2 == 0 { 2 } else { 11 }, Some(24), Some(32)),
+            (
+                "bimodal-split",
+                96,
+                |w| if w % 2 == 0 { 2 } else { 11 },
+                Some(24),
+                Some(32),
+            ),
         ]
     };
 
@@ -113,7 +128,13 @@ fn main() {
         }
         (tokens, spans)
     };
-    let windows: Vec<(&str, Vec<usize>, Vec<Range<usize>>, Option<usize>, Option<usize>)> = shapes
+    let windows: Vec<(
+        &str,
+        Vec<usize>,
+        Vec<Range<usize>>,
+        Option<usize>,
+        Option<usize>,
+    )> = shapes
         .iter()
         .map(|(n, w, l, c, cap)| {
             let (t, s) = build(*w, *l);
@@ -123,7 +144,9 @@ fn main() {
 
     let seed = std::env::temp_dir().join("grad_coverage_seed.hier");
     let seed = seed.to_str().unwrap();
-    Hierarchical::new(&gpu, cfg).save(&gpu, seed, &[]).expect("save seed");
+    Hierarchical::new(&gpu, cfg)
+        .save(&gpu, seed, &[])
+        .expect("save seed");
     let fresh = || {
         // The pool caches the previous model's blocks, and at production width
         // that cache alone is enough to fail the next model's arena allocation.
@@ -144,7 +167,12 @@ fn main() {
         if na < 1e-12 {
             return 0.0;
         }
-        a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt() / na
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum::<f32>()
+            .sqrt()
+            / na
     };
 
     let mut model = fresh();
@@ -194,9 +222,15 @@ fn main() {
         for (_, k) in &kinds {
             *n.entry(*k).or_insert(0) += 1;
         }
-        println!("{segs} segments, {} model", if full { "production" } else { "small" });
+        println!(
+            "{segs} segments, {} model",
+            if full { "production" } else { "small" }
+        );
         println!("blocks by cell kind: {n:?}\n");
-        assert!(!kinds.values().any(|k| *k == "?"), "unrecognized block layout");
+        assert!(
+            !kinds.values().any(|k| *k == "?"),
+            "unrecognized block layout"
+        );
     }
 
     let mut any_bad = false;
@@ -322,7 +356,11 @@ fn main() {
         let ctrl = whole
             .iter()
             .zip(&plain)
-            .filter(|((_, a), (_, b))| a.iter().zip(b.iter()).any(|(x, y)| x.to_bits() != y.to_bits()))
+            .filter(|((_, a), (_, b))| {
+                a.iter()
+                    .zip(b.iter())
+                    .any(|(x, y)| x.to_bits() != y.to_bits())
+            })
             .count();
 
         let dead: Vec<&(String, usize, usize)> = zeroed.iter().flatten().collect();
@@ -334,7 +372,11 @@ fn main() {
                 share.len()
             );
         } else {
-            println!("{:<15}  *** {} (tensor, segment) pairs got zero gradient", "", dead.len());
+            println!(
+                "{:<15}  *** {} (tensor, segment) pairs got zero gradient",
+                "",
+                dead.len()
+            );
             for (n, lo, hi) in dead.iter().take(6) {
                 println!("{:<15}      {n} sees nothing from words [{lo}..{hi})", "");
             }
@@ -342,14 +384,21 @@ fn main() {
         }
         // A dropped gradient is a whole missing term, not a rounding difference: flag
         // only what stands well clear of the same tensor's repeat noise.
-        if let Some(&(d, _, cancel, n)) =
-            resid.iter().find(|&&(d, _, cancel, _)| d / cancel.max(1.0) > 0.02)
+        if let Some(&(d, _, cancel, n)) = resid
+            .iter()
+            .find(|&&(d, _, cancel, _)| d / cancel.max(1.0) > 0.02)
         {
-            println!("{:<15}  *** {n}: residual {d:.2e} at {cancel:.1}x cancellation", "");
+            println!(
+                "{:<15}  *** {n}: residual {d:.2e} at {cancel:.1}x cancellation",
+                ""
+            );
             any_bad = true;
         }
         if ctrl > 0 {
-            println!("{:<15}  *** all-true mask differs from the plain path in {ctrl} tensors", "");
+            println!(
+                "{:<15}  *** all-true mask differs from the plain path in {ctrl} tensors",
+                ""
+            );
             any_bad = true;
         }
         println!();
@@ -363,7 +412,13 @@ fn main() {
 
     println!("=== leakage: does a window inherit the one before it?\n");
     let run = |m: &mut Hierarchical,
-               w: &(&str, Vec<usize>, Vec<Range<usize>>, Option<usize>, Option<usize>)| {
+               w: &(
+        &str,
+        Vec<usize>,
+        Vec<Range<usize>>,
+        Option<usize>,
+        Option<usize>,
+    )| {
         m.set_bb_chunk(w.3);
         m.set_group_cap(w.4);
         m.forward_backward(&gpu, &w.1, &w.2)
@@ -399,7 +454,9 @@ fn main() {
                 .iter()
                 .zip(&g)
                 .filter(|((_, x), (_, y))| {
-                    x.iter().zip(y.iter()).any(|(p, q)| p.to_bits() != q.to_bits())
+                    x.iter()
+                        .zip(y.iter())
+                        .any(|(p, q)| p.to_bits() != q.to_bits())
                 })
                 .map(|((n, _), _)| n.as_str())
                 .collect();
@@ -418,7 +475,11 @@ fn main() {
                 );
                 any_bad = true;
             }
-            row.push(if bad.is_empty() && !loss_moved { '.' } else { 'X' });
+            row.push(if bad.is_empty() && !loss_moved {
+                '.'
+            } else {
+                'X'
+            });
         }
         println!("  {:<15} {}", wa.0, row.iter().collect::<String>());
     }
