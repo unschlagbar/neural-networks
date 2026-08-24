@@ -145,7 +145,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         progress.done = skip;
 
         let epoch_start = Instant::now();
-        let mut tokens_since_print = 0usize;
+        let mut tokens_since_print = 0;
         let mut time = Instant::now();
         data.rewind();
 

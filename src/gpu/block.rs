@@ -822,6 +822,9 @@ impl<C: Cell> Block<C> {
     }
 
     /// Forward over `[B, T, H]` → `y` `[B, T, H]`.
+    /// `x` and `y` must not alias: the input is read straight from the caller's buffer
+    /// rather than copied, so writing the output over it would corrupt the residual.
+    /// Every caller ping-pongs a pair, which satisfies this.
     pub fn forward(
         &mut self,
         gpu: &Gpu,
@@ -875,10 +878,10 @@ impl<C: Cell> Block<C> {
             self.fwd_chunks += 1;
         }
 
-        // Owned [N, H] copy of the input: it feeds both the norm path and the
-        // residual, and the caller's `x` is only lent to us.
-        let mut x_flat = a.pool.take(gpu, &[n, h]);
-        x_flat.copy_from(gpu, x);
+        // The input seen as [N, H]: it feeds both the norm path and the residual, and
+        // neither writes to it. A view rather than a pooled copy — the storage stays
+        // the caller's, so this must not outlive `x` and must not go back to the pool.
+        let x_flat = GTensor::view(gpu, &x.buf, 0, &[n, h]);
 
         // Residual 1: z = x + cell(pre_norm1(x)). The cell's output is already
         // normalized — each kind does it its own way, inside itself.
@@ -896,7 +899,7 @@ impl<C: Cell> Block<C> {
         cell_out.reshape_to(&[n, h]);
         let mut z = a.pool.take(gpu, &[n, h]);
         ops::add_into(gpu, &x_flat, &cell_out, &mut z);
-        a.pool.put_all([x_flat, cell_out]);
+        a.pool.put(cell_out);
 
         // Residual 2: y = z + SwiGLU(pre_norm2(z)). The three SwiGLU operands are
         // the only values backward needs, so they alone go to permanent buffers.
@@ -1017,6 +1020,7 @@ impl<C: Cell> Block<C> {
     }
 
     /// Backward over `[B, T, H]` → `dx` `[B, T, H]`.
+    /// `dy` and `dx` must not alias, for the reason given on [`forward`](Self::forward).
     pub fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
         let (b, t) = self.seq.pop().expect("Block::backward before forward");
         let (h, u) = (self.hidden, self.up);
@@ -1045,8 +1049,9 @@ impl<C: Cell> Block<C> {
         a.pool.assert_drained("Block::backward");
 
         // Owned [N, H]: read by lin_down.backward and again by the d_z residual.
-        let mut dy_flat = a.pool.take(gpu, &[n, h]);
-        dy_flat.copy_from(gpu, dy);
+        // Read-only view of the incoming delta as [N, H], the counterpart of `x_flat`
+        // in the forward: nothing writes to it, so it needs no pooled copy.
+        let dy_flat = GTensor::view(gpu, &dy.buf, 0, &[n, h]);
 
         // Residual 2.
         let mut d_mixed = a.pool.take(gpu, &[n, u]);
@@ -1090,7 +1095,7 @@ impl<C: Cell> Block<C> {
         self.pre_norm2.backward(gpu, &d_zn, &mut d_z_mlp);
         let mut d_z = a.pool.take(gpu, &[n, h]);
         ops::add_into(gpu, &d_z_mlp, &dy_flat, &mut d_z);
-        a.pool.put_all([d_zn, d_z_mlp, dy_flat]);
+        a.pool.put_all([d_zn, d_z_mlp]);
 
         // Residual 1. The cell receives a copy of d_z rather than d_z itself: its
         // backward must not clobber d_z, which the dx residual still needs.

@@ -40,6 +40,20 @@ const MAX_SLOTS: usize = WORDS_PER_SEQ * MAX_TMAX;
 /// the window's, not `max_rows`'.
 pub const MAX_GROUP_IDS: usize = 4 * MAX_SLOTS + 2 * WORDS_PER_SEQ;
 
+/// Rows the widest rectangle a group cap of `cap` allows (`0` = uncapped), so a
+/// buffer sized to it fits every group of every window. A cap is a row budget that
+/// converts to a word count, but a rectangle is never narrower than a single word,
+/// so `tmax` is the floor and a cap below it does not shrink the rectangle further.
+pub const fn max_group_rows(cap: usize) -> usize {
+    if cap == 0 {
+        MAX_SLOTS
+    } else if cap < MAX_TMAX {
+        MAX_TMAX
+    } else {
+        cap
+    }
+}
+
 /// One rectangle: a run of same-length words, and where its cells live.
 #[derive(Clone, Copy, Default)]
 struct Group {

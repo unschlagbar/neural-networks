@@ -35,7 +35,7 @@ use cudarc::driver::CudaSlice;
 
 use super::arena::{ParamArena, ParamKind, ParamSlot};
 use super::block::Block;
-use super::word_groups::{DecoderGroups, EncoderGroups, GroupIds};
+use super::word_groups::{DecoderGroups, EncoderGroups, GroupIds, max_group_rows};
 use super::{GTensor, Gpu, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm};
 use crate::config::{GROUP_MAX_ROWS, WORDS_PER_SEQ};
 use crate::format::{Meta, ModelKind, Seen, Writer};
@@ -239,52 +239,49 @@ struct Scratch {
     /// The encoder stack's ping-pong pair for the group currently running: one holds
     /// the block's input, the other its output, and they swap after every block.
     /// Presented at that group's `[n_g, tmax, HC]`.
-    enc_h: GTensor<f32>,
-    enc_h_next: GTensor<f32>,
-    /// The same pair for the backward sweep's deltas.
-    enc_d: GTensor<f32>,
-    enc_d_next: GTensor<f32>,
+    ///
+    /// One pair serves both directions. A block copies the input it is lent, so the
+    /// pair is dead the moment the stack returns, and the backward's re-forward and
+    /// its delta sweep never overlap.
+    /// Slot 0 always holds the live side; [`Scratch::rect_pair`] hands out both and
+    /// [`swap`](slice::swap) rotates them.
+    enc_rect: [GTensor<f32>; 2],
 }
 
 impl Scratch {
-    fn new(gpu: &Gpu, hc: usize) -> Self {
-        // The four encoder buffers are sized to the largest rectangle the row cap
-        // allows; an uncapped run grows them once (`fit`) and then holds that size.
-        let rect = [GROUP_MAX_ROWS, hc];
+    fn new(gpu: &Gpu, hc: usize, group_cap: usize) -> Self {
+        // Sized to the widest rectangle this model's row cap can produce, so every
+        // group of every window is a reshape of the same allocation.
+        let rect = [max_group_rows(group_cap), hc];
         Self {
             enc: EncoderGroups::new(),
             dec: DecoderGroups::new(),
             // Uninit: a window rewrites every row it presents before reading one.
             word_embeds: GTensor::uninit(gpu, &[WORDS_PER_SEQ, hc]),
-            enc_h: GTensor::uninit(gpu, &rect),
-            enc_h_next: GTensor::uninit(gpu, &rect),
-            enc_d: GTensor::uninit(gpu, &rect),
-            enc_d_next: GTensor::uninit(gpu, &rect),
+            enc_rect: [GTensor::uninit(gpu, &rect), GTensor::uninit(gpu, &rect)],
         }
     }
 
     /// Device bytes this holds for the whole run, independent of the window.
     fn fixed_bytes(&self) -> usize {
-        [
-            &self.word_embeds,
-            &self.enc_h,
-            &self.enc_h_next,
-            &self.enc_d,
-            &self.enc_d_next,
-        ]
-        .iter()
-        .map(|t| t.capacity() * size_of::<f32>())
-        .sum()
+        [&self.word_embeds, &self.enc_rect[0], &self.enc_rect[1]]
+            .iter()
+            .map(|t| t.capacity() * size_of::<f32>())
+            .sum()
     }
-}
 
-/// Present a reused buffer at `dims`, reallocating only if it does not fit. The
-/// contents are not preserved — every caller overwrites what it presents.
-fn fit(gpu: &Gpu, t: &mut GTensor<f32>, dims: &[usize]) {
-    if dims.iter().product::<usize>() > t.capacity() {
-        *t = GTensor::uninit(gpu, dims);
-    } else {
-        t.shrink_to(dims);
+    /// Present both halves of the encoder pair at one group's rectangle.
+    fn fit_rect(&mut self, dims: &[usize]) {
+        for t in self.enc_rect.iter_mut() {
+            t.shrink_to(dims);
+        }
+    }
+
+    /// `(live, spare)` — two `&mut` into the same array need a split, so it is done
+    /// once here rather than at every call site.
+    fn rect_pair(&mut self) -> (&mut GTensor<f32>, &mut GTensor<f32>) {
+        let (live, spare) = self.enc_rect.split_at_mut(1);
+        (&mut live[0], &mut spare[0])
     }
 }
 
@@ -696,11 +693,11 @@ impl Hierarchical {
 
         let hc = self.cfg.hc;
         let mut sc = self.scratch.take().unwrap_or_else(|| {
-            let sc = Scratch::new(gpu, hc);
+            let sc = Scratch::new(gpu, hc, self.group_cap());
             if self.flags.mem {
                 let mib = |b: usize| b as f64 / (1 << 20) as f64;
                 println!(
-                    "  fixed scratch: word embeds {:.2} MiB, group ids {:.2} MiB \
+                    "  fixed scratch: tensors {:.2} MiB, group ids {:.2} MiB \
                      (+{:.2} MiB pinned host)",
                     mib(sc.fixed_bytes()),
                     mib(GroupIds::BYTES_PER_SIDE),
@@ -762,7 +759,7 @@ impl Hierarchical {
     }
 
     /// Run one encoder group's rectangle through the block stack, leaving the result in
-    /// `sc.enc_h` at `[rows, HC]`. The group's id rectangle must already be uploaded to
+    /// `sc.enc_rect` at `[rows, HC]`. The group's id rectangle must already be uploaded to
     /// [`enc_id::IDS`].
     fn encoder_stack_forward(
         &mut self,
@@ -774,24 +771,24 @@ impl Hierarchical {
         cache: &mut TrainingCache,
     ) {
         let hc = self.cfg.hc;
-        // Blocks are H-in == H-out, so one spare buffer ping-pongs the stack. Swapping
-        // the buffers themselves keeps the live activations in `enc_h` after every
-        // block, so the caller always finds the result there.
-        fit(gpu, &mut sc.enc_h, &[n_g, tmax, hc]);
-        fit(gpu, &mut sc.enc_h_next, &[n_g, tmax, hc]);
+        // Blocks are H-in == H-out, so one spare buffer ping-pongs the stack. Rotating
+        // the pair after every block keeps the live activations in slot 0, so the caller
+        // always finds the result there.
+        sc.fit_rect(&[n_g, tmax, hc]);
         ops::embedding_gather_u32_into(
             gpu,
-            &mut sc.enc_h,
+            &mut sc.enc_rect[0],
             &self.table,
             &self.ids.list(enc_id::IDS),
             rows,
             hc,
         );
         for blk in self.encoder.blocks.iter_mut() {
-            blk.forward(gpu, &sc.enc_h, &mut sc.enc_h_next, cache);
-            mem::swap(&mut sc.enc_h, &mut sc.enc_h_next);
+            let (live, spare) = sc.rect_pair();
+            blk.forward(gpu, live, spare, cache);
+            sc.enc_rect.swap(0, 1);
         }
-        sc.enc_h.reshape_to(&[rows, hc]);
+        sc.enc_rect[0].reshape_to(&[rows, hc]);
     }
 
     /// PHASE 1 — encode every word, one dense rectangle per length group, into
@@ -838,7 +835,7 @@ impl Hierarchical {
             ops::pack_rows_u32(
                 gpu,
                 &mut sc.word_embeds,
-                &sc.enc_h,
+                &sc.enc_rect[0],
                 &self.ids.list(enc_id::WORDS),
                 tmax,
                 tmax - 1,
@@ -1316,30 +1313,30 @@ impl Hierarchical {
 
             // This group's word-embedding grad onto its [W]-step rows; zeros elsewhere,
             // since no other timestep reached the loss.
-            fit(gpu, &mut sc.enc_d, &[rows, hc]);
-            fit(gpu, &mut sc.enc_d_next, &[n_words, tmax, hc]);
-            sc.enc_d.zero_(gpu);
+            sc.fit_rect(&[rows, hc]);
+            sc.enc_rect[0].zero_(gpu);
             ops::unpack_rows_u32(
                 gpu,
-                &mut sc.enc_d,
+                &mut sc.enc_rect[0],
                 d_word_embeds,
                 &self.ids.list(enc_id::WORDS),
                 tmax,
                 tmax - 1,
                 n_words,
             );
-            sc.enc_d.reshape_to(&[n_words, tmax, hc]);
+            sc.fit_rect(&[n_words, tmax, hc]);
             for blk in self.encoder.blocks.iter_mut().rev() {
-                blk.backward(gpu, &sc.enc_d, &mut sc.enc_d_next);
-                mem::swap(&mut sc.enc_d, &mut sc.enc_d_next);
+                let (live, spare) = sc.rect_pair();
+                blk.backward(gpu, live, spare);
+                sc.enc_rect.swap(0, 1);
             }
-            sc.enc_d.reshape_to(&[rows, hc]);
+            sc.enc_rect[0].reshape_to(&[rows, hc]);
             ops::embedding_scatter_add_u32(
                 gpu,
                 &mut self.dtable,
                 &self.ids.list(enc_id::IDS),
                 rows,
-                &sc.enc_d,
+                &sc.enc_rect[0],
                 hc,
             );
             for blk in self.encoder.blocks.iter_mut() {
