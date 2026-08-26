@@ -30,7 +30,6 @@ fn main() {
     use neural_networks::gpu::{GTensor, Gpu, mlstm::MLstm};
     use neural_networks::tensor::Tensor;
 
-    let mut cache = TrainingCache::new();
 
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -39,6 +38,7 @@ fn main() {
             return;
         }
     };
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
 
     // Reading the clock is what makes a suspicious round attributable rather than
     // just noisy; absent nvidia-smi it is simply not reported.
@@ -83,14 +83,14 @@ fn main() {
             let mut dev = MLstm::new_rand(&gpu, d, d, heads, dqk);
             let mut y = GTensor::uninit(&gpu, &[b, t, d]);
             for _ in 0..3 {
-                dev.forward(&gpu, &x, &mut y, &mut cache);
-                let _ = dev.backward_alloc(&gpu, &g);
+                dev.forward(&gpu, &x, &mut y, &cache);
+                let _ = dev.backward_alloc(&gpu, &g, &cache);
             }
             gpu.stream.synchronize().unwrap();
             let t0 = Instant::now();
             for _ in 0..iters {
-                dev.forward(&gpu, &x, &mut y, &mut cache);
-                let _ = dev.backward_alloc(&gpu, &g);
+                dev.forward(&gpu, &x, &mut y, &cache);
+                let _ = dev.backward_alloc(&gpu, &g, &cache);
             }
             gpu.stream.synchronize().unwrap();
             t0.elapsed().as_secs_f64() / iters as f64 * 1e3

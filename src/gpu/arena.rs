@@ -18,6 +18,7 @@
 
 use cudarc::driver::{CudaSlice, PushKernelArg};
 
+use super::temp::TempCache;
 use super::{GTensor, Gpu, ops};
 use crate::nn2::optim::AdamCfg;
 
@@ -198,12 +199,42 @@ fn pack(gpu: &Gpu, slots: &mut [ParamSlot<'_>], total: usize, role: usize) -> Cu
     base
 }
 
-#[derive(Default)]
-pub struct TrainingCache {}
+/// Everything a window's forward and backward borrow rather than allocate.
+///
+/// Threaded through every layer's `forward`/`backward` by shared reference: a caller
+/// holds several temporaries while calling further down the stack, so a `&mut` here
+/// would forbid the nesting that makes the slots worth having. See [`super::temp`].
+pub struct TrainingCache {
+    /// Scratch slots for every temporary, of every stage, in both directions.
+    pub temps: TempCache,
+}
 
 impl TrainingCache {
-    pub fn new() -> Self {
-        Self {}
+    /// Allocate the window scratch for a model whose widest temporary is `elems`
+    /// `f32`s — see [`temp::widest`](super::temp::widest).
+    pub fn new(gpu: &Gpu, elems: usize, small_elems: usize, chunk_elems: usize) -> Self {
+        Self {
+            temps: TempCache::new(gpu, elems, small_elems, chunk_elems),
+        }
+    }
+
+    /// A cache for a single stack of `rows` × `hidden`, for a one-shot call site or
+    /// a test that runs a layer on its own rather than as part of a model.
+    ///
+    /// Sized for the widest head split (`dqk = hidden`, `heads = hidden`), so it
+    /// covers any geometry that stack could have.
+    pub fn for_shape(gpu: &Gpu, rows: usize, hidden: usize) -> Self {
+        Self::new(
+            gpu,
+            super::temp::widest(rows, hidden, 1, hidden, 0),
+            super::temp::widest_small(rows, hidden),
+            super::temp::widest_chunk(rows, rows, 1, hidden, hidden, 1),
+        )
+    }
+
+    /// Device bytes held for the whole run.
+    pub fn bytes(&self) -> usize {
+        self.temps.bytes()
     }
 }
 

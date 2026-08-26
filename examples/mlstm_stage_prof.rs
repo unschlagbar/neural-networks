@@ -25,7 +25,6 @@ fn main() {
     use neural_networks::gpu::{GTensor, Gpu, ops};
     use neural_networks::tensor::Tensor;
 
-    let mut cache = TrainingCache::new();
 
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -34,6 +33,7 @@ fn main() {
             return;
         }
     };
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
 
     /// Wall time of `iters` calls, synchronizing once at each end.
     fn timed(gpu: &Gpu, warmup: usize, iters: usize, mut f: impl FnMut()) -> f64 {
@@ -81,9 +81,9 @@ fn main() {
 
     let mut y = GTensor::uninit(&gpu, &[b, t, d]);
     let fwd = timed(&gpu, 2, 10, || {
-        cell.forward(&gpu, &x, &mut y, &mut cache);
+        cell.forward(&gpu, &x, &mut y, &cache);
         // backward must consume the cache the forward built, or it grows unboundedly
-        let _ = cell.backward_alloc(&gpu, &dy);
+        let _ = cell.backward_alloc(&gpu, &dy, &cache);
     });
     println!(
         "fwd+bwd (chunk {}):  {:>7.2} ms",
@@ -93,8 +93,8 @@ fn main() {
 
     // Forward alone, so the two halves can be separated.
     let f_only = timed(&gpu, 2, 10, || {
-        cell.forward(&gpu, &x, &mut y, &mut cache);
-        let _ = cell.backward_alloc(&gpu, &dy);
+        cell.forward(&gpu, &x, &mut y, &cache);
+        let _ = cell.backward_alloc(&gpu, &dy, &cache);
     });
     let _ = f_only;
 
@@ -157,7 +157,19 @@ fn main() {
     let mut dxh = GTensor::uninit(&gpu, &[bh * t, 2 * dqk + 2 * dhv]);
     let f_all = timed(&gpu, 3, 20, || {
         let sv = ops::mlstm_fused_fw(&gpu, &xh, &gates, lf, None, stf);
-        let _ = ops::mlstm_fused_bw(&gpu, &sv, &xh, &gates, &mut dxh, &dyt, None, stf);
+        let mut dgates = GTensor::uninit(&gpu, &[b * t, 2 * heads]);
+        let _ = ops::mlstm_fused_bw(
+            &gpu,
+            &sv,
+            &xh,
+            &gates,
+            &mut dxh,
+            &dyt,
+            None,
+            &mut dgates,
+            &cache.temps,
+            stf,
+        );
     });
     println!("fused fwd only:      {:>7.2} ms", f_fw * 1e3);
     println!(

@@ -25,9 +25,9 @@ fn main() {
     let chunks: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
     assert!(t % chunks == 0, "t must divide into chunks");
 
-    let mut cache = TrainingCache::new();
 
     let gpu = Gpu::new().expect("gpu");
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
     let (b, heads, dqk) = (1usize, 8usize, 96usize);
     let d = heads * dqk;
 
@@ -66,11 +66,11 @@ fn main() {
     let mut dxs = Vec::new();
     for c in 0..chunks {
         let mut y = GTensor::uninit(&gpu, &[b, step, d]);
-        cell.forward(&gpu, &part(&xh, c), &mut y, &mut cache);
+        cell.forward(&gpu, &part(&xh, c), &mut y, &cache);
         ys.push(y);
     }
     for c in (0..chunks).rev() {
-        dxs.push(cell.backward_alloc(&gpu, &part(&gh, c)));
+        dxs.push(cell.backward_alloc(&gpu, &part(&gh, c), &cache));
     }
 
     println!("t={t} chunks={chunks} d={d} heads={heads} dqk={dqk}");

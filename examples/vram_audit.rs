@@ -229,12 +229,10 @@ fn main() {
                 worst_at = (sp.len(), tk.len());
             }
             if it % 4 == 0 || now >= peak {
-                let ps = model.pool_shapes();
-                let sizes: usize = ps.iter().map(|(_, s, _)| s).sum();
-                let bufs: usize = ps.iter().map(|(_, _, b)| b).sum();
+                let (high, slots) = model.temp_high_water();
                 println!(
                     "  it {it:3}: {:5} words, {:6} tokens -> live {now:8.0} MB  \
-                     (peak {peak:8.0})  pool: {sizes} sizes / {bufs} bufs",
+                     (peak {peak:8.0})  temp slots: {high}/{slots}",
                     sp.len(),
                     tk.len()
                 );
@@ -250,18 +248,17 @@ fn main() {
         let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
         println!("\n--- after the sweep, by owner (MB) ---");
         println!(
-            "{:<10} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
-            "stage", "ffn", "pool", "norms", "proj", "cell_saved", "cell_other"
+            "{:<10} {:>8} {:>8} {:>8} {:>10} {:>10}",
+            "stage", "ffn", "norms", "proj", "cell_saved", "cell_other"
         );
         for (label, c) in model.act_breakdown() {
             println!(
-                "{label:<10} {:>8.0} {:>8.0} {:>8.0} {:>8.0} {:>10.0} {:>10.0}",
+                "{label:<10} {:>8.0} {:>8.0} {:>8.0} {:>10.0} {:>10.0}",
                 mb(c[0]),
                 mb(c[1]),
                 mb(c[2]),
                 mb(c[3]),
-                mb(c[4]),
-                mb(c[5])
+                mb(c[4])
             );
         }
     }
@@ -295,23 +292,22 @@ fn main() {
         mb(tp + ta)
     );
 
-    // Which owner inside each stage holds it. Only `ffn` and `pool` are reachable
+    // Which owner inside each stage holds it. Only `ffn` is reachable
     // from drop_saved_act + trim_to; `norms`, `proj` and `cell_other` are held inside
     // the sub-layers and survive both.
     println!("\n--- activations by owner (MB) ---");
     println!(
-        "{:<10} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
-        "stage", "ffn", "pool", "norms", "proj", "cell_saved", "cell_other"
+        "{:<10} {:>8} {:>8} {:>8} {:>10} {:>10}",
+        "stage", "ffn", "norms", "proj", "cell_saved", "cell_other"
     );
     for (label, c) in model.act_breakdown() {
         println!(
-            "{label:<10} {:>8.0} {:>8.0} {:>8.0} {:>8.0} {:>10.0} {:>10.0}",
+            "{label:<10} {:>8.0} {:>8.0} {:>8.0} {:>10.0} {:>10.0}",
             mb(c[0]),
             mb(c[1]),
             mb(c[2]),
             mb(c[3]),
-            mb(c[4]),
-            mb(c[5])
+            mb(c[4])
         );
     }
 

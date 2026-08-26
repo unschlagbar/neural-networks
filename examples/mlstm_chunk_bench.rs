@@ -30,7 +30,6 @@ fn main() {
     use neural_networks::gpu::{GTensor, Gpu, mlstm::MLstm};
     use neural_networks::tensor::Tensor;
 
-    let mut cache = TrainingCache::new();
 
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -39,6 +38,7 @@ fn main() {
             return;
         }
     };
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
 
     let mem_used = || {
         let (free, total) = cudarc::driver::result::mem_get_info().expect("mem_get_info");
@@ -72,23 +72,23 @@ fn main() {
         // Peak: memory live between forward and backward (decay matrices resident).
         let before = mem_used();
         let mut y = GTensor::uninit(&gpu, &[b, t, d]);
-        dev.forward(&gpu, &x, &mut y, &mut cache);
+        dev.forward(&gpu, &x, &mut y, &cache);
         gpu.stream.synchronize().unwrap();
         let peak = mem_used();
         drop(y);
-        let _ = dev.backward_alloc(&gpu, &g);
+        let _ = dev.backward_alloc(&gpu, &g, &cache);
         gpu.stream.synchronize().unwrap();
 
         let mut y = GTensor::uninit(&gpu, &[b, t, d]);
         for _ in 0..warmup {
-            dev.forward(&gpu, &x, &mut y, &mut cache);
-            let _ = dev.backward_alloc(&gpu, &g);
+            dev.forward(&gpu, &x, &mut y, &cache);
+            let _ = dev.backward_alloc(&gpu, &g, &cache);
         }
         gpu.stream.synchronize().unwrap();
         let t0 = Instant::now();
         for _ in 0..iters {
-            dev.forward(&gpu, &x, &mut y, &mut cache);
-            let _ = dev.backward_alloc(&gpu, &g);
+            dev.forward(&gpu, &x, &mut y, &cache);
+            let _ = dev.backward_alloc(&gpu, &g, &cache);
         }
         gpu.stream.synchronize().unwrap();
         let secs = t0.elapsed().as_secs_f64();

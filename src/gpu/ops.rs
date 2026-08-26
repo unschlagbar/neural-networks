@@ -373,93 +373,8 @@ pub fn quantize_bf16_(gpu: &Gpu, t: &mut GTensor<f32>) {
     unsafe { b.launch(elem_cfg(gpu, n as u32)) }.expect("quantize_bf16_inplace");
 }
 
-/// One bf16 copy of an activation that several layers read.
-///
-/// mLSTM hands the same `xf` to three projections, and the same `xf` again to their
-/// three backwards. Each `Linear` owns a private [`GemmBf16`], so none can see the
-/// others' staged copy and the tensor is narrowed six times per cell. This holds the
-/// single narrowed copy; the layers take it through [`Linear::forward_staged`] and
-/// [`Linear::backward_staged_x`].
-///
-/// It is **scratch**, live only within one cell's forward or backward. Blocks run
-/// strictly one at a time (`Lm` sweeps `blocks.iter_mut()`, and `.rev()` backward), so
-/// one buffer serves the whole stack — a per-cell copy would hold 32 of them at the
-/// backbone, 31 of which are idle. [`with_shared_lhs`] is that single instance.
-///
-/// Deliberately not a `Pool`: the shape is the cell's `[N, inp]`, the same on every
-/// call, so there is nothing to search for and nothing to round up.
-#[derive(Default)]
-pub struct SharedLhs {
-    t: Option<super::GTensor<u16>>,
-}
 
 thread_local! {
-    /// The staging scratch, and the CUDA stream it was allocated on.
-    ///
-    /// Thread-local because the CPU-side replica pool runs stacks on several threads at
-    /// once and a device buffer must not be shared across them. The stream tag is what
-    /// makes it safe to keep across calls: a buffer belongs to the context that
-    /// allocated it, and reusing one under a *different* context is a stale device
-    /// pointer — silent corruption, not an error. Tests hit exactly that (each builds
-    /// its own `Gpu` while the thread-local survives), which is how it was caught.
-    static SHARED_LHS: std::cell::RefCell<(Option<usize>, SharedLhs)> =
-        const { std::cell::RefCell::new((None, SharedLhs { t: None })) };
-}
-
-/// Run `f` with the shared staging buffer holding `src` narrowed to bf16.
-///
-/// The closure form is what keeps this sound: the borrow cannot outlive the call, so
-/// nothing can hold the buffer across a point where another cell would restage it.
-pub fn with_shared_lhs<R>(
-    gpu: &Gpu,
-    src: &GTensor<f32>,
-    f: impl FnOnce(&super::GTensor<u16>) -> R,
-) -> R {
-    SHARED_LHS.with(|s| {
-        let mut s = s.borrow_mut();
-        let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
-        if s.0 != Some(tag) {
-            s.1.clear();
-            s.0 = Some(tag);
-        }
-        let staged = s.1.stage(gpu, src);
-        f(staged)
-    })
-}
-
-/// Device bytes the shared staging scratch holds on this thread. Diagnostic.
-pub fn shared_lhs_bytes() -> usize {
-    SHARED_LHS.with(|s| s.borrow().1.retained_bytes())
-}
-
-thread_local! {
-    /// The fused forward's ping-pong `h` mirror, `[B, HP]` holding two bf16 planes
-    /// packed into one fp32 buffer.
-    ///
-    /// Kept across calls because it is a few KB and every cell in the stack wants the
-    /// same shape; reallocating per launch would churn the pool inside the hot loop.
-    /// Stream-tagged for the same reason as [`SHARED_LHS`] — a buffer reused under a
-    /// different context is a stale device pointer.
-    static FUSED_ALT: std::cell::RefCell<(Option<usize>, Option<GTensor<f32>>)> =
-        const { std::cell::RefCell::new((None, None)) };
-
-    /// The fused forward's global `Wh` tail, bf16 packed into fp32 like [`FUSED_ALT`].
-    /// A block re-reads its share of it once per timestep, so it wants to stay put and
-    /// stay in L2 rather than be reallocated per launch.
-    static FUSED_TAIL: std::cell::RefCell<(Option<usize>, Option<GTensor<f32>>)> =
-        const { std::cell::RefCell::new((None, None)) };
-
-    /// The batched forward's ping-ponged bf16 `h` mirror and the batched backward's
-    /// `dg` mirror, each two planes packed into one fp32 scratch. Their own buffers
-    /// rather than [`FUSED_ALT`]'s, which is sized to an exact shape: the encoder walks
-    /// twenty group widths per window, and reallocating per group put an allocate-and-
-    /// zero of up to a megabyte in front of every one of them.
-    static BATCHED_H: std::cell::RefCell<(Option<usize>, Option<GTensor<f32>>)> =
-        const { std::cell::RefCell::new((None, None)) };
-    static BATCHED_DG: std::cell::RefCell<(Option<usize>, Option<GTensor<f32>>)> =
-        const { std::cell::RefCell::new((None, None)) };
-
-
     /// Resolved batched geometry per `(kernel, H, B)`. Choosing one costs an NVRTC
     /// lookup and a driver occupancy query per `rpt` candidate, and the encoder asks the
     /// same twenty questions every window — so the answer is remembered, including a
@@ -487,143 +402,12 @@ fn cached_geom(
     })
 }
 
-/// Run `f` with one of the batched kernels' mirrors, at least `len` fp32 elements —
-/// two bf16 planes' worth.
-///
-/// Grown, never shrunk, and never initialised: both kernels address their planes from
-/// compile-time widths and read nothing they did not write this launch, so a buffer
-/// larger than the shape needs is slack rather than a hazard.
-fn with_batched_mirror<R>(
-    slot: &'static std::thread::LocalKey<std::cell::RefCell<(Option<usize>, Option<GTensor<f32>>)>>,
-    gpu: &Gpu,
-    len: usize,
-    f: impl FnOnce(&mut GTensor<f32>) -> R,
-) -> R {
-    slot.with(|s| {
-        let mut s = s.borrow_mut();
-        let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
-        if s.0 != Some(tag) {
-            s.1 = None;
-            s.0 = Some(tag);
-        }
-        if s.1.as_ref().is_none_or(|t| t.len() < len) {
-            s.1 = Some(GTensor::uninit(gpu, &[len]));
-        }
-        f(s.1.as_mut().unwrap())
-    })
-}
 
 
 
-/// Run `f` with a zeroed `[rows, cols]` scratch tensor, reallocated only on a shape
-/// or context change.
-fn with_fused_alt<R>(
-    gpu: &Gpu,
-    rows: usize,
-    cols: usize,
-    f: impl FnOnce(&mut GTensor<f32>) -> R,
-) -> R {
-    FUSED_ALT.with(|s| {
-        let mut s = s.borrow_mut();
-        let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
-        if s.0 != Some(tag) {
-            s.1 = None;
-            s.0 = Some(tag);
-        }
-        if s.1.as_ref().map_or(true, |t| t.dims() != [rows, cols]) {
-            s.1 = Some(GTensor::zeros(gpu, &[rows, cols]));
-        }
-        f(s.1.as_mut().unwrap())
-    })
-}
 
-/// Run `f` with the fused forward's `Wh` tail scratch, `len` fp32 elements. The
-/// kernel fills it before its first `grid.sync()`, so the contents need not survive
-/// a call — only the allocation does.
-fn with_fused_tail<R>(gpu: &Gpu, len: usize, f: impl FnOnce(&mut GTensor<f32>) -> R) -> R {
-    FUSED_TAIL.with(|s| {
-        let mut s = s.borrow_mut();
-        let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
-        if s.0 != Some(tag) {
-            s.1 = None;
-            s.0 = Some(tag);
-        }
-        // Grown, never resized down: the kernel addresses the tail from compile-time
-        // constants and never reads past its own columns, so a buffer larger than
-        // this launch needs is simply slack — and the stack alternates widths (the
-        // backbone has a tail, the encoder and decoder do not), which an exact fit
-        // would turn into an allocate-and-zero on every phase change.
-        //
-        // One element even with no tail: the kernel takes the pointer either way, and
-        // a null argument is not something the launch builder can express.
-        let want = len.max(1);
-        if s.1.as_ref().map_or(true, |t| t.len() < want) {
-            s.1 = Some(GTensor::zeros(gpu, &[want]));
-        }
-        f(s.1.as_mut().unwrap())
-    })
-}
 
-/// Release the fused ping-pong scratch on this thread.
-pub fn clear_fused_alt() {
-    for slot in [&BATCHED_H, &BATCHED_DG] {
-        slot.with(|s| {
-            let mut s = s.borrow_mut();
-            s.1 = None;
-            s.0 = None;
-        });
-    }
-    FUSED_ALT.with(|s| {
-        let mut s = s.borrow_mut();
-        s.1 = None;
-        s.0 = None;
-    });
-    FUSED_TAIL.with(|s| {
-        let mut s = s.borrow_mut();
-        s.1 = None;
-        s.0 = None;
-    });
-}
 
-/// Release the shared staging scratch on this thread.
-pub fn clear_shared_lhs() {
-    SHARED_LHS.with(|s| {
-        let mut s = s.borrow_mut();
-        s.1.clear();
-        s.0 = None;
-    });
-}
-
-impl SharedLhs {
-    /// Narrow `src` into the shared buffer and hand back a reference to it.
-    ///
-    /// Reuse is bounded, unlike the fixed-shape staging inside [`GemmBf16`]: one buffer
-    /// serves every cell width and every window size, so keeping whatever the largest
-    /// one left would ratchet to the biggest shape ever seen and hold it forever.
-    pub fn stage(&mut self, gpu: &Gpu, src: &GTensor<f32>) -> &super::GTensor<u16> {
-        let n = src.len();
-        let keep = self
-            .t
-            .as_ref()
-            .is_some_and(|t| t.capacity() >= n && t.capacity() <= n.saturating_mul(4));
-        if keep {
-            self.t.as_mut().expect("checked").shrink_to(src.dims());
-        } else {
-            self.t = Some(super::GTensor::uninit(gpu, src.dims()));
-        }
-        self.t.as_mut().expect("just filled").store(gpu, src);
-        self.t.as_ref().expect("staged")
-    }
-
-    /// Device bytes held (2 bytes/element). Diagnostic.
-    pub fn retained_bytes(&self) -> usize {
-        self.t.as_ref().map_or(0, |t| t.capacity() * 2)
-    }
-
-    pub fn clear(&mut self) {
-        self.t = None;
-    }
-}
 
 /// Reusable bf16 staging for a layer's GEMM operands.
 ///
@@ -829,7 +613,7 @@ impl GemmBf16 {
         matmul_bf16_into(gpu, form, lhs, rhs, c, beta);
     }
 
-    /// `Y = X·W` where `X` is **already narrowed** into a [`SharedLhs`], so this
+    /// `Y = X·W` where `X` is **already narrowed** to bf16 by the caller, so this
     /// launches no cast for it. The weight still comes from the cache.
     pub fn run_staged_lhs(
         &mut self,
@@ -857,7 +641,7 @@ impl GemmBf16 {
     }
 
     /// [`run_backward`](Self::run_backward) where `x` is already narrowed into a
-    /// [`SharedLhs`] — only `dy` is cast here.
+    /// bf16 by the caller — only `dy` is cast here.
     pub fn run_backward_staged_x(
         &mut self,
         gpu: &Gpu,
@@ -1291,15 +1075,26 @@ pub fn broadcast_row_resid(
 
 /// Accumulate the column sum of `dy` (`[rows, N]`) into `db` (`[N]`) — the bias
 /// gradient.
-pub fn add_col_sum(gpu: &Gpu, db: &mut GTensor<f32>, dy: &GTensor<f32>) {
-    col_sum_into(gpu, db, dy, None, None);
+pub fn add_col_sum(
+    gpu: &Gpu,
+    db: &mut GTensor<f32>,
+    dy: &GTensor<f32>,
+    cache: &super::temp::TempCache,
+) {
+    col_sum_into(gpu, db, dy, None, None, cache);
 }
 
 /// [`add_col_sum`] over the elementwise product `dy ⊙ mul` — RMSNorm's `dgamma`,
 /// which is the same reduction with one more operand.
-pub fn add_col_sum_mul(gpu: &Gpu, db: &mut GTensor<f32>, dy: &GTensor<f32>, mul: &GTensor<f32>) {
+pub fn add_col_sum_mul(
+    gpu: &Gpu,
+    db: &mut GTensor<f32>,
+    dy: &GTensor<f32>,
+    mul: &GTensor<f32>,
+    cache: &super::temp::TempCache,
+) {
     assert_eq!(dy.len(), mul.len(), "add_col_sum_mul: operand sizes");
-    col_sum_into(gpu, db, dy, Some(WideOrSlab::F32(mul)), None);
+    col_sum_into(gpu, db, dy, Some(WideOrSlab::F32(mul)), None, cache);
 }
 
 /// [`add_col_sum_mul`] with each column divided by `div[o]` after the reduction.
@@ -1314,10 +1109,11 @@ pub fn add_col_sum_mul_div(
     dy: &GTensor<f32>,
     mul: WideOrSlab<'_>,
     div: &GTensor<f32>,
+    cache: &super::temp::TempCache,
 ) {
     assert_eq!(dy.as_2d(), mul.as_2d(), "add_col_sum_mul_div: operand shapes");
     assert_eq!(db.len(), div.len(), "add_col_sum_mul_div: divisor width");
-    col_sum_into(gpu, db, dy, Some(mul), Some(div));
+    col_sum_into(gpu, db, dy, Some(mul), Some(div), cache);
 }
 
 /// `db[o] += Σ_r dy[r, o]` (times `mul[r, o]` if given), **deterministically**.
@@ -1385,6 +1181,7 @@ fn col_sum_into(
     dy: &GTensor<f32>,
     mul: Option<WideOrSlab<'_>>,
     div: Option<&GTensor<f32>>,
+    cache: &super::temp::TempCache,
 ) {
     // `as_2d`, not `rows()`/`cols()`: RMSNorm hands this a `[B, T, d]` activation.
     let (rows, n) = dy.as_2d();
@@ -1412,7 +1209,7 @@ fn col_sum_into(
     let bands = col_sum_bands(gpu, rows, by, cfg.grid_dim.0 as usize);
     if bands > 1 {
         col_sum_banded(
-            gpu, db, dy, mul, use_mul, div, use_div, rows, n, bx, by, cfg, bands,
+            gpu, db, dy, mul, use_mul, div, use_div, rows, n, bx, by, cfg, bands, cache,
         );
         return;
     }
@@ -1465,11 +1262,14 @@ fn col_sum_banded(
     by: usize,
     cfg: LaunchConfig,
     bands: usize,
+    cache: &super::temp::TempCache,
 ) {
     let (rows_i, n_i) = (rows as i32, n as i32);
     let band_i = rows.div_ceil(bands) as i32;
     let bands_i = bands as i32;
-    with_col_sum_part(gpu, bands, n, |part| {
+    {
+        let mut part = cache.get::<f32>(gpu, &[bands, n]);
+        let part = &mut *part;
         let f = gpu.kernels.get(mul.pick("col_sum_part", "col_sum_part_slab"));
         let mut lb = gpu.stream.launch_builder(&f);
         lb.arg(&mut part.buf).arg(&dy.buf);
@@ -1502,51 +1302,11 @@ fn col_sum_banded(
             })
         }
         .expect("col_sum_merge");
-    });
+    }
 }
 
-thread_local! {
-    /// Band partials for [`col_sum_banded`], and the stream they were allocated on.
-    ///
-    /// A few tens of KB at the largest shape here, wanted by every Linear and RMSNorm
-    /// backward in the stack, so it is held across calls rather than allocated per
-    /// reduction. Stream-tagged for the same reason as [`SHARED_LHS`].
-    static COL_SUM_PART: std::cell::RefCell<(Option<usize>, Option<GTensor<f32>>)> =
-        const { std::cell::RefCell::new((None, None)) };
-}
 
-/// Run `f` with a `[bands, n]` scratch, reallocated only when it is too small or the
-/// context changed. Contents are undefined on entry — `col_sum_part` writes every
-/// element it later reads.
-fn with_col_sum_part<R>(
-    gpu: &Gpu,
-    bands: usize,
-    n: usize,
-    f: impl FnOnce(&mut GTensor<f32>) -> R,
-) -> R {
-    COL_SUM_PART.with(|s| {
-        let mut s = s.borrow_mut();
-        let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
-        if s.0 != Some(tag) {
-            s.1 = None;
-            s.0 = Some(tag);
-        }
-        let need = bands * n;
-        match &mut s.1 {
-            Some(t) if t.capacity() >= need => t.shrink_to(&[bands, n]),
-            _ => s.1 = Some(GTensor::uninit(gpu, &[bands, n])),
-        }
-        f(s.1.as_mut().expect("just filled"))
-    })
-}
 
-/// Release the column-sum band scratch on this thread.
-pub fn clear_col_sum_part() {
-    COL_SUM_PART.with(|s| {
-        let mut s = s.borrow_mut();
-        s.1 = None;
-    });
-}
 
 /// Gather rows of `table` (`[vocab, dim]`) by `ids` into a `[ids.len(), dim]`
 /// tensor.
@@ -1848,9 +1608,20 @@ pub fn rms_norm_backward(
     gamma: &GTensor<f32>,
     dgamma: &mut GTensor<f32>,
     group: usize,
+    cache: &super::temp::TempCache,
 ) -> GTensor<f32> {
     let mut dx = GTensor::uninit(gpu, &[dy.rows(), dy.cols()]);
-    rms_norm_backward_into(gpu, dy, fwd, WideOrSlab::F32(y), gamma, dgamma, group, &mut dx);
+    rms_norm_backward_into(
+        gpu,
+        dy,
+        fwd,
+        WideOrSlab::F32(y),
+        gamma,
+        dgamma,
+        group,
+        &mut dx,
+        cache,
+    );
     dx
 }
 
@@ -1868,6 +1639,7 @@ pub fn rms_norm_backward_into(
     dgamma: &mut GTensor<f32>,
     group: usize,
     dx: &mut GTensor<f32>,
+    cache: &super::temp::TempCache,
 ) {
     let (b, f) = dy.as_2d();
     let groups_per_row = f / group;
@@ -1895,7 +1667,7 @@ pub fn rms_norm_backward_into(
     //
     // `x̂ = y/γ` and γ is constant down a column, so the divide comes out of the sum
     // entirely — which is what lets this path run without materializing `x̂` anywhere.
-    add_col_sum_mul_div(gpu, dgamma, dy, y, gamma);
+    add_col_sum_mul_div(gpu, dgamma, dy, y, gamma, cache);
 }
 
 /// Fused softmax + cross-entropy. Returns `(mean_loss, dlogits)` with
@@ -3153,6 +2925,7 @@ pub fn slstm_batched_fwd(
     out: &mut GTensor<f32>,
     t: usize,
     carry: bool,
+    cache: &super::temp::TempCache,
 ) -> bool {
     if !gpu.kernels.has_coop {
         return false;
@@ -3175,7 +2948,9 @@ pub fn slstm_batched_fwd(
     };
     let rows_per_launch = geom.rows_per_launch();
     let (t_i, b_i, carry_i) = (t as i32, b as i32, i32::from(carry));
-    with_batched_mirror(&BATCHED_H, gpu, b * h, |hmir| {
+    {
+        let mut hmir = cache.get::<f32>(gpu, &[b * h]);
+        let hmir = &mut *hmir;
         let mut row0 = 0usize;
         while row0 < b {
             // The last chunk gets a narrower grid rather than blocks that would sit
@@ -3217,7 +2992,7 @@ pub fn slstm_batched_fwd(
             row0 += rows_per_launch;
         }
         true
-    })
+    }
 }
 
 /// The whole forward T-loop as **one cooperative launch**: see `slstm_fused_time`
@@ -3240,6 +3015,7 @@ pub fn slstm_fused_time(
     out: &mut GTensor<f32>,
     t: usize,
     carry: bool,
+    cache: &super::temp::TempCache,
 ) -> bool {
     if !gpu.kernels.has_coop {
         return false;
@@ -3286,8 +3062,14 @@ pub fn slstm_fused_time(
     // race a block still reading step t-1. `wtail` holds the rows of `Wh` that did
     // not fit shared memory, in the same packing; it is empty at the widths where
     // the whole slice is staged.
-    with_fused_alt(gpu, b, fused_hp(h), |hmir| {
-        with_fused_tail(gpu, fused_tail_len(h, staged_rows), |wtail| {
+    {
+        // Zeroed: the kernel reads the alternate plane before it has written it on the
+        // first step, and the tail before its first `grid.sync()`.
+        let mut hmir = cache.get_zeroed::<f32>(gpu, &[b, fused_hp(h)]);
+        let hmir = &mut *hmir;
+        {
+            let mut wtail = cache.get_zeroed::<f32>(gpu, &[fused_tail_len(h, staged_rows).max(1)]);
+            let wtail = &mut *wtail;
             let mut lb = gpu.stream.launch_builder(&f);
             lb.arg(&wh.buf).arg(&mut g.buf).arg(&bcat.buf);
             push_slab!(lb, slabs.h_prev);
@@ -3319,8 +3101,8 @@ pub fn slstm_fused_time(
                     false
                 }
             }
-        })
-    })
+        }
+    }
 }
 
 /// Launch geometry for [`slstm_batched_bwd`], or `None` when the shape does not fit.
@@ -3431,6 +3213,7 @@ pub fn slstm_batched_bwd(
     dn_recur: &mut GTensor<f32>,
     slabs: &SlstmSlabs,
     t: usize,
+    cache: &super::temp::TempCache,
 ) -> bool {
     if !gpu.kernels.has_coop {
         return false;
@@ -3453,7 +3236,9 @@ pub fn slstm_batched_bwd(
     };
     let rows_per_launch = geom.rows_per_launch();
     let (t_i, b_i) = (t as i32, b as i32);
-    with_batched_mirror(&BATCHED_DG, gpu, b * 4 * h, |dgmir| {
+    {
+        let mut dgmir = cache.get::<f32>(gpu, &[b * 4 * h]);
+        let dgmir = &mut *dgmir;
         let mut row0 = 0usize;
         while row0 < b {
             let by = (b - row0).div_ceil(16 * rpt).min(blocks_y);
@@ -3489,7 +3274,7 @@ pub fn slstm_batched_bwd(
             row0 += rows_per_launch;
         }
         true
-    })
+    }
 }
 
 /// One fused backward step of the sLSTM cell.
@@ -4361,22 +4146,25 @@ fn ogate_cfg(rows: usize, d: usize) -> LaunchConfig {
     }
 }
 
-/// o-gate backward → `d_yhat`, with `do_pre` written into `dxh`'s o columns.
+/// o-gate backward into `d_yhat`, with `do_pre` written into `dxh`'s o columns.
 ///
 /// `xh` is the fused `q‖k‖v‖o` forward output and `dxh` its gradient, so `do_pre`
 /// lands exactly where `mlstm_fused_bw` puts dq/dk/dv — the two together fill the
 /// buffer the merged projection's backward reads whole.
+///
+/// `d_yhat` is the caller's `[rows, d]` buffer, written in full.
 pub fn ogate_bwd(
     gpu: &Gpu,
     d_hconcat: &GTensor<f32>,
     xh: &SlabBuf,
     yhat: &GTensor<f32>,
     dxh: &mut GTensor<f32>,
+    d_yhat: &mut GTensor<f32>,
     o_off: usize,
-) -> GTensor<f32> {
+) {
     let (rows, d, stride) = (d_hconcat.rows(), d_hconcat.cols(), dxh.cols());
     let (d_i, stride_i, off_i) = (d as i32, stride as i32, o_off as i32);
-    let mut d_yhat = GTensor::uninit(gpu, d_hconcat.dims());
+    debug_assert_eq!(d_yhat.dims(), d_hconcat.dims(), "ogate_bwd — d_yhat shape");
     let f = gpu.kernels.get("ogate_bwd");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&d_hconcat.buf);
@@ -4388,7 +4176,6 @@ pub fn ogate_bwd(
         .arg(&stride_i)
         .arg(&off_i);
     unsafe { lb.launch(ogate_cfg(rows, d)) }.expect("ogate_bwd");
-    d_yhat
 }
 
 /// Reduce `P` `[BH,T,T]` into `(dfc, dig)` `[BH,T]` (see kernel).
@@ -5078,8 +4865,15 @@ fn read_state_slot_n(
     slots: usize,
     idx: usize,
     stride: usize,
+    into: Option<GTensor<f32>>,
 ) -> GTensor<f32> {
-    let mut out = GTensor::uninit(gpu, &[bh * stride]);
+    // `into` is the previous chunk's buffer handed back: this runs once per chunk per
+    // layer, so allocating a fresh pair each time is one allocation per block per chunk
+    // on the hot path for a value whose shape never changes within a sweep.
+    let mut out = match into {
+        Some(t) if t.len() == bh * stride => t,
+        _ => GTensor::uninit(gpu, &[bh * stride]),
+    };
     state_slot_copy(gpu, src, &mut out, bh, slots, idx, stride, true);
     out
 }
@@ -5295,11 +5089,12 @@ pub fn mlstm_fused_fw(
 /// `mlstm_bw_parallel` — the mirror of [`mlstm_fused_fw`], launch for launch.
 ///
 /// Writes dq/dk/dv into `dxh`'s own column blocks — `ogate_bwd` fills the fourth —
-/// and returns `(dgates, dstate)`: the gate grads laid out like the gate logits, plus
-/// the BPTT state to hand to the chunk on the left (see [`MlstmDState`]).
+/// and `dgates` (the gate grads, laid out like the gate logits), and returns the BPTT
+/// state to hand to the chunk on the left (see [`MlstmDState`]).
 ///
-/// `dxh` is the caller's because the o-gate half of it is produced before this runs;
-/// between the two, every column of it is written, so it may come in uninitialised.
+/// `dxh` and `dgates` are both the caller's. `dxh` has to be, because the o-gate half
+/// of it is produced before this runs; between the two, every column is written, so it
+/// may come in uninitialised.
 #[allow(clippy::too_many_arguments)]
 pub fn mlstm_fused_bw(
     gpu: &Gpu,
@@ -5314,9 +5109,21 @@ pub fn mlstm_fused_bw(
     d_ytil: &GTensor<f32>, // [BH, T, dhv]
     // BPTT state flowing in from the chunk to the RIGHT, or `None` for the rightmost
     // chunk (and for an unchunked call), where it is zero.
-    carry_in: Option<&MlstmDState>,
+    //
+    // Taken by value, and handed back as the return: it is seeded into `dcst`/`dnst`
+    // below and dead from that point, so its two buffers are rewritten with this
+    // chunk's outgoing state instead of a fresh pair being allocated. That pair is
+    // otherwise one allocation per block per chunk, on the hot path, for a shape that
+    // never changes within a sweep.
+    carry_in: Option<MlstmDState>,
+    // `[N, 2·heads]`, written in full by `mlstm_bw_parallel`.
+    dgates: &mut GTensor<f32>,
+    // Scratch this call needs and the caller never sees — the per-timestep dψ.
+    // Borrowed rather than allocated, so it is bounded by the slot count like every
+    // other temporary; see [`super::temp`].
+    cache: &super::temp::TempCache,
     st: MlstmShape,
-) -> (GTensor<f32>, MlstmDState) {
+) -> MlstmDState {
     let (bh, t, dqk, dhv) = (st.batch * st.heads, st.t, st.dqk, st.dhv);
     let (l, nc) = (sv.l, sv.nc);
     let h_i = st.heads as i32;
@@ -5327,19 +5134,22 @@ pub fn mlstm_fused_bw(
     // when nothing is carried in. At the backbone's shape that is a 38 MB memset
     // saved, and it is what lets `mlstm_bw_parallel` read slot k+1 unconditionally
     // instead of branching on being the rightmost chunk.
-    let mut dcst = GTensor::uninit(gpu, &[bh, nc + 1, dhv, dqk]);
-    let mut dnst = GTensor::uninit(gpu, &[bh, nc + 1, dqk]);
+    // Their own array, not stage-sized slots: one state per chunk *boundary*, so these
+    // grow as the chunk length SHRINKS, where every other temporary is bounded by
+    // `rows x width`. See `temp::widest_chunk`.
+    let mut dcst = cache.get_chunk::<f32>(gpu, &[bh, nc + 1, dhv, dqk]);
+    let mut dnst = cache.get_chunk::<f32>(gpu, &[bh, nc + 1, dqk]);
     // Seed slot NC with the gradient from the chunk to the right; `mlstm_bw_dC` reads
     // CARRY and leaves it alone instead of zeroing it.
-    if let Some(dst) = carry_in {
+    let carry_i = carry_in.is_some() as i32;
+    if let Some(dst) = &carry_in {
         seed_state_slot_n(gpu, &dst.dc, &mut dcst, bh, nc + 1, nc, dhv * dqk);
         seed_state_slot_n(gpu, &dst.dn, &mut dnst, bh, nc + 1, nc, dqk);
     }
-    let carry_i = carry_in.is_some() as i32;
 
     // dψ per timestep. A reduction over the whole `dhv` row, and both kernels below
     // want it, so it is computed once rather than twice.
-    let mut dqnv = GTensor::<f32>::uninit(gpu, &[bh, t]);
+    let mut dqnv = cache.get_small::<f32>(gpu, &[bh, t]);
     {
         let n = bh * t;
         let (n_i, dhv_only) = (n as i32, dhv as i32);
@@ -5412,7 +5222,11 @@ pub fn mlstm_fused_bw(
         [n, st.heads * (2 * dqk + 2 * dhv)],
         "mlstm_fused_bw — dq‖dk‖dv‖do shape"
     );
-    let mut dgates = GTensor::uninit(gpu, &[n, 2 * st.heads]);
+    debug_assert_eq!(
+        dgates.dims(),
+        [n, 2 * st.heads],
+        "mlstm_fused_bw — dgates shape"
+    );
 
     let par_threads = parallel_threads(bw_parallel_warps(l, dqk, dhv));
     let (f, smem) = fused_kernel_spec(
@@ -5456,15 +5270,26 @@ pub fn mlstm_fused_bw(
 
     // Slot 0 is the gradient wrt the state entering chunk 0 — i.e. what flows out of
     // this chunk into the one on its left.
-    let dstate = MlstmDState {
-        dc: read_state_slot_n(gpu, &dcst, bh, nc + 1, 0, dhv * dqk),
-        dn: read_state_slot_n(gpu, &dnst, bh, nc + 1, 0, dqk),
+    // `carry_in` is dead now — seeded into the arrays above — so its buffers become
+    // this chunk's output.
+    let (prev_dc, prev_dn) = match carry_in {
+        Some(d) => (Some(d.dc), Some(d.dn)),
+        None => (None, None),
     };
-    (dgates, dstate)
+    let dstate = MlstmDState {
+        dc: read_state_slot_n(gpu, &dcst, bh, nc + 1, 0, dhv * dqk, prev_dc),
+        dn: read_state_slot_n(gpu, &dnst, bh, nc + 1, 0, dqk, prev_dn),
+    };
+    dstate
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// One temp cache per test, sized past every shape this module presents.
+    fn test_cache(gpu: &Gpu) -> super::super::arena::TrainingCache {
+        super::super::arena::TrainingCache::new(gpu, 1 << 20, 1 << 16, 1 << 20)
+    }
     use super::*;
     use crate::tensor::{Tensor, gemm};
 
@@ -6036,6 +5861,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         use crate::nn2::ops as cpu;
         let (b, n) = (7, 5);
         let bias = Tensor::random(&[n], 1.0);
@@ -6050,7 +5876,7 @@ mod tests {
         let mut db_cpu = Tensor::random(&[n], 1.0);
         let mut db_gpu = GTensor::from_host(&gpu, &db_cpu);
         cpu::add_col_sum(&mut db_cpu, &dy);
-        add_col_sum(&gpu, &mut db_gpu, &GTensor::from_host(&gpu, &dy));
+        add_col_sum(&gpu, &mut db_gpu, &GTensor::from_host(&gpu, &dy), &tc.temps);
         assert_close(&db_gpu.to_host(&gpu).data, &db_cpu.data);
     }
 
@@ -6062,13 +5888,14 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         use crate::nn2::ops as cpu;
         for (rows, n) in [(512, 768), (2048, 768), (1, 768), (333, 257)] {
             let dy = Tensor::random(&[rows, n], 1.0);
             let mut db_cpu = Tensor::random(&[n], 1.0);
             let mut db_gpu = GTensor::from_host(&gpu, &db_cpu);
             cpu::add_col_sum(&mut db_cpu, &dy);
-            add_col_sum(&gpu, &mut db_gpu, &GTensor::from_host(&gpu, &dy));
+            add_col_sum(&gpu, &mut db_gpu, &GTensor::from_host(&gpu, &dy), &tc.temps);
             let got = db_gpu.to_host(&gpu).data;
             // Summation order differs from the CPU's row-major walk, so this is a
             // float-reassociation tolerance, not an exactness check.
@@ -6114,6 +5941,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         use crate::nn2::ops as cpu;
         let eps = 1e-5;
         // (rows, features, group): ungrouped wide (the block norms), a multi-group
@@ -6147,6 +5975,7 @@ mod tests {
                 &gamma_d,
                 &mut dg_gpu,
                 group,
+                &tc.temps,
             );
 
             let what = format!("b={b} f={f} group={group}");
@@ -6174,6 +6003,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         use crate::nn2::ops as cpu;
         let (b, f, group, eps) = (5, 12, 4, 1e-5); // head-wise case: 3 groups/row
         let x = Tensor::random(&[b, f], 1.0);
@@ -6195,13 +6025,14 @@ mod tests {
             rms_norm_forward(&gpu, &GTensor::from_host(&gpu, &x), &dgamma_t, group, eps);
         let mut dg_gpu = GTensor::zeros(&gpu, &[f]);
         let dx_gpu = rms_norm_backward(
-            &gpu,
+                &gpu,
             &GTensor::from_host(&gpu, &dy),
             &fwd_gpu,
             &out_gpu,
             &dgamma_t,
             &mut dg_gpu,
             group,
+            &tc.temps,
         );
         assert_close(&out_gpu.to_host(&gpu).data, &fwd_cpu.out.data);
         assert_close(&dx_gpu.to_host(&gpu).data, &dx_cpu.data);

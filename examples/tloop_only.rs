@@ -19,6 +19,8 @@ fn main() {
     use neural_networks::tensor::Tensor;
 
     let gpu = Gpu::new().expect("gpu");
+    use neural_networks::gpu::arena::TrainingCache;
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
     let iters: usize = 20;
 
     // (label, B, T, H)
@@ -75,7 +77,19 @@ fn main() {
 
         let mut fwd = |g: &mut GTensor<f32>, slabs: &mut SlstmSlabs, out: &mut GTensor<f32>| {
             ops::slstm_fused_time(
-                &gpu, &whr, g, &bcat, &mut cs, &mut ns, &mut ms, &mut hs, slabs, out, t, false,
+                &gpu,
+                &whr,
+                g,
+                &bcat,
+                &mut cs,
+                &mut ns,
+                &mut ms,
+                &mut hs,
+                slabs,
+                out,
+                t,
+                false,
+                &cache.temps,
             )
         };
         let ok = fwd(&mut g, &mut slabs, &mut out);

@@ -24,7 +24,6 @@ fn main() {
     use neural_networks::gpu::{GTensor, Gpu, mlstm::MLstm};
     use neural_networks::tensor::Tensor;
 
-    let mut cache = TrainingCache::new();
 
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -33,6 +32,7 @@ fn main() {
             return;
         }
     };
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
 
     let clock = || -> String {
         std::process::Command::new("nvidia-smi")
@@ -82,7 +82,7 @@ fn main() {
     for (i, (x, cell, y)) in cells.iter_mut().enumerate() {
         let _ = i;
         for _ in 0..10 {
-            cell.forward(&gpu, x, y, &mut cache);
+            cell.forward(&gpu, x, y, &cache);
             cell.drop_saved();
         }
     }
@@ -97,7 +97,7 @@ fn main() {
             gpu.stream.synchronize().unwrap();
             let t0 = Instant::now();
             for _ in 0..iters {
-                cell.forward(&gpu, x, y, &mut cache);
+                cell.forward(&gpu, x, y, &cache);
                 cell.drop_saved();
             }
             gpu.stream.synchronize().unwrap();

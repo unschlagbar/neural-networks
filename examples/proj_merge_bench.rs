@@ -22,6 +22,7 @@ fn main() {
     use neural_networks::gpu::{GTensor, Gpu, ops};
 
     let gpu = Gpu::new().expect("gpu");
+    use neural_networks::gpu::arena::TrainingCache;
 
     fn timed(gpu: &Gpu, warm: usize, iters: usize, mut f: impl FnMut()) -> f64 {
         for _ in 0..warm {
@@ -79,76 +80,65 @@ fn main() {
         // the bias fused into the GEMM epilogue. That is a different cuBLASLt call
         // from the fp32-output one below, and it picks its tiles differently — which
         // is the whole question here, so it has to be measured on the real path.
+        // Staged once per shape, as `MLstm` now does: the narrowing is not what these
+        // loops are measuring, and hoisting it keeps it out of every timing.
+        let cache = TrainingCache::for_shape(&gpu, rows, inp);
+        let mut xb = cache.temps.get::<u16>(&gpu, x.dims());
+        xb.store(&gpu, &x);
         let mut slab_qkv = ops::SlabBuf::new(&gpu, &[rows, wqkv]);
         let mut slab_qkvo = ops::SlabBuf::new(&gpu, &[rows, wall]);
         let fw_slab3 = timed(&gpu, 20, 200, || {
-            ops::with_shared_lhs(&gpu, &x, |xb| {
-                lin_qkv.forward_staged_slab(&gpu, &x, xb, &mut slab_qkv);
-                lin_o.forward_staged(&gpu, &x, xb, &mut out_o);
-                lin_if.forward_staged(&gpu, &x, xb, &mut out_if);
-            });
+                            lin_qkv.forward_staged_slab(&gpu, &x, &xb, &mut slab_qkv);
+            lin_o.forward_staged(&gpu, &x, &xb, &mut out_o);
+            lin_if.forward_staged(&gpu, &x, &xb, &mut out_if);
         });
         let fw_slab2 = timed(&gpu, 20, 200, || {
-            ops::with_shared_lhs(&gpu, &x, |xb| {
-                lin_qkvo.forward_staged_slab(&gpu, &x, xb, &mut slab_qkvo);
-                lin_if.forward_staged(&gpu, &x, xb, &mut out_if);
-            });
+                            lin_qkvo.forward_staged_slab(&gpu, &x, &xb, &mut slab_qkvo);
+            lin_if.forward_staged(&gpu, &x, &xb, &mut out_if);
         });
         println!(
             "{name} rows={rows:<5} in={inp:<5}  SLAB fw  qkv+o+if={fw_slab3:7.1}us  qkvo+if={fw_slab2:7.1}us"
         );
 
         let fw6 = timed(&gpu, 20, 200, || {
-            ops::with_shared_lhs(&gpu, &x, |xb| {
-                for (l, o) in six.iter_mut().zip(outs.iter_mut()) {
-                    l.forward_staged(&gpu, &x, xb, o);
-                }
-            });
+                            for (l, o) in six.iter_mut().zip(outs.iter_mut()) {
+                l.forward_staged(&gpu, &x, &xb, o);
+            }
         });
         let fw2 = timed(&gpu, 20, 200, || {
-            ops::with_shared_lhs(&gpu, &x, |xb| {
-                lin_qkvo.forward_staged(&gpu, &x, xb, &mut out_qkvo);
-                lin_if.forward_staged(&gpu, &x, xb, &mut out_if);
-            });
+                            lin_qkvo.forward_staged(&gpu, &x, &xb, &mut out_qkvo);
+            lin_if.forward_staged(&gpu, &x, &xb, &mut out_if);
         });
         let fw3 = timed(&gpu, 20, 200, || {
-            ops::with_shared_lhs(&gpu, &x, |xb| {
-                lin_qkv.forward_staged(&gpu, &x, xb, &mut out_qkv);
-                lin_o.forward_staged(&gpu, &x, xb, &mut out_o);
-                lin_if.forward_staged(&gpu, &x, xb, &mut out_if);
-            });
+                            lin_qkv.forward_staged(&gpu, &x, &xb, &mut out_qkv);
+            lin_o.forward_staged(&gpu, &x, &xb, &mut out_o);
+            lin_if.forward_staged(&gpu, &x, &xb, &mut out_if);
         });
 
         // Backward: the six accumulate into one `dx` with an add per extra term.
         let mut acc = GTensor::uninit(&gpu, &[rows, inp]);
         let mut part = GTensor::uninit(&gpu, &[rows, inp]);
         let bw6 = timed(&gpu, 20, 200, || {
-            ops::with_shared_lhs(&gpu, &x, |xb| {
-                for (i, (l, o)) in six.iter_mut().zip(outs.iter()).enumerate() {
-                    if i == 0 {
-                        l.backward_staged_x(&gpu, &x, xb, o, &mut acc);
-                    } else {
-                        l.backward_staged_x(&gpu, &x, xb, o, &mut part);
-                        ops::add_assign(&gpu, &mut acc, &part);
-                    }
+                            for (i, (l, o)) in six.iter_mut().zip(outs.iter()).enumerate() {
+                if i == 0 {
+                    l.backward_staged_x(&gpu, &x, &xb, o, &mut acc, &cache);
+                } else {
+                    l.backward_staged_x(&gpu, &x, &xb, o, &mut part, &cache);
+                    ops::add_assign(&gpu, &mut acc, &part);
                 }
-            });
+            }
         });
         let bw2 = timed(&gpu, 20, 200, || {
-            ops::with_shared_lhs(&gpu, &x, |xb| {
-                lin_qkvo.backward_staged_x(&gpu, &x, xb, &out_qkvo, &mut acc);
-                lin_if.backward_staged_x(&gpu, &x, xb, &out_if, &mut part);
-                ops::add_assign(&gpu, &mut acc, &part);
-            });
+                            lin_qkvo.backward_staged_x(&gpu, &x, &xb, &out_qkvo, &mut acc, &cache);
+            lin_if.backward_staged_x(&gpu, &x, &xb, &out_if, &mut part, &cache);
+            ops::add_assign(&gpu, &mut acc, &part);
         });
         let bw3 = timed(&gpu, 20, 200, || {
-            ops::with_shared_lhs(&gpu, &x, |xb| {
-                lin_qkv.backward_staged_x(&gpu, &x, xb, &out_qkv, &mut acc);
-                lin_o.backward_staged_x(&gpu, &x, xb, &out_o, &mut part);
-                ops::add_assign(&gpu, &mut acc, &part);
-                lin_if.backward_staged_x(&gpu, &x, xb, &out_if, &mut part);
-                ops::add_assign(&gpu, &mut acc, &part);
-            });
+                            lin_qkv.backward_staged_x(&gpu, &x, &xb, &out_qkv, &mut acc, &cache);
+            lin_o.backward_staged_x(&gpu, &x, &xb, &out_o, &mut part, &cache);
+            ops::add_assign(&gpu, &mut acc, &part);
+            lin_if.backward_staged_x(&gpu, &x, &xb, &out_if, &mut part, &cache);
+            ops::add_assign(&gpu, &mut acc, &part);
         });
 
         println!(

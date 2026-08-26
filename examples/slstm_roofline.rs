@@ -42,6 +42,8 @@ fn main() {
             return;
         }
     };
+    use neural_networks::gpu::arena::TrainingCache;
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
 
     let t = 1024; // the backbone's unroll (words per window)
 
@@ -53,15 +55,15 @@ fn main() {
         let iters = 10;
 
         for _ in 0..2 {
-            let y = dev.forward_alloc(&gpu, &x);
-            let _ = dev.backward_alloc(&gpu, &y, &g);
+            let y = dev.forward_alloc(&gpu, &x, &cache);
+            let _ = dev.backward_alloc(&gpu, &y, &g, &cache);
         }
         gpu.stream.synchronize().unwrap();
 
         let t0 = Instant::now();
         for _ in 0..iters {
-            let y = dev.forward_alloc(&gpu, &x);
-            let _ = dev.backward_alloc(&gpu, &y, &g);
+            let y = dev.forward_alloc(&gpu, &x, &cache);
+            let _ = dev.backward_alloc(&gpu, &y, &g, &cache);
         }
         gpu.stream.synchronize().unwrap();
         let secs = t0.elapsed().as_secs_f64() / iters as f64;

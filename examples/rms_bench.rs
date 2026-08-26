@@ -35,6 +35,7 @@ fn main() {
     use neural_networks::tensor::Tensor;
 
     let gpu = Gpu::new().expect("gpu");
+    use neural_networks::gpu::arena::TrainingCache;
     let clk = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=clocks.sm", "--format=csv,noheader"])
         .output()
@@ -75,6 +76,7 @@ fn main() {
         let mut dxs: Vec<GTensor<f32>> = (0..SETS)
             .map(|_| GTensor::uninit(&gpu, &[rows, width]))
             .collect();
+        let cache = TrainingCache::for_shape(&gpu, rows, width);
         let mut ys_w: Vec<GTensor<f32>> = (0..SETS)
             .map(|_| GTensor::uninit(&gpu, &[rows, width]))
             .collect();
@@ -119,9 +121,9 @@ fn main() {
                 for r in 0..REPS {
                     let i = r % SETS;
                     if variant == 0 {
-                        wide.backward(&gpu, &dys[i], &ys_w[i], &mut dxs[i]);
+                        wide.backward(&gpu, &dys[i], &ys_w[i], &mut dxs[i], &cache);
                     } else {
-                        narrow.backward_slab(&gpu, &dys[i], &ys_n[i], &mut dxs[i]);
+                        narrow.backward_slab(&gpu, &dys[i], &ys_n[i], &mut dxs[i], &cache);
                     }
                 }
                 gpu.stream.synchronize().expect("sync");
@@ -181,6 +183,8 @@ fn main() {
         let mut dxs: Vec<GTensor<f32>> = (0..SETS)
             .map(|_| GTensor::uninit(&gpu, &[rows, width]))
             .collect();
+        let cache = TrainingCache::for_shape(&gpu, rows, width);
+        let mut xb = cache.temps.get::<u16>(&gpu, &[rows, width]);
         let mut ys_w: Vec<GTensor<f32>> = (0..SETS)
             .map(|_| GTensor::uninit(&gpu, &[rows, width]))
             .collect();
@@ -206,7 +210,7 @@ fn main() {
                         wide.forward(&gpu, &xs[i], &mut ys_w[i]);
                         // What the FFN does today: narrow the fp32 result once for the
                         // pair of projections that read it.
-                        ops::with_shared_lhs(&gpu, &ys_w[i], |_| {});
+                        xb.store(&gpu, &ys_w[i]);
                     } else {
                         narrow.forward_slab(&gpu, &xs[i], &mut ys_n[i]);
                     }
@@ -219,10 +223,10 @@ fn main() {
                 for r in 0..REPS {
                     let i = r % SETS;
                     if variant == 0 {
-                        ops::with_shared_lhs(&gpu, &ys_w[i], |_| {});
-                        wide.backward(&gpu, &dys[i], &ys_w[i], &mut dxs[i]);
+                        xb.store(&gpu, &ys_w[i]);
+                        wide.backward(&gpu, &dys[i], &ys_w[i], &mut dxs[i], &cache);
                     } else {
-                        narrow.backward_slab(&gpu, &dys[i], &ys_n[i], &mut dxs[i]);
+                        narrow.backward_slab(&gpu, &dys[i], &ys_n[i], &mut dxs[i], &cache);
                     }
                 }
                 gpu.stream.synchronize().expect("sync");

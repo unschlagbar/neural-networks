@@ -45,6 +45,8 @@ fn main() {
             return;
         }
     };
+    use neural_networks::gpu::arena::TrainingCache;
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
 
     // Backbone shape: one window (B=1), width WORD_HIDDEN.
     let (b, d) = (1, neural_networks::config::WORD_HIDDEN);
@@ -64,8 +66,8 @@ fn main() {
         let warmup = (iters / 5).max(2);
 
         for _ in 0..warmup {
-            let y = dev.forward_alloc(&gpu, &x);
-            let _ = dev.backward_alloc(&gpu, &y, &g);
+            let y = dev.forward_alloc(&gpu, &x, &cache);
+            let _ = dev.backward_alloc(&gpu, &y, &g, &cache);
         }
         gpu.stream.synchronize().unwrap();
 
@@ -73,8 +75,8 @@ fn main() {
         // CPU spent pushing driver calls (plus any stall once the queue fills).
         let t0 = Instant::now();
         for _ in 0..iters {
-            let y = dev.forward_alloc(&gpu, &x);
-            let _ = dev.backward_alloc(&gpu, &y, &g);
+            let y = dev.forward_alloc(&gpu, &x, &cache);
+            let _ = dev.backward_alloc(&gpu, &y, &g, &cache);
         }
         let issue = t0.elapsed().as_secs_f64();
         gpu.stream.synchronize().unwrap();

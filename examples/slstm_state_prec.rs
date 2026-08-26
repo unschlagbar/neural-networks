@@ -30,6 +30,8 @@ fn main() {
 
     let out = std::env::args().nth(1).unwrap_or_else(|| "/tmp/slstm.bin".into());
     let gpu = Gpu::new().expect("gpu");
+    use neural_networks::gpu::arena::TrainingCache;
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
     println!(
         "slab_bf16 = {}   state_bf16 = {}",
         gpu.kernels.slab_bf16, gpu.kernels.state_bf16
@@ -79,11 +81,15 @@ fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
-        let mut y = cell.forward_alloc(&gpu, &GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, h], 0.5, 7)));
+        let mut y = cell.forward_alloc(
+            &gpu,
+            &GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, h], 0.5, 7)),
+            &cache,
+        );
         let mut extremes = cell.state_extremes(&gpu);
         let mut dx = {
             let gy = GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, h], 0.7, 9));
-            cell.backward_alloc(&gpu, &y, &gy)
+            cell.backward_alloc(&gpu, &y, &gy, &cache)
         };
         for i in 1..acc {
             // Each pair gets its own draw, so the contributions differ in magnitude the
@@ -92,13 +98,13 @@ fn main() {
                 &gpu,
                 &Tensor::random_seeded(&[b, t, h], 0.5, 7 + i as u64 * 13),
             );
-            y = cell.forward_alloc(&gpu, &x);
+            y = cell.forward_alloc(&gpu, &x, &cache);
             extremes = cell.state_extremes(&gpu);
             let gy = GTensor::from_host(
                 &gpu,
                 &Tensor::random_seeded(&[b, t, h], 0.7, 9 + i as u64 * 13),
             );
-            dx = cell.backward_alloc(&gpu, &y, &gy);
+            dx = cell.backward_alloc(&gpu, &y, &gy, &cache);
         }
 
         let yh = y.to_host(&gpu).data;

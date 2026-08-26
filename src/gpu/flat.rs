@@ -43,6 +43,9 @@ pub struct Flat {
     head: Linear,
     cap: f32,
 
+    /// Window scratch, built at the first backward. One per model — see
+    /// [`temp`](super::temp).
+    cache: Option<crate::gpu::arena::TrainingCache>,
     // Per-forward caches for backward.
     ids: Vec<usize>,
     rms: Option<GpuRmsForward>,
@@ -67,6 +70,7 @@ impl Flat {
         let (vocab, dim) = (table.rows(), table.cols());
         let hidden = gamma.len();
         Self {
+            cache: None,
             table: GTensor::from_host(gpu, table),
             dtable: GTensor::zeros(gpu, &[vocab, dim]),
             m_tbl: GTensor::zeros(gpu, &[vocab, dim]),
@@ -110,8 +114,11 @@ impl Flat {
     pub fn backward(&mut self, gpu: &Gpu, dlogits: &GTensor<f32>) {
         let logits = self.logits.as_ref().expect("forward before backward");
         let rms = self.rms.as_ref().expect("forward before backward");
+        let cache = self.cache.get_or_insert_with(|| {
+            crate::gpu::arena::TrainingCache::for_shape(gpu, dlogits.rows(), self.hidden)
+        });
         let d_pre = ops::softcap_backward(gpu, dlogits, logits, self.cap);
-        let d_rmsout = self.head.backward_alloc(gpu, &d_pre);
+        let d_rmsout = self.head.backward_alloc(gpu, &d_pre, cache);
         // `head` saved its own input, which is the norm's output — what the norm's
         // backward rebuilds `x̂` from, so nothing else has to keep it.
         let d_h = ops::rms_norm_backward(
@@ -122,8 +129,9 @@ impl Flat {
             &self.gamma,
             &mut self.dgamma,
             self.hidden,
+            &cache.temps,
         );
-        let d_e = self.lin1.backward_alloc(gpu, &d_h);
+        let d_e = self.lin1.backward_alloc(gpu, &d_h, cache);
         ops::embedding_scatter_add(gpu, &mut self.dtable, &self.ids, &d_e, self.dim);
     }
 

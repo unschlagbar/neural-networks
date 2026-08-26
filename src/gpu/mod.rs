@@ -35,15 +35,17 @@ pub mod offload;
 pub mod ops;
 pub mod rms_norm;
 pub mod slstm;
+pub mod temp;
 pub mod train;
 pub mod word_groups;
 
 pub use arena::{ParamArena, ParamKind, ParamSlot};
 pub use bf16::Slab;
-pub use buf::{Buf, Pool, SlabSlot};
+pub use buf::{Buf, SlabSlot};
 pub use gtensor::GTensor;
 use kernels::Kernels;
 pub use offload::OffloadRing;
+pub use temp::{Temp, TempCache};
 
 use iron_oxide::collections::Matrix;
 

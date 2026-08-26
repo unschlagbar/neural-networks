@@ -255,10 +255,6 @@ pub struct SLstm {
     /// Where the post-cell norm's backward lands, so the loop reads a buffer this
     /// cell owns and reuses instead of allocating one per call.
     dy_buf: Option<GTensor<f32>>,
-    /// Scratch for widening a bf16 `h_prev` slab back to fp32 for the `dWh` GEMM.
-    /// Only allocated when the kernels and the whole-sequence GEMMs were built at
-    /// different widths — normally that GEMM takes the slab as it stands.
-    h_prev_f32: Option<GTensor<f32>>,
     batch: usize,
     /// bf16 staging for the **whole-sequence** GEMMs (`x·Wx` forward; `dg·Wxᵀ`,
     /// `xᵀ·dg` and `h_prevᵀ·dg` backward). Those run once per call over `[N, ·]`,
@@ -514,7 +510,6 @@ impl SLstm {
             x_saved: None,
             out_buf: None,
             dy_buf: None,
-            h_prev_f32: None,
             chunk_saved: Vec::new(),
             park: None,
             batch: 0,
@@ -711,7 +706,7 @@ impl SLstm {
         gpu: &Gpu,
         x: &GTensor<f32>,
         y: &mut GTensor<f32>,
-        cache: &mut TrainingCache,
+        cache: &TrainingCache,
     ) {
         // Release the previous eviction before allocating anything here: freeing
         // returns memory to the CUDA allocator, which must not hand it back while a
@@ -787,7 +782,7 @@ impl SLstm {
         let mut out = take_uninit(gpu, self.out_buf.take(), &[b, t, h]);
 
         phase::timed(gpu, phase::Bucket::SlstmLoopFwd, || {
-            self.fwd_loop(gpu, &mut g, &mut slabs, &mut out, t, carry);
+            self.fwd_loop(gpu, &mut g, &mut slabs, &mut out, t, carry, cache);
         });
 
         // The loop writes `out`, and the result reaches the caller's buffer through
@@ -824,6 +819,7 @@ impl SLstm {
         out: &mut GTensor<f32>,
         t: usize,
         carry: bool,
+        cache: &TrainingCache,
     ) {
         // The kernel declines by returning false when the shape does not fit or the
         // shape-specialized build is unavailable, leaving the per-step path intact.
@@ -842,6 +838,7 @@ impl SLstm {
                 out,
                 t,
                 carry,
+                &cache.temps,
             )
         {
             return;
@@ -860,6 +857,7 @@ impl SLstm {
                 out,
                 t,
                 carry,
+                &cache.temps,
             )
         {
             return;
@@ -936,9 +934,14 @@ impl SLstm {
 
     /// Forward into a freshly allocated `[B, T, H]` — the by-value companion to
     /// [`forward`](Self::forward), used by tests and one-shot call sites.
-    pub fn forward_alloc(&mut self, gpu: &Gpu, x: &GTensor<f32>) -> GTensor<f32> {
+    pub fn forward_alloc(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        cache: &TrainingCache,
+    ) -> GTensor<f32> {
         let mut y: GTensor<f32> = GTensor::uninit(gpu, &[x.shape[0], x.shape[1], self.hidden]);
-        self.forward(gpu, x, &mut y, &mut TrainingCache::new());
+        self.forward(gpu, x, &mut y, cache);
         y
     }
 
@@ -949,9 +952,10 @@ impl SLstm {
         gpu: &Gpu,
         y: &GTensor<f32>,
         dy: &GTensor<f32>,
+        cache: &TrainingCache,
     ) -> GTensor<f32> {
         let mut dx = GTensor::uninit(gpu, &[dy.shape[0], dy.shape[1], self.input]);
-        self.backward(gpu, y, dy, &mut dx);
+        self.backward(gpu, y, dy, &mut dx, cache);
         dx
     }
 
@@ -966,6 +970,7 @@ impl SLstm {
         y: &GTensor<f32>,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
+        cache: &TrainingCache,
     ) {
         assert_eq!(dy.rank, 3, "SLstm::backward expects [B, T, H]");
         let (b, t, h) = (dy.shape[0], dy.shape[1], dy.shape[2]);
@@ -1000,13 +1005,13 @@ impl SLstm {
         // the norm doubles as the staging the loop would otherwise need.
         let mut dy_buf = take_uninit(gpu, self.dy_buf.take(), &[b, t, h]);
         phase::timed(gpu, phase::Bucket::SlstmCopyBwd, || {
-            self.post_norm.backward(gpu, dy, y, &mut dy_buf);
+            self.post_norm.backward(gpu, dy, y, &mut dy_buf, cache);
         });
 
         // The only thing the loop must carry is BPTT: the gate deltas go straight
         // back into `g`, and everything derived from them waits until the loop ends.
         phase::timed(gpu, phase::Bucket::SlstmLoopBwd, || {
-            self.bwd_loop(gpu, &dy_buf, &mut g, &slabs, t);
+            self.bwd_loop(gpu, &dy_buf, &mut g, &slabs, t, cache);
         });
         self.dy_buf = Some(dy_buf);
 
@@ -1024,16 +1029,15 @@ impl SLstm {
         let dwx = &mut self.dwx;
         let dwhr = &mut self.dwhr;
         let gemm_dx = &mut self.gemm_dx;
-        let h_prev_f32 = &mut self.h_prev_f32;
         phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || {
             match (&x_flat, &slabs.h_prev) {
                 (SlabBuf::Bf16(xb), SlabBuf::Bf16(hb)) => {
                     gemm_dx.run_slstm_backward(gpu, xb, hb, &dg, wx, dwx, dwhr, dx)
                 }
                 // Either the GEMMs or the kernels were built fp32, so `dWh` goes to
-                // cuBLAS wide — widening a narrow `h_prev` into reusable scratch first.
-                // The scratch is transient (one GEMM) while the slab is pinned across
-                // the whole forward and backward, so it still gives memory back.
+                // cuBLAS wide — widening a narrow `h_prev` into a borrowed slot first.
+                // It feeds one GEMM and is dead, while the slab is pinned across the
+                // whole forward and backward.
                 (x, hp) => {
                     match x {
                         SlabBuf::Bf16(xb) => {
@@ -1044,10 +1048,9 @@ impl SLstm {
                             ops::matmul_tn_into(gpu, xf, &dg, dwx, 1.0);
                         }
                     }
-                    let mut scratch = take_uninit(gpu, h_prev_f32.take(), &[n, h]);
+                    let mut scratch = cache.temps.get::<f32>(gpu, &[n, h]);
                     let hf = hp.as_f32(gpu, &mut scratch);
                     ops::matmul_tn_into(gpu, hf, &dg, dwhr, 1.0);
-                    *h_prev_f32 = Some(scratch);
                 }
             }
         });
@@ -1057,7 +1060,7 @@ impl SLstm {
         // into the fused `dbcat`. Nothing to scatter afterwards.
         let dbcat = &mut self.dbcat;
         phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || {
-            ops::add_col_sum(gpu, dbcat, &dg);
+            ops::add_col_sum(gpu, dbcat, &dg, &cache.temps);
         });
 
         // FlashRNN keeps `dR`/`db` at bf16 (`Ctype = CUDA_R_16BF`, `beta = 1`), so every
@@ -1115,6 +1118,7 @@ impl SLstm {
         g: &mut GTensor<f32>,
         slabs: &SlstmSlabs,
         t: usize,
+        cache: &TrainingCache,
     ) {
         // One cooperative launch for the whole reverse loop. It carries the gate deltas
         // through `g` itself, so it needs no scratch of its own.
@@ -1145,6 +1149,7 @@ impl SLstm {
                 &mut self.dn_bptt,
                 slabs,
                 t,
+                &cache.temps,
             )
         {
             return;
@@ -1440,7 +1445,7 @@ impl SLstm {
         self.chunk_saved.clear();
         self.post_norm.drop_saved_act();
 
-        // `g`, `out_buf`, `dy_buf` and `h_prev_f32` are deliberately KEPT: the
+        // `g`, `out_buf` and `dy_buf` are deliberately KEPT: the
         // encoder and decoder run one rectangle per length bucket and the buckets
         // repeat window after window, so dropping them per group would mean a fresh
         // allocation for every group of every window.
@@ -1477,7 +1482,7 @@ impl SLstm {
         .iter()
         .map(|t| t.capacity() * 4)
         .sum();
-        let opt: usize = [&self.g, &self.out_buf, &self.dy_buf, &self.h_prev_f32]
+        let opt: usize = [&self.g, &self.out_buf, &self.dy_buf]
             .iter()
             .filter_map(|s| s.as_ref())
             .map(|t| t.capacity() * 4)
@@ -1521,6 +1526,11 @@ impl SLstm {
 }
 #[cfg(test)]
 mod tests {
+
+    /// One temp cache per test, sized past every shape this module presents.
+    fn test_cache(gpu: &Gpu) -> TrainingCache {
+        TrainingCache::new(gpu, 1 << 20, 1 << 16, 1 << 20)
+    }
     use super::*;
     use crate::nn2::optim::AdamCfg;
     use crate::nn2::slstm::SLstm as CpuSLstm;
@@ -1653,6 +1663,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (b, t, inp, h) = (2, 4, 5, 6);
         let mut cell = SLstm::new_rand(&gpu, inp, h);
         let x = GTensor::from_host(&gpu, &Tensor::random(&[b, t, inp], 0.5));
@@ -1662,7 +1673,7 @@ mod tests {
         // a stale `Wx` stays hidden and the test passes with the invalidation removed
         // (measured). Writing only `Wx` makes the cache the single variable.
         for round in 1..=3 {
-            let before = cell.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let before = cell.forward_alloc(&gpu, &x, &tc).to_host(&gpu).data;
 
             let mut hw = cell.wx.to_host(&gpu);
             for (i, v) in hw.data.iter_mut().enumerate() {
@@ -1672,7 +1683,7 @@ mod tests {
             // The write above is exactly what `params_mut` exists to guard.
             cell.params_mut();
 
-            let after = cell.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let after = cell.forward_alloc(&gpu, &x, &tc).to_host(&gpu).data;
             let changed = before
                 .iter()
                 .zip(&after)
@@ -1695,6 +1706,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (b, t, inp, h) = (2, 5, 4, 6);
 
         let mut cpu = CpuRef::new(inp, h);
@@ -1705,12 +1717,12 @@ mod tests {
 
         // Forward
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x));
+        let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x), &tc);
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, tol(&gpu, 2e-3));
 
         // Backward
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward_alloc(&gpu, &y_dev, &GTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &y_dev, &GTensor::from_host(&gpu, &g), &tc);
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 2e-3));
         assert_close(&dev.gate_dw(&gpu, 0), &cpu.cell.dwz.data, tol(&gpu, 2e-3));
         assert_close(&dev.gate_dw(&gpu, 2), &cpu.cell.dwf.data, tol(&gpu, 2e-3));
@@ -1754,6 +1766,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         assert!(
             64 > FUSED_MIN_T,
             "this test must exercise the time-fused path"
@@ -1769,11 +1782,11 @@ mod tests {
             let g = Tensor::random(&[b, t, h], 1.0);
 
             let y_cpu = cpu.forward(&x);
-            let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x));
+            let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x), &tc);
             assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, tol(&gpu, 2e-3));
 
             let dx_cpu = cpu.backward(&g);
-            let dx_dev = dev.backward_alloc(&gpu, &y_dev, &GTensor::from_host(&gpu, &g));
+            let dx_dev = dev.backward_alloc(&gpu, &y_dev, &GTensor::from_host(&gpu, &g), &tc);
             assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 2e-3));
             assert_close(&dev.gate_dw(&gpu, 0), &cpu.cell.dwz.data, tol(&gpu, 2e-3));
             assert_close(&dev.gate_dw(&gpu, 2), &cpu.cell.dwf.data, tol(&gpu, 2e-3));
@@ -1805,6 +1818,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (b, inp, h) = (1, 64, 64);
         let mut cpu = CpuRef::new(inp, h);
         let mut dev = from_cpu(&gpu, &cpu.cell);
@@ -1824,10 +1838,10 @@ mod tests {
             let g = Tensor::random(&[b, t, h], 1.0);
 
             let y_cpu = cpu.forward(&x);
-            let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x));
+            let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x), &tc);
             assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, tol(&gpu, 2e-3));
             let dx_cpu = cpu.backward(&g);
-            let dx_dev = dev.backward_alloc(&gpu, &y_dev, &GTensor::from_host(&gpu, &g));
+            let dx_dev = dev.backward_alloc(&gpu, &y_dev, &GTensor::from_host(&gpu, &g), &tc);
             assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 2e-3));
 
             poison(256 * 4 * h * b);
@@ -1853,6 +1867,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (b, t, h) = (1088usize, 32usize, 32usize);
         let s = 1.0 / (h as f32).sqrt();
         let w: Vec<Tensor> = (0..4)
@@ -1867,11 +1882,11 @@ mod tests {
             )
         };
         // Default selection: asks for the fused path, gets told no, falls back.
-        let got = build().forward_alloc(&gpu, &x).to_host(&gpu);
+        let got = build().forward_alloc(&gpu, &x, &tc).to_host(&gpu);
         // The path it lands on, pinned directly.
         let mut forced = build();
         forced.force_fused_time = Some(false);
-        let want = forced.forward_alloc(&gpu, &x).to_host(&gpu);
+        let want = forced.forward_alloc(&gpu, &x, &tc).to_host(&gpu);
         assert_eq!(
             got.data, want.data,
             "fallback must be the per-step loop exactly"
@@ -1908,6 +1923,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         if !gpu.kernels.has_coop {
             return; // cooperative kernels unavailable (no CUDA headers)
         }
@@ -1936,14 +1952,14 @@ mod tests {
             &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3], None,
         );
         per_step.force_fused_time = Some(false);
-        let y_per = per_step.forward_alloc(&gpu, &dx);
+        let y_per = per_step.forward_alloc(&gpu, &dx, &tc);
         let want = y_per.to_host(&gpu);
 
         let mut fused = SLstm::from_parts(
             &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3], None,
         );
         fused.force_fused_time = Some(true);
-        let y_fused = fused.forward_alloc(&gpu, &dx);
+        let y_fused = fused.forward_alloc(&gpu, &dx, &tc);
         let got = y_fused.to_host(&gpu);
 
         // bf16 staging costs ~3 decimal digits on the operand, and a T-loop
@@ -1994,8 +2010,8 @@ mod tests {
                 );
             }
         };
-        let want_dx = per_step.backward_alloc(&gpu, &y_per, &gy).to_host(&gpu);
-        let got_dx = fused.backward_alloc(&gpu, &y_fused, &gy).to_host(&gpu);
+        let want_dx = per_step.backward_alloc(&gpu, &y_per, &gy, &tc).to_host(&gpu);
+        let got_dx = fused.backward_alloc(&gpu, &y_fused, &gy, &tc).to_host(&gpu);
         close_rel(0.0, &want_dx.data, &got_dx.data, "dx");
         // Measured separation at B = 1/64/256: the degenerate input-gate slice sits at
         // 2-4e-4 of the largest bias gradient, the healthy ones at 0.05-0.14. Two
@@ -2045,6 +2061,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         if !gpu.kernels.has_coop || ops::slstm_batched_geometry(&gpu, h, b).is_none() {
             return;
         }
@@ -2067,10 +2084,10 @@ mod tests {
             c
         };
         let mut per_step = build(false);
-        let y_per = per_step.forward_alloc(&gpu, &x);
+        let y_per = per_step.forward_alloc(&gpu, &x, &tc);
         let want = y_per.to_host(&gpu);
         let mut batched = build(true);
-        let y_bat = batched.forward_alloc(&gpu, &x);
+        let y_bat = batched.forward_alloc(&gpu, &x, &tc);
         let got = y_bat.to_host(&gpu);
 
         // Both paths contract on bf16 operands — cuBLAS on a narrowed `h`/`Whr`, this
@@ -2093,8 +2110,8 @@ mod tests {
                 );
             }
         };
-        let want_dx = per_step.backward_alloc(&gpu, &y_per, &gy).to_host(&gpu);
-        let got_dx = batched.backward_alloc(&gpu, &y_bat, &gy).to_host(&gpu);
+        let want_dx = per_step.backward_alloc(&gpu, &y_per, &gy, &tc).to_host(&gpu);
+        let got_dx = batched.backward_alloc(&gpu, &y_bat, &gy, &tc).to_host(&gpu);
         close_rel(&want_dx.data, &got_dx.data, "dx");
         for gi in 0..4 {
             close_rel(
@@ -2120,6 +2137,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (b, h, chunks) = (64usize, 256usize, [6usize, 10]);
         if !gpu.kernels.has_coop || ops::slstm_batched_geometry(&gpu, h, b).is_none() {
             return;
@@ -2156,7 +2174,7 @@ mod tests {
             let mut off = 0;
             for &len in &chunks {
                 let xc = GTensor::from_host(&gpu, &cut(off, len));
-                y.extend(cell.forward_alloc(&gpu, &xc).to_host(&gpu).data);
+                y.extend(cell.forward_alloc(&gpu, &xc, &tc).to_host(&gpu).data);
                 off += len;
             }
             y
@@ -2188,6 +2206,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (b, inp, h) = (1, 8, 12);
         let chunks = [48usize, 48, 32]; // ragged: the last chunk is a different length
         let t: usize = chunks.iter().sum();
@@ -2198,10 +2217,10 @@ mod tests {
 
         // Reference: one call over the whole sequence.
         let mut whole = from_cpu(&gpu, &cpu);
-        let y_whole_dev = whole.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x));
+        let y_whole_dev = whole.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x), &tc);
         let y_whole = y_whole_dev.to_host(&gpu);
         let dx_whole = whole
-            .backward_alloc(&gpu, &y_whole_dev, &GTensor::from_host(&gpu, &dy))
+            .backward_alloc(&gpu, &y_whole_dev, &GTensor::from_host(&gpu, &dy), &tc)
             .to_host(&gpu);
 
         // Chunked: same weights, same input, one call per chunk.
@@ -2219,7 +2238,7 @@ mod tests {
         let mut off = 0;
         for &c in &chunks {
             let xc = GTensor::from_host(&gpu, &cut(&x, inp, off, c));
-            y_parts.extend(part.forward_alloc(&gpu, &xc).to_host(&gpu).data);
+            y_parts.extend(part.forward_alloc(&gpu, &xc, &tc).to_host(&gpu).data);
             off += c;
         }
         assert_close(&y_parts, &y_whole.data, 1e-4);
@@ -2253,11 +2272,11 @@ mod tests {
             let mut o = 0;
             for &pc in &chunks[..i] {
                 let xp = GTensor::from_host(&gpu, &cut(&x, inp, o, pc));
-                part.forward_alloc(&gpu, &xp);
+                part.forward_alloc(&gpu, &xp, &tc);
                 o += pc;
             }
             let xc = GTensor::from_host(&gpu, &cut(&x, inp, ends[i], c));
-            let yc = part.forward_alloc(&gpu, &xc);
+            let yc = part.forward_alloc(&gpu, &xc, &tc);
 
             // The BPTT channels must carry from the chunk to the right, so they are
             // NOT reset here — except for the rightmost chunk, which starts at zero.
@@ -2265,7 +2284,7 @@ mod tests {
                 part.reset_bptt(&gpu);
             }
             let dyc = GTensor::from_host(&gpu, &cut(&dy, h, ends[i], c));
-            dx_parts.push(part.backward_alloc(&gpu, &yc, &dyc).to_host(&gpu).data);
+            dx_parts.push(part.backward_alloc(&gpu, &yc, &dyc, &tc).to_host(&gpu).data);
         }
         dx_parts.reverse();
         let dx_flat: Vec<f32> = dx_parts.concat();
@@ -2289,6 +2308,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         use crate::nn::slstm::SLSTMLayer as InferSLstm;
         use crate::nn_layer::NnLayer;
 
@@ -2304,7 +2324,7 @@ mod tests {
 
         let x = Tensor::random(&[1, t, inp], 0.5);
         let y_dev = dev
-            .forward_alloc(&gpu, &GTensor::from_host(&gpu, &x))
+            .forward_alloc(&gpu, &GTensor::from_host(&gpu, &x), &tc)
             .to_host(&gpu)
             .data;
 

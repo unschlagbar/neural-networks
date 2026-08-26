@@ -34,9 +34,9 @@ fn main() {
     };
     let (reps, iters) = (env("REPS", 5), env("ITERS", 20));
 
-    let mut cache = TrainingCache::new();
 
     let gpu = Gpu::new().expect("gpu");
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
     println!(
         "SMs {}  smem_optin {}  best of {reps} x {iters}\n",
         gpu.sm_count, gpu.max_shared_optin
@@ -74,13 +74,13 @@ fn main() {
 
         for _ in 0..reps {
             for _ in 0..3 {
-                cell.forward(&gpu, &x, &mut y, &mut cache);
+                cell.forward(&gpu, &x, &mut y, &cache);
             }
             gpu.stream.synchronize().unwrap();
 
             let t0 = Instant::now();
             for _ in 0..iters {
-                cell.forward(&gpu, &x, &mut y, &mut cache);
+                cell.forward(&gpu, &x, &mut y, &cache);
             }
             let issue = t0.elapsed().as_secs_f64() / iters as f64;
             gpu.stream.synchronize().unwrap();

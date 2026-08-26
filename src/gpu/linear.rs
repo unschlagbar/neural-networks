@@ -10,7 +10,7 @@
 //! moments and the saved forward input are all `GTensor<f32>`s, so a forward→backward→
 //! step cycle touches host memory only if the caller downloads a result.
 
-use super::arena::{self, ParamKind, ParamSlot};
+use super::arena::{self, ParamKind, ParamSlot, TrainingCache};
 use super::{GTensor, Gpu, ops};
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
@@ -247,7 +247,7 @@ impl Linear {
     }
 
     /// [`forward_shared`](Self::forward_shared) where `x` has already been narrowed
-    /// into a [`ops::SharedLhs`] by the caller — saves the per-layer cast when several
+    /// into bf16 by the caller — saves the per-layer cast when several
     /// layers project the same input. `x` is the fp32 original, used only when this
     /// layer is pinned to fp32.
     pub fn forward_staged(
@@ -313,14 +313,15 @@ impl Linear {
         x: &ops::SlabBuf,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
-    ) {
+            cache: &TrainingCache,
+) {
         match x {
-            ops::SlabBuf::F32(t) => self.backward_with_x(gpu, t, dy, dx),
+            ops::SlabBuf::F32(t) => self.backward_with_x(gpu, t, dy, dx, cache),
             ops::SlabBuf::Bf16(b) => {
                 assert!(self.bf16, "Linear::backward_slab_x — layer is fp32-pinned");
                 self.gemm
                     .run_backward_staged_x(gpu, b, dy, &self.w, &mut self.dw, dx);
-                ops::add_col_sum(gpu, &mut self.db, dy);
+                ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
             }
         }
     }
@@ -373,7 +374,7 @@ impl Linear {
     }
 
     /// [`backward_with_x`](Self::backward_with_x) where the saved input is already
-    /// narrowed into a [`ops::SharedLhs`].
+    /// narrowed into bf16 by the caller.
     pub fn backward_staged_x(
         &mut self,
         gpu: &Gpu,
@@ -381,7 +382,8 @@ impl Linear {
         x_b: &super::GTensor<u16>,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
-    ) {
+            cache: &TrainingCache,
+) {
         assert_eq!(
             dy.cols(),
             self.output,
@@ -395,10 +397,10 @@ impl Linear {
         if self.bf16 {
             self.gemm
                 .run_backward_staged_x(gpu, x_b, dy, &self.w, &mut self.dw, dx);
-            ops::add_col_sum(gpu, &mut self.db, dy);
+            ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
         } else {
             Self::grad_w(gpu, &mut self.gemm, self.bf16, x, dy, &mut self.dw);
-            ops::add_col_sum(gpu, &mut self.db, dy);
+            ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
             self.grad_x(gpu, dy, dx);
         }
     }
@@ -416,9 +418,9 @@ impl Linear {
 
     /// Backward into a freshly allocated `dX` `[B, in]` — the by-value companion
     /// to [`backward`](Self::backward).
-    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>) -> GTensor<f32> {
+    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>, cache: &TrainingCache) -> GTensor<f32> {
         let mut dx = GTensor::uninit(gpu, &[dy.rows(), self.input]);
-        self.backward(gpu, dy, &mut dx);
+        self.backward(gpu, dy, &mut dx, cache);
         dx
     }
 
@@ -428,15 +430,16 @@ impl Linear {
         gpu: &Gpu,
         x: &GTensor<f32>,
         dy: &GTensor<f32>,
-    ) -> GTensor<f32> {
+            cache: &TrainingCache,
+) -> GTensor<f32> {
         let mut dx = GTensor::uninit(gpu, &[dy.rows(), self.input]);
-        self.backward_with_x(gpu, x, dy, &mut dx);
+        self.backward_with_x(gpu, x, dy, &mut dx, cache);
         dx
     }
 
     /// Given `dY` `[B, out]`, accumulate `dW`/`db` and write `dX = dY · Wᵀ` into
     /// `dx` `[B, in]`.
-    pub fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
+    pub fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>, cache: &TrainingCache) {
         assert_eq!(
             self.x.rows(),
             dy.rows(),
@@ -446,7 +449,7 @@ impl Linear {
         // see that through a `&mut self` method call — so the shared body takes the
         // three tensors it touches, not `self`.
         Self::grad_w(gpu, &mut self.gemm, self.bf16, &self.x, dy, &mut self.dw);
-        ops::add_col_sum(gpu, &mut self.db, dy);
+        ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
         self.grad_x(gpu, dy, dx);
     }
 
@@ -466,7 +469,8 @@ impl Linear {
         x: &GTensor<f32>,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
-    ) {
+            cache: &TrainingCache,
+) {
         assert_eq!(
             dy.cols(),
             self.output,
@@ -492,10 +496,10 @@ impl Linear {
             // per Linear backward.
             self.gemm
                 .run_backward(gpu, x, dy, &self.w, &mut self.dw, dx);
-            ops::add_col_sum(gpu, &mut self.db, dy);
+            ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
         } else {
             Self::grad_w(gpu, &mut self.gemm, self.bf16, x, dy, &mut self.dw);
-            ops::add_col_sum(gpu, &mut self.db, dy);
+            ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
             self.grad_x(gpu, dy, dx);
         }
     }
@@ -595,6 +599,11 @@ impl Linear {
 
 #[cfg(test)]
 mod tests {
+
+    /// One temp cache per test, sized past every shape this module presents.
+    fn test_cache(gpu: &Gpu) -> TrainingCache {
+        TrainingCache::new(gpu, 1 << 20, 1 << 16, 1 << 20)
+    }
     use super::*;
     use crate::nn2::linear::Linear as CpuLinear;
     use crate::nn2::optim::AdamCfg;
@@ -648,6 +657,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         if !ops::gemm_bf16_enabled(&gpu) {
             return; // no weight cache to keep
         }
@@ -670,7 +680,7 @@ mod tests {
         // ...and the survivor is still live, not frozen at its pre-step value.
         for t in 1..=3 {
             let before = gl.forward_alloc(&gpu, &x).to_host(&gpu).data;
-            let _ = gl.backward_alloc(&gpu, &dy);
+            let _ = gl.backward_alloc(&gpu, &dy, &tc);
             let mut c = AdamCfg::new(1e-2, 0.0);
             c.t = t;
             gl.step(&gpu, &c);
@@ -701,6 +711,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (b, i, o) = (4usize, 6usize, 5usize);
         let cpu = CpuLinear::new(i, o);
         let mut gl = Linear::from_parts(&gpu, &cpu.w, &cpu.b);
@@ -719,7 +730,7 @@ mod tests {
             let before = gl.forward_alloc(&gpu, &x).to_host(&gpu).data;
             let w_before = gl.w.to_host(&gpu).data;
 
-            let _ = gl.backward_alloc(&gpu, &dy);
+            let _ = gl.backward_alloc(&gpu, &dy, &tc);
             let mut c = cfg;
             c.t = t;
             // The bias is frozen (above), so a step moves `w` alone: one that also
@@ -756,6 +767,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (batch, input, output) = (12, 7, 5);
 
         let w = Tensor::xavier(input, output);
@@ -773,7 +785,7 @@ mod tests {
 
         // Backward
         let dx_cpu = cpu.backward(&dy);
-        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &dy));
+        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &dy), &tc);
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 1e-3));
         assert_close(&dev.dw.to_host(&gpu).data, &cpu.dw.data, tol(&gpu, 1e-3));
         assert_close(&dev.db.to_host(&gpu).data, &cpu.db.data, 1e-3);
@@ -797,6 +809,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (batch, input, output) = (12, 7, 5);
         let w = Tensor::xavier(input, output);
         let b = Tensor::random(&[output], 0.1);
@@ -829,9 +842,9 @@ mod tests {
         assert!(shared.x.is_empty(), "forward_shared kept an [N, in] copy");
         assert!(!saving.x.is_empty(), "forward should keep its input");
 
-        let dx_saving = saving.backward_alloc(&gpu, &dy);
+        let dx_saving = saving.backward_alloc(&gpu, &dy, &tc);
         let mut dx_shared = GTensor::uninit(&gpu, &[batch, input]);
-        shared.backward_with_x(&gpu, &x, &dy, &mut dx_shared);
+        shared.backward_with_x(&gpu, &x, &dy, &mut dx_shared, &tc);
 
         eq(
             &dx_shared.to_host(&gpu).data,
@@ -866,6 +879,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (batch, input, output, blk) = (14, 7, 5, 4); // 14 = 3·4 + 2 (ragged)
         let w = Tensor::xavier(input, output);
         let b = Tensor::random(&[output], 0.1);
@@ -877,7 +891,7 @@ mod tests {
         let mut whole = Linear::from_parts(&gpu, &w, &b);
         let mut blocked = Linear::from_parts(&gpu, &w, &b);
 
-        let dx_whole = whole.backward_alloc_with_x(&gpu, &x, &dy);
+        let dx_whole = whole.backward_alloc_with_x(&gpu, &x, &dy, &tc);
 
         // Row blocks are contiguous in a row-major [batch, ·] tensor, so a block is a
         // plain host sub-slice — no gather needed.
@@ -896,6 +910,7 @@ mod tests {
                 &gpu,
                 &GTensor::from_host(&gpu, &xb),
                 &GTensor::from_host(&gpu, &dyb),
+                &tc,
             );
             dx_blocked.extend_from_slice(&part.to_host(&gpu).data);
         }

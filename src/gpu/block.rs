@@ -17,7 +17,7 @@
 //! a generic GPU `Cell`.
 
 use super::{
-    Buf, GTensor, Gpu, Pool, SlabSlot,
+    Buf, GTensor, Gpu, SlabSlot,
     arena::{self, ParamSlot},
     linear::Linear,
     mlstm::MLstm,
@@ -141,7 +141,7 @@ pub trait Cell {
         gpu: &Gpu,
         x: &GTensor<f32>,
         out: &mut GTensor<f32>,
-        cache: &mut TrainingCache,
+        cache: &TrainingCache,
     );
     /// `y` is this cell's own forward output — which, because a cell ends in a
     /// post-norm, is that norm's output and so what its backward rebuilds `x̂` from.
@@ -152,6 +152,7 @@ pub trait Cell {
         y: &GTensor<f32>,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
+        cache: &TrainingCache,
     );
     fn zero_grad(&mut self, gpu: &Gpu);
     /// Every parameter with its gradient and AdamW moments, in a fixed order.
@@ -235,7 +236,7 @@ impl Cell for SLstm {
         gpu: &Gpu,
         x: &GTensor<f32>,
         out: &mut GTensor<f32>,
-        cache: &mut TrainingCache,
+        cache: &TrainingCache,
     ) {
         SLstm::forward(self, gpu, x, out, cache)
     }
@@ -245,8 +246,9 @@ impl Cell for SLstm {
         y: &GTensor<f32>,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
+        cache: &TrainingCache,
     ) {
-        SLstm::backward(self, gpu, y, dy, dx)
+        SLstm::backward(self, gpu, y, dy, dx, cache)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {
         SLstm::zero_grad(self, gpu)
@@ -324,21 +326,32 @@ pub trait BlockLike {
         gpu: &Gpu,
         x: &GTensor<f32>,
         out: &mut GTensor<f32>,
-        cache: &mut TrainingCache,
+        cache: &TrainingCache,
     );
-    fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>);
+    fn backward(
+        &mut self,
+        gpu: &Gpu,
+        dy: &GTensor<f32>,
+        dx: &mut GTensor<f32>,
+        cache: &TrainingCache,
+    );
     /// Forward into a freshly allocated `[B, T, H]`. Blocks are H-in == H-out, so
     /// the shape follows the input. For benchmarks and one-shot call sites; a
     /// training loop passes its own buffer to [`forward`](Self::forward).
-    fn forward_alloc(&mut self, gpu: &Gpu, x: &GTensor<f32>) -> GTensor<f32> {
+    fn forward_alloc(&mut self, gpu: &Gpu, x: &GTensor<f32>, cache: &TrainingCache) -> GTensor<f32> {
         let mut y = GTensor::uninit(gpu, x.dims());
-        self.forward(gpu, x, &mut y, &mut TrainingCache::new());
+        self.forward(gpu, x, &mut y, cache);
         y
     }
     /// Backward into a freshly allocated `dx`, shaped like `dy`.
-    fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>) -> GTensor<f32> {
+    fn backward_alloc(
+        &mut self,
+        gpu: &Gpu,
+        dy: &GTensor<f32>,
+        cache: &TrainingCache,
+    ) -> GTensor<f32> {
         let mut dx = GTensor::uninit(gpu, dy.dims());
-        self.backward(gpu, dy, &mut dx);
+        self.backward(gpu, dy, &mut dx, cache);
         dx
     }
     fn zero_grad(&mut self, gpu: &Gpu);
@@ -380,9 +393,8 @@ pub trait BlockLike {
     /// [`Block::drop_all_act`].
     fn drop_all_act(&mut self, gpu: &Gpu);
     /// Retained activation bytes by owner. See [`Block::act_breakdown`].
-    fn act_breakdown(&self) -> [usize; 5];
-    /// Pool free-list shape `(distinct sizes, buffers)`. See [`Block::pool_shape`].
-    fn pool_shape(&self) -> (usize, usize);
+    fn act_breakdown(&self) -> [usize; 4];
+
     /// Carry the cell's recurrence across calls, for a chunked sweep.
     fn set_carry(&mut self, carry: bool);
     /// Zero the carried forward state (before a sweep's first chunk).
@@ -402,12 +414,18 @@ impl<C: Cell> BlockLike for Block<C> {
         gpu: &Gpu,
         x: &GTensor<f32>,
         out: &mut GTensor<f32>,
-        cache: &mut TrainingCache,
+        cache: &TrainingCache,
     ) {
         Block::forward(self, gpu, x, out, cache)
     }
-    fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
-        Block::backward(self, gpu, dy, dx)
+    fn backward(
+        &mut self,
+        gpu: &Gpu,
+        dy: &GTensor<f32>,
+        dx: &mut GTensor<f32>,
+        cache: &TrainingCache,
+    ) {
+        Block::backward(self, gpu, dy, dx, cache)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {
         Block::zero_grad(self, gpu)
@@ -436,12 +454,10 @@ impl<C: Cell> BlockLike for Block<C> {
     fn drop_all_act(&mut self, gpu: &Gpu) {
         Block::drop_all_act(self, gpu)
     }
-    fn act_breakdown(&self) -> [usize; 5] {
+    fn act_breakdown(&self) -> [usize; 4] {
         Block::act_breakdown(self)
     }
-    fn pool_shape(&self) -> (usize, usize) {
-        Block::pool_shape(self)
-    }
+
     fn set_carry(&mut self, carry: bool) {
         self.carry = carry;
         // The two pre-norms save an `x̂` per forward, exactly like the FFN and the cell.
@@ -498,18 +514,17 @@ pub struct Block<C: Cell> {
 /// Only three values have to survive the forward: the SwiGLU operands its
 /// backward differentiates. Those get a permanent [`Buf`] each. Everything else
 /// — the residual chain, the norm outputs, every `d_*` — is a temporary consumed
-/// within the same call, and lives in a [`Pool`] instead.
+/// within the same call, and comes from the shared slots in
+/// [`temp`](super::temp) instead.
 ///
 /// That split is what keeps the memory honest. Giving all 23 intermediates a
 /// permanent buffer pins every one of them at once: measured at the backbone's
 /// shape (16 blocks, N=2048, H=1024) that is 4–6 GB of retained activations, and
-/// it pushed an 11 GB step to an out-of-memory abort. Pooling the temporaries
+/// it pushed an 11 GB step to an out-of-memory abort. Borrowing the temporaries
 /// keeps only as many buffers as are simultaneously live — a handful — while
 /// still allocating nothing once the shapes are steady.
 #[derive(Default)]
 struct Act {
-    /// Scratch for every temporary, recycled by size within the call.
-    pool: Pool,
     // The two norm outputs on the residual path. Each is what its norm's backward
     // rebuilds `x̂` from (see `RmsNorm::backward`), which is why neither norm stores an
     // `[N, H]` of its own — these ARE that tensor, and they are parkable besides.
@@ -629,18 +644,15 @@ impl<C: Cell> Block<C> {
     /// buffers nothing will ever read, and because [`Buf`] reuses by capacity they
     /// settle at the largest group's size and stay resident for the whole step.
     ///
-    /// Release pooled scratch far larger than a `rows`-row window needs.
+    /// Release saved scratch far larger than a `rows`-row window needs.
     ///
-    /// Call at a window boundary. Window sizes vary across a corpus and both [`Buf`]
-    /// and [`Pool`] reuse by capacity, so without this every buffer ratchets to the
+    /// Call at a window boundary. Window sizes vary across a corpus and [`Buf`]
+    /// reuses by capacity, so without this every buffer ratchets to the
     /// largest window ever seen: measured on the real `hg` path at
     /// `WORDS_PER_SEQ = 2048`, device memory climbed monotonically window over window
     /// — 10.4 GB, 13.4, 15.9, 16.6 — until it aborted. Nothing about the *steady*
     /// footprint was the problem.
     pub fn trim_to(&mut self, rows: usize) {
-        // The widest thing this block pools is `[rows, up]`; sizing the bound from
-        // that keeps the ordinary spread of window sizes reusable.
-        self.act.pool.trim(rows * self.up);
         self.cell.trim_to(rows);
     }
 
@@ -685,8 +697,7 @@ impl<C: Cell> Block<C> {
             act += a;
         }
         let a = &self.act;
-        act += a.pool.retained_bytes()
-            + a.xn1.retained_bytes()
+        act += a.xn1.retained_bytes()
             + a.cell_out.retained_bytes()
             + a.gate_pre.retained_bytes()
             + a.gate_act.retained_bytes()
@@ -697,12 +708,12 @@ impl<C: Cell> Block<C> {
     }
 
     /// Retained activation bytes broken out by owner, for the memory audit:
-    /// `(ffn_bufs, pool, norms, projections, cell)`.
+    /// `(ffn_bufs, norms, projections, cell)`.
     ///
-    /// The split matters because only the first two are reachable from
+    /// The split matters because only the first is reachable from
     /// [`drop_saved_act`](Self::drop_saved_act) + [`trim_to`](Self::trim_to); the last
     /// three are held inside the sub-layers and survive both.
-    pub fn act_breakdown(&self) -> [usize; 5] {
+    pub fn act_breakdown(&self) -> [usize; 4] {
         let a = &self.act;
         let saved = a.xn1.retained_bytes()
             + a.cell_out.retained_bytes()
@@ -719,18 +730,7 @@ impl<C: Cell> Block<C> {
             .iter()
             .map(|l| l.retained_bytes().1)
             .sum();
-        [
-            saved,
-            a.pool.retained_bytes(),
-            norms,
-            proj,
-            self.cell.retained_bytes().1,
-        ]
-    }
-
-    /// This block's pool free-list shape `(distinct sizes, buffers)`. Diagnostic.
-    pub fn pool_shape(&self) -> (usize, usize) {
-        self.act.pool.free_list_shape()
+        [saved, norms, proj, self.cell.retained_bytes().1]
     }
 
     /// Release every activation this block holds, everywhere — the FFN buffers and
@@ -879,7 +879,7 @@ impl<C: Cell> Block<C> {
         gpu: &Gpu,
         input: &GTensor<f32>,
         out: &mut GTensor<f32>,
-        cache: &mut TrainingCache,
+        cache: &TrainingCache,
     ) {
         assert_eq!(input.rank, 3, "Block::forward expects [B, T, H]");
         let (b, t, h) = (input.shape[0], input.shape[1], input.shape[2]);
@@ -914,7 +914,6 @@ impl<C: Cell> Block<C> {
             park.release_previous();
         }
         let a = &mut self.act;
-        a.pool.assert_drained("Block::forward");
         // Chunked sweep without offload: the previous chunk's FFN activations are still
         // owed a backward, so move them aside before the `Buf` slots below overwrite
         // them. With offload on, the park already holds a generation per chunk and the
@@ -947,7 +946,7 @@ impl<C: Cell> Block<C> {
 
         // Downstream is position-wise [N, H].
         cell_out.reshape_to(&[n, h]);
-        let mut z = a.pool.take(gpu, &[n, h]);
+        let mut z = cache.temps.get::<f32>(gpu, &[n, h]);
         ops::add_into(gpu, &x_flat, a.cell_out.expect("cell wrote it"), &mut z);
 
         // Residual 2: out = z + SwiGLU(pre_norm2(z)). The three SwiGLU operands are
@@ -989,7 +988,7 @@ impl<C: Cell> Block<C> {
                 .forward_shared_resid(gpu, mixed.expect("mixed"), &z, out);
         });
         out.reshape_to(&[b, t, h]);
-        a.pool.put(z);
+        drop(z);
         // With offload on, this block's saved activations go to the host now and the
         // device buffers are released. Backward restores them (see `restore_act`).
         self.evict_act(gpu);
@@ -1074,7 +1073,13 @@ impl<C: Cell> Block<C> {
 
     /// Backward over `[B, T, H]` → `dx` `[B, T, H]`.
     /// `dy` and `dx` must not alias, for the reason given on [`forward`](Self::forward).
-    pub fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
+    pub fn backward(
+        &mut self,
+        gpu: &Gpu,
+        dy: &GTensor<f32>,
+        dx: &mut GTensor<f32>,
+        cache: &TrainingCache,
+    ) {
         let (b, t) = self.seq.pop().expect("Block::backward before forward");
         let (h, u) = (self.hidden, self.up);
         let n = b * t;
@@ -1099,7 +1104,6 @@ impl<C: Cell> Block<C> {
         let saved = BlockSaved::take(&mut self.act);
         self.fwd_chunks = self.fwd_chunks.saturating_sub(1);
         let a = &mut self.act;
-        a.pool.assert_drained("Block::backward");
 
         // Owned [N, H]: read by lin_down.backward and again by the d_z residual.
         // Read-only view of the incoming delta as [N, H], the counterpart of `x_flat`
@@ -1107,15 +1111,15 @@ impl<C: Cell> Block<C> {
         let dy_flat = GTensor::view(gpu, &dy.buf, 0, &[n, h]);
 
         // Residual 2.
-        let mut d_mixed = a.pool.take(gpu, &[n, u]);
+        let mut d_mixed = cache.temps.get::<f32>(gpu, &[n, u]);
         let ffn_t0 = phase::enabled().then(|| {
             gpu.stream.synchronize().expect("sync");
             std::time::Instant::now()
         });
         self.lin_down
-            .backward_with_x(gpu, &saved.mixed, &dy_flat, &mut d_mixed);
-        let mut d_gate = a.pool.take(gpu, &[n, u]);
-        let mut d_value = a.pool.take(gpu, &[n, u]);
+            .backward_with_x(gpu, &saved.mixed, &dy_flat, &mut d_mixed, cache);
+        let mut d_gate = cache.temps.get::<f32>(gpu, &[n, u]);
+        let mut d_value = cache.temps.get::<f32>(gpu, &[n, u]);
         ops::swiglu_backward_into(
             gpu,
             &d_mixed,
@@ -1125,54 +1129,54 @@ impl<C: Cell> Block<C> {
             &mut d_gate,
             &mut d_value,
         );
-        a.pool.put(d_mixed);
+        drop(d_mixed);
         // Both projections read the one saved `zn`, which the forward already wrote at
         // the width their GEMMs want — so neither narrows anything here.
-        let mut d_zn_g = a.pool.take(gpu, &[n, h]);
-        let mut d_zn_v = a.pool.take(gpu, &[n, h]);
+        let mut d_zn_g = cache.temps.get::<f32>(gpu, &[n, h]);
+        let mut d_zn_v = cache.temps.get::<f32>(gpu, &[n, h]);
         self.lin_gate
-            .backward_slab_x(gpu, &saved.zn, &d_gate, &mut d_zn_g);
+            .backward_slab_x(gpu, &saved.zn, &d_gate, &mut d_zn_g, cache);
         self.lin_value
-            .backward_slab_x(gpu, &saved.zn, &d_value, &mut d_zn_v);
-        let mut d_zn = a.pool.take(gpu, &[n, h]);
+            .backward_slab_x(gpu, &saved.zn, &d_value, &mut d_zn_v, cache);
+        let mut d_zn = cache.temps.get::<f32>(gpu, &[n, h]);
         ops::add_into(gpu, &d_zn_g, &d_zn_v, &mut d_zn);
         if let Some(t0) = ffn_t0 {
             gpu.stream.synchronize().expect("sync");
             phase::add(phase::Bucket::FfnBwd, t0.elapsed().as_nanos() as u64);
         }
-        a.pool.put_all([d_gate, d_value, d_zn_g, d_zn_v]);
+        drop((d_gate, d_value, d_zn_g, d_zn_v));
 
         // z feeds pre_norm2 (the MLP path) and the y = z + down residual, so the
         // norm's dx and the incoming dy sum into d_z. `d_z_mlp` is separate because
         // `add_into`'s destination must not be one of its operands.
-        let mut d_z_mlp = a.pool.take(gpu, &[n, h]);
+        let mut d_z_mlp = cache.temps.get::<f32>(gpu, &[n, h]);
         // `zn` is pre_norm2's own output — see `RmsNorm::backward`.
-        self.pre_norm2.backward_slab(gpu, &d_zn, &saved.zn, &mut d_z_mlp);
-        let mut d_z = a.pool.take(gpu, &[n, h]);
+        self.pre_norm2.backward_slab(gpu, &d_zn, &saved.zn, &mut d_z_mlp, cache);
+        let mut d_z = cache.temps.get::<f32>(gpu, &[n, h]);
         ops::add_into(gpu, &d_z_mlp, &dy_flat, &mut d_z);
-        a.pool.put_all([d_zn, d_z_mlp]);
+        drop((d_zn, d_z_mlp));
 
         // Residual 1. The cell receives a copy of d_z rather than d_z itself: its
         // backward must not clobber d_z, which the dx residual still needs.
-        let mut d_cell_out = a.pool.take(gpu, &[n, h]);
+        let mut d_cell_out = cache.temps.get::<f32>(gpu, &[n, h]);
         d_cell_out.copy_from(gpu, &d_z);
         d_cell_out.reshape_to(&[b, t, h]);
-        let mut d_cell_in = a.pool.take(gpu, &[b, t, h]);
+        let mut d_cell_in = cache.temps.get::<f32>(gpu, &[b, t, h]);
         let (_cf, cb) = self.cell.phase_buckets();
         phase::timed(gpu, cb, || {
             self.cell
-                .backward(gpu, &saved.cell_out, &d_cell_out, &mut d_cell_in)
+                .backward(gpu, &saved.cell_out, &d_cell_out, &mut d_cell_in, cache)
         });
-        a.pool.put(d_cell_out);
+        drop(d_cell_out);
         d_cell_in.reshape_to(&[n, h]);
-        let mut d_xn1 = a.pool.take(gpu, &[n, h]);
+        let mut d_xn1 = cache.temps.get::<f32>(gpu, &[n, h]);
         self.pre_norm1
-            .backward(gpu, &d_cell_in, &saved.xn1, &mut d_xn1);
+            .backward(gpu, &d_cell_in, &saved.xn1, &mut d_xn1, cache);
         // x feeds pre_norm1 (cell path) and the z = x + cn residual.
         dx.reshape_to(&[n, h]);
         ops::add_into(gpu, &d_xn1, &d_z, dx);
         dx.reshape_to(&[b, t, h]);
-        a.pool.put_all([d_cell_in, d_xn1, d_z]);
+        drop((d_cell_in, d_xn1, d_z));
         // Give the saved buffers back to their owned slots so the next forward reuses
         // the allocations. On the offload path this drops them instead, which is what
         // releases the restored device memory again.
@@ -1310,6 +1314,11 @@ impl Block<MLstm> {
 
 #[cfg(test)]
 mod tests {
+
+    /// One temp cache per test, sized past every shape this module presents.
+    fn test_cache(gpu: &Gpu) -> TrainingCache {
+        TrainingCache::new(gpu, 1 << 20, 1 << 16, 1 << 20)
+    }
     use super::*;
     use crate::nn2::block::{MLstmBlock as CpuMLstmBlock, SLstmBlock as CpuSLstmBlock};
     use crate::nn2::optim::AdamCfg;
@@ -1394,6 +1403,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (b, t, h, u) = (2, 4, 8, 12);
 
         let mut cpu = CpuSLstmBlock::new_slstm(h, u);
@@ -1404,12 +1414,12 @@ mod tests {
 
         // Forward
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x));
+        let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x), &tc);
         assert_close_rel(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, rel(&gpu), "y");
 
         // Backward
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g), &tc);
         assert_close_rel(
             &dx_dev.to_host(&gpu).data,
             &dx_cpu.data,
@@ -1455,6 +1465,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (b, t, h, u, heads, dqk) = (2, 5, 8, 12, 2, 4); // dhv = 4
 
         let mut cpu = CpuMLstmBlock::new_mlstm(h, u, heads, dqk);
@@ -1468,11 +1479,11 @@ mod tests {
         let g = Tensor::random(&[b, t, h], 1.0);
 
         let y_cpu = cpu.forward(&x);
-        let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x));
+        let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x), &tc);
         assert_close_rel(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, rel(&gpu), "y");
 
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g), &tc);
         assert_close_rel(
             &dx_dev.to_host(&gpu).data,
             &dx_cpu.data,
@@ -1515,12 +1526,14 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (b, t, h, u) = (2, 5, 8, 12);
 
         // `run` builds an identical block from identical CPU weights, so the only
         // difference between the two calls is where the activations lived.
         fn run<C: Cell, F: Fn() -> Block<C>>(
             gpu: &Gpu,
+            tc: &TrainingCache,
             build: F,
             x: &Tensor,
             g: &Tensor,
@@ -1530,8 +1543,8 @@ mod tests {
             if offload {
                 dev.enable_offload(gpu, offload::InFlight::shared());
             }
-            let y = dev.forward_alloc(gpu, &GTensor::from_host(gpu, x));
-            let dx = dev.backward_alloc(gpu, &GTensor::from_host(gpu, g));
+            let y = dev.forward_alloc(gpu, &GTensor::from_host(gpu, x), tc);
+            let dx = dev.backward_alloc(gpu, &GTensor::from_host(gpu, g), tc);
             // Gradients of the three FFN projections are the ones the parked buffers
             // feed, so they are the sharpest probe.
             let dw_down = dev.lin_down.dw.to_host(gpu).data;
@@ -1545,8 +1558,8 @@ mod tests {
         // sLSTM cell.
         let cpu_s = CpuSLstmBlock::new_slstm(h, u);
         let build_s = || Block::<SLstm>::from_cpu(&gpu, &cpu_s);
-        let resident = run(&gpu, build_s, &x, &g, false);
-        let parked = run(&gpu, build_s, &x, &g, true);
+        let resident = run(&gpu, &tc, build_s, &x, &g, false);
+        let parked = run(&gpu, &tc, build_s, &x, &g, true);
         assert_eq!(parked.0, resident.0, "sLSTM: y differs under offload");
         assert_eq!(parked.1, resident.1, "sLSTM: dx differs under offload");
         assert_eq!(
@@ -1563,8 +1576,8 @@ mod tests {
         cpu_m.cell.wi = Tensor::random(&[h, 2], 0.3);
         cpu_m.cell.wf = Tensor::random(&[h, 2], 0.3);
         let build_m = || Block::<MLstm>::from_cpu(&gpu, &cpu_m);
-        let resident = run(&gpu, build_m, &x, &g, false);
-        let parked = run(&gpu, build_m, &x, &g, true);
+        let resident = run(&gpu, &tc, build_m, &x, &g, false);
+        let parked = run(&gpu, &tc, build_m, &x, &g, true);
         assert_eq!(parked.0, resident.0, "mLSTM: y differs under offload");
         assert_eq!(parked.1, resident.1, "mLSTM: dx differs under offload");
         assert_eq!(
@@ -1588,6 +1601,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (h, u) = (8, 12);
         let cpu = CpuSLstmBlock::new_slstm(h, u);
         let mut resident = Block::<SLstm>::from_cpu(&gpu, &cpu);
@@ -1603,12 +1617,12 @@ mod tests {
             let dx = GTensor::from_host(&gpu, &x);
             let dg = GTensor::from_host(&gpu, &g);
 
-            let y_r = resident.forward_alloc(&gpu, &dx).to_host(&gpu).data;
-            let y_p = parked.forward_alloc(&gpu, &dx).to_host(&gpu).data;
+            let y_r = resident.forward_alloc(&gpu, &dx, &tc).to_host(&gpu).data;
+            let y_p = parked.forward_alloc(&gpu, &dx, &tc).to_host(&gpu).data;
             assert_eq!(y_p, y_r, "step {step}: y diverged");
 
-            let dxr = resident.backward_alloc(&gpu, &dg).to_host(&gpu).data;
-            let dxp = parked.backward_alloc(&gpu, &dg).to_host(&gpu).data;
+            let dxr = resident.backward_alloc(&gpu, &dg, &tc).to_host(&gpu).data;
+            let dxp = parked.backward_alloc(&gpu, &dg, &tc).to_host(&gpu).data;
             assert_eq!(dxp, dxr, "step {step}: dx diverged");
 
             cfg.t += 1;
@@ -1634,6 +1648,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         let (h, u, b, t) = (8, 12, 1, 6);
         let cpu = CpuSLstmBlock::new_slstm(h, u);
         let mut resident = Block::<SLstm>::from_cpu(&gpu, &cpu);
@@ -1652,14 +1667,14 @@ mod tests {
             let mut ys = Vec::new();
             for x in &xs {
                 let dx = GTensor::from_host(&gpu, x);
-                ys.push(dev.forward_alloc(&gpu, &dx).to_host(&gpu).data);
+                ys.push(dev.forward_alloc(&gpu, &dx, &tc).to_host(&gpu).data);
             }
             // Unwind right to left; the rightmost chunk starts with no incoming grad.
             dev.reset_bptt(&gpu);
             let mut dxs = Vec::new();
             for g in gs.iter().rev() {
                 let dg = GTensor::from_host(&gpu, g);
-                dxs.push(dev.backward_alloc(&gpu, &dg).to_host(&gpu).data);
+                dxs.push(dev.backward_alloc(&gpu, &dg, &tc).to_host(&gpu).data);
             }
             (ys, dxs, dev.lin_down.dw.to_host(&gpu).data)
         };

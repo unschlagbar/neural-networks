@@ -31,6 +31,7 @@ fn main() {
     use neural_networks::tensor::Tensor;
 
     let gpu = Gpu::new().expect("gpu");
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
     let rounds: usize = env_usize("ROUNDS", 9);
     let iters: usize = env_usize("ITERS", 6);
 
@@ -107,7 +108,6 @@ fn main() {
         let gy = GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, h], 0.7, 9));
         let mut y: GTensor<f32> = GTensor::uninit(&gpu, &[b, t, h]);
         let mut dx: GTensor<f32> = GTensor::uninit(&gpu, &[b, t, h]);
-        let mut cache = TrainingCache::new();
 
         // Three arms: the scalar time-fused kernel, the mma batched one, and the
         // per-step loop both replace.
@@ -117,8 +117,8 @@ fn main() {
             gpu.stream.synchronize().ok();
             let t0 = Instant::now();
             for _ in 0..n {
-                cell.forward(&gpu, &x, &mut y, &mut cache);
-                cell.backward(&gpu, &y, &gy, &mut dx);
+                cell.forward(&gpu, &x, &mut y, &cache);
+                cell.backward(&gpu, &y, &gy, &mut dx, &cache);
             }
             gpu.stream.synchronize().ok();
             t0.elapsed().as_secs_f64() * 1e3 / n as f64

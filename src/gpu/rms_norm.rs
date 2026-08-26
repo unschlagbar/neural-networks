@@ -7,7 +7,7 @@
 //! `group == size`. Scale, grad, moments and the saved `inv_rms` all live on the
 //! device; `x̂` is never stored — backward rebuilds it from the forward output.
 
-use super::arena::{self, ParamKind, ParamSlot};
+use super::arena::{self, ParamKind, ParamSlot, TrainingCache};
 use super::ops::{self, GpuRmsForward};
 use super::{GTensor, Gpu};
 use crate::nn2::optim::AdamCfg;
@@ -137,9 +137,9 @@ impl RmsNorm {
     }
 
     /// Backward into a freshly allocated `dX` `[B, F]`.
-    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>, y: &GTensor<f32>) -> GTensor<f32> {
+    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>, y: &GTensor<f32>, cache: &TrainingCache) -> GTensor<f32> {
         let mut dx = GTensor::uninit(gpu, &[dy.rows(), dy.cols()]);
-        self.backward(gpu, dy, y, &mut dx);
+        self.backward(gpu, dy, y, &mut dx, cache);
         dx
     }
 
@@ -154,8 +154,9 @@ impl RmsNorm {
         dy: &GTensor<f32>,
         y: &GTensor<f32>,
         dx: &mut GTensor<f32>,
-    ) {
-        self.backward_wos(gpu, dy, ops::WideOrSlab::F32(y), dx);
+            cache: &TrainingCache,
+) {
+        self.backward_wos(gpu, dy, ops::WideOrSlab::F32(y), dx, cache);
     }
 
     /// [`backward`](Self::backward) where `y` is the slab this norm's
@@ -167,8 +168,9 @@ impl RmsNorm {
         dy: &GTensor<f32>,
         y: &ops::SlabBuf,
         dx: &mut GTensor<f32>,
-    ) {
-        self.backward_wos(gpu, dy, ops::WideOrSlab::Slab(y), dx);
+            cache: &TrainingCache,
+) {
+        self.backward_wos(gpu, dy, ops::WideOrSlab::Slab(y), dx, cache);
     }
 
     fn backward_wos(
@@ -177,12 +179,23 @@ impl RmsNorm {
         dy: &GTensor<f32>,
         y: ops::WideOrSlab<'_>,
         dx: &mut GTensor<f32>,
-    ) {
+            cache: &TrainingCache,
+) {
         let (_, f) = dy.as_2d();
         assert_eq!(f, self.size, "RmsNorm::backward — width mismatch");
         assert_eq!(y.as_2d(), dy.as_2d(), "RmsNorm::backward — y shape");
         let fwd = self.fwd.as_ref().expect("RmsNorm::backward before forward");
-        ops::rms_norm_backward_into(gpu, dy, fwd, y, &self.gamma, &mut self.dgamma, self.group, dx);
+        ops::rms_norm_backward_into(
+            gpu,
+            dy,
+            fwd,
+            y,
+            &self.gamma,
+            &mut self.dgamma,
+            self.group,
+            dx,
+            &cache.temps,
+        );
         // Chunks unwind right to left, so hand the slot to the chunk on the left.
         if let Some(prev) = self.chunk_saved.pop() {
             self.fwd = Some(prev);
@@ -250,6 +263,11 @@ impl RmsNorm {
 
 #[cfg(test)]
 mod tests {
+
+    /// One temp cache per test, sized past every shape this module presents.
+    fn test_cache(gpu: &Gpu) -> TrainingCache {
+        TrainingCache::new(gpu, 1 << 20, 1 << 16, 1 << 20)
+    }
     use super::*;
     use crate::gpu::GTensor;
 
@@ -265,6 +283,7 @@ mod tests {
         let Some(gpu) = crate::gpu::test_gpu() else {
             return;
         };
+        let tc = test_cache(&gpu);
         // A block-norm shape (group == width) and a head-norm one (group << width),
         // which take different launch geometries.
         for (rows, size, group) in [(64usize, 256usize, 256usize), (128, 128, 16)] {
@@ -276,13 +295,13 @@ mod tests {
             let mut y_w = GTensor::uninit(&gpu, &[rows, size]);
             wide.forward(&gpu, &x, &mut y_w);
             let mut dx_w = GTensor::uninit(&gpu, &[rows, size]);
-            wide.backward(&gpu, &dy, &y_w, &mut dx_w);
+            wide.backward(&gpu, &dy, &y_w, &mut dx_w, &tc);
 
             let mut narrow = RmsNorm::from_parts_grouped(&gpu, &g, group);
             let mut y_n = ops::SlabBuf::new(&gpu, &[rows, size]);
             narrow.forward_slab(&gpu, &x, &mut y_n);
             let mut dx_n = GTensor::uninit(&gpu, &[rows, size]);
-            narrow.backward_slab(&gpu, &dy, &y_n, &mut dx_n);
+            narrow.backward_slab(&gpu, &dy, &y_n, &mut dx_n, &tc);
 
             // bf16 keeps 8 mantissa bits, so a single rounding is ~4e-3 relative. The
             // fp32 build makes the two paths the same kernel, hence the tighter bound.

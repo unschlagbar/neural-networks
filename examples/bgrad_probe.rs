@@ -42,6 +42,8 @@ fn main() {
             return;
         }
     };
+    use neural_networks::gpu::arena::TrainingCache;
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
 
     const IT: usize = 300;
     // Weight-gradient shapes from one real step: (rows, in, out).
@@ -232,7 +234,7 @@ fn main() {
             let mut go = || {
                 ops::matmul_bf16_into(&gpu, ops::MmForm::Tn, &x_b, &dy_b, &mut dw_ref, 1.0);
                 if with_colsum {
-                    ops::add_col_sum(&gpu, &mut db, &dy);
+                    ops::add_col_sum(&gpu, &mut db, &dy, &cache.temps);
                 }
             };
             for _ in 0..30 {

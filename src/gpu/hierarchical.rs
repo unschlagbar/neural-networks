@@ -35,6 +35,7 @@ use cudarc::driver::CudaSlice;
 
 use super::arena::{ParamArena, ParamKind, ParamSlot};
 use super::block::Block;
+use super::temp;
 use super::word_groups::{DecoderGroups, EncoderGroups, GroupIds, max_group_rows};
 use super::{GTensor, Gpu, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm};
 use crate::config::{GROUP_MAX_ROWS, WORDS_PER_SEQ};
@@ -420,9 +421,15 @@ pub struct Hierarchical {
     /// Reused host-side word grouping (see [`Scratch`]). Taken for the duration of a
     /// window so the stage methods can borrow it beside `&mut self`.
     scratch: Option<Scratch>,
-    /// Forward activations of the current window, owned by the model so its buffers
-    /// survive across windows instead of being rebuilt every step (see [`Scratch`]).
-    cache: TrainingCache,
+    /// Window scratch, owned by the model so its slots survive across windows.
+    ///
+    /// Built at the first window rather than at construction, for the same reason
+    /// [`Scratch`] is: `set_group_cap`/`set_bb_chunk` override the shapes the stages
+    /// present, and a slot has to be sized for the shapes this instance will actually
+    /// ask for. Taken for the duration of a window so the stage methods can borrow it
+    /// beside `&mut self` — a *shared* borrow, which is what lets a caller hold
+    /// temporaries across a nested call.
+    cache: Option<TrainingCache>,
     /// Staging for the per-group index lists, so each group's ids go up in one
     /// pinned async transfer rather than one blocking transfer per list.
     ids: GroupIds,
@@ -507,7 +514,7 @@ impl Hierarchical {
     fn unbound(gpu: &Gpu, cfg: ModelCfg) -> Self {
         let bb_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.bb_blocks)
             .map(|i| {
-                if i.is_multiple_of(8) {
+                if i.is_multiple_of(6) {
                     Box::new(Block::from_cell(
                         gpu,
                         cfg.wh,
@@ -574,7 +581,7 @@ impl Hierarchical {
             timer: PhaseTimer::new(&flags),
             flags,
             scratch: None,
-            cache: TrainingCache::default(),
+            cache: None,
             ids: GroupIds::new(gpu),
             loss_acc: None,
             last_word_loss: 0.0,
@@ -706,20 +713,48 @@ impl Hierarchical {
             }
             sc
         });
-        let mut cache = mem::take(&mut self.cache);
+        let cache = self.cache.take().unwrap_or_else(|| {
+            let c = TrainingCache::new(
+                gpu,
+                self.temp_slot_elems(),
+                self.temp_small_elems(),
+                self.temp_chunk_elems(),
+            );
+            if self.flags.mem {
+                let kib = |e: usize| e as f64 * 4.0 / 1024.0;
+                println!(
+                    "  temp slots: {} x {:.2} MiB + {} x {:.0} KiB = {:.2} MiB",
+                    temp::SLOTS,
+                    kib(c.temps.slot_elems()) / 1024.0,
+                    temp::SMALL_SLOTS,
+                    kib(c.temps.small_slot_elems()),
+                    c.temps.bytes() as f64 / (1 << 20) as f64,
+                );
+            }
+            c
+        });
+        // Every temporary of the previous window must have been released with it.
+        cache.temps.assert_drained("window start");
 
-        let enc_rows = self.encoder_forward(gpu, tokens, words, &mut sc, &mut cache);
-        let bb = self.backbone_forward(gpu, &sc.word_embeds, dw, &mut cache);
+        let enc_rows = self.encoder_forward(gpu, tokens, words, &mut sc, &cache);
+        let bb = self.backbone_forward(gpu, &sc.word_embeds, dw, &cache);
 
         let bb_rows_max = bb.rows_max;
         let (loss, d_o, dec_rows_max) =
-            self.decode_groups(gpu, tokens, words, word_loss, &bb.o, &mut sc, &mut cache);
+            self.decode_groups(gpu, tokens, words, word_loss, &bb.o, &mut sc, &cache);
 
-        let d_word_embeds = self.backbone_backward(gpu, bb, &d_o, dw);
-        self.encoder_backward(gpu, &d_word_embeds, &mut sc, &mut cache);
+        let d_word_embeds = self.backbone_backward(gpu, bb, &d_o, dw, &cache);
+        self.encoder_backward(gpu, &d_word_embeds, &mut sc, &cache);
 
         self.scratch = Some(sc);
-        self.cache = cache;
+        if self.flags.mem {
+            // What SLOTS actually had to be. A high water well under the count means
+            // slots are being held that nothing asks for.
+            let (high, of) = cache.temps.high_water();
+            let (shigh, sof) = cache.temps.small_high_water();
+            println!("  temp slots peak: {high}/{of}  small {shigh}/{sof}");
+        }
+        self.cache = Some(cache);
 
         // Release pooled scratch far larger than this window needed.
         self.trim_pools(bb_rows_max, enc_rows, dec_rows_max);
@@ -738,16 +773,8 @@ impl Hierarchical {
         }
         let widest = hist.iter().rposition(|&c| c > 0).unwrap_or(0);
         let lengths = hist.iter().filter(|&&c| c > 0).count();
-        // Pool free-list shape alongside the shape of the window that produced it:
-        // `mem_get_info` cannot separate live memory from allocator cache, and a
-        // climbing size count is the signal that the free list is accumulating one
-        // entry per distinct shape rather than converging. See `buf::size_class`.
-        let ps = self.pool_shapes();
-        let sizes: usize = ps.iter().map(|(_, s, _)| s).sum();
-        let bufs: usize = ps.iter().map(|(_, _, b)| b).sum();
         println!(
-            "  window: {} words, {} tokens, longest {widest}, {lengths} lengths  \
-             | pool {sizes} sizes / {bufs} bufs",
+            "  window: {} words, {} tokens, longest {widest}, {lengths} lengths",
             words.len(),
             tokens.len()
         );
@@ -756,6 +783,68 @@ impl Hierarchical {
     /// Largest rectangle this model allows before a length run is split.
     fn group_cap(&self) -> usize {
         self.group_cap.unwrap_or(GROUP_MAX_ROWS)
+    }
+
+    /// `f32` elements per temp slot: the widest temporary any of the three stages can
+    /// present, at *this instance's* caps. See [`super::temp`].
+    ///
+    /// The encoder and decoder are bounded by the group row cap, the backbone by its
+    /// chunk length — and an unchunked backbone by the whole window, which is the
+    /// same O(words) residency that made chunking necessary in the first place.
+    fn temp_slot_elems(&self) -> usize {
+        let (hc, wh) = (self.cfg.hc, self.cfg.wh);
+        let enc_rows = max_group_rows(self.group_cap());
+        let bb_rows = match self.bb_chunk {
+            Some(c) => c.min(WORDS_PER_SEQ).max(1),
+            None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(WORDS_PER_SEQ).max(1),
+            None => WORDS_PER_SEQ,
+        };
+        // The encoder and decoder fix `heads` at 16 (see `WordEncoder::new`); only the
+        // backbone takes its head split from the config.
+        let enc_heads = 16.min(hc);
+        let enc_dqk = (hc / enc_heads).max(1);
+        temp::widest(enc_rows, hc, enc_heads, enc_dqk, 0)
+            .max(temp::widest(bb_rows, wh, self.cfg.heads, self.cfg.dqk, 0))
+            .max(temp::widest(enc_rows, hc, enc_heads, enc_dqk, self.cfg.vocab))
+    }
+
+    /// `f32` elements per **chunk-state** temp slot. See [`temp::widest_chunk`].
+    ///
+    /// The mLSTM cuts its sequence into chunks of `MLSTM_CHUNK`, so a stage's chunk
+    /// count follows its own `T`: the encoder and decoder run a short `tmax` (one
+    /// chunk), the backbone `BACKBONE_CHUNK`.
+    fn temp_chunk_elems(&self) -> usize {
+        let l = crate::config::MLSTM_CHUNK;
+        let enc_rows = max_group_rows(self.group_cap());
+        let enc_tmax = crate::config::MAX_WORD_BYTES + 1;
+        let bb_rows = match self.bb_chunk {
+            Some(c) => c.min(WORDS_PER_SEQ).max(1),
+            None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(WORDS_PER_SEQ).max(1),
+            None => WORDS_PER_SEQ,
+        };
+        let (hc, wh) = (self.cfg.hc, self.cfg.wh);
+        let eh = 16.min(hc);
+        temp::widest_chunk(enc_rows, enc_tmax, eh, hc / eh, hc / eh, l).max(temp::widest_chunk(
+            bb_rows,
+            bb_rows,
+            self.cfg.heads,
+            self.cfg.dqk,
+            wh / self.cfg.heads,
+            l,
+        ))
+    }
+
+    /// `f32` elements per **small** temp slot, at this instance's caps. See
+    /// [`temp::widest_small`].
+    fn temp_small_elems(&self) -> usize {
+        let enc_rows = max_group_rows(self.group_cap());
+        let bb_rows = match self.bb_chunk {
+            Some(c) => c.min(WORDS_PER_SEQ).max(1),
+            None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(WORDS_PER_SEQ).max(1),
+            None => WORDS_PER_SEQ,
+        };
+        temp::widest_small(enc_rows, 16)
+            .max(temp::widest_small(bb_rows, self.cfg.heads))
     }
 
     /// Run one encoder group's rectangle through the block stack, leaving the result in
@@ -768,7 +857,7 @@ impl Hierarchical {
         n_g: usize,
         tmax: usize,
         rows: usize,
-        cache: &mut TrainingCache,
+        cache: &TrainingCache,
     ) {
         let hc = self.cfg.hc;
         // Blocks are H-in == H-out, so one spare buffer ping-pongs the stack. Rotating
@@ -808,7 +897,7 @@ impl Hierarchical {
         tokens: &[usize],
         words: &[Range<usize>],
         sc: &mut Scratch,
-        cache: &mut TrainingCache,
+        cache: &TrainingCache,
     ) -> usize {
         let hc = self.cfg.hc;
         let dw = words.len() - 1;
@@ -893,7 +982,7 @@ impl Hierarchical {
         gpu: &Gpu,
         word_embeds: &GTensor<f32>,
         dw: usize,
-        cache: &mut TrainingCache,
+        cache: &TrainingCache,
     ) -> BackboneFwd {
         let (hc, wh) = (self.cfg.hc, self.cfg.wh);
         let bb_in = self.bb_front.forward_alloc(gpu, word_embeds); // [dw, WH]
@@ -963,7 +1052,7 @@ impl Hierarchical {
         word_loss: Option<&[bool]>,
         o: &GTensor<f32>,
         sc: &mut Scratch,
-        cache: &mut TrainingCache,
+        cache: &TrainingCache,
     ) -> (f32, GTensor<f32>, usize) {
         let hc = self.cfg.hc;
         let dw = words.len() - 1;
@@ -1024,7 +1113,7 @@ impl Hierarchical {
             self.timer.accum(gpu, "decoder fwd");
 
             let d_dec_in =
-                self.decoder_stack_backward(gpu, &d_capped, &capped, n_words, tmax, rows);
+                self.decoder_stack_backward(gpu, &d_capped, &capped, n_words, tmax, rows, cache);
             self.scatter_decoder_grads(gpu, &d_dec_in, &mut d_o, n_words, tmax, n_chars);
 
             // This group is completely finished — forward AND backward — so nothing
@@ -1096,7 +1185,7 @@ impl Hierarchical {
         n_g: usize,
         tmax: usize,
         rows: usize,
-        cache: &mut TrainingCache,
+        cache: &TrainingCache,
     ) -> GTensor<f32> {
         let hc = self.cfg.hc;
         let mut hd = dec_in.reshaped(&[n_g, tmax, hc]);
@@ -1120,20 +1209,23 @@ impl Hierarchical {
         n_g: usize,
         tmax: usize,
         rows: usize,
+        cache: &TrainingCache,
     ) -> GTensor<f32> {
         let hc = self.cfg.hc;
         let d_logits = ops::softcap_backward(gpu, d_capped, capped, self.cfg.cap);
-        let d_hdn = self.dec_head.backward_alloc(gpu, &d_logits);
+        let d_hdn = self.dec_head.backward_alloc(gpu, &d_logits, cache);
         // `dec_head` saved its own input, which is exactly `dec_norm`'s output — the
         // tensor the norm's backward rebuilds `x̂` from, so nothing else has to keep it.
         let d_hd_flat = {
-            let Self { dec_head, dec_norm, .. } = self;
-            dec_norm.backward_alloc(gpu, &d_hdn, dec_head.saved_x())
+            let Self {
+                dec_head, dec_norm, ..
+            } = self;
+            dec_norm.backward_alloc(gpu, &d_hdn, dec_head.saved_x(), cache)
         };
         let mut d_hd = d_hd_flat.reshaped(&[n_g, tmax, hc]);
         let mut d_hd_next = GTensor::uninit(gpu, &[n_g, tmax, hc]);
         for blk in self.dec_blocks.iter_mut().rev() {
-            blk.backward(gpu, &d_hd, &mut d_hd_next);
+            blk.backward(gpu, &d_hd, &mut d_hd_next, cache);
             mem::swap(&mut d_hd, &mut d_hd_next);
         }
         d_hd.reshaped(&[rows, hc])
@@ -1191,6 +1283,7 @@ impl Hierarchical {
         bb: BackboneFwd,
         d_o: &GTensor<f32>,
         dw: usize,
+        cache: &TrainingCache,
     ) -> GTensor<f32> {
         let wh = self.cfg.wh;
         let BackboneFwd { spans, back_in, .. } = bb;
@@ -1202,7 +1295,7 @@ impl Hierarchical {
         if let Some(last) = self.bb_blocks.last_mut() {
             last.prefetch_act(gpu);
         }
-        let d_bb_out = self.bb_back_backward(gpu, &back_in, &spans, d_o, dw);
+        let d_bb_out = self.bb_back_backward(gpu, &back_in, &spans, d_o, dw, cache);
 
         let mut d_parts: Vec<Option<GTensor<f32>>> = (0..spans.len()).map(|_| None).collect();
         let mut d_bb_out = Some(d_bb_out);
@@ -1229,7 +1322,7 @@ impl Hierarchical {
                 // Single chunk: hand the whole tensor over rather than copying it.
                 d_bb_out.take().expect("d_bb_out").reshaped(&[1, len, wh])
             };
-            d_parts[ci] = Some(self.bb_blocks_backward(gpu, d_hb, len));
+            d_parts[ci] = Some(self.bb_blocks_backward(gpu, d_hb, len, cache));
         }
         let mut d_parts: Vec<GTensor<f32>> = d_parts
             .into_iter()
@@ -1240,7 +1333,7 @@ impl Hierarchical {
         } else {
             concat_rows(gpu, &d_parts, dw, wh)
         };
-        let d_word_embeds = self.bb_front.backward_alloc(gpu, &d_hb_all); // [dw, HC]
+        let d_word_embeds = self.bb_front.backward_alloc(gpu, &d_hb_all, cache); // [dw, HC]
         self.timer.mark(gpu, "backbone bwd");
         d_word_embeds
     }
@@ -1259,15 +1352,16 @@ impl Hierarchical {
         spans: &[(usize, usize)],
         d_o: &GTensor<f32>,
         dw: usize,
+        cache: &TrainingCache,
     ) -> GTensor<f32> {
         if back_in.len() == 1 {
-            return self.bb_back.backward_alloc_with_x(gpu, &back_in[0], d_o);
+            return self.bb_back.backward_alloc_with_x(gpu, &back_in[0], d_o, cache);
         }
         let (hc, wh) = (self.cfg.hc, self.cfg.wh);
         let mut parts: Vec<GTensor<f32>> = Vec::with_capacity(back_in.len());
         for (i, &(c0, len)) in spans.iter().enumerate() {
             let d_o_c = slice_rows(gpu, d_o, c0, len, hc);
-            parts.push(self.bb_back.backward_alloc_with_x(gpu, &back_in[i], &d_o_c));
+            parts.push(self.bb_back.backward_alloc_with_x(gpu, &back_in[i], &d_o_c, cache));
         }
         concat_rows(gpu, &parts, dw, wh)
     }
@@ -1278,7 +1372,13 @@ impl Hierarchical {
     /// first — so block i-1's upload is started *before* block i's backward runs, giving
     /// it a whole block of compute to hide behind. Issuing the copy and waiting for it
     /// in the same breath exposes the whole transfer (measured: +37 ms).
-    fn bb_blocks_backward(&mut self, gpu: &Gpu, d_hb: GTensor<f32>, len: usize) -> GTensor<f32> {
+    fn bb_blocks_backward(
+        &mut self,
+        gpu: &Gpu,
+        d_hb: GTensor<f32>,
+        len: usize,
+        cache: &TrainingCache,
+    ) -> GTensor<f32> {
         let wh = self.cfg.wh;
         let mut d_hb = d_hb;
         let mut d_hb_next = GTensor::uninit(gpu, &[1, len, wh]);
@@ -1286,9 +1386,9 @@ impl Hierarchical {
             if i > 0 {
                 let (head, tail) = self.bb_blocks.split_at_mut(i);
                 head[i - 1].prefetch_act(gpu);
-                tail[0].backward(gpu, &d_hb, &mut d_hb_next);
+                tail[0].backward(gpu, &d_hb, &mut d_hb_next, cache);
             } else {
-                self.bb_blocks[0].backward(gpu, &d_hb, &mut d_hb_next);
+                self.bb_blocks[0].backward(gpu, &d_hb, &mut d_hb_next, cache);
             }
             mem::swap(&mut d_hb, &mut d_hb_next);
         }
@@ -1307,7 +1407,7 @@ impl Hierarchical {
         gpu: &Gpu,
         d_word_embeds: &GTensor<f32>,
         sc: &mut Scratch,
-        cache: &mut TrainingCache,
+        cache: &TrainingCache,
     ) {
         let hc = self.cfg.hc;
         for g in 0..sc.enc.len() {
@@ -1335,7 +1435,7 @@ impl Hierarchical {
             sc.fit_rect(&[n_words, tmax, hc]);
             for blk in self.encoder.blocks.iter_mut().rev() {
                 let (live, spare) = sc.rect_pair();
-                blk.backward(gpu, live, spare);
+                blk.backward(gpu, live, spare, cache);
                 sc.enc_rect.swap(0, 1);
             }
             sc.enc_rect[0].reshape_to(&[rows, hc]);
@@ -1544,10 +1644,10 @@ impl Hierarchical {
 
     /// Per-stage retained activations broken out by owner, for the memory audit.
     ///
-    /// Columns: `ffn_bufs, pool, norms, projections, cell_saved, cell_other`. The
-    /// first two are what `drop_saved_act` + `trim_to` reach; the rest live inside the
-    /// sub-layers and survive both, which is where the unaccounted memory was.
-    pub fn act_breakdown(&self) -> Vec<(String, [usize; 6])> {
+    /// Columns: `ffn_bufs, norms, projections, cell_saved, cell_other`. The first is
+    /// what `drop_saved_act` + `trim_to` reach; the rest live inside the sub-layers
+    /// and survive both, which is where the unaccounted memory was.
+    pub fn act_breakdown(&self) -> Vec<(String, [usize; 5])> {
         let stages: [(&str, &Vec<Box<dyn BlockLike>>); 3] = [
             ("encoder", &self.encoder.blocks),
             ("backbone", &self.bb_blocks),
@@ -1556,11 +1656,11 @@ impl Hierarchical {
         stages
             .iter()
             .map(|(label, blocks)| {
-                let mut cols = [0usize; 6];
+                let mut cols = [0usize; 5];
                 for b in blocks.iter() {
-                    let [ffn, pool, norms, proj, _] = b.act_breakdown();
+                    let [ffn, norms, proj, _] = b.act_breakdown();
                     let (cs, co) = b.cell_act_split();
-                    for (c, v) in cols.iter_mut().zip([ffn, pool, norms, proj, cs, co]) {
+                    for (c, v) in cols.iter_mut().zip([ffn, norms, proj, cs, co]) {
                         *c += v;
                     }
                 }
@@ -1569,27 +1669,15 @@ impl Hierarchical {
             .collect()
     }
 
-    /// Per-stage pool free-list shape: `(distinct sizes, buffers)` summed over the
-    /// stage's blocks. Diagnostic — a climbing size count is the free list keeping one
-    /// entry per distinct shape ever seen.
-    pub fn pool_shapes(&self) -> Vec<(String, usize, usize)> {
-        let stages: [(&str, &Vec<Box<dyn BlockLike>>); 3] = [
-            ("encoder", &self.encoder.blocks),
-            ("backbone", &self.bb_blocks),
-            ("decoder", &self.dec_blocks),
-        ];
-        stages
-            .iter()
-            .map(|(label, blocks)| {
-                let (mut sizes, mut bufs) = (0, 0);
-                for b in blocks.iter() {
-                    let (s, n) = b.pool_shape();
-                    sizes += s;
-                    bufs += n;
-                }
-                (label.to_string(), sizes, bufs)
-            })
-            .collect()
+    /// Slots ever live at once over this model's life, and how many there are.
+    ///
+    /// The first number is what [`temp::SLOTS`] actually had to be — see
+    /// [`TempCache::high_water`](super::temp::TempCache::high_water). `(0, SLOTS)`
+    /// before the first window builds the cache.
+    pub fn temp_high_water(&self) -> (usize, usize) {
+        self.cache
+            .as_ref()
+            .map_or((0, temp::SLOTS), |c| c.temps.high_water())
     }
 
     /// Release every activation every layer holds, everywhere.
@@ -1612,9 +1700,6 @@ impl Hierarchical {
             l.drop_saved_act(gpu);
         }
         self.dec_norm.drop_saved_act();
-        // Safe here and not per block: the whole stack is done, so no cell is mid-sweep
-        // holding a reference to the shared staging scratch.
-        ops::clear_shared_lhs();
     }
 
     /// Release the retained activations of one stage only, for the memory audit.

@@ -40,8 +40,9 @@ pub struct Lm {
     ids: Vec<usize>,
     logits: Option<GTensor<f32>>, // capped logits, for the SoftCap backward
     seq: (usize, usize),          // (B, T)
-    /// Forward activations, owned so the buffers survive across calls.
-    cache: TrainingCache,
+    /// Window scratch, owned so the slots survive across calls. Built at the first
+    /// forward, when `B·T` is known — see [`Hierarchical`](super::hierarchical).
+    cache: Option<TrainingCache>,
 }
 
 impl Lm {
@@ -81,7 +82,7 @@ impl Lm {
             ids: Vec::new(),
             logits: None,
             seq: (0, 0),
-            cache: TrainingCache::default(),
+            cache: None,
         }
     }
 
@@ -94,8 +95,11 @@ impl Lm {
         let mut seq = e.reshaped(&[b, t, h]);
         // Blocks are H-in == H-out, so one spare buffer ping-pongs the whole stack.
         let mut next = GTensor::uninit(gpu, &[b, t, h]);
+        let cache = self
+            .cache
+            .get_or_insert_with(|| TrainingCache::for_shape(gpu, n, h));
         for blk in self.blocks.iter_mut() {
-            blk.forward(gpu, &seq, &mut next, &mut self.cache);
+            blk.forward(gpu, &seq, &mut next, cache);
             std::mem::swap(&mut seq, &mut next);
         }
         let flat = seq.reshaped(&[n, h]);
@@ -115,19 +119,22 @@ impl Lm {
         let (n, h) = (b * t, self.hidden);
         let logits = self.logits.as_ref().expect("Lm::backward before forward");
 
+        let cache = self
+            .cache
+            .get_or_insert_with(|| TrainingCache::for_shape(gpu, n, h));
         let d_pre = ops::softcap_backward(gpu, dlogits, logits, self.cap);
-        let d_normed = self.head.backward_alloc(gpu, &d_pre);
+        let d_normed = self.head.backward_alloc(gpu, &d_pre, cache);
         // `head` saved its own input, which is `norm`'s output — what the norm's
         // backward rebuilds `x̂` from.
         let d_flat = {
             let Self { head, norm, .. } = self;
-            norm.backward_alloc(gpu, &d_normed, head.saved_x()) // [N, H]
+            norm.backward_alloc(gpu, &d_normed, head.saved_x(), cache) // [N, H]
         };
 
         let mut d_seq = d_flat.reshaped(&[b, t, h]);
         let mut d_next = GTensor::uninit(gpu, &[b, t, h]);
         for blk in self.blocks.iter_mut().rev() {
-            blk.backward(gpu, &d_seq, &mut d_next);
+            blk.backward(gpu, &d_seq, &mut d_next, cache);
             std::mem::swap(&mut d_seq, &mut d_next);
         }
         let d_e = d_seq.reshaped(&[n, h]);

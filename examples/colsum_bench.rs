@@ -26,6 +26,8 @@ fn main() {
             return;
         }
     };
+    use neural_networks::gpu::arena::TrainingCache;
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
 
     // (rows, n, use_mul, calls per step) — measured with COLSUM_HIST over one step.
     let shapes: &[(usize, usize, bool, usize)] = &[
@@ -59,9 +61,9 @@ fn main() {
 
         for _ in 0..30 {
             if use_mul {
-                ops::add_col_sum_mul(&gpu, &mut db, &dy, &mul);
+                ops::add_col_sum_mul(&gpu, &mut db, &dy, &mul, &cache.temps);
             } else {
-                ops::add_col_sum(&gpu, &mut db, &dy);
+                ops::add_col_sum(&gpu, &mut db, &dy, &cache.temps);
             }
         }
         gpu.stream.synchronize().unwrap();
@@ -69,9 +71,9 @@ fn main() {
         let t0 = Instant::now();
         for _ in 0..ITERS {
             if use_mul {
-                ops::add_col_sum_mul(&gpu, &mut db, &dy, &mul);
+                ops::add_col_sum_mul(&gpu, &mut db, &dy, &mul, &cache.temps);
             } else {
-                ops::add_col_sum(&gpu, &mut db, &dy);
+                ops::add_col_sum(&gpu, &mut db, &dy, &cache.temps);
             }
         }
         gpu.stream.synchronize().unwrap();

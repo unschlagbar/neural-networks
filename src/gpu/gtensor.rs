@@ -126,6 +126,24 @@ impl<T> GBuf<T> {
         }
     }
 
+    /// A window of `len` elements of `T` starting at device address `at`.
+    ///
+    /// The width-agnostic form of [`window`](Self::window): the caller supplies the
+    /// address rather than a typed base, so one allocation can be viewed at a width
+    /// it was not allocated at. [`super::temp::TempCache`] hands out its f32 slots as
+    /// bf16 through this.
+    ///
+    /// The caller guarantees `at..at + len * size_of::<T>()` lies inside a live
+    /// allocation that outlives the window.
+    fn window_at(gpu: &Gpu, at: u64, len: usize) -> Self {
+        // SAFETY: the caller's guarantee above; `Drop` below never frees a window.
+        let slice = unsafe { gpu.stream.upgrade_device_ptr::<T>(at, len) };
+        Self {
+            slice: ManuallyDrop::new(slice),
+            owned: false,
+        }
+    }
+
     /// Whether this buffer owns its allocation (false for an arena window).
     #[inline]
     pub fn is_owned(&self) -> bool {
@@ -292,6 +310,24 @@ impl<T: DeviceRepr + ValidAsZeroBits> GTensor<T> {
             shape,
             rank: dims.len(),
             buf: GBuf::window(gpu, base, off, n),
+        }
+    }
+
+    /// A tensor of shape `dims` viewing device address `at`, at this tensor's own
+    /// width. See [`GBuf::window_at`] for the safety contract.
+    pub fn view_at(gpu: &Gpu, at: u64, dims: &[usize]) -> Self {
+        assert!(
+            dims.len() <= MAX_RANK,
+            "rank {} exceeds MAX_RANK",
+            dims.len()
+        );
+        let n: usize = dims.iter().product();
+        let mut shape = [0usize; MAX_RANK];
+        shape[..dims.len()].copy_from_slice(dims);
+        Self {
+            shape,
+            rank: dims.len(),
+            buf: GBuf::window_at(gpu, at, n),
         }
     }
 

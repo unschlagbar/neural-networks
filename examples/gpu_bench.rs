@@ -29,7 +29,6 @@ fn main() {
     use neural_networks::nn2::slstm::SLstm as CpuSLstm;
     use neural_networks::tensor::{Tensor, gemm};
 
-    let mut cache = TrainingCache::new();
 
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -38,6 +37,7 @@ fn main() {
             return;
         }
     };
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
 
     /// CPU timer: untimed `warmup` runs, then `iters` timed; returns seconds.
     fn cpu_time(warmup: usize, iters: usize, mut f: impl FnMut()) -> f64 {
@@ -172,7 +172,7 @@ fn main() {
         let ddy = GTensor::from_host(&gpu, &dy);
         let gpu_s = gpu_time(&gpu, 3, iters, || {
             let _y = dev.forward_alloc(&gpu, &dx_in);
-            let _dx = dev.backward_alloc(&gpu, &ddy);
+            let _dx = dev.backward_alloc(&gpu, &ddy, &cache);
             dev.step(&gpu, &cfg);
         });
 
@@ -222,8 +222,8 @@ fn main() {
         let dx_in = GTensor::from_host(&gpu, &x);
         let ddy = GTensor::from_host(&gpu, &dy);
         let gpu_s = gpu_time(&gpu, GPU_WARMUP, GPU_ITERS, || {
-            let y = dev.forward_alloc(&gpu, &dx_in);
-            let _dx = dev.backward_alloc(&gpu, &y, &ddy);
+            let y = dev.forward_alloc(&gpu, &dx_in, &cache);
+            let _dx = dev.backward_alloc(&gpu, &y, &ddy, &cache);
             dev.step(&gpu, &cfg);
         });
 
@@ -281,8 +281,8 @@ fn main() {
         let ddy = GTensor::from_host(&gpu, &dy);
         let mut y_dev = GTensor::uninit(&gpu, &[b, t, d]);
         let gpu_s = gpu_time(&gpu, GPU_WARMUP, GPU_ITERS, || {
-            dev.forward(&gpu, &dx_in, &mut y_dev, &mut cache);
-            let _dx = dev.backward_alloc(&gpu, &ddy);
+            dev.forward(&gpu, &dx_in, &mut y_dev, &cache);
+            let _dx = dev.backward_alloc(&gpu, &ddy, &cache);
             dev.step(&gpu, &cfg);
         });
 

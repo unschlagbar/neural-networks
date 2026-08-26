@@ -20,6 +20,8 @@ fn main() {
     use neural_networks::tensor::Tensor;
 
     let gpu = Gpu::new().expect("gpu");
+    use neural_networks::gpu::arena::TrainingCache;
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
     if !gpu.kernels.has_coop {
         eprintln!("no cooperative kernels");
         return;
@@ -68,12 +70,12 @@ fn main() {
     let mut per_step = build(false);
     let mut fused = build(true);
 
-    let y_per = per_step.forward_alloc(&gpu, &x);
-    let y_fused = fused.forward_alloc(&gpu, &x);
+    let y_per = per_step.forward_alloc(&gpu, &x, &cache);
+    let y_fused = fused.forward_alloc(&gpu, &x, &cache);
     let want = y_per.to_host(&gpu);
     let got = y_fused.to_host(&gpu);
-    let want_dx = per_step.backward_alloc(&gpu, &y_per, &gy).to_host(&gpu);
-    let got_dx = fused.backward_alloc(&gpu, &y_fused, &gy).to_host(&gpu);
+    let want_dx = per_step.backward_alloc(&gpu, &y_per, &gy, &cache).to_host(&gpu);
+    let got_dx = fused.backward_alloc(&gpu, &y_fused, &gy, &cache).to_host(&gpu);
 
     // Relative to the tensor's own scale: a max-abs alone says nothing without
     // knowing how big the values are.

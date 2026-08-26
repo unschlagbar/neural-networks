@@ -25,7 +25,6 @@ fn main() {
     use neural_networks::gpu::{GTensor, Gpu, mlstm::MLstm};
     use neural_networks::tensor::Tensor;
 
-    let mut cache = TrainingCache::new();
 
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -34,6 +33,7 @@ fn main() {
             return;
         }
     };
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
 
     let clock = || -> String {
         std::process::Command::new("nvidia-smi")
@@ -102,8 +102,8 @@ fn main() {
 
     for (x, g, cell, y) in cells.iter_mut() {
         for _ in 0..warmup {
-            cell.forward(&gpu, x, y, &mut cache);
-            let _ = cell.backward_alloc(&gpu, g);
+            cell.forward(&gpu, x, y, &cache);
+            let _ = cell.backward_alloc(&gpu, g, &cache);
         }
     }
     gpu.stream.synchronize().unwrap();
@@ -117,7 +117,7 @@ fn main() {
             gpu.stream.synchronize().unwrap();
             let t0 = Instant::now();
             for _ in 0..iters {
-                cell.forward(&gpu, x, y, &mut cache);
+                cell.forward(&gpu, x, y, &cache);
                 cell.drop_saved();
             }
             gpu.stream.synchronize().unwrap();
@@ -126,8 +126,8 @@ fn main() {
             gpu.stream.synchronize().unwrap();
             let t0 = Instant::now();
             for _ in 0..iters {
-                cell.forward(&gpu, x, y, &mut cache);
-                let _ = cell.backward_alloc(&gpu, g);
+                cell.forward(&gpu, x, y, &cache);
+                let _ = cell.backward_alloc(&gpu, g, &cache);
             }
             gpu.stream.synchronize().unwrap();
             let both = t0.elapsed().as_secs_f64() / iters as f64 * 1e3;

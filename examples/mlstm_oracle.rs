@@ -35,9 +35,9 @@ fn main() {
     let inp = d;
     assert!(t % chunks == 0, "t must divide into chunks");
 
-    let mut cache = TrainingCache::new();
 
     let gpu = Gpu::new().expect("gpu");
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
     println!("t={t} chunks={chunks} b={b} inp={inp} d={d} heads={heads} dqk={dqk}");
 
     // Fan-in-scaled like `MLstm::new`, but seeded, so a second source tree runs the
@@ -141,14 +141,14 @@ fn main() {
         let mut ys = Vec::new();
         for c in 0..nchunk {
             let mut y = GTensor::uninit(&gpu, &[b, step, d]);
-            dev.forward(&gpu, &cut(&x, c, inp), &mut y, &mut cache);
+            dev.forward(&gpu, &cut(&x, c, inp), &mut y, &cache);
             ys.push(y.to_host(&gpu).data.to_vec());
         }
         dev.reset_bptt(&gpu);
         let mut dxs = vec![Vec::new(); nchunk];
         for c in (0..nchunk).rev() {
             dxs[c] = dev
-                .backward_alloc(&gpu, &cut(&g, c, d))
+                .backward_alloc(&gpu, &cut(&g, c, d), &cache)
                 .to_host(&gpu)
                 .data
                 .to_vec();

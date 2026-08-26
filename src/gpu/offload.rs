@@ -5,12 +5,12 @@
 //! no reordering of the forward loop frees them. Only moving them off the device — or
 //! recomputing them — changes the scaling.
 //!
-//! An [`OffloadRing`] is the third storage kind in this module, alongside the two in
-//! [`buf`](super::buf):
+//! An [`OffloadRing`] is the third storage kind, alongside [`buf`](super::buf) and
+//! [`temp`](super::temp):
 //!
 //! | | lives | sized by |
 //! |---|---|---|
-//! | [`Pool`](super::Pool) | within one phase | high-water mark of live temporaries |
+//! | [`TempCache`](super::TempCache) | within one call | a fixed slot count |
 //! | [`Buf`](super::Buf) | across calls, on device | one activation |
 //! | `OffloadRing` | across calls, **on the host** | K timesteps of device staging |
 //!

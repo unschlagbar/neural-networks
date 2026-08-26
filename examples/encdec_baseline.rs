@@ -24,6 +24,7 @@ fn main() {
     use neural_networks::tensor::Tensor;
 
     let gpu = Gpu::new().expect("gpu");
+    let cache = TrainingCache::new(&gpu, 1 << 23, 1 << 18, 1 << 23);
     let h = CHAR_HIDDEN;
     let rounds: usize = std::env::var("ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
     // `ARM=step` or `ARM=bat` runs one arm only, so a profiler sees just that one.
@@ -64,7 +65,6 @@ fn main() {
     };
 
     let mut cell = SLstm::new_rand(&gpu, h, h);
-    let mut cache = TrainingCache::new();
     println!("H={h}, {} groups, min of {rounds} rounds\n", groups.iter().map(|g| g.2).sum::<usize>());
     println!("{:>3} {:>6} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8}",
              "T", "B", "pieces", "fwd step", "fwd bat", "f+b step", "f+b bat", "speedup");
@@ -89,9 +89,9 @@ fn main() {
             gpu.stream.synchronize().ok();
             let t0 = Instant::now();
             for _ in 0..n {
-                cell.forward(&gpu, &x, &mut y, &mut cache);
+                cell.forward(&gpu, &x, &mut y, &cache);
                 if bwd {
-                    cell.backward(&gpu, &y, &gy, &mut dx);
+                    cell.backward(&gpu, &y, &gy, &mut dx, &cache);
                 }
             }
             gpu.stream.synchronize().ok();
