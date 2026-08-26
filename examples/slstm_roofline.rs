@@ -54,16 +54,14 @@ fn main() {
 
         for _ in 0..2 {
             let y = dev.forward_alloc(&gpu, &x);
-            drop(y);
-            let _ = dev.backward_alloc(&gpu, &g);
+            let _ = dev.backward_alloc(&gpu, &y, &g);
         }
         gpu.stream.synchronize().unwrap();
 
         let t0 = Instant::now();
         for _ in 0..iters {
             let y = dev.forward_alloc(&gpu, &x);
-            drop(y);
-            let _ = dev.backward_alloc(&gpu, &g);
+            let _ = dev.backward_alloc(&gpu, &y, &g);
         }
         gpu.stream.synchronize().unwrap();
         let secs = t0.elapsed().as_secs_f64() / iters as f64;

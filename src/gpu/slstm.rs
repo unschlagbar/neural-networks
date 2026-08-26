@@ -32,13 +32,18 @@
 //!     runs the entire T-loop as ONE cooperative launch, with `Wh` staged in shared
 //!     memory and `grid.sync()` in place of the per-step launches. See the kernel in
 //!     `cuda/slstm_coop.cu`; it is where essentially all of the forward's GPU time is.
-//!   * **short T** (the encoder/decoder, one word per sequence) — two launches per
-//!     timestep, a cuBLAS matmul for `h_{t-1}·Wh` plus `slstm_step_fused`. A whole
-//!     word is a handful of steps, so there is no launch cost worth fusing away, and
-//!     the batch is wide enough that cuBLAS beats anything hand-written.
+//!   * **wide B** (the encoder/decoder, one word per sequence, 120-2048 of them) —
+//!     `slstm_batched_fwd` runs the whole T-loop as one cooperative launch too, but
+//!     does `h_{t-1}·Wh` on the bf16 MMA unit instead of scalar FMA, so the batch fills
+//!     a tensor-core tile rather than multiplying the work. See
+//!     `cuda/slstm_batched.cu`. It re-reads `h` once per column block, which is what
+//!     eventually loses to cuBLAS — hence the ceiling in `ops::slstm_batched_pays`.
+//!   * **neither** — two launches per timestep, a cuBLAS matmul for `h_{t-1}·Wh` plus
+//!     `slstm_step_fused`. The fallback, and the reference both fused paths are pinned
+//!     against.
 //!
-//! Backward mirrors it, on the same split: `slstm_fused_time_bwd` for a long
-//! sequence, two launches per timestep for a short one. Either way the gate deltas go
+//! Backward mirrors it, on the same split: `slstm_fused_time_bwd` for a long sequence,
+//! `slstm_batched_bwd` for a wide batch, two launches per timestep otherwise. Either way the gate deltas go
 //! back into `g` (its forward contents are dead by then) and the loop carries only the
 //! BPTT channels — `dh = dg[:, t, :]·Whᵀ` — so `dx`, `dWx`, `dWh` and the bias grads
 //! all fall out of three whole-sequence GEMMs plus one reduction *after* the loop.
@@ -70,6 +75,37 @@ use crate::tensor::Tensor;
 /// fuses.
 const FUSED_MIN_T: usize = 32;
 
+/// Above this batch the time-fused path stops paying and the per-step path wins.
+///
+/// `FUSED_MIN_T` is only half the predicate. `T` decides whether there are enough
+/// timesteps to amortise the `Wh` staging; **`B` decides the sign of the trade**. The
+/// fused kernel does the recurrent product with scalar `fmaf` + a warp shuffle, so its
+/// cost is *linear* in the batch, while the per-step path hands the same product to
+/// cuBLAS, whose tensor-core tiles are underfilled at small `B` and therefore *flat*
+/// until they fill. Measured crossover is B ~= 32 (fwd+bwd, T=512, H=1024):
+///
+/// | B | fused | per-step |
+/// |---|-------|----------|
+/// | 1 | 3.31  | 11.50    |
+/// | 8 | 29.32 | 16.62    |
+///
+/// Until `slstm_fused_time_batched` lands (mma-based, flat in B — see
+/// `docs/slstm-batched-fused-plan.md`) a wide batch must take the per-step path.
+/// `force_fused_time` still overrides this, so benchmarks can measure the losing arm.
+const FUSED_MAX_B: usize = 32;
+
+/// Whether the sLSTM's own weight gradients are held at bf16 precision
+/// (`SLSTM_BF16_GRAD=1`), matching FlashRNN's `dR`/`db`.
+///
+/// A measurement switch, not a memory saving: the gradients stay fp32 arena windows
+/// and are merely rounded. See `ops::quantize_bf16_`.
+fn grad_bf16(gpu: &Gpu) -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SLSTM_BF16_GRAD").as_deref() == Ok("1")) && gpu.kernels.has_bf16
+}
+
+
 /// The time-fused T-loop (`slstm_fused_time` / `_bwd`): the whole forward or
 /// backward sequence as ONE cooperative launch instead of two launches per
 /// timestep. **On by default**; `SLSTM_NO_FUSED_TIME=1` forces the per-step path,
@@ -88,6 +124,18 @@ const FUSED_MIN_T: usize = 32;
 fn fused_time_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("SLSTM_NO_FUSED_TIME").is_err())
+}
+
+/// Narrowest batch the batch-parallel fused path takes. The mma M axis is 16 rows
+/// wide, so below a couple of tiles the contraction is mostly padding and the
+/// per-step cuBLAS call is doing the same thing with less setup.
+const SB_MIN_B: usize = 32;
+
+/// The batch-parallel fused T-loop (`slstm_batched_fwd`). **On by default**;
+/// `SLSTM_NO_BATCHED=1` forces the per-step path, which is the A/B baseline.
+fn batched_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SLSTM_NO_BATCHED").is_err())
 }
 
 pub struct SLstm {
@@ -128,6 +176,11 @@ pub struct SLstm {
     /// them.
     pub force_fused_time: Option<bool>,
 
+    /// Per-instance override of the batch-parallel fused path (`slstm_batched_fwd`),
+    /// the mma-based twin of the time-fused one for wide batches. `None` follows the
+    /// global default (see [`batched_enabled`]).
+    pub force_batched: Option<bool>,
+
     /// Continue the previous call's recurrence instead of starting from zero.
     ///
     /// Off by default: a `forward` is a whole sequence, and its state is private to
@@ -143,9 +196,14 @@ pub struct SLstm {
     n_state: GTensor<f32>,
     m_state: GTensor<f32>,
     /// Contiguous `[B, 4H]` scratch for the current timestep's recurrent gate half
-    /// (`h_{t-1}·Wh` forward, the gate deltas backward). It exists so both of those
-    /// GEMMs stay dense at any batch size — see `slstm_step_fused` in `kernels.rs`.
+    /// (`h_{t-1}·Wh`). It exists so that GEMM stays dense at any batch size — see
+    /// `slstm_step_fused` in `kernels.rs`.
     gh: GTensor<f32>,
+    /// The backward twin of [`gh`](Self::gh): this timestep's gate deltas, `[B, 4H]`,
+    /// at the slab width. `slstm_step_fused_bwd` writes it, `dh = dg·Whᵀ` reads it —
+    /// nothing else — so it is narrow for the same reason [`h_narrow`](Self::h_narrow)
+    /// is, and that GEMM gets tensor-core operands with no cast launch of its own.
+    dgh: ops::SlabBuf,
     /// The left operand of the per-timestep recurrent GEMM: `h_{t-1}` at the slab
     /// width, `[B, H]`.
     ///
@@ -210,10 +268,13 @@ pub struct SLstm {
     /// fused kernel owns that path anyway.
     gemm_x: ops::GemmBf16,
     gemm_dx: ops::GemmBf16,
-    /// Weight cache for the **per-timestep** recurrent GEMM `h_{t-1}·Whr`. Separate
-    /// from the two above only because `GemmBf16` holds one cached weight and this
-    /// one is `whr`, not `wx`; its left operand is [`h_narrow`](Self::h_narrow), which
-    /// arrives already narrowed, so a step of the loop is still one GEMM.
+    /// Weight cache for the **per-timestep** recurrent GEMMs `h_{t-1}·Whr` and
+    /// `dg_t·Whrᵀ`. Separate from the two above only because `GemmBf16` holds one
+    /// cached weight and this one is `whr`, not `wx`; both GEMMs read `whr` as their
+    /// right operand, so one narrowing per optimizer step serves the whole sweep. The
+    /// left operand ([`h_narrow`](Self::h_narrow) forward, [`dgh`](Self::dgh)
+    /// backward) arrives already narrowed, so a step of either loop is still one
+    /// launch per GEMM.
     gemm_h: ops::GemmBf16,
     /// Whether the whole-sequence GEMMs take the bf16 path. Pinned at construction so
     /// forward and backward cannot disagree.
@@ -245,8 +306,8 @@ fn park_order(g: GTensor<f32>, slabs: SlstmSlabs, x_saved: SlabBuf) -> Vec<super
     vec![
         Parked::from(g),
         Parked::from(x_saved),
-        Parked::from(slabs.c_prev),
-        Parked::from(slabs.n_prev),
+        Parked::from(slabs.c_entry),
+        Parked::from(slabs.n_entry),
         Parked::from(slabs.i_prime),
         Parked::from(slabs.f_prime),
         Parked::from(slabs.c),
@@ -275,12 +336,12 @@ fn park_unorder(p: Vec<super::offload::Parked>) -> (GTensor<f32>, SlstmSlabs, Sl
         SlabBuf::from(it.next().expect("slstm park: short restore"))
     };
     let x_saved = slab(&mut it);
-    let (c_prev, n_prev) = (wide(&mut it, "c_prev"), wide(&mut it, "n_prev"));
-    let (i_prime, f_prime) = (wide(&mut it, "i_prime"), wide(&mut it, "f_prime"));
-    let (c, n) = (wide(&mut it, "c"), wide(&mut it, "n"));
+    let (c_entry, n_entry) = (slab(&mut it), slab(&mut it));
+    let (i_prime, f_prime) = (slab(&mut it), slab(&mut it));
+    let (c, n) = (slab(&mut it), slab(&mut it));
     let slabs = SlstmSlabs {
-        c_prev,
-        n_prev,
+        c_entry,
+        n_entry,
         i_prime,
         f_prime,
         c,
@@ -325,15 +386,19 @@ fn fit_slabs(gpu: &Gpu, slot: Option<SlstmSlabs>, dims: &[usize]) -> SlstmSlabs 
     {
         return s;
     }
-    let wide = || GTensor::uninit(gpu, dims);
     let slab = || SlabBuf::new(gpu, dims);
+    // The stabilizer group follows `state_bf16`, a different switch from the plain
+    // slabs' `slab_bf16` — see `SlstmSlabs` and `gpu::bf16`.
+    let st = || SlabBuf::new_width(gpu, dims, gpu.kernels.state_bf16);
+    // `c_entry`/`n_entry` hold one timestep, not the sweep: [B, H], not [B, T, H].
+    let entry = || SlabBuf::new_width(gpu, &[dims[0], dims[2]], gpu.kernels.state_bf16);
     SlstmSlabs {
-        c_prev: wide(),
-        n_prev: wide(),
-        i_prime: wide(),
-        f_prime: wide(),
-        c: wide(),
-        n: wide(),
+        c_entry: entry(),
+        n_entry: entry(),
+        i_prime: st(),
+        f_prime: st(),
+        c: st(),
+        n: st(),
         zt: slab(),
         ot: slab(),
         h_prev: slab(),
@@ -432,12 +497,14 @@ impl SLstm {
             mbcat: GTensor::zeros(gpu, &[h4]),
             vbcat: GTensor::zeros(gpu, &[h4]),
             force_fused_time: None,
+            force_batched: None,
             carry: false,
             h_state: GTensor::zeros(gpu, &[0, 0]),
             c_state: GTensor::zeros(gpu, &[0, 0]),
             n_state: GTensor::zeros(gpu, &[0, 0]),
             m_state: GTensor::zeros(gpu, &[0, 0]),
             gh: GTensor::zeros(gpu, &[0, 0]),
+            dgh: ops::SlabBuf::new(gpu, &[0, 0]),
             h_narrow: ops::SlabBuf::new(gpu, &[0, 0]),
             dh_bptt: GTensor::zeros(gpu, &[0, 0]),
             dc_bptt: GTensor::zeros(gpu, &[0, 0]),
@@ -760,9 +827,27 @@ impl SLstm {
     ) {
         // The kernel declines by returning false when the shape does not fit or the
         // shape-specialized build is unavailable, leaving the per-step path intact.
-        if t >= FUSED_MIN_T
-            && self.force_fused_time.unwrap_or_else(fused_time_enabled)
+        let b = self.h_state.rows();
+        if self.fuses_at(b, t)
             && ops::slstm_fused_time(
+                gpu,
+                &self.whr,
+                g,
+                &self.bcat,
+                &mut self.c_state,
+                &mut self.n_state,
+                &mut self.m_state,
+                &mut self.h_state,
+                slabs,
+                out,
+                t,
+                carry,
+            )
+        {
+            return;
+        }
+        if self.batches_at(gpu, b)
+            && ops::slstm_batched_fwd(
                 gpu,
                 &self.whr,
                 g,
@@ -857,16 +942,31 @@ impl SLstm {
         y
     }
 
-    /// Backward into a freshly allocated `dx` `[B, T, in]`.
-    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>) -> GTensor<f32> {
+    /// Backward into a freshly allocated `dx` `[B, T, in]`. `y` is the forward output,
+    /// as for [`backward`](Self::backward).
+    pub fn backward_alloc(
+        &mut self,
+        gpu: &Gpu,
+        y: &GTensor<f32>,
+        dy: &GTensor<f32>,
+    ) -> GTensor<f32> {
         let mut dx = GTensor::uninit(gpu, &[dy.shape[0], dy.shape[1], self.input]);
-        self.backward(gpu, dy, &mut dx);
+        self.backward(gpu, y, dy, &mut dx);
         dx
     }
 
     /// Backward over the whole sequence. `dy` is `[B, T, H]`, `dx` is the
     /// caller's `[B, T, in]` output. Accumulates weight/bias grads.
-    pub fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
+    /// `y` is this cell's forward output — the post-cell norm's output, which that
+    /// norm's backward divides by γ to recover `x̂`. The caller keeps it; the norm
+    /// itself stores only `inv_rms`.
+    pub fn backward(
+        &mut self,
+        gpu: &Gpu,
+        y: &GTensor<f32>,
+        dy: &GTensor<f32>,
+        dx: &mut GTensor<f32>,
+    ) {
         assert_eq!(dy.rank, 3, "SLstm::backward expects [B, T, H]");
         let (b, t, h) = (dy.shape[0], dy.shape[1], dy.shape[2]);
         assert_eq!(b, self.batch, "SLstm::backward — batch mismatch");
@@ -900,7 +1000,7 @@ impl SLstm {
         // the norm doubles as the staging the loop would otherwise need.
         let mut dy_buf = take_uninit(gpu, self.dy_buf.take(), &[b, t, h]);
         phase::timed(gpu, phase::Bucket::SlstmCopyBwd, || {
-            self.post_norm.backward(gpu, dy, &mut dy_buf);
+            self.post_norm.backward(gpu, dy, y, &mut dy_buf);
         });
 
         // The only thing the loop must carry is BPTT: the gate deltas go straight
@@ -960,6 +1060,20 @@ impl SLstm {
             ops::add_col_sum(gpu, dbcat, &dg);
         });
 
+        // FlashRNN keeps `dR`/`db` at bf16 (`Ctype = CUDA_R_16BF`, `beta = 1`), so every
+        // accumulation into them round-trips through 8 mantissa bits. Ours are fp32
+        // arena windows; rounding them here reproduces that precision exactly, which is
+        // the half of the question that can be answered without narrowing the whole
+        // arena. Off unless `SLSTM_BF16_GRAD=1`.
+        if grad_bf16(gpu) {
+            let Self {
+                dwx, dwhr, dbcat, ..
+            } = self;
+            for t in [dwx, dwhr, dbcat] {
+                ops::quantize_bf16_(gpu, t);
+            }
+        }
+
         // Give the buffers back at their original shapes so the next forward reuses
         // the same allocations.
         self.g = Some(dg.reshaped(&[b, t, h4]));
@@ -1004,9 +1118,24 @@ impl SLstm {
     ) {
         // One cooperative launch for the whole reverse loop. It carries the gate deltas
         // through `g` itself, so it needs no scratch of its own.
-        if t >= FUSED_MIN_T
-            && self.force_fused_time.unwrap_or_else(fused_time_enabled)
+        let b = dy.shape[0];
+        if self.fuses_at(b, t)
             && ops::slstm_fused_time_bwd(
+                gpu,
+                &self.whr,
+                dy,
+                g,
+                &mut self.dh_bptt,
+                &mut self.dc_bptt,
+                &mut self.dn_bptt,
+                slabs,
+                t,
+            )
+        {
+            return;
+        }
+        if self.batches_at(gpu, b)
+            && ops::slstm_batched_bwd(
                 gpu,
                 &self.whr,
                 dy,
@@ -1035,21 +1164,35 @@ impl SLstm {
         // rather than in `backward` because which path runs is not known until the
         // fused one has been *tried* — it can decline at launch, not just at geometry.
         let (b, h) = (self.dc_bptt.rows(), self.dc_bptt.cols());
-        fit_uninit(gpu, &mut self.gh, &[b, 4 * h]);
+        self.dgh.fit(gpu, &[b, 4 * h]);
         for step in (0..t).rev() {
             ops::slstm_step_fused_bwd(
                 gpu,
                 dy,
                 g,
-                &mut self.gh,
+                &mut self.dgh,
                 &self.dh_bptt,
                 slabs,
                 &mut self.dc_bptt,
                 &mut self.dn_bptt,
                 step,
             );
-            // dh_{t-1} = dgates_t · Whᵀ — the one gradient BPTT cannot defer.
-            ops::matmul_nt_into(gpu, &self.gh, &self.whr, &mut self.dh_bptt, 0.0);
+            // dh_{t-1} = dgates_t · Whᵀ — the one gradient BPTT cannot defer. The
+            // weight comes from the same cache the forward's `h·Wh` fills: it is the
+            // same `whr`, narrowed once per optimizer step rather than once per GEMM.
+            let Self {
+                gemm_h,
+                dgh,
+                whr,
+                dh_bptt,
+                ..
+            } = self;
+            match dgh {
+                ops::SlabBuf::Bf16(d) => {
+                    gemm_h.run_staged_lhs(gpu, ops::MmForm::Nt, d, whr, dh_bptt, 0.0)
+                }
+                ops::SlabBuf::F32(d) => ops::matmul_nt_into(gpu, d, whr, dh_bptt, 0.0),
+            }
         }
     }
 
@@ -1111,8 +1254,12 @@ impl SLstm {
     /// whole `[B, T, H]` slabs, so it belongs in a probe.
     pub fn state_extremes(&self, gpu: &Gpu) -> Option<(f32, f32, f32)> {
         let slabs = self.slabs.as_ref()?;
-        let n = slabs.n.to_host(gpu).data.to_vec();
-        let c = slabs.c.to_host(gpu).data.to_vec();
+        // Widened into scratch: under `SLSTM_BF16_STATE` these are the narrow copies,
+        // and the extremes we are after are precisely what narrowing might move.
+        let mut scratch = GTensor::uninit(gpu, slabs.n.dims());
+        let n = slabs.n.as_f32(gpu, &mut scratch).to_host(gpu).data.to_vec();
+        let mut scratch = GTensor::uninit(gpu, slabs.c.dims());
+        let c = slabs.c.as_f32(gpu, &mut scratch).to_host(gpu).data.to_vec();
         let min_n = n.iter().map(|v| v.abs()).fold(f32::INFINITY, f32::min);
         let max_c = c.iter().map(|v| v.abs()).fold(0.0, f32::max);
         let max_ratio = c
@@ -1154,6 +1301,42 @@ impl SLstm {
     /// before the **last** backward chunk, so each sweep starts from zero. Leaving it
     /// set across a window silently seeds the next window with the previous one's
     /// final state.
+    /// Whether a `[B, T, H]` sweep takes the time-fused path rather than the per-step
+    /// one. Both halves matter: `T` must be long enough to amortise the `Wh` staging,
+    /// and `B` small enough that the fused kernel's scalar recurrent product still beats
+    /// cuBLAS. `force_fused_time` overrides both so a benchmark can measure either arm.
+    ///
+    /// The kernel can still decline at launch (shared memory, registers, cooperative
+    /// co-residency), so a `true` here is necessary, not sufficient.
+    pub fn fuses_at(&self, b: usize, t: usize) -> bool {
+        t >= FUSED_MIN_T
+            && self
+                .force_fused_time
+                .unwrap_or_else(|| fused_time_enabled() && b <= FUSED_MAX_B)
+    }
+
+    /// Whether a `[B, T, H]` sweep takes the **batch-parallel** fused path.
+    ///
+    /// The complement of [`fuses_at`](Self::fuses_at): that one is the scalar
+    /// contraction, which is right exactly where the batch cannot fill a tensor-core
+    /// tile; this one puts `h·Wh` on the mma unit and takes over once the batch is wide
+    /// enough to fill one. `SB_MIN_B` is that width — below it the M axis is mostly
+    /// padding — and `ops::slstm_batched_pays` is the ceiling, where the kernels'
+    /// per-column-block operand re-reads outgrow the launches they save.
+    ///
+    /// `T` does not appear. The kernel amortises nothing over the sequence that a
+    /// wide batch does not already amortise over the rows, and the encoder's whole
+    /// range (T = 1..17) is a case the per-step path loses outright: it pays two
+    /// launches per timestep for a matmul the GPU finishes in under a microsecond.
+    ///
+    /// The kernel can still decline at launch (shared memory, registers, cooperative
+    /// co-residency), so a `true` here is necessary, not sufficient.
+    pub fn batches_at(&self, gpu: &Gpu, b: usize) -> bool {
+        self.force_batched.unwrap_or_else(|| {
+            batched_enabled() && b >= SB_MIN_B && ops::slstm_batched_pays(gpu, self.hidden, b)
+        })
+    }
+
     pub fn set_carry(&mut self, carry: bool) {
         self.carry = carry;
         self.post_norm.set_carry(carry);
@@ -1312,7 +1495,9 @@ impl SLstm {
         ]
         .iter()
         .map(|t| t.capacity() * 4)
-        .sum();
+        .sum::<usize>()
+            + self.h_narrow.retained_bytes()
+            + self.dgh.retained_bytes();
         let slabs = self.slabs.as_ref().map_or(0, |s| s.retained_bytes());
         let staging = self.gemm_x.retained_bytes()
             + self.gemm_dx.retained_bytes()
@@ -1334,7 +1519,6 @@ impl SLstm {
         arena::step_slots(gpu, &mut self.param_slots(), cfg);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1526,7 +1710,7 @@ mod tests {
 
         // Backward
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g));
+        let dx_dev = dev.backward_alloc(&gpu, &y_dev, &GTensor::from_host(&gpu, &g));
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 2e-3));
         assert_close(&dev.gate_dw(&gpu, 0), &cpu.cell.dwz.data, tol(&gpu, 2e-3));
         assert_close(&dev.gate_dw(&gpu, 2), &cpu.cell.dwf.data, tol(&gpu, 2e-3));
@@ -1589,7 +1773,7 @@ mod tests {
             assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, tol(&gpu, 2e-3));
 
             let dx_cpu = cpu.backward(&g);
-            let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g));
+            let dx_dev = dev.backward_alloc(&gpu, &y_dev, &GTensor::from_host(&gpu, &g));
             assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 2e-3));
             assert_close(&dev.gate_dw(&gpu, 0), &cpu.cell.dwz.data, tol(&gpu, 2e-3));
             assert_close(&dev.gate_dw(&gpu, 2), &cpu.cell.dwf.data, tol(&gpu, 2e-3));
@@ -1643,7 +1827,7 @@ mod tests {
             let y_dev = dev.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x));
             assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, tol(&gpu, 2e-3));
             let dx_cpu = cpu.backward(&g);
-            let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g));
+            let dx_dev = dev.backward_alloc(&gpu, &y_dev, &GTensor::from_host(&gpu, &g));
             assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, tol(&gpu, 2e-3));
 
             poison(256 * 4 * h * b);
@@ -1752,13 +1936,15 @@ mod tests {
             &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3], None,
         );
         per_step.force_fused_time = Some(false);
-        let want = per_step.forward_alloc(&gpu, &dx).to_host(&gpu);
+        let y_per = per_step.forward_alloc(&gpu, &dx);
+        let want = y_per.to_host(&gpu);
 
         let mut fused = SLstm::from_parts(
             &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3], None,
         );
         fused.force_fused_time = Some(true);
-        let got = fused.forward_alloc(&gpu, &dx).to_host(&gpu);
+        let y_fused = fused.forward_alloc(&gpu, &dx);
+        let got = y_fused.to_host(&gpu);
 
         // bf16 staging costs ~3 decimal digits on the operand, and a T-loop
         // accumulates several of them.
@@ -1808,8 +1994,8 @@ mod tests {
                 );
             }
         };
-        let want_dx = per_step.backward_alloc(&gpu, &gy).to_host(&gpu);
-        let got_dx = fused.backward_alloc(&gpu, &gy).to_host(&gpu);
+        let want_dx = per_step.backward_alloc(&gpu, &y_per, &gy).to_host(&gpu);
+        let got_dx = fused.backward_alloc(&gpu, &y_fused, &gy).to_host(&gpu);
         close_rel(0.0, &want_dx.data, &got_dx.data, "dx");
         // Measured separation at B = 1/64/256: the degenerate input-gate slice sits at
         // 2-4e-4 of the largest bias gradient, the healthy ones at 0.05-0.14. Two
@@ -1833,6 +2019,154 @@ mod tests {
                 &per_step.gate_db(&gpu, gi),
                 &fused.gate_db(&gpu, gi),
                 &format!("db[{gi}]"),
+            );
+        }
+    }
+
+    /// The batch-parallel fused forward (`slstm_batched_fwd`) must agree with the
+    /// per-step path it replaces.
+    ///
+    /// The batch sizes are the encoder's real length buckets — a word of T characters
+    /// arrives as B = ~2048/T rows — and T is deliberately short, which is the regime
+    /// the scalar time-fused kernel refuses and this one is built for. Rows that do not
+    /// fill the last 16-row mma tile are the interesting case: 120 and 341 are neither
+    /// a multiple of the tile nor of a block's row range.
+    ///
+    /// The backward runs per-step in BOTH arms, so the gradients here check the saved
+    /// slabs the fused forward wrote, not a second kernel.
+    #[test]
+    fn slstm_batched_matches_per_step() {
+        for (b, t) in [(120usize, 16usize), (341, 5), (1024, 1), (682, 2), (64, 33)] {
+            batched_matches_per_step_at(b, t, 256);
+        }
+    }
+
+    fn batched_matches_per_step_at(b: usize, t: usize, h: usize) {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        if !gpu.kernels.has_coop || ops::slstm_batched_geometry(&gpu, h, b).is_none() {
+            return;
+        }
+        let s = 1.0 / (h as f32).sqrt();
+        let w: Vec<Tensor> = (0..4)
+            .map(|g| Tensor::random_seeded(&[2 * h, h], s * (1.0 + g as f32 * 0.05), 11 + g as u64))
+            .collect();
+        let bi: Vec<Tensor> = (0..4)
+            .map(|g| Tensor::random_seeded(&[h], 0.2 + g as f32 * 0.01, 31 + g as u64))
+            .collect();
+        let x = GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, h], 0.5, 7));
+        let gy = GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, h], 0.7, 9));
+
+        let build = |batched: bool| {
+            let mut c = SLstm::from_parts(
+                &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3], None,
+            );
+            c.force_fused_time = Some(false);
+            c.force_batched = Some(batched);
+            c
+        };
+        let mut per_step = build(false);
+        let y_per = per_step.forward_alloc(&gpu, &x);
+        let want = y_per.to_host(&gpu);
+        let mut batched = build(true);
+        let y_bat = batched.forward_alloc(&gpu, &x);
+        let got = y_bat.to_host(&gpu);
+
+        // Both paths contract on bf16 operands — cuBLAS on a narrowed `h`/`Whr`, this
+        // one on mma fragments of the same — so they agree to bf16's ~3 decimal digits,
+        // not fp32's ~6.
+        let rel_tol = 1e-2;
+        for (i, (a, c)) in want.data.iter().zip(got.data.iter()).enumerate() {
+            assert!(
+                (a - c).abs() <= rel_tol * a.abs().max(1.0),
+                "batched vs per-step forward diverged at {i} (B={b}, T={t}): {a} vs {c}"
+            );
+        }
+
+        let close_rel = |want: &[f32], got: &[f32], what: &str| {
+            let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            for (i, (a, c)) in want.iter().zip(got).enumerate() {
+                assert!(
+                    (a - c).abs() <= rel_tol * scale,
+                    "{what} diverged at {i} (B={b}, T={t}): {a} vs {c} (scale {scale})"
+                );
+            }
+        };
+        let want_dx = per_step.backward_alloc(&gpu, &y_per, &gy).to_host(&gpu);
+        let got_dx = batched.backward_alloc(&gpu, &y_bat, &gy).to_host(&gpu);
+        close_rel(&want_dx.data, &got_dx.data, "dx");
+        for gi in 0..4 {
+            close_rel(
+                &per_step.gate_dw(&gpu, gi),
+                &batched.gate_dw(&gpu, gi),
+                &format!("dW[{gi}]"),
+            );
+        }
+    }
+
+    /// The batched path must honour `carry` — the state a chunk hands the next one.
+    ///
+    /// Nothing in production reaches this yet (the encoder and decoder run one word per
+    /// sequence, and the backbone, which does chunk, is at B=1 on the scalar path), but
+    /// the forward implements it — step 0 of a carried sweep takes `h_{-1}` from
+    /// `h_state` rather than from the mirror, which is a branch nothing else covers.
+    ///
+    /// The check is against the same chunked sweep on the per-step path rather than
+    /// against an unchunked run, so a carry that is dropped or read from the wrong place
+    /// shows up as a difference in the kernel and not in the chunking.
+    #[test]
+    fn slstm_batched_carry_matches_per_step() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let (b, h, chunks) = (64usize, 256usize, [6usize, 10]);
+        if !gpu.kernels.has_coop || ops::slstm_batched_geometry(&gpu, h, b).is_none() {
+            return;
+        }
+        let t: usize = chunks.iter().sum();
+        let sc = 1.0 / (h as f32).sqrt();
+        let w: Vec<Tensor> = (0..4)
+            .map(|g| Tensor::random_seeded(&[2 * h, h], sc * (1.0 + g as f32 * 0.05), 41 + g as u64))
+            .collect();
+        let bi: Vec<Tensor> = (0..4)
+            .map(|g| Tensor::random_seeded(&[h], 0.2, 61 + g as u64))
+            .collect();
+        let x = Tensor::random_seeded(&[b, t, h], 0.5, 13);
+        // A time chunk of a `[B, T, H]` tensor is one row range per batch row, so this
+        // gathers rather than slicing.
+        let cut = |off: usize, len: usize| {
+            let mut d = Vec::with_capacity(b * len * h);
+            for r in 0..b {
+                let s = (r * t + off) * h;
+                d.extend_from_slice(&x.data[s..s + len * h]);
+            }
+            Tensor::new(&[b, len, h], d)
+        };
+
+        let sweep = |batched: bool| -> Vec<f32> {
+            let mut cell = SLstm::from_parts(
+                &gpu, h, h, &w[0], &w[1], &w[2], &w[3], &bi[0], &bi[1], &bi[2], &bi[3], None,
+            );
+            cell.force_fused_time = Some(false);
+            cell.force_batched = Some(batched);
+            cell.set_carry(true);
+            cell.reset_state(&gpu);
+            let mut y = Vec::with_capacity(b * t * h);
+            let mut off = 0;
+            for &len in &chunks {
+                let xc = GTensor::from_host(&gpu, &cut(off, len));
+                y.extend(cell.forward_alloc(&gpu, &xc).to_host(&gpu).data);
+                off += len;
+            }
+            y
+        };
+        let (want, got) = (sweep(false), sweep(true));
+        let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        for (i, (a, c)) in want.iter().zip(got.iter()).enumerate() {
+            assert!(
+                (a - c).abs() <= 1e-2 * scale,
+                "carried forward diverged at {i}: {a} vs {c} (scale {scale})"
             );
         }
     }
@@ -1864,11 +2198,10 @@ mod tests {
 
         // Reference: one call over the whole sequence.
         let mut whole = from_cpu(&gpu, &cpu);
-        let y_whole = whole
-            .forward_alloc(&gpu, &GTensor::from_host(&gpu, &x))
-            .to_host(&gpu);
+        let y_whole_dev = whole.forward_alloc(&gpu, &GTensor::from_host(&gpu, &x));
+        let y_whole = y_whole_dev.to_host(&gpu);
         let dx_whole = whole
-            .backward_alloc(&gpu, &GTensor::from_host(&gpu, &dy))
+            .backward_alloc(&gpu, &y_whole_dev, &GTensor::from_host(&gpu, &dy))
             .to_host(&gpu);
 
         // Chunked: same weights, same input, one call per chunk.
@@ -1924,7 +2257,7 @@ mod tests {
                 o += pc;
             }
             let xc = GTensor::from_host(&gpu, &cut(&x, inp, ends[i], c));
-            part.forward_alloc(&gpu, &xc);
+            let yc = part.forward_alloc(&gpu, &xc);
 
             // The BPTT channels must carry from the chunk to the right, so they are
             // NOT reset here — except for the rightmost chunk, which starts at zero.
@@ -1932,7 +2265,7 @@ mod tests {
                 part.reset_bptt(&gpu);
             }
             let dyc = GTensor::from_host(&gpu, &cut(&dy, h, ends[i], c));
-            dx_parts.push(part.backward_alloc(&gpu, &dyc).to_host(&gpu).data);
+            dx_parts.push(part.backward_alloc(&gpu, &yc, &dyc).to_host(&gpu).data);
         }
         dx_parts.reverse();
         let dx_flat: Vec<f32> = dx_parts.concat();
@@ -1998,5 +2331,53 @@ mod tests {
                 i % h
             );
         }
+    }
+
+    /// The dispatch predicate is two-dimensional, and production depends on it landing
+    /// the right way for shapes the model actually runs. `T` alone is not enough: the
+    /// fused kernel's recurrent product is scalar and therefore linear in `B`, while the
+    /// per-step path's cuBLAS call is flat until its tensor-core tiles fill, so a wide
+    /// batch must NOT fuse (measured crossover B ~= 32).
+    ///
+    /// Correctness tests pin the math, not which path ran, so without this a dispatch
+    /// regression is silent — and at B=8/T=512 it costs 29.32 ms against 16.62 ms.
+    ///
+    /// The same goes for the batched path at the other end of the batch axis: it is
+    /// worth 1.03-1.67x on the encoder's narrow groups and a loss on its widest, and
+    /// nothing else would notice it being taken at the wrong shape.
+    #[test]
+    fn dispatch_picks_the_right_path_for_production_shapes() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let cell = SLstm::new_rand(&gpu, 6, 6);
+
+        // Backbone: one sequence, a whole chunk of words. Fuses.
+        assert!(cell.fuses_at(1, crate::config::BACKBONE_CHUNK), "backbone must fuse");
+
+        // Encoder/decoder: a word is at most MAX_WORD_BYTES + 1 steps, and the batch is
+        // the whole length group. Must not fuse — on either count.
+        for t in 1..=(crate::config::MAX_WORD_BYTES + 1) {
+            for b in [120, 227, 512, 1024, crate::config::GROUP_MAX_ROWS] {
+                assert!(!cell.fuses_at(b, t), "encoder shape B={b} T={t} must not fuse");
+            }
+        }
+
+        // The batch axis alone decides it at a length that clears FUSED_MIN_T.
+        assert!(cell.fuses_at(FUSED_MAX_B, 512), "B at the cap still fuses");
+        assert!(!cell.fuses_at(FUSED_MAX_B + 1, 512), "one past the cap must not");
+
+        // ...and the batched path is the other half of that split: it takes the
+        // encoder/decoder groups the scalar one refuses, up to the batch where its
+        // operand re-reads stop paying. At CHAR_HIDDEN the narrow groups must take it
+        // and the widest must not — a regression either way is otherwise silent.
+        let enc = SLstm::new_rand(&gpu, crate::config::CHAR_HIDDEN, crate::config::CHAR_HIDDEN);
+        for b in [120, 128, 186] {
+            assert!(enc.batches_at(&gpu, b), "encoder group B={b} must take the batched path");
+        }
+        for b in [292, 512, 1024, crate::config::GROUP_MAX_ROWS] {
+            assert!(!enc.batches_at(&gpu, b), "B={b} re-reads too much to be worth it");
+        }
+        assert!(!enc.batches_at(&gpu, SB_MIN_B - 1), "a batch that cannot fill an mma tile");
     }
 }

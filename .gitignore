@@ -3,3 +3,8 @@
 /models_arch
 /data
 political_speeches.xml
+# Python side-project (python/): the venv is ~8 GB of torch + CUDA wheels, and the
+# vendored FlashRNN carries the NXAI Community License -- neither belongs in git.
+/python/.venv
+/python/flashrnn
+/python/**/__pycache__

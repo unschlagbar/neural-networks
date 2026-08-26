@@ -338,7 +338,7 @@ impl MLstm {
         gpu: &Gpu,
         x: &GTensor<f32>,
         out: &mut GTensor<f32>,
-        cache: &mut TrainingCache,
+        _cache: &mut TrainingCache,
     ) {
         // Release the previous eviction before allocating anything here: freeing
         // returns memory to the CUDA allocator, which must not hand it back while a
@@ -645,7 +645,9 @@ impl MLstm {
         // they wrote `ytil` with, and the head norm's output is already in that layout.
         // It leaves the pool for the duration of the call and is returned below.
         let mut d_ytil = self.pool.take(gpu, &[n, d]);
-        self.headnorm.backward(gpu, &d_yhat, &mut d_ytil);
+        // `yhat` is the head norm's own output, kept for `ogate_bwd` — which is also
+        // what its backward rebuilds `x̂` from, so the norm stores no `[N, d]` of its own.
+        self.headnorm.backward(gpu, &d_yhat, sv.yhat(), &mut d_ytil);
         // `d_yhat` came from `ogate_bwd`, so it is only dropped — see the note at the
         // end of this function.
         drop(d_yhat);
@@ -753,7 +755,9 @@ impl Cell for MLstm {
     ) {
         MLstm::forward(self, gpu, x, out, cache)
     }
-    fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
+    /// The head norm keeps its own output (`yhat`, for the o-gate), so this cell has
+    /// no use for the block's copy.
+    fn backward(&mut self, gpu: &Gpu, _y: &GTensor<f32>, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
         MLstm::backward(self, gpu, dy, dx)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {

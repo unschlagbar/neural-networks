@@ -103,8 +103,8 @@ __device__ __forceinline__ void fused_load_slice(float* dst, const __nv_bfloat16
 extern "C" __global__ void slstm_fused_time(
         const float* __restrict__ wh, float* g, const float* __restrict__ bcat,
         slab_t* h_prev, float* c_state, float* n_state, float* m_state, float* h_state,
-        float* hmir, float* wtail, float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
-        float* i_prime, float* f_prime, float* c_out, float* n_out,
+        float* hmir, float* wtail, state_t* c_entry, state_t* n_entry, slab_t* zt, slab_t* ot,
+        state_t* i_prime, state_t* f_prime, state_t* c_out, state_t* n_out,
         float* out, int T, int units_per_block, int carry) {
     extern __shared__ __align__(16) float smem[];
     cg::grid_group grid = cg::this_grid();
@@ -293,11 +293,15 @@ extern "C" __global__ void slstm_fused_time(
             float c = fp * c_reg + ip * z;
             float n = fp * n_reg + ip;
 
-            c_prev[s] = c_reg;
-            n_prev[s] = n_reg;
+            // Only the sweep's first predecessor is stored: for t > 0 backward reads
+            // c_out/n_out one timestep back. See `slstm_step_fused`.
+            if (t == 0) {
+                state_st(c_entry, (long long)b_pw * FUSED_H + j_pw, c_reg);
+                state_st(n_entry, (long long)b_pw * FUSED_H + j_pw, n_reg);
+            }
             slab_st(zt, s, z); slab_st(ot, s, o);
-            i_prime[s] = ip; f_prime[s] = fp;
-            c_out[s] = c; n_out[s] = n;
+            state_st(i_prime, s, ip); state_st(f_prime, s, fp);
+            state_st(c_out, s, c);  state_st(n_out, s, n);
             c_reg = c; n_reg = n; m_reg = m;
 
             h_reg = o * c / n;
@@ -374,10 +378,10 @@ extern "C" __global__ void slstm_fused_time(
 extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
         const float* __restrict__ wh, const float* __restrict__ dy, float* g,
         float* dh_recur, float* dc_recur, float* dn_recur,
-        const slab_t* __restrict__ ot, const float* __restrict__ c_t,
-        const float* __restrict__ n_t, const float* __restrict__ c_prev,
-        const float* __restrict__ n_prev, const slab_t* __restrict__ zt,
-        const float* __restrict__ i_gate, const float* __restrict__ f_gate, int T) {
+        const slab_t* __restrict__ ot, const state_t* __restrict__ c_t,
+        const state_t* __restrict__ n_t, const state_t* __restrict__ c_entry,
+        const state_t* __restrict__ n_entry, const slab_t* __restrict__ zt,
+        const state_t* __restrict__ i_gate, const state_t* __restrict__ f_gate, int T) {
     cg::grid_group grid = cg::this_grid();
 
     // The block's whole dh vector: written by the contraction's lane 0, read by the
@@ -440,13 +444,15 @@ extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
         f_dy = dy[s];
         f_fpre = g[go + 2 * SLSTM_H]; // biased forget pre-activation, from the forward
         f_o = slab_ld(ot, s);
-        f_c = c_t[s];
-        f_n = n_t[s];
-        f_cp = c_prev[s];
-        f_np = n_prev[s];
+        f_c = state_ld(c_t, s);
+        f_n = state_ld(n_t, s);
+        f_cp = (t == 0) ? state_ld(c_entry, (long long)b_pw * SLSTM_H + j_pw)
+                        : state_ld(c_t, s - SLSTM_H);
+        f_np = (t == 0) ? state_ld(n_entry, (long long)b_pw * SLSTM_H + j_pw)
+                        : state_ld(n_t, s - SLSTM_H);
         f_z = slab_ld(zt, s);
-        f_i = i_gate[s];
-        f_f = f_gate[s];
+        f_i = state_ld(i_gate, s);
+        f_f = state_ld(f_gate, s);
     };
     fetch(T - 1);
     __syncthreads(); // dh seeded before the first timestep reads it

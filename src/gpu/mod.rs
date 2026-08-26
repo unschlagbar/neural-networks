@@ -40,7 +40,7 @@ pub mod word_groups;
 
 pub use arena::{ParamArena, ParamKind, ParamSlot};
 pub use bf16::Slab;
-pub use buf::{Buf, Pool};
+pub use buf::{Buf, Pool, SlabSlot};
 pub use gtensor::GTensor;
 use kernels::Kernels;
 pub use offload::OffloadRing;

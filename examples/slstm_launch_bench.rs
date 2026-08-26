@@ -65,8 +65,7 @@ fn main() {
 
         for _ in 0..warmup {
             let y = dev.forward_alloc(&gpu, &x);
-            drop(y);
-            let _ = dev.backward_alloc(&gpu, &g);
+            let _ = dev.backward_alloc(&gpu, &y, &g);
         }
         gpu.stream.synchronize().unwrap();
 
@@ -75,8 +74,7 @@ fn main() {
         let t0 = Instant::now();
         for _ in 0..iters {
             let y = dev.forward_alloc(&gpu, &x);
-            drop(y);
-            let _ = dev.backward_alloc(&gpu, &g);
+            let _ = dev.backward_alloc(&gpu, &y, &g);
         }
         let issue = t0.elapsed().as_secs_f64();
         gpu.stream.synchronize().unwrap();

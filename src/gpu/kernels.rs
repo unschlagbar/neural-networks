@@ -35,7 +35,9 @@ const SRC: &str = concat!(
     include_str!("cuda/prelude.cu"),
     include_str!("cuda/common.cu"),
     include_str!("cuda/bf16_cast.cu"),
+    include_str!("cuda/mma.cu"),
     include_str!("cuda/slstm_coop.cu"),
+    include_str!("cuda/slstm_batched.cu"),
     include_str!("cuda/slstm_fused.cu"),
     include_str!("cuda/block.cu"),
     include_str!("cuda/mlstm_ops.cu"),
@@ -49,13 +51,17 @@ const NAMES: &[&str] = &[
     "broadcast_row",
     "broadcast_row_resid",
     "add_col_sum",
+    "add_col_sum_slab",
     "col_sum_part",
+    "col_sum_part_slab",
     "col_sum_merge",
     "embedding_gather",
     "embedding_scatter_add",
     "embedding_scatter_merge",
     "rms_norm_forward",
+    "rms_norm_forward_slab",
     "rms_norm_backward",
+    "rms_norm_backward_slab",
     "softmax_ce",
     "adamw",
     "adamw_arena",
@@ -125,7 +131,7 @@ const MMA_NAMES: &[&str] = &[
 /// compiled at [`COOP_CANARY`] and its functions are thrown away: what it establishes
 /// is that the cooperative include path resolves AND that both kernels still compile,
 /// neither of which a module built without the shape defines would notice.
-const COOP_NAMES: &[&str] = &["slstm_fused_time", "slstm_fused_time_bwd"];
+const COOP_NAMES: &[&str] = &["slstm_fused_time", "slstm_fused_time_bwd", "slstm_batched_fwd", "slstm_batched_bwd"];
 
 /// The throwaway shape [`COOP_NAMES`] is compiled at to prove it still builds. Small
 /// enough to compile fast, and legal for both kernels' geometry contracts.
@@ -139,12 +145,26 @@ const COOP_CANARY: &[(&str, usize)] = &[
     ("SLSTM_RS", 256),
     ("SLSTM_NJ", 1),
     ("SLSTM_TH", 64),
+    ("SLSTM_MMA", 1),
+    ("SB_NJ", 16),
+    ("SB_RPT", 1),
+    ("SB_WSR", 256),
+    ("SB_WSC", 512),
 ];
 
 /// fp32 <-> bf16 casts. Need `<cuda_bf16.h>` only — a strictly smaller include
 /// requirement than [`COOP_NAMES`], hence their own module: a machine that cannot
 /// build the cooperative kernels can still store activations in bf16.
-const BF16_NAMES: &[&str] = &["cast_f32_to_bf16", "cast_bf16_to_f32"];
+/// Whether the sLSTM's stabilizer group is stored narrow (`SLSTM_BF16_STATE=1`).
+///
+/// Opt-in, and read once: a forward and its backward must agree on the layout of what
+/// was saved, so this cannot change within a process.
+fn state_bf16_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SLSTM_BF16_STATE").as_deref() == Ok("1"))
+}
+
+const BF16_NAMES: &[&str] = &["cast_f32_to_bf16", "cast_bf16_to_f32", "quantize_bf16_inplace"];
 
 /// Directory holding `cuda_bf16.h`, or `None` if it cannot be found.
 ///
@@ -222,6 +242,12 @@ pub struct Kernels {
     /// expects `float` (or the reverse) is a silent out-of-bounds walk, not a type
     /// error. Every slab allocation reads this flag rather than the env var.
     pub slab_bf16: bool,
+    /// Whether the kernels were built with `-DSTATE_BF16`, i.e. whether the sLSTM's
+    /// **stabilizer-carrying** saved tensors (`c`, `n`, `i_prime`, `f_prime`) are
+    /// narrow. Opt-IN via `SLSTM_BF16_STATE=1`, unlike [`slab_bf16`](Self::slab_bf16)
+    /// which is on by default — this group is the one `gpu::bf16` argues must stay
+    /// fp32, and the switch exists to measure that.
+    pub state_bf16: bool,
     /// Include flags the optional modules were compiled with, kept so the
     /// shape-specialized variants can reuse them. `None` if the headers were absent.
     coop_includes: Option<Vec<String>>,
@@ -318,6 +344,9 @@ impl Kernels {
             if bf16 {
                 let inc = inc.as_deref().expect("checked is_some");
                 options.push("-DSLAB_BF16=1".to_string());
+                if state_bf16_enabled() {
+                    options.push("-DSTATE_BF16=1".to_string());
+                }
                 options.push(format!("-I{inc}"));
                 options.extend(extra_include_dirs(inc).iter().map(|d| format!("-I{d}")));
             }
@@ -366,6 +395,12 @@ impl Kernels {
             if slab_bf16 {
                 let inc = inc.as_deref().expect("slab_bf16 implies an include dir");
                 options.push("-DSLAB_BF16=1".to_string());
+                if state_bf16_enabled() {
+                    options.push("-DSTATE_BF16=1".to_string());
+                }
+                if state_bf16_enabled() {
+                    options.push("-DSTATE_BF16=1".to_string());
+                }
                 options.push(format!("-I{inc}"));
                 options.extend(extra_include_dirs(inc).iter().map(|d| format!("-I{d}")));
             }
@@ -415,6 +450,9 @@ impl Kernels {
                 // module's eager ones, so they MUST be built at the same width.
                 if slab_bf16 {
                     options.push("-DSLAB_BF16=1".to_string());
+                    if state_bf16_enabled() {
+                        options.push("-DSTATE_BF16=1".to_string());
+                    }
                 }
                 options.extend(extra.iter().map(|d| format!("-I{d}")));
                 let opts = CompileOptions {
@@ -455,6 +493,7 @@ impl Kernels {
             funcs,
             has_bf16,
             slab_bf16,
+            state_bf16: slab_bf16 && state_bf16_enabled(),
             has_coop,
             coop_includes,
             arch: (major, minor),
@@ -515,6 +554,9 @@ impl Kernels {
         // Same slab width as every other module — see `load`.
         if self.slab_bf16 {
             options.push("-DSLAB_BF16=1".to_string());
+            if self.state_bf16 {
+                options.push("-DSTATE_BF16=1".to_string());
+            }
             if let Some(inc) = cuda_include_dir() {
                 options.push(format!("-I{inc}"));
                 options.extend(extra_include_dirs(&inc).iter().map(|d| format!("-I{d}")));
@@ -573,6 +615,9 @@ impl Kernels {
         // specialized kernel would read the saved slabs at the wrong stride.
         if self.slab_bf16 {
             options.push("-DSLAB_BF16=1".to_string());
+            if self.state_bf16 {
+                options.push("-DSTATE_BF16=1".to_string());
+            }
         }
         options.extend(includes.iter().cloned());
         let built = compile_ptx_with_opts(

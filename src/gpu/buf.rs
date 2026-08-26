@@ -29,7 +29,7 @@
 //! does anyway. Use [`Buf::get_zeroed`] when the buffer is accumulated into rather
 //! than overwritten.
 
-use super::{GTensor, Gpu};
+use super::{GTensor, Gpu, ops};
 
 /// How much larger than the request a retained allocation may be before it is
 /// dropped and replaced with a right-sized one.
@@ -205,6 +205,66 @@ impl Buf {
 
     /// Release the allocation. Only for a layer being torn down or deliberately
     /// shrunk — the point of a `Buf` is to keep its memory across calls.
+    pub fn clear(&mut self) {
+        self.slot = None;
+    }
+}
+
+/// A [`Buf`] whose tensor is stored at the slab width — bf16 where the kernels were
+/// built for it, fp32 otherwise.
+///
+/// Same contract as `Buf` (persist across calls, reuse by capacity, allocate at a size
+/// class), for a value whose every reader takes it narrow. `zn` in a `Block` is the
+/// case that motivated it: its norm writes it, two GEMMs and that norm's own backward
+/// read it, and all four are happy with bf16 — so materializing it fp32 only to narrow
+/// it again was a full extra pass over the tensor per reader.
+#[derive(Default)]
+pub struct SlabSlot {
+    slot: Option<ops::SlabBuf>,
+    /// Whether this slot narrows. Fixed for the slot's life, because a forward and its
+    /// backward have to agree on the layout of what was written.
+    bf16: bool,
+}
+
+impl SlabSlot {
+    /// `bf16` is the caller's decision, not the kernels' — see
+    /// [`ops::SlabBuf::new_width`].
+    pub const fn new(bf16: bool) -> Self {
+        Self { slot: None, bf16 }
+    }
+
+    /// Device bytes held, at this slab's actual element width. Diagnostic.
+    pub fn retained_bytes(&self) -> usize {
+        self.slot.as_ref().map_or(0, |t| t.retained_bytes())
+    }
+
+    /// The buffer at `dims`, reusing the allocation while it fits. See [`Buf::get`].
+    pub fn get(&mut self, gpu: &Gpu, dims: &[usize]) -> &mut ops::SlabBuf {
+        let n: usize = dims.iter().product();
+        match &mut self.slot {
+            Some(t) if fits(t.capacity(), n) => t.shrink_to(dims),
+            _ => {
+                let mut t = ops::SlabBuf::new_width(gpu, &[size_class(n)], self.bf16);
+                t.shrink_to(dims);
+                self.slot = Some(t);
+            }
+        }
+        self.slot.as_mut().expect("just filled")
+    }
+
+    /// The saved slab, panicking with `what` if the forward never ran.
+    pub fn expect(&self, what: &str) -> &ops::SlabBuf {
+        self.slot.as_ref().expect(what)
+    }
+
+    pub fn take(&mut self) -> Option<ops::SlabBuf> {
+        self.slot.take()
+    }
+
+    pub fn put(&mut self, t: ops::SlabBuf) {
+        self.slot = Some(t);
+    }
+
     pub fn clear(&mut self) {
         self.slot = None;
     }

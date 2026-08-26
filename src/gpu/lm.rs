@@ -117,7 +117,12 @@ impl Lm {
 
         let d_pre = ops::softcap_backward(gpu, dlogits, logits, self.cap);
         let d_normed = self.head.backward_alloc(gpu, &d_pre);
-        let d_flat = self.norm.backward_alloc(gpu, &d_normed); // [N, H]
+        // `head` saved its own input, which is `norm`'s output — what the norm's
+        // backward rebuilds `x̂` from.
+        let d_flat = {
+            let Self { head, norm, .. } = self;
+            norm.backward_alloc(gpu, &d_normed, head.saved_x()) // [N, H]
+        };
 
         let mut d_seq = d_flat.reshaped(&[b, t, h]);
         let mut d_next = GTensor::uninit(gpu, &[b, t, h]);

@@ -58,4 +58,22 @@ extern "C" __global__ void cast_bf16_to_f32(const __nv_bfloat16* src, float* dst
         for (int i = i0; i < n; i += stride) dst[i] = __bfloat162float(src[i]);
     }
 }
+
+// Round an fp32 buffer to bf16 precision IN PLACE, staying fp32.
+//
+// The point is precision, not storage: it reproduces what a cuBLAS GEMM with
+// `Ctype = CUDA_R_16BF` and `beta = 1` does to an accumulator — read at bf16, add the
+// fp32 product, store back at bf16 — for a caller whose buffer has to remain fp32.
+// FlashRNN's `dR`/`db` are exactly that, and the sLSTM's gradients are windows into a
+// uniformly fp32 `ParamArena` that cannot hold a narrow one for a single layer. So the
+// question "does a bf16 gradient hurt?" is answered here, and the question "can we
+// have the memory back?" is answered by narrowing the whole arena, separately.
+//
+// No scratch and one launch, unlike a narrow-then-widen pair.
+extern "C" __global__ void quantize_bf16_inplace(float* p, int n) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        p[i] = __bfloat162float(__float2bfloat16(p[i]));
+    }
+}
 #endif

@@ -846,10 +846,13 @@ impl Hierarchical {
             // what was just saved.
             //
             // `drop_all_act` rather than `drop_saved_act`: the latter leaves each
-            // projection's saved input, its bf16 GEMM staging and the norms' `x̂`
+            // projection's saved input, its narrowed activations and the norms' `x̂`
             // resident. Those are sized to this group's rectangle, the next group's is a
             // different shape and reuse is by capacity, so every group would leave a
             // full set behind — 1259 MB for a stage whose largest rectangle is ~25 MB.
+            // What it does *not* reach is the cached bf16 weight: that one is sized to
+            // the weight, and dropping it here cost a re-narrow of the whole stack per
+            // group — half of all `cast_f32_to_bf16` traffic in a step.
             for blk in self.encoder.blocks.iter_mut() {
                 blk.drop_all_act(gpu);
             }
@@ -1121,7 +1124,12 @@ impl Hierarchical {
         let hc = self.cfg.hc;
         let d_logits = ops::softcap_backward(gpu, d_capped, capped, self.cfg.cap);
         let d_hdn = self.dec_head.backward_alloc(gpu, &d_logits);
-        let d_hd_flat = self.dec_norm.backward_alloc(gpu, &d_hdn);
+        // `dec_head` saved its own input, which is exactly `dec_norm`'s output — the
+        // tensor the norm's backward rebuilds `x̂` from, so nothing else has to keep it.
+        let d_hd_flat = {
+            let Self { dec_head, dec_norm, .. } = self;
+            dec_norm.backward_alloc(gpu, &d_hdn, dec_head.saved_x())
+        };
         let mut d_hd = d_hd_flat.reshaped(&[n_g, tmax, hc]);
         let mut d_hd_next = GTensor::uninit(gpu, &[n_g, tmax, hc]);
         for blk in self.dec_blocks.iter_mut().rev() {

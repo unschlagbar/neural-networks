@@ -163,23 +163,25 @@ fn main() {
         use neural_networks::gpu::ops::{SlabBuf, SlstmSlabs};
         let (b, t, h) = (1usize, 2047usize, 512usize);
         let h4 = 4 * h;
-        let slab = || GTensor::zeros(&gpu, &[b, t, h]);
         // The plain-activation slabs follow the compiled kernels' width (bf16 unless
-        // GPU_NO_BF16); the stabilizer-carrying ones are always fp32.
+        // GPU_NO_BF16); the stabilizer-carrying ones follow `state_bf16`.
         let act = || SlabBuf::new(&gpu, &[b, t, h]);
+        let state = || SlabBuf::new_width(&gpu, &[b, t, h], gpu.kernels.state_bf16);
+        let entry = || SlabBuf::new_width(&gpu, &[b, h], gpu.kernels.state_bf16);
         let mut slabs = SlstmSlabs {
-            c_prev: slab(),
-            n_prev: slab(),
-            i_prime: slab(),
-            f_prime: slab(),
-            c: slab(),
-            n: slab(),
+            c_entry: entry(),
+            n_entry: entry(),
+            i_prime: state(),
+            f_prime: state(),
+            c: state(),
+            n: state(),
             zt: act(),
             ot: act(),
             h_prev: act(),
         };
         let mut g = GTensor::zeros(&gpu, &[b, t, h4]);
         let mut gh = GTensor::zeros(&gpu, &[b, h4]);
+        let mut dgh = SlabBuf::new(&gpu, &[b, h4]);
         let bcat = GTensor::zeros(&gpu, &[h4]);
         let (mut cs, mut ns, mut ms, mut hs2) = (
             GTensor::zeros(&gpu, &[b, h]),
@@ -217,7 +219,7 @@ fn main() {
                 &gpu,
                 &dy,
                 &mut g,
-                &mut gh,
+                &mut dgh,
                 &dhb,
                 &slabs,
                 &mut dc,
@@ -242,15 +244,15 @@ fn main() {
         let mut cell = SLstm::new_rand(&gpu, wh, wh);
         let x = GTensor::zeros(&gpu, &[1, words, wh]);
         let g = GTensor::zeros(&gpu, &[1, words, wh]);
-        let _ = cell.forward_alloc(&gpu, &x);
-        let _ = cell.backward_alloc(&gpu, &g);
+        let y = cell.forward_alloc(&gpu, &x);
+        let _ = cell.backward_alloc(&gpu, &y, &g);
         gpu.stream.synchronize().unwrap();
         let t0 = Instant::now();
-        let _ = cell.forward_alloc(&gpu, &x);
+        let y = cell.forward_alloc(&gpu, &x);
         gpu.stream.synchronize().unwrap();
         let f = t0.elapsed();
         let t1 = Instant::now();
-        let _ = cell.backward_alloc(&gpu, &g);
+        let _ = cell.backward_alloc(&gpu, &y, &g);
         gpu.stream.synchronize().unwrap();
         println!(
             "bare sLSTM cell x1          B=1     T={words}  H={wh}  fwd {:>8.1?}  bwd {:>8.1?}",

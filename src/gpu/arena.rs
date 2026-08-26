@@ -16,7 +16,7 @@
 //! the extent of the update are both bound checks on the element index rather than a
 //! per-tensor lookup.
 
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, PushKernelArg};
 
 use super::{GTensor, Gpu, ops};
 use crate::nn2::optim::AdamCfg;
@@ -165,7 +165,7 @@ impl ParamArena {
             .arg(&bc2)
             .arg(&decay_end)
             .arg(&n);
-        unsafe { lb.launch(LaunchConfig::for_num_elems(self.step_end as u32)) }
+        unsafe { lb.launch(super::ops::elem_cfg(gpu, self.step_end as u32)) }
             .expect("adamw_arena");
         self.zero_grad(gpu);
     }

@@ -222,8 +222,8 @@ fn main() {
         let dx_in = GTensor::from_host(&gpu, &x);
         let ddy = GTensor::from_host(&gpu, &dy);
         let gpu_s = gpu_time(&gpu, GPU_WARMUP, GPU_ITERS, || {
-            let _y = dev.forward_alloc(&gpu, &dx_in);
-            let _dx = dev.backward_alloc(&gpu, &ddy);
+            let y = dev.forward_alloc(&gpu, &dx_in);
+            let _dx = dev.backward_alloc(&gpu, &y, &ddy);
             dev.step(&gpu, &cfg);
         });
 

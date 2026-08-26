@@ -14,6 +14,40 @@ use cudarc::cublas::sys::cublasOperation_t::{CUBLAS_OP_N, CUBLAS_OP_T};
 use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{CudaSlice, CudaView, LaunchConfig, PushKernelArg};
 
+/// Launch geometry for a pure elementwise kernel over `n` items.
+///
+/// `LaunchConfig::for_num_elems` hardcodes 1024 threads per block, so anything with
+/// `n <= 1024` runs as a SINGLE block — one multiprocessor busy and 83 idle. That is
+/// the worst case for exactly the kernels that hit it: small casts, state copies and
+/// the per-step sLSTM pointwise, all latency-bound, where the only lever is having
+/// more SMs issuing loads at once.
+///
+/// Every kernel launched this way is elementwise — none use `__syncthreads`,
+/// `__shfl` or shared memory — so the block width is free to choose. 256 is what they
+/// want once there is enough work to fill the device; below that the width narrows
+/// until the grid covers the SMs, never past a warp.
+///
+/// `GPU_WIDE_BLOCKS=1` restores the old fixed 1024 for an A/B.
+pub(crate) fn elem_cfg(gpu: &Gpu, n: u32) -> LaunchConfig {
+    use std::sync::OnceLock;
+    static WIDE: OnceLock<bool> = OnceLock::new();
+    if *WIDE.get_or_init(|| std::env::var("GPU_WIDE_BLOCKS").is_ok()) {
+        return LaunchConfig::for_num_elems(n);
+    }
+    let sm = (gpu.sm_count as u32).max(1);
+    let mut threads = 256u32;
+    if n < sm * threads {
+        threads = n.div_ceil(sm).next_power_of_two().clamp(32, 256);
+    }
+    LaunchConfig {
+        grid_dim: (n.div_ceil(threads).max(1), 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+use std::collections::HashMap;
+
 use super::{GTensor, Gpu};
 use crate::nn2::optim::AdamCfg;
 
@@ -321,6 +355,24 @@ pub fn matmul_bf16_bias_into(
     .expect("cublasLt matmul bf16 + bias");
 }
 
+/// Round `t` to bf16 precision in place, leaving it fp32.
+///
+/// Reproduces a cuBLAS accumulate with `Ctype = CUDA_R_16BF, beta = 1` — which is how
+/// FlashRNN stores `dR` and `db` — for a buffer that has to stay fp32 because it is a
+/// window into the fp32 [`ParamArena`](super::arena::ParamArena). See
+/// `quantize_bf16_inplace` in `bf16_cast.cu` for why the two questions are separable.
+pub fn quantize_bf16_(gpu: &Gpu, t: &mut GTensor<f32>) {
+    let n = t.len();
+    if n == 0 {
+        return;
+    }
+    let f = gpu.kernels.get("quantize_bf16_inplace");
+    let n_i = n as i32;
+    let mut b = gpu.stream.launch_builder(&f);
+    b.arg(&mut t.buf).arg(&n_i);
+    unsafe { b.launch(elem_cfg(gpu, n as u32)) }.expect("quantize_bf16_inplace");
+}
+
 /// One bf16 copy of an activation that several layers read.
 ///
 /// mLSTM hands the same `xf` to three projections, and the same `xf` again to their
@@ -396,7 +448,72 @@ thread_local! {
     /// stay in L2 rather than be reallocated per launch.
     static FUSED_TAIL: std::cell::RefCell<(Option<usize>, Option<GTensor<f32>>)> =
         const { std::cell::RefCell::new((None, None)) };
+
+    /// The batched forward's ping-ponged bf16 `h` mirror and the batched backward's
+    /// `dg` mirror, each two planes packed into one fp32 scratch. Their own buffers
+    /// rather than [`FUSED_ALT`]'s, which is sized to an exact shape: the encoder walks
+    /// twenty group widths per window, and reallocating per group put an allocate-and-
+    /// zero of up to a megabyte in front of every one of them.
+    static BATCHED_H: std::cell::RefCell<(Option<usize>, Option<GTensor<f32>>)> =
+        const { std::cell::RefCell::new((None, None)) };
+    static BATCHED_DG: std::cell::RefCell<(Option<usize>, Option<GTensor<f32>>)> =
+        const { std::cell::RefCell::new((None, None)) };
+
+
+    /// Resolved batched geometry per `(kernel, H, B)`. Choosing one costs an NVRTC
+    /// lookup and a driver occupancy query per `rpt` candidate, and the encoder asks the
+    /// same twenty questions every window — so the answer is remembered, including a
+    /// remembered `None`.
+    static BATCHED_GEOM: std::cell::RefCell<(Option<usize>, HashMap<(bool, usize, usize), Option<SbGeom>>)> =
+        std::cell::RefCell::new((None, HashMap::new()));
 }
+
+/// Memoize `resolve` per `(bwd, h, b)` on this thread and stream.
+fn cached_geom(
+    gpu: &Gpu,
+    bwd: bool,
+    h: usize,
+    b: usize,
+    resolve: impl FnOnce() -> Option<SbGeom>,
+) -> Option<SbGeom> {
+    BATCHED_GEOM.with(|s| {
+        let mut s = s.borrow_mut();
+        let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
+        if s.0 != Some(tag) {
+            s.1.clear();
+            s.0 = Some(tag);
+        }
+        *s.1.entry((bwd, h, b)).or_insert_with(resolve)
+    })
+}
+
+/// Run `f` with one of the batched kernels' mirrors, at least `len` fp32 elements —
+/// two bf16 planes' worth.
+///
+/// Grown, never shrunk, and never initialised: both kernels address their planes from
+/// compile-time widths and read nothing they did not write this launch, so a buffer
+/// larger than the shape needs is slack rather than a hazard.
+fn with_batched_mirror<R>(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<(Option<usize>, Option<GTensor<f32>>)>>,
+    gpu: &Gpu,
+    len: usize,
+    f: impl FnOnce(&mut GTensor<f32>) -> R,
+) -> R {
+    slot.with(|s| {
+        let mut s = s.borrow_mut();
+        let tag = std::sync::Arc::as_ptr(&gpu.stream) as usize;
+        if s.0 != Some(tag) {
+            s.1 = None;
+            s.0 = Some(tag);
+        }
+        if s.1.as_ref().is_none_or(|t| t.len() < len) {
+            s.1 = Some(GTensor::uninit(gpu, &[len]));
+        }
+        f(s.1.as_mut().unwrap())
+    })
+}
+
+
 
 /// Run `f` with a zeroed `[rows, cols]` scratch tensor, reallocated only on a shape
 /// or context change.
@@ -449,6 +566,13 @@ fn with_fused_tail<R>(gpu: &Gpu, len: usize, f: impl FnOnce(&mut GTensor<f32>) -
 
 /// Release the fused ping-pong scratch on this thread.
 pub fn clear_fused_alt() {
+    for slot in [&BATCHED_H, &BATCHED_DG] {
+        slot.with(|s| {
+            let mut s = s.borrow_mut();
+            s.1 = None;
+            s.0 = None;
+        });
+    }
     FUSED_ALT.with(|s| {
         let mut s = s.borrow_mut();
         s.1 = None;
@@ -595,11 +719,20 @@ impl GemmBf16 {
 
     /// Drop the staging buffers. The next `run` reallocates them.
     pub fn clear(&mut self) {
-        self.lhs = None;
-        self.rhs = None;
+        self.clear_operands();
         self.w = None;
         self.w_valid = false;
         self.b = None;
+    }
+
+    /// Drop only the buffers sized to the *call* — the narrowed activations. The
+    /// weight cache is sized to the weight, so it neither grows with a rectangle nor
+    /// goes stale between two calls that step nothing: dropping it at a group boundary
+    /// gives back parameter-sized memory the layer will want again immediately, and
+    /// buys a re-narrow of every weight in the stack per group.
+    pub fn clear_operands(&mut self) {
+        self.lhs = None;
+        self.rhs = None;
     }
 
     /// `Y = X·W + b` with a bf16 `Y`, bias in the epilogue. `x_b` is the caller's
@@ -1062,7 +1195,7 @@ pub fn scale_(gpu: &Gpu, x: &mut GTensor<f32>, s: f32) {
     let f = gpu.kernels.get("scale_inplace");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut x.buf).arg(&s).arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("scale_inplace");
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("scale_inplace");
 }
 
 /// In-place numerically-stable sigmoid. The mLSTM o-gate projection.
@@ -1072,7 +1205,7 @@ pub fn sigmoid_(gpu: &Gpu, x: &mut GTensor<f32>) {
     let f = gpu.kernels.get("sigmoid_inplace");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut x.buf).arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("sigmoid_inplace");
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("sigmoid_inplace");
 }
 
 /// SoftCap forward: `y = cap · tanh(x / cap)`.
@@ -1083,7 +1216,7 @@ pub fn softcap_forward(gpu: &Gpu, x: &GTensor<f32>, cap: f32) -> GTensor<f32> {
     let f = gpu.kernels.get("softcap_forward");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&x.buf).arg(&mut y.buf).arg(&cap).arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("softcap_forward");
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("softcap_forward");
     y
 }
 
@@ -1099,7 +1232,7 @@ pub fn softcap_backward(gpu: &Gpu, dy: &GTensor<f32>, y: &GTensor<f32>, cap: f32
         .arg(&mut dx.buf)
         .arg(&cap)
         .arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("softcap_backward");
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("softcap_backward");
     dx
 }
 
@@ -1159,14 +1292,32 @@ pub fn broadcast_row_resid(
 /// Accumulate the column sum of `dy` (`[rows, N]`) into `db` (`[N]`) — the bias
 /// gradient.
 pub fn add_col_sum(gpu: &Gpu, db: &mut GTensor<f32>, dy: &GTensor<f32>) {
-    col_sum_into(gpu, db, dy, None);
+    col_sum_into(gpu, db, dy, None, None);
 }
 
 /// [`add_col_sum`] over the elementwise product `dy ⊙ mul` — RMSNorm's `dgamma`,
 /// which is the same reduction with one more operand.
 pub fn add_col_sum_mul(gpu: &Gpu, db: &mut GTensor<f32>, dy: &GTensor<f32>, mul: &GTensor<f32>) {
     assert_eq!(dy.len(), mul.len(), "add_col_sum_mul: operand sizes");
-    col_sum_into(gpu, db, dy, Some(mul));
+    col_sum_into(gpu, db, dy, Some(WideOrSlab::F32(mul)), None);
+}
+
+/// [`add_col_sum_mul`] with each column divided by `div[o]` after the reduction.
+///
+/// RMSNorm's `dγ` when backward rebuilds `x̂` from the norm's output: `x̂ = y/γ` and γ
+/// is constant down a column, so `Σ_r dy·x̂ = (Σ_r dy·y)/γ` and the divide leaves the
+/// inner loop. That is what lets the output-sourced path run without materializing
+/// `x̂` anywhere. See [`crate::gpu::rms_norm::XHat`].
+pub fn add_col_sum_mul_div(
+    gpu: &Gpu,
+    db: &mut GTensor<f32>,
+    dy: &GTensor<f32>,
+    mul: WideOrSlab<'_>,
+    div: &GTensor<f32>,
+) {
+    assert_eq!(dy.as_2d(), mul.as_2d(), "add_col_sum_mul_div: operand shapes");
+    assert_eq!(db.len(), div.len(), "add_col_sum_mul_div: divisor width");
+    col_sum_into(gpu, db, dy, Some(mul), Some(div));
 }
 
 /// `db[o] += Σ_r dy[r, o]` (times `mul[r, o]` if given), **deterministically**.
@@ -1181,7 +1332,60 @@ pub fn add_col_sum_mul(gpu: &Gpu, db: &mut GTensor<f32>, dy: &GTensor<f32>, mul:
 /// A single band (the whole row axis in one block) leaves the grid at `ceil(n / 32)`,
 /// which at these layer widths is 8–24 blocks and reads at a tenth of the machine's
 /// bandwidth. [`col_sum_bands`] decides when the second launch is worth paying for.
-fn col_sum_into(gpu: &Gpu, db: &mut GTensor<f32>, dy: &GTensor<f32>, mul: Option<&GTensor<f32>>) {
+
+/// An operand that may be stored fp32 or narrow, borrowed for one launch.
+///
+/// RMSNorm's output is read by three different kernels (its own backward, the `dγ`
+/// reduction, and whatever consumes it downstream), and once the forward is allowed to
+/// write it narrow they all have to follow. This is what lets one launcher serve both
+/// widths instead of a parallel set of functions per width.
+#[derive(Clone, Copy)]
+pub enum WideOrSlab<'a> {
+    F32(&'a GTensor<f32>),
+    Slab(&'a SlabBuf),
+}
+
+impl<'a> WideOrSlab<'a> {
+    pub fn as_2d(&self) -> (usize, usize) {
+        match self {
+            WideOrSlab::F32(t) => t.as_2d(),
+            WideOrSlab::Slab(SlabBuf::F32(t)) => t.as_2d(),
+            WideOrSlab::Slab(SlabBuf::Bf16(t)) => t.as_2d(),
+        }
+    }
+
+    /// Pick between a kernel's fp32 and `_slab` entry points.
+    ///
+    /// `SlabBuf::F32` takes the fp32 one: a slab in a build without bf16 IS an fp32
+    /// tensor, and the narrow entry point would be the same kernel under a second
+    /// name. Both names are `&'static str` so the choice costs no allocation on a
+    /// path that runs per launch.
+    fn pick(&self, wide: &'static str, narrow: &'static str) -> &'static str {
+        match self {
+            WideOrSlab::Slab(SlabBuf::Bf16(_)) => narrow,
+            _ => wide,
+        }
+    }
+}
+
+/// Push a [`WideOrSlab`] as the next kernel argument.
+macro_rules! push_wos {
+    ($lb:expr, $v:expr) => {
+        match $v {
+            WideOrSlab::F32(t) => $lb.arg(&t.buf),
+            WideOrSlab::Slab(SlabBuf::F32(t)) => $lb.arg(&t.buf),
+            WideOrSlab::Slab(SlabBuf::Bf16(t)) => $lb.arg(&t.buf),
+        }
+    };
+}
+
+fn col_sum_into(
+    gpu: &Gpu,
+    db: &mut GTensor<f32>,
+    dy: &GTensor<f32>,
+    mul: Option<WideOrSlab<'_>>,
+    div: Option<&GTensor<f32>>,
+) {
     // `as_2d`, not `rows()`/`cols()`: RMSNorm hands this a `[B, T, d]` activation.
     let (rows, n) = dy.as_2d();
     assert_eq!(db.len(), n, "col_sum: db width");
@@ -1198,21 +1402,27 @@ fn col_sum_into(gpu: &Gpu, db: &mut GTensor<f32>, dy: &GTensor<f32>, mul: Option
         shared_mem_bytes: (bx * by * std::mem::size_of::<f32>()) as u32,
     };
     // No second operand: hand the kernel `dy` again rather than a null it would have
-    // to test per element.
+    // to test per element. The divisor stands in the same way — `dy` is at least `n`
+    // wide, so the unused read stays in bounds.
     let use_mul = mul.is_some() as i32;
-    let mul = mul.unwrap_or(dy);
+    let mul = mul.unwrap_or(WideOrSlab::F32(dy));
+    let use_div = div.is_some() as i32;
+    let div = div.unwrap_or(dy);
 
     let bands = col_sum_bands(gpu, rows, by, cfg.grid_dim.0 as usize);
     if bands > 1 {
-        col_sum_banded(gpu, db, dy, mul, use_mul, rows, n, bx, by, cfg, bands);
+        col_sum_banded(
+            gpu, db, dy, mul, use_mul, div, use_div, rows, n, bx, by, cfg, bands,
+        );
         return;
     }
-    let f = gpu.kernels.get("add_col_sum");
+    let f = gpu.kernels.get(mul.pick("add_col_sum", "add_col_sum_slab"));
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&mut db.buf)
-        .arg(&dy.buf)
-        .arg(&mul.buf)
-        .arg(&use_mul)
+    lb.arg(&mut db.buf).arg(&dy.buf);
+    push_wos!(lb, mul);
+    lb.arg(&use_mul)
+        .arg(&div.buf)
+        .arg(&use_div)
         .arg(&rows_i)
         .arg(&n_i);
     unsafe { lb.launch(cfg) }.expect("add_col_sum");
@@ -1245,8 +1455,10 @@ fn col_sum_banded(
     gpu: &Gpu,
     db: &mut GTensor<f32>,
     dy: &GTensor<f32>,
-    mul: &GTensor<f32>,
+    mul: WideOrSlab<'_>,
     use_mul: i32,
+    div: &GTensor<f32>,
+    use_div: i32,
     rows: usize,
     n: usize,
     bx: usize,
@@ -1258,12 +1470,11 @@ fn col_sum_banded(
     let band_i = rows.div_ceil(bands) as i32;
     let bands_i = bands as i32;
     with_col_sum_part(gpu, bands, n, |part| {
-        let f = gpu.kernels.get("col_sum_part");
+        let f = gpu.kernels.get(mul.pick("col_sum_part", "col_sum_part_slab"));
         let mut lb = gpu.stream.launch_builder(&f);
-        lb.arg(&mut part.buf)
-            .arg(&dy.buf)
-            .arg(&mul.buf)
-            .arg(&use_mul)
+        lb.arg(&mut part.buf).arg(&dy.buf);
+        push_wos!(lb, mul);
+        lb.arg(&use_mul)
             .arg(&rows_i)
             .arg(&n_i)
             .arg(&band_i);
@@ -1276,7 +1487,12 @@ fn col_sum_banded(
 
         let f = gpu.kernels.get("col_sum_merge");
         let mut lb = gpu.stream.launch_builder(&f);
-        lb.arg(&mut db.buf).arg(&part.buf).arg(&bands_i).arg(&n_i);
+        lb.arg(&mut db.buf)
+            .arg(&part.buf)
+            .arg(&div.buf)
+            .arg(&use_div)
+            .arg(&bands_i)
+            .arg(&n_i);
         let threads = n.clamp(32, 256).next_power_of_two().min(1024);
         unsafe {
             lb.launch(LaunchConfig {
@@ -1381,7 +1597,7 @@ pub fn embedding_gather_u32_into(
         .arg(&mut out.buf)
         .arg(&dim_i)
         .arg(&rows_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((rows * dim) as u32)) }
+    unsafe { lb.launch(elem_cfg(gpu, (rows * dim) as u32)) }
         .expect("embedding_gather");
 }
 
@@ -1455,15 +1671,18 @@ pub fn embedding_scatter_add_u32(
         .arg(&part.buf)
         .arg(&n_i)
         .arg(&slices_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((vocab * dim) as u32)) }
+    unsafe { lb.launch(elem_cfg(gpu, (vocab * dim) as u32)) }
         .expect("embedding_scatter_merge");
 }
 
-/// Saved intermediates from a GPU RMSNorm forward, consumed by its backward.
-/// The forward *output* is returned separately (it flows onward), so this holds
-/// only what backward needs.
+/// The one intermediate a GPU RMSNorm forward saves: `1/rms(x)` per normalization
+/// group, `[N]` for a plain norm.
+///
+/// Not `x̂`. Backward rebuilds that from the forward output as `x̂ = y/γ` — the same
+/// trade every fast implementation makes (Apex's `memory_efficient` mode; Liger saves
+/// the input and rebuilds `x̂ = x·inv_rms` from the other side). `x̂` is `[N, F]`, so
+/// storing it costs the full activation width for a value two flops recover.
 pub struct GpuRmsForward {
-    pub x_hat: GTensor<f32>,
     pub inv_rms: CudaSlice<f32>,
 }
 
@@ -1480,7 +1699,6 @@ pub fn rms_norm_forward(
     let total_groups = b * (f / group);
     let mut out = GTensor::uninit(gpu, &[b, f]);
     let mut saved = GpuRmsForward {
-        x_hat: GTensor::uninit(gpu, &[b, f]),
         inv_rms: gpu
             .stream
             .alloc_zeros::<f32>(total_groups)
@@ -1539,13 +1757,52 @@ pub fn rms_norm_forward_into(
     out: &mut GTensor<f32>,
     saved: &mut GpuRmsForward,
 ) {
+    // No reshape: `out` may legitimately be `[B, T, H]` and the caller's next op
+    // depends on its rank. `as_2d` in the launcher folds it for the shape check only.
+    rms_fwd_launch(gpu, x, gamma, group, eps, RmsOut::F32(out), saved);
+}
+
+/// [`rms_norm_forward_into`] writing a slab.
+///
+/// `x` stays fp32 — it is the residual stream, which is the one tensor in the block
+/// that must not be narrowed — but the output need not be: its consumer is a GEMM
+/// that reads bf16 anyway, so writing narrow here both halves the store and removes
+/// the cast pass that would otherwise read the fp32 result straight back out of HBM
+/// to produce the very same bits.
+pub fn rms_norm_forward_into_slab(
+    gpu: &Gpu,
+    x: &GTensor<f32>,
+    gamma: &GTensor<f32>,
+    group: usize,
+    eps: f32,
+    out: &mut SlabBuf,
+    saved: &mut GpuRmsForward,
+) {
+    let (b, f) = x.as_2d();
+    out.fit(gpu, &[b, f]);
+    rms_fwd_launch(gpu, x, gamma, group, eps, RmsOut::Slab(out), saved);
+}
+
+/// The forward's output, at either width. Mutable, so it cannot reuse [`WideOrSlab`].
+enum RmsOut<'a> {
+    F32(&'a mut GTensor<f32>),
+    Slab(&'a mut SlabBuf),
+}
+
+fn rms_fwd_launch(
+    gpu: &Gpu,
+    x: &GTensor<f32>,
+    gamma: &GTensor<f32>,
+    group: usize,
+    eps: f32,
+    out: RmsOut<'_>,
+    saved: &mut GpuRmsForward,
+) {
     // Position-wise over the last axis, so a `[B, T, H]` caller is served as-is —
     // see `GTensor::as_2d`.
     let (b, f) = x.as_2d();
     let groups_per_row = f / group;
     let total_groups = b * groups_per_row;
-    assert_eq!(out.as_2d(), (b, f), "rms_norm_forward: out shape");
-    assert_eq!(saved.x_hat.as_2d(), (b, f), "rms_norm_forward: x_hat shape");
     assert_eq!(
         saved.inv_rms.len(),
         total_groups,
@@ -1553,13 +1810,28 @@ pub fn rms_norm_forward_into(
     );
     let (gpr_i, group_i, tg_i) = (groups_per_row as i32, group as i32, total_groups as i32);
     let cfg = rms_norm_cfg(total_groups, group);
-    let func = gpu.kernels.get("rms_norm_forward");
+    let name = match &out {
+        RmsOut::Slab(SlabBuf::Bf16(_)) => "rms_norm_forward_slab",
+        _ => "rms_norm_forward",
+    };
+    let func = gpu.kernels.get(name);
     let mut lb = gpu.stream.launch_builder(&func);
-    lb.arg(&x.buf)
-        .arg(&gamma.buf)
-        .arg(&mut out.buf)
-        .arg(&mut saved.x_hat.buf)
-        .arg(&mut saved.inv_rms)
+    lb.arg(&x.buf).arg(&gamma.buf);
+    match out {
+        RmsOut::F32(t) => {
+            assert_eq!(t.as_2d(), (b, f), "rms_norm_forward: out shape");
+            lb.arg(&mut t.buf)
+        }
+        RmsOut::Slab(SlabBuf::F32(t)) => {
+            assert_eq!(t.as_2d(), (b, f), "rms_norm_forward: out shape");
+            lb.arg(&mut t.buf)
+        }
+        RmsOut::Slab(SlabBuf::Bf16(t)) => {
+            assert_eq!(t.as_2d(), (b, f), "rms_norm_forward: out shape");
+            lb.arg(&mut t.buf)
+        }
+    };
+    lb.arg(&mut saved.inv_rms)
         .arg(&gpr_i)
         .arg(&group_i)
         .arg(&eps)
@@ -1572,12 +1844,13 @@ pub fn rms_norm_backward(
     gpu: &Gpu,
     dy: &GTensor<f32>,
     fwd: &GpuRmsForward,
+    y: &GTensor<f32>,
     gamma: &GTensor<f32>,
     dgamma: &mut GTensor<f32>,
     group: usize,
 ) -> GTensor<f32> {
     let mut dx = GTensor::uninit(gpu, &[dy.rows(), dy.cols()]);
-    rms_norm_backward_into(gpu, dy, fwd, gamma, dgamma, group, &mut dx);
+    rms_norm_backward_into(gpu, dy, fwd, WideOrSlab::F32(y), gamma, dgamma, group, &mut dx);
     dx
 }
 
@@ -1585,10 +1858,12 @@ pub fn rms_norm_backward(
 /// [`rms_norm_backward`]. `dgamma` is accumulated into (not overwritten); `dx` is
 /// written in full.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn rms_norm_backward_into(
     gpu: &Gpu,
     dy: &GTensor<f32>,
     fwd: &GpuRmsForward,
+    y: WideOrSlab<'_>,
     gamma: &GTensor<f32>,
     dgamma: &mut GTensor<f32>,
     group: usize,
@@ -1598,22 +1873,29 @@ pub fn rms_norm_backward_into(
     let groups_per_row = f / group;
     let total_groups = b * groups_per_row;
     assert_eq!(dx.as_2d(), (b, f), "rms_norm_backward: dx shape");
+    assert_eq!(y.as_2d(), (b, f), "rms_norm_backward: y shape");
     let (gpr_i, group_i, tg_i) = (groups_per_row as i32, group as i32, total_groups as i32);
     let cfg = rms_norm_cfg(total_groups, group);
-    let func = gpu.kernels.get("rms_norm_backward");
+    // `dy` and `dx` stay fp32 either way: `dx` continues into the residual chain.
+    let func = gpu
+        .kernels
+        .get(y.pick("rms_norm_backward", "rms_norm_backward_slab"));
     let mut lb = gpu.stream.launch_builder(&func);
-    lb.arg(&dy.buf)
-        .arg(&fwd.x_hat.buf)
-        .arg(&fwd.inv_rms)
+    lb.arg(&dy.buf);
+    push_wos!(lb, y);
+    lb.arg(&fwd.inv_rms)
         .arg(&gamma.buf)
         .arg(&mut dx.buf)
         .arg(&gpr_i)
         .arg(&group_i)
         .arg(&tg_i);
     unsafe { lb.launch(cfg) }.expect("rms_norm_backward");
-    // dγ is a sum over ROWS of `dy ⊙ x_hat`, so every block above would contribute to
-    // the same slots. Its own deterministic reduction instead of an atomic there.
-    add_col_sum_mul(gpu, dgamma, dy, &fwd.x_hat);
+    // dγ is a sum over ROWS of `dy ⊙ x̂`, so every block above would contribute to the
+    // same slots. Its own deterministic reduction instead of an atomic there.
+    //
+    // `x̂ = y/γ` and γ is constant down a column, so the divide comes out of the sum
+    // entirely — which is what lets this path run without materializing `x̂` anywhere.
+    add_col_sum_mul_div(gpu, dgamma, dy, y, gamma);
 }
 
 /// Fused softmax + cross-entropy. Returns `(mean_loss, dlogits)` with
@@ -1643,7 +1925,7 @@ pub fn softmax_cross_entropy(
         .arg(&c_i)
         .arg(&inv_b)
         .arg(&b_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(b as u32)) }.expect("softmax_ce");
+    unsafe { lb.launch(elem_cfg(gpu, b as u32)) }.expect("softmax_ce");
     let losses = gpu.stream.clone_dtoh(&row_loss).expect("download row_loss");
     let loss = losses.iter().sum::<f32>() * inv_b;
     (loss, dlogits)
@@ -1695,7 +1977,7 @@ pub fn adamw(
         .arg(&bc1)
         .arg(&bc2)
         .arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("adamw");
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("adamw");
 }
 
 // sLSTM cell kernels (recurrent core, see gpu/slstm.rs). Each is the device
@@ -1728,7 +2010,7 @@ pub fn concat_xh(
         .arg(&inp_i)
         .arg(&h_i)
         .arg(&br_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(br as u32)) }.expect("concat_xh");
+    unsafe { lb.launch(elem_cfg(gpu, br as u32)) }.expect("concat_xh");
 }
 
 /// Split `dxh` (`[B, rows]`) into `dx[:, t, :]` (first `inp` cols) and `dh_bptt`
@@ -1756,7 +2038,7 @@ pub fn split_dxh(
         .arg(&inp_i)
         .arg(&h_i)
         .arg(&br_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(br as u32)) }.expect("split_dxh");
+    unsafe { lb.launch(elem_cfg(gpu, br as u32)) }.expect("split_dxh");
 }
 
 /// Per-step saved tensors of one sLSTM forward step, consumed by the backward
@@ -1819,7 +2101,7 @@ pub fn slstm_cell_step(
         .arg(&bigt_i)
         .arg(&h_i)
         .arg(&bh_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slstm_cell_step");
+    unsafe { lb.launch(elem_cfg(gpu, bh as u32)) }.expect("slstm_cell_step");
 }
 
 /// One backward sLSTM step: from `dy[:, t, :]` + the incoming BPTT channels,
@@ -1868,7 +2150,7 @@ pub fn slstm_cell_step_bwd(
         .arg(&mut dob.buf)
         .arg(&h_i)
         .arg(&bh_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slstm_cell_step_bwd");
+    unsafe { lb.launch(elem_cfg(gpu, bh as u32)) }.expect("slstm_cell_step_bwd");
 }
 
 // Fused-gate sLSTM (the fast path; see gpu/slstm.rs). The four gates run as one
@@ -1903,7 +2185,7 @@ pub fn slstm_pack(
         .arg(&inp_i)
         .arg(&h_i)
         .arg(&rows_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((rows * 4 * h) as u32)) }.expect("slstm_pack_w");
+    unsafe { lb.launch(elem_cfg(gpu, (rows * 4 * h) as u32)) }.expect("slstm_pack_w");
 
     let f = gpu.kernels.get("slstm_pack_b");
     let mut lb = gpu.stream.launch_builder(&f);
@@ -1913,7 +2195,7 @@ pub fn slstm_pack(
         .arg(&bias[3].buf)
         .arg(&mut bcat.buf)
         .arg(&h_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((4 * h) as u32)) }.expect("slstm_pack_b");
+    unsafe { lb.launch(elem_cfg(gpu, (4 * h) as u32)) }.expect("slstm_pack_b");
 }
 
 /// `dw[g] += ` the g-th column block of the fused `dwx` / `dwh` (the inverse of
@@ -1940,7 +2222,7 @@ pub fn slstm_unpack_dw(
         .arg(&inp_i)
         .arg(&h_i)
         .arg(&rows_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((rows * 4 * h) as u32)) }
+    unsafe { lb.launch(elem_cfg(gpu, (rows * 4 * h) as u32)) }
         .expect("slstm_unpack_dw");
 }
 
@@ -1951,7 +2233,7 @@ pub fn fill(gpu: &Gpu, t: &mut GTensor<f32>, v: f32) {
     let f = gpu.kernels.get("fill_const");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut t.buf).arg(&v).arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("fill_const");
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("fill_const");
 }
 
 /// `db[g] += ` column sums of the g-th block of the fused gate deltas `dg [N, 4H]`.
@@ -1976,22 +2258,29 @@ pub fn slstm_db_from_dg(
         .arg(&mut db2.buf)
         .arg(&mut db3.buf)
         .arg(&h_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((4 * h) as u32)) }.expect("slstm_unpack_db");
+    unsafe { lb.launch(elem_cfg(gpu, (4 * h) as u32)) }.expect("slstm_unpack_db");
 }
 
 /// Saved forward tensors of a fused-gate sLSTM, each a `[B, T, H]` slab (indexed
 /// `(b·T + t)·H + j`) rather than one small tensor per timestep.
 pub struct SlstmSlabs {
-    // Stabilizer-carrying: fp32, always. `c`/`n` and their `_prev` counterparts
-    // hold the exp(-m)-scaled cell and normalizer, and `i_prime`/`f_prime` ARE
-    // exp(·-m). Narrowing any of them injects a multiplicative error into the
-    // quantity that keeps the recurrence bounded — see `gpu::bf16`.
-    pub c_prev: GTensor<f32>,
-    pub n_prev: GTensor<f32>,
-    pub i_prime: GTensor<f32>,
-    pub f_prime: GTensor<f32>,
-    pub c: GTensor<f32>,
-    pub n: GTensor<f32>,
+    // Stabilizer-carrying. `c`/`n` hold the exp(-m)-scaled cell and normalizer and
+    // `i_prime`/`f_prime` ARE exp(·-m), so an absolute error here is a multiplicative
+    // error in the quantity that keeps the recurrence bounded. fp32 unless
+    // `SLSTM_BF16_STATE=1` — see `Kernels::state_bf16` and `gpu::bf16`.
+    /// The cell and normalizer *entering* the sweep, `[B, H]` — the `t = 0`
+    /// predecessor and nothing more.
+    ///
+    /// Backward needs `c_{t-1}`/`n_{t-1}` at every step, but for `t > 0` that is
+    /// `c`/`n` one timestep back in the very same buffer (`s - H`). Only the first
+    /// step has no predecessor there. Storing the whole history separately cost two
+    /// extra `[B, T, H]` tensors for one timestep's worth of information.
+    pub c_entry: SlabBuf,
+    pub n_entry: SlabBuf,
+    pub i_prime: SlabBuf,
+    pub f_prime: SlabBuf,
+    pub c: SlabBuf,
+    pub n: SlabBuf,
     // Plain activations: bf16 when the kernels were built for it. These are bounded
     // by construction (`zt` is a tanh, `ot` a sigmoid, `h_prev` their product over a
     // normalized ratio), written once and read once, and enter no reduction in their
@@ -2005,21 +2294,22 @@ pub struct SlstmSlabs {
 }
 
 impl SlstmSlabs {
-    /// Device bytes this saved set holds. Diagnostic — the fp32 stabilizer group and
-    /// the (possibly bf16) plain slabs are counted at their real widths.
+    /// Device bytes this saved set holds, each slab at its real width. Diagnostic.
     pub fn retained_bytes(&self) -> usize {
-        let f32s: usize = [
-            &self.c_prev,
-            &self.n_prev,
+        [
+            &self.c_entry,
+            &self.n_entry,
             &self.i_prime,
             &self.f_prime,
             &self.c,
             &self.n,
+            &self.zt,
+            &self.ot,
+            &self.h_prev,
         ]
         .iter()
-        .map(|t| t.capacity() * 4)
-        .sum();
-        f32s + self.zt.retained_bytes() + self.ot.retained_bytes() + self.h_prev.retained_bytes()
+        .map(|t| t.retained_bytes())
+        .sum()
     }
 }
 
@@ -2038,6 +2328,21 @@ pub enum SlabBuf {
 }
 
 impl SlabBuf {
+    /// An uninitialized slab at an explicitly chosen width.
+    ///
+    /// For a value whose readers are not the fused kernels: `zn` is normalized by the
+    /// RMSNorm kernels (which take either width) and read by GEMMs (which take bf16
+    /// only under `gemm_bf16_enabled`), so it must narrow only when *both* switches
+    /// are on. [`new`](Self::new) asks the kernels alone, which is right for a slab the
+    /// fused kernels own.
+    pub fn new_width(gpu: &Gpu, dims: &[usize], bf16: bool) -> Self {
+        if bf16 {
+            SlabBuf::Bf16(super::GTensor::uninit(gpu, dims))
+        } else {
+            SlabBuf::F32(GTensor::uninit(gpu, dims))
+        }
+    }
+
     /// An uninitialized slab at the width the kernels expect.
     pub fn new(gpu: &Gpu, dims: &[usize]) -> Self {
         if gpu.kernels.slab_bf16 {
@@ -2197,20 +2502,21 @@ pub fn slstm_step_fused(
         .arg(&mut m_state.buf)
         .arg(&mut h_state.buf);
     push_slab!(lb, *h_narrow);
-    lb.arg(&mut slabs.c_prev.buf).arg(&mut slabs.n_prev.buf);
+    push_slab!(lb, slabs.c_entry);
+    push_slab!(lb, slabs.n_entry);
     push_slab!(lb, slabs.zt);
     push_slab!(lb, slabs.ot);
-    lb.arg(&mut slabs.i_prime.buf)
-        .arg(&mut slabs.f_prime.buf)
-        .arg(&mut slabs.c.buf)
-        .arg(&mut slabs.n.buf)
-        .arg(&mut out.buf)
+    push_slab!(lb, slabs.i_prime);
+    push_slab!(lb, slabs.f_prime);
+    push_slab!(lb, slabs.c);
+    push_slab!(lb, slabs.n);
+    lb.arg(&mut out.buf)
         .arg(&t_i)
         .arg(&bigt_i)
         .arg(&h_i)
         .arg(&bh_i)
         .arg(&first_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slstm_step_fused");
+    unsafe { lb.launch(elem_cfg(gpu, bh as u32)) }.expect("slstm_step_fused");
 }
 
 /// Grid width for the fused kernels (`SLSTM_BLOCKS`), overriding the geometry's own
@@ -2551,12 +2857,14 @@ pub fn slstm_fused_time_bwd(
         .arg(&mut dc_recur.buf)
         .arg(&mut dn_recur.buf);
     push_slab_ref!(lb, slabs.ot);
-    lb.arg(&slabs.c.buf)
-        .arg(&slabs.n.buf)
-        .arg(&slabs.c_prev.buf)
-        .arg(&slabs.n_prev.buf);
+    push_slab_ref!(lb, slabs.c);
+    push_slab_ref!(lb, slabs.n);
+    push_slab_ref!(lb, slabs.c_entry);
+    push_slab_ref!(lb, slabs.n_entry);
     push_slab_ref!(lb, slabs.zt);
-    lb.arg(&slabs.i_prime.buf).arg(&slabs.f_prime.buf).arg(&t_i);
+    push_slab_ref!(lb, slabs.i_prime);
+    push_slab_ref!(lb, slabs.f_prime);
+    lb.arg(&t_i);
     // SAFETY: the geometry above guarantees a co-resident grid.
     match unsafe { lb.launch_cooperative(cfg) } {
         Ok(_) => true,
@@ -2565,6 +2873,351 @@ pub fn slstm_fused_time_bwd(
             false
         }
     }
+}
+
+/// Hidden units one `slstm_batched_fwd` block owns. Sets the block width outright
+/// (one warp per 8 of the `4*SB_NJ` gate columns, so `threads = 16 * nj`) and, with
+/// it, how many column blocks the grid needs: `H / nj`.
+///
+/// It also sets how many COLUMN blocks the grid has (`cb = H / nj`) and therefore how
+/// many times the two kernels re-read their big operand: every column block reads the
+/// whole `h` (forward) or `dg` (backward) row for its batch rows, every timestep. Both
+/// pull the same way — a narrower block means more of them — and which wins turns
+/// entirely on where the grid lands against the SM count. See [`sb_nj_for`].
+///
+/// Only 16 and 32 are ever worth taking. 8 loses at every batch even where its grid
+/// fits (67.6 us against 54.0 at B=32), and 64 needs a 1024-thread block, whose
+/// 64-register budget spills the backward's `Wh` fragments (`ptxas -v`) — 82.0 us
+/// against 77.3 at B=186.
+const SB_NJ_CANDIDATES: [usize; 2] = [16, 32];
+
+/// Ceiling, in 32-bit registers, on the `Wh` B-fragments a batched thread holds.
+///
+/// A warp keeps its gate columns over its whole share of the reduction axis in
+/// registers — one `mma` B-fragment pair per k-tile. Past this the array spills to local
+/// memory and gives back the whole win, so a wider `H` declines and takes another path.
+/// 64 registers reaches H = 512.
+const SB_MAX_WH_REGS: usize = 64;
+
+/// Units per block for a `[B, H]` sweep: the NARROWEST whose grid stays inside
+/// `max_blocks`, else the widest.
+///
+/// A cooperative grid must be fully resident, so more blocks than the device holds is
+/// not a second wave — it doubles up on some SMs while the rest hold one block, and
+/// every `grid.sync()` then waits on the doubled ones. Up to a point that is worth
+/// paying: the narrower block gives twice the blocks for the same work, which hides
+/// latency better, and its extra operand re-reads stay in L2. Measured at H=256, T=16
+/// (us per pass, `rpt` = 1, grid = `(H / nj) * ceil(B / 16)`):
+///
+/// | B | 48 | 64 | 80 | 96 | 128 | 144 | 160 |
+/// |---|----|----|----|----|-----|-----|-----|
+/// | fwd nj=16 | 39.9 | 40.5 | 41.5 | 49.0 | 49.8 | 50.4 | 51.6 |
+/// | fwd nj=32 | 48.4 | 48.5 | 48.4 | 49.4 | 50.0 | 50.8 | 52.1 |
+/// | bwd nj=16 | 55.7 | 57.7 | 59.9 | 72.0 | 77.6 | 82.7 | 92.1 |
+/// | bwd nj=32 | 66.3 | 68.3 | 69.9 | 74.5 | 78.1 | 81.3 | 86.0 |
+///
+/// So the two halves want different ceilings — the forward stays ahead to twice the SM
+/// count, the backward only to about 1.5x, because its operand is `[B, 4H]` and the
+/// re-reads cost four times as much. Each geometry passes its own.
+///
+/// Only 16 and 32 are ever worth taking. 8 loses at every batch even where its grid
+/// fits (67.6 us against 54.0 at B=32), and 64 needs a 1024-thread block, whose
+/// 64-register budget spills the backward's `Wh` fragments (`ptxas -v`).
+fn sb_nj_for(h: usize, b: usize, max_blocks: usize) -> usize {
+    if let Some(n) = std::env::var("SLSTM_BATCH_NJ").ok().and_then(|v| v.parse().ok()) {
+        return n;
+    }
+    // `rpt` is 1 for every shape this path takes, so a block owns 16 rows.
+    let rows = b.div_ceil(16);
+    let last = SB_NJ_CANDIDATES[SB_NJ_CANDIDATES.len() - 1];
+    SB_NJ_CANDIDATES
+        .into_iter()
+        .find(|&nj| h % nj == 0 && h / nj * rows <= max_blocks)
+        .unwrap_or(last)
+}
+
+/// Blocks the forward may put on the device before a narrower block stops paying, and
+/// the same for the backward — see [`sb_nj_for`] for the measurements behind the two.
+fn sb_fwd_max_blocks(gpu: &Gpu) -> usize {
+    2 * gpu.sm_count
+}
+
+fn sb_bwd_max_blocks(gpu: &Gpu) -> usize {
+    3 * gpu.sm_count / 2
+}
+
+/// Widest `cb * B` — column blocks times batch rows — the batched path takes.
+///
+/// Both kernels re-read their big operand once per COLUMN block: the forward reads
+/// `h` (`[B, H]`) `cb` times per timestep, the backward `dg` (`[B, 4H]`) `cb` times.
+/// The per-step path reads each exactly once and pays two launches instead, so the
+/// trade turns on whether `(cb - 1)` extra copies cost more than those launches — and
+/// that grows with the batch while the launches do not.
+///
+/// Measured over the encoder's twenty length groups at H=256, where `cb` = 8: the
+/// batched path runs 1.03-1.67x at B <= 186, sits inside the noise (0.96-1.08x) from
+/// 204 to 256 and loses from 292 up. The cap is the bottom of that neutral band rather
+/// than the top of it — the groups inside it are worth nothing either way, and the ones
+/// above are a real loss.
+///
+/// Written in `cb * B` rather than `B` because it is the re-read row count that
+/// decides, so a wider `H` — which needs more column blocks — moves the crossover down
+/// on its own.
+const SB_MAX_REREAD_ROWS: usize = 1536;
+
+/// Whether the batched path is worth taking at this shape — see
+/// [`SB_MAX_REREAD_ROWS`]. Correctness never depends on it: both kernels compute the
+/// same thing at any batch the geometry accepts, and `SLstm::force_batched` overrides
+/// this so a benchmark or a test can measure the losing arm.
+pub fn slstm_batched_pays(gpu: &Gpu, h: usize, b: usize) -> bool {
+    let nj = sb_nj_for(h, b, sb_bwd_max_blocks(gpu));
+    nj > 0 && h / nj.max(1) * b <= SB_MAX_REREAD_ROWS
+}
+
+/// Rows-per-thread candidates for [`slstm_batched_geometry`], smallest first.
+///
+/// A block owns `16 * rpt` batch rows, and the recurrent state of every one of them
+/// lives in registers. Raising it is the only handle on how many ROW blocks the grid
+/// has — and it is never worth pulling: the M-tiles inside a block run in sequence
+/// with a barrier between them, so halving the grid also doubles the serial chain.
+/// Measured at H=256, T=16 (us, forward): `rpt` = 1 / 2 / 4 costs 54.6 / 85.4 / 158.9
+/// at B=64 and 58.4 / 89.8 / 157.7 at B=96. The search therefore takes the first that
+/// the device can place, which is 1 wherever 1 fits, and lets the host loop row chunks
+/// rather than widening the block to avoid a second launch.
+const SB_RPT_CANDIDATES: [usize; 4] = [1, 2, 4, 8];
+
+/// `SLSTM_BATCH_RPT` pins the rows per thread, for sweeping the grid shape: `rpt` is
+/// the only handle on how many ROW blocks the grid has, and how the grid lands against
+/// the SM count is worth more here than anything inside a block.
+fn sb_rpt_override() -> Option<usize> {
+    std::env::var("SLSTM_BATCH_RPT").ok().and_then(|v| v.parse().ok())
+}
+
+/// Resolved launch geometry for [`slstm_batched_fwd`]: the grid is `(cb, blocks_y)`
+/// and one launch covers `blocks_y * 16 * rpt` batch rows.
+#[derive(Clone, Copy, Debug)]
+pub struct SbGeom {
+    pub nj: usize,
+    pub rpt: usize,
+    pub cb: usize,
+    pub blocks_y: usize,
+    pub threads: usize,
+    pub shared: usize,
+    /// Rows (forward) or reduction columns (backward) of the `Wh` slice one staging
+    /// pass holds. A specialization constant, so it belongs with the rest of them.
+    pub stage: usize,
+}
+
+impl SbGeom {
+    /// Batch rows one cooperative launch covers.
+    pub fn rows_per_launch(&self) -> usize {
+        self.blocks_y * 16 * self.rpt
+    }
+}
+
+/// Launch geometry for [`slstm_batched_fwd`], or `None` when the shape does not fit.
+///
+/// `nj` fixes the block width and the column half of the grid (`cb = H / nj`); what is
+/// left to choose is `rpt`, the batch rows a block owns. Bigger `rpt` means fewer row
+/// blocks — which matters only when the grid would otherwise not be co-resident — and
+/// costs registers, shared memory (the `h` tile is `[16*rpt, H]`) and a longer serial
+/// chain of M-tiles inside every timestep. So the search takes the SMALLEST `rpt` whose
+/// grid still covers the whole batch in one launch, and only falls back to a wider one
+/// when it cannot.
+///
+/// How many blocks are co-resident is the driver's answer, not `sm_count`: at the
+/// encoder's shapes a block is small enough that two or three share an SM, and reading
+/// the ceiling as one block per SM would force `rpt` up — leaving most of the device
+/// idle behind a grid too narrow to fill it.
+pub fn slstm_batched_geometry(gpu: &Gpu, h: usize, b: usize) -> Option<SbGeom> {
+    cached_geom(gpu, false, h, b, || batched_fwd_geometry(gpu, h, b))
+}
+
+fn batched_fwd_geometry(gpu: &Gpu, h: usize, b: usize) -> Option<SbGeom> {
+    // `SB_KT` must be even (the k-loop runs two accumulators), and the `Wh` fragments
+    // are a register array of `2 * H / 16` entries.
+    if h % 32 != 0 || b == 0 || 2 * h / 16 > SB_MAX_WH_REGS {
+        return None;
+    }
+    let nj = sb_nj_for(h, b, sb_fwd_max_blocks(gpu));
+    if nj < 2 || nj % 2 != 0 || h % nj != 0 || 16 * nj > MAX_BLOCK_THREADS {
+        return None;
+    }
+    let (cb, threads) = (h / nj, 16 * nj);
+    let smem_cap = gpu.max_shared_optin.saturating_sub(1024);
+    let ld = h.next_multiple_of(16) + 8; // BF16_LD, in elements; a multiple of 8
+    for rpt in SB_RPT_CANDIDATES {
+        if sb_rpt_override().is_some_and(|r| r != rpt) {
+            continue;
+        }
+        let br = 16 * rpt;
+        // What is live for the whole T-loop: the gate scratch and the `h` tile.
+        let live = 16 * 4 * nj * 4 + br * ld * 2;
+        // The `Wh` staging overlays that same block before either region exists, and
+        // runs in passes so it never widens it — sizing the allocation by the whole
+        // slice would cost occupancy for the entire loop to save a prologue.
+        let wsr = stage_rows(h, 4 * nj * 2, live);
+        let shared = live.max(wsr * 4 * nj * 2);
+        if shared > smem_cap {
+            break;
+        }
+        let Some(f) = batched_fwd_kernel(gpu, h, nj, rpt, wsr, shared) else {
+            break;
+        };
+        let per_sm = f
+            .occupancy_max_active_blocks_per_multiprocessor(threads as u32, shared, None)
+            .ok()? as usize;
+        let max_blocks = per_sm * gpu.sm_count;
+        if max_blocks < cb {
+            break; // not even one row block would be co-resident
+        }
+        let blocks_y = (max_blocks / cb).min(b.div_ceil(br));
+        let geom = SbGeom {
+            nj,
+            rpt,
+            cb,
+            blocks_y,
+            threads,
+            shared,
+            stage: wsr,
+        };
+        return Some(geom);
+    }
+    None
+}
+
+/// The batched forward specialized to `(h, nj, rpt)`, with its shared-memory carve-out
+/// opted into. Both are cached by the kernel cache, so this is a lookup after the
+/// first call at a shape.
+/// Rows (or columns) of the `Wh` slice one staging pass holds: the largest halving of
+/// `total` whose `stride` bytes fit `budget`, never below one MMA k-tile. `total` is a
+/// multiple of 32, so every halving down to 16 divides it and the passes tile it
+/// exactly.
+fn stage_rows(total: usize, stride: usize, budget: usize) -> usize {
+    let mut n = total;
+    while n > 16 && n * stride > budget {
+        n /= 2;
+    }
+    n
+}
+
+fn batched_fwd_kernel(
+    gpu: &Gpu,
+    h: usize,
+    nj: usize,
+    rpt: usize,
+    wsr: usize,
+    shared: usize,
+) -> Option<cudarc::driver::CudaFunction> {
+    let f = gpu.kernels.specialized(
+        &gpu.context,
+        "slstm_batched_fwd",
+        &[
+            ("SLSTM_MMA", 1),
+            ("SLSTM_H", h),
+            ("SB_NJ", nj),
+            ("SB_RPT", rpt),
+            ("SB_WSR", wsr),
+        ],
+    )?;
+    // Without this the launch fails for any tile above the default 48 KB.
+    if let Err(e) = f.set_attribute(
+        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared as i32,
+    ) {
+        eprintln!("slstm_batched_fwd: shared-memory opt-in failed: {e:?}");
+        return None;
+    }
+    Some(f)
+}
+
+/// The whole forward T-loop as **one cooperative launch per row chunk**, with the
+/// recurrent product on the bf16 MMA unit: see `slstm_batched_fwd` in
+/// `cuda/slstm_batched.cu`. The batch-parallel twin of [`slstm_fused_time`], for the
+/// encoder and decoder — wide batch, a handful of timesteps.
+///
+/// `g` must already hold the input half `x·Wx` for every timestep; the kernel adds the
+/// recurrent half in place and runs the recurrence. Returns `false` (having launched
+/// nothing) when the kernel is unavailable or the shape does not fit.
+#[allow(clippy::too_many_arguments)]
+pub fn slstm_batched_fwd(
+    gpu: &Gpu,
+    wh: &GTensor<f32>,
+    g: &mut GTensor<f32>,
+    bcat: &GTensor<f32>,
+    c_state: &mut GTensor<f32>,
+    n_state: &mut GTensor<f32>,
+    m_state: &mut GTensor<f32>,
+    h_state: &mut GTensor<f32>,
+    slabs: &mut SlstmSlabs,
+    out: &mut GTensor<f32>,
+    t: usize,
+    carry: bool,
+) -> bool {
+    if !gpu.kernels.has_coop {
+        return false;
+    }
+    let (b, h) = (c_state.rows(), c_state.cols());
+    let Some(geom) = slstm_batched_geometry(gpu, h, b) else {
+        return false;
+    };
+    let SbGeom {
+        nj,
+        rpt,
+        cb,
+        blocks_y,
+        threads,
+        shared,
+        stage,
+    } = geom;
+    let Some(f) = batched_fwd_kernel(gpu, h, nj, rpt, stage, shared) else {
+        return false;
+    };
+    let rows_per_launch = geom.rows_per_launch();
+    let (t_i, b_i, carry_i) = (t as i32, b as i32, i32::from(carry));
+    with_batched_mirror(&BATCHED_H, gpu, b * h, |hmir| {
+        let mut row0 = 0usize;
+        while row0 < b {
+            // The last chunk gets a narrower grid rather than blocks that would sit
+            // out the whole T-loop while still having to reach every `grid.sync()`.
+            let by = (b - row0).div_ceil(16 * rpt).min(blocks_y);
+            let cfg = LaunchConfig {
+                grid_dim: (cb as u32, by as u32, 1),
+                block_dim: (threads as u32, 1, 1),
+                shared_mem_bytes: shared as u32,
+            };
+            let row0_i = row0 as i32;
+            let mut lb = gpu.stream.launch_builder(&f);
+            lb.arg(&wh.buf).arg(&mut g.buf).arg(&bcat.buf);
+            push_slab!(lb, slabs.h_prev);
+            lb.arg(&mut c_state.buf)
+                .arg(&mut n_state.buf)
+                .arg(&mut m_state.buf)
+                .arg(&mut h_state.buf)
+                .arg(&mut hmir.buf);
+            push_slab!(lb, slabs.c_entry);
+            push_slab!(lb, slabs.n_entry);
+            push_slab!(lb, slabs.zt);
+            push_slab!(lb, slabs.ot);
+            push_slab!(lb, slabs.i_prime);
+            push_slab!(lb, slabs.f_prime);
+            push_slab!(lb, slabs.c);
+            push_slab!(lb, slabs.n);
+            lb.arg(&mut out.buf)
+                .arg(&t_i)
+                .arg(&b_i)
+                .arg(&row0_i)
+                .arg(&carry_i);
+            // SAFETY: `coop_grid_fits` above confirmed the driver will place this grid,
+            // and the geometry keeps every block's shared slice inside the opt-in.
+            if let Err(e) = unsafe { lb.launch_cooperative(cfg) } {
+                eprintln!("slstm_batched_fwd: cooperative launch failed: {e:?}");
+                return false;
+            }
+            row0 += rows_per_launch;
+        }
+        true
+    })
 }
 
 /// The whole forward T-loop as **one cooperative launch**: see `slstm_fused_time`
@@ -2644,15 +3297,16 @@ pub fn slstm_fused_time(
                 .arg(&mut h_state.buf)
                 .arg(&mut hmir.buf)
                 .arg(&mut wtail.buf)
-                .arg(&mut slabs.c_prev.buf)
-                .arg(&mut slabs.n_prev.buf);
+                ;
+            push_slab!(lb, slabs.c_entry);
+            push_slab!(lb, slabs.n_entry);
             push_slab!(lb, slabs.zt);
             push_slab!(lb, slabs.ot);
-            lb.arg(&mut slabs.i_prime.buf)
-                .arg(&mut slabs.f_prime.buf)
-                .arg(&mut slabs.c.buf)
-                .arg(&mut slabs.n.buf)
-                .arg(&mut out.buf)
+            push_slab!(lb, slabs.i_prime);
+            push_slab!(lb, slabs.f_prime);
+            push_slab!(lb, slabs.c);
+            push_slab!(lb, slabs.n);
+            lb.arg(&mut out.buf)
                 .arg(&t_i)
                 .arg(&upb_i)
                 .arg(&carry_i);
@@ -2669,6 +3323,175 @@ pub fn slstm_fused_time(
     })
 }
 
+/// Launch geometry for [`slstm_batched_bwd`], or `None` when the shape does not fit.
+///
+/// The same `(cb, blocks_y)` grid as the forward's, chosen the same way, but its
+/// shared footprint is a different sum: the `dg` tile (one k-chunk of `[16*rpt,
+/// 4H/rpt]`, so constant in `rpt`), the cross-warp reduction buffer and the `dh`
+/// exchange, against the forward's `h` tile.
+pub fn slstm_batched_bwd_geometry(gpu: &Gpu, h: usize, b: usize) -> Option<SbGeom> {
+    cached_geom(gpu, true, h, b, || batched_bwd_geometry(gpu, h, b))
+}
+
+fn batched_bwd_geometry(gpu: &Gpu, h: usize, b: usize) -> Option<SbGeom> {
+    if h % 32 != 0 || b == 0 || 2 * h / 16 > SB_MAX_WH_REGS {
+        return None;
+    }
+    let nj = sb_nj_for(h, b, sb_bwd_max_blocks(gpu));
+    // A warp owns 8 units and the warps split the reduction four ways, so `nj` must be
+    // a multiple of 8 — the forward only needs it even.
+    if nj % 8 != 0 || h % nj != 0 || 16 * nj > MAX_BLOCK_THREADS {
+        return None;
+    }
+    let (cb, threads) = (h / nj, 16 * nj);
+    let wk = (nj / 2) / (nj / 8);
+    let smem_cap = gpu.max_shared_optin.saturating_sub(1024);
+    for rpt in SB_RPT_CANDIDATES {
+        if sb_rpt_override().is_some_and(|r| r != rpt) {
+            continue;
+        }
+        let (br, kc) = (16 * rpt, 4 * h / rpt);
+        if kc % (16 * wk) != 0 {
+            continue; // a warp's share of a chunk is not a whole number of k-tiles
+        }
+        let live = br * (kc + 8) * 2 + wk * br * nj * 4 + br * nj * 4;
+        let wsc = stage_rows(4 * h, nj * 2, live);
+        let shared = live.max(nj * wsc * 2);
+        if shared > smem_cap {
+            break;
+        }
+        let Some(f) = batched_bwd_kernel(gpu, h, nj, rpt, wsc, shared) else {
+            break;
+        };
+        let per_sm = f
+            .occupancy_max_active_blocks_per_multiprocessor(threads as u32, shared, None)
+            .ok()? as usize;
+        let max_blocks = per_sm * gpu.sm_count;
+        if max_blocks < cb {
+            break;
+        }
+        let geom = SbGeom {
+            nj,
+            rpt,
+            cb,
+            blocks_y: (max_blocks / cb).min(b.div_ceil(br)),
+            threads,
+            shared,
+            stage: wsc,
+        };
+        return Some(geom);
+    }
+    None
+}
+
+fn batched_bwd_kernel(
+    gpu: &Gpu,
+    h: usize,
+    nj: usize,
+    rpt: usize,
+    wsc: usize,
+    shared: usize,
+) -> Option<cudarc::driver::CudaFunction> {
+    let f = gpu.kernels.specialized(
+        &gpu.context,
+        "slstm_batched_bwd",
+        &[
+            ("SLSTM_MMA", 1),
+            ("SLSTM_H", h),
+            ("SB_NJ", nj),
+            ("SB_RPT", rpt),
+            ("SB_WSC", wsc),
+        ],
+    )?;
+    if let Err(e) = f.set_attribute(
+        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared as i32,
+    ) {
+        eprintln!("slstm_batched_bwd: shared-memory opt-in failed: {e:?}");
+        return None;
+    }
+    Some(f)
+}
+
+/// The whole reverse T-loop as **one cooperative launch per row chunk**: see
+/// `slstm_batched_bwd` in `cuda/slstm_batched.cu`. Writes the gate deltas into `g`
+/// (the post-loop `dWx`/`dWh`/`db` GEMMs read them there) and carries the BPTT
+/// channels in registers.
+///
+/// Returns `false` (having launched nothing) when the kernel is unavailable or the
+/// shape does not fit.
+#[allow(clippy::too_many_arguments)]
+pub fn slstm_batched_bwd(
+    gpu: &Gpu,
+    wh: &GTensor<f32>,
+    dy: &GTensor<f32>,
+    g: &mut GTensor<f32>,
+    dh_recur: &mut GTensor<f32>,
+    dc_recur: &mut GTensor<f32>,
+    dn_recur: &mut GTensor<f32>,
+    slabs: &SlstmSlabs,
+    t: usize,
+) -> bool {
+    if !gpu.kernels.has_coop {
+        return false;
+    }
+    let (b, h) = (dc_recur.rows(), dc_recur.cols());
+    let Some(geom) = slstm_batched_bwd_geometry(gpu, h, b) else {
+        return false;
+    };
+    let SbGeom {
+        nj,
+        rpt,
+        cb,
+        blocks_y,
+        threads,
+        shared,
+        stage,
+    } = geom;
+    let Some(f) = batched_bwd_kernel(gpu, h, nj, rpt, stage, shared) else {
+        return false;
+    };
+    let rows_per_launch = geom.rows_per_launch();
+    let (t_i, b_i) = (t as i32, b as i32);
+    with_batched_mirror(&BATCHED_DG, gpu, b * 4 * h, |dgmir| {
+        let mut row0 = 0usize;
+        while row0 < b {
+            let by = (b - row0).div_ceil(16 * rpt).min(blocks_y);
+            let cfg = LaunchConfig {
+                grid_dim: (cb as u32, by as u32, 1),
+                block_dim: (threads as u32, 1, 1),
+                shared_mem_bytes: shared as u32,
+            };
+            let row0_i = row0 as i32;
+            let mut lb = gpu.stream.launch_builder(&f);
+            lb.arg(&wh.buf)
+                .arg(&dy.buf)
+                .arg(&mut g.buf)
+                .arg(&mut dh_recur.buf)
+                .arg(&mut dc_recur.buf)
+                .arg(&mut dn_recur.buf)
+                .arg(&mut dgmir.buf);
+            push_slab_ref!(lb, slabs.ot);
+            push_slab_ref!(lb, slabs.c);
+            push_slab_ref!(lb, slabs.n);
+            push_slab_ref!(lb, slabs.c_entry);
+            push_slab_ref!(lb, slabs.n_entry);
+            push_slab_ref!(lb, slabs.zt);
+            push_slab_ref!(lb, slabs.i_prime);
+            push_slab_ref!(lb, slabs.f_prime);
+            lb.arg(&t_i).arg(&b_i).arg(&row0_i);
+            // SAFETY: the geometry confirmed the driver will place this grid, and every
+            // block's shared slice is inside the opt-in.
+            if let Err(e) = unsafe { lb.launch_cooperative(cfg) } {
+                eprintln!("slstm_batched_bwd: cooperative launch failed: {e:?}");
+                return false;
+            }
+            row0 += rows_per_launch;
+        }
+        true
+    })
+}
+
 /// One fused backward step of the sLSTM cell.
 ///
 /// Reads the biased forget pre-activation out of `gates` and then overwrites all
@@ -2679,7 +3502,8 @@ pub fn slstm_fused_time(
 ///
 /// * `d_out` — `[B, T, H]` grad of this layer's output `h_t`.
 /// * `gates` — `[B, T, 4H]` gate pre-activations in, gate deltas out.
-/// * `d_gates_flat` — `[B, 4H]` this step's deltas, contiguous, for the dh GEMM.
+/// * `d_gates_flat` — `[B, 4H]` this step's deltas, contiguous and at the slab
+///   width, so the dh GEMM reads a tensor-core operand without a cast of its own.
 /// * `d_h_recur` — `[B, H]` grad arriving from step `t+1` through `h`.
 /// * `slabs` — the forward's saved activations (`o`, `c`, `n`, `z`, `i'`, `f'`).
 /// * `d_c_recur` / `d_n_recur` — `[B, H]` cell and normalizer grads, carried
@@ -2690,7 +3514,7 @@ pub fn slstm_step_fused_bwd(
     gpu: &Gpu,
     d_out: &GTensor<f32>,
     gates: &mut GTensor<f32>,
-    d_gates_flat: &mut GTensor<f32>,
+    d_gates_flat: &mut SlabBuf,
     d_h_recur: &GTensor<f32>,
     slabs: &SlstmSlabs,
     d_c_recur: &mut GTensor<f32>,
@@ -2703,25 +3527,24 @@ pub fn slstm_step_fused_bwd(
     let (t_i, bigt_i, h_i, bh_i) = (t as i32, big_t as i32, h as i32, bh as i32);
     let f = gpu.kernels.get("slstm_step_fused_bwd");
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&d_out.buf)
-        .arg(&mut gates.buf)
-        .arg(&mut d_gates_flat.buf)
-        .arg(&d_h_recur.buf);
+    lb.arg(&d_out.buf).arg(&mut gates.buf);
+    push_slab!(lb, *d_gates_flat);
+    lb.arg(&d_h_recur.buf);
     push_slab_ref!(lb, slabs.ot);
-    lb.arg(&slabs.c.buf)
-        .arg(&slabs.n.buf)
-        .arg(&slabs.c_prev.buf)
-        .arg(&slabs.n_prev.buf);
+    push_slab_ref!(lb, slabs.c);
+    push_slab_ref!(lb, slabs.n);
+    push_slab_ref!(lb, slabs.c_entry);
+    push_slab_ref!(lb, slabs.n_entry);
     push_slab_ref!(lb, slabs.zt);
-    lb.arg(&slabs.i_prime.buf)
-        .arg(&slabs.f_prime.buf)
-        .arg(&mut d_c_recur.buf)
+    push_slab_ref!(lb, slabs.i_prime);
+    push_slab_ref!(lb, slabs.f_prime);
+    lb.arg(&mut d_c_recur.buf)
         .arg(&mut d_n_recur.buf)
         .arg(&t_i)
         .arg(&bigt_i)
         .arg(&h_i)
         .arg(&bh_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slstm_step_fused_bwd");
+    unsafe { lb.launch(elem_cfg(gpu, bh as u32)) }.expect("slstm_step_fused_bwd");
 }
 
 // Residual block / SwiGLU kernels (see gpu/block.rs).
@@ -2747,7 +3570,7 @@ pub fn add_assign(gpu: &Gpu, acc: &mut GTensor<f32>, b: &GTensor<f32>) {
     let f = gpu.kernels.get("add_assign");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut acc.buf).arg(&b.buf).arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("add_assign");
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("add_assign");
 }
 
 /// Elementwise `out = a + b` into a caller-owned buffer. The allocating [`add`]
@@ -2763,7 +3586,7 @@ pub fn add_into(gpu: &Gpu, a: &GTensor<f32>, b: &GTensor<f32>, out: &mut GTensor
     let f = gpu.kernels.get("add");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut out.buf).arg(&a.buf).arg(&b.buf).arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("add");
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("add");
 }
 
 /// SwiGLU forward: returns `(gate_act = SiLU(gate_pre), mixed = gate_act ⊙ value)`.
@@ -2803,7 +3626,7 @@ pub fn swiglu_forward_into(
         .arg(&mut gate_act.buf)
         .arg(&mut mixed.buf)
         .arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("swiglu_forward");
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("swiglu_forward");
 }
 
 /// SwiGLU backward: from `d_mixed` and the saved `gate_act`/`value`/`gate_pre`,
@@ -2854,7 +3677,7 @@ pub fn swiglu_backward_into(
         .arg(&mut d_gate.buf)
         .arg(&mut d_value.buf)
         .arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("swiglu_backward");
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("swiglu_backward");
 }
 
 // mLSTM parallel/chunkwise core (see gpu/mlstm.rs).
@@ -2882,7 +3705,7 @@ pub fn cumsum_logsig(gpu: &Gpu, f: &GTensor<f32>) -> GTensor<f32> {
     let func = gpu.kernels.get("cumsum_logsig");
     let mut lb = gpu.stream.launch_builder(&func);
     lb.arg(&f.buf).arg(&mut fc.buf).arg(&ti).arg(&bhi);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("cumsum_logsig");
+    unsafe { lb.launch(elem_cfg(gpu, bh as u32)) }.expect("cumsum_logsig");
     fc
 }
 
@@ -2956,7 +3779,7 @@ fn slice_t_inner(
         .arg(&c0i)
         .arg(&wi)
         .arg(&total_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("slice_t");
+    unsafe { lb.launch(elem_cfg(gpu, total as u32)) }.expect("slice_t");
     out
 }
 
@@ -3064,7 +3887,7 @@ pub fn slice_t_batch(
         let f = gpu.kernels.get("slice_t_batch");
         let mut lb = gpu.stream.launch_builder(&f);
         lb.arg(&a).arg(&ti).arg(&li).arg(&c0i).arg(&total_i);
-        unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("slice_t_batch");
+        unsafe { lb.launch(elem_cfg(gpu, total as u32)) }.expect("slice_t_batch");
     }
     outs
 }
@@ -3137,7 +3960,7 @@ pub fn unslice_t_batch(
     let f = gpu.kernels.get("unslice_t_batch");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&a).arg(&ti).arg(&li).arg(&c0i).arg(&total_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("unslice_t_batch");
+    unsafe { lb.launch(elem_cfg(gpu, total as u32)) }.expect("unslice_t_batch");
 }
 
 /// Write `src` `[BH, len, W]` back into the T-range `[c0, c0+len)` of `dst`
@@ -3181,7 +4004,7 @@ fn unslice_t_inner(
         .arg(&c0i)
         .arg(&wi)
         .arg(&total_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(total as u32)) }.expect("unslice_t");
+    unsafe { lb.launch(elem_cfg(gpu, total as u32)) }.expect("unslice_t");
 }
 
 /// `out[r] += Σ_w x[r,w]·y[r,w]` for `[R, W]` operands (`out` is `[R]`).
@@ -3273,7 +4096,7 @@ pub fn mlstm_chunk_ab_bwd(
         .arg(&mut dig.buf)
         .arg(&li)
         .arg(&bhl);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((bh * l) as u32)) }.expect("mlstm_chunk_ab_bwd");
+    unsafe { lb.launch(elem_cfg(gpu, (bh * l) as u32)) }.expect("mlstm_chunk_ab_bwd");
 }
 
 /// Copy rows of `src` into arbitrary rows of `dst`: `dst[row_ids[i]] = src[i]`.
@@ -3306,7 +4129,7 @@ pub fn scatter_rows_u32(
         .arg(ids)
         .arg(&dim_i)
         .arg(&rows_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((rows * dim) as u32)) }.expect("scatter_rows");
+    unsafe { lb.launch(elem_cfg(gpu, (rows * dim) as u32)) }.expect("scatter_rows");
 }
 
 /// `dst[dst_ids[i]] = src[src_ids[i]]` for `rows` rows of `dim` floats — a gather and a
@@ -3330,7 +4153,7 @@ pub fn route_rows_u32(
         .arg(dst_ids)
         .arg(&dim_i)
         .arg(&rows_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((rows * dim) as u32)) }.expect("route_rows");
+    unsafe { lb.launch(elem_cfg(gpu, (rows * dim) as u32)) }.expect("route_rows");
 }
 
 /// `dst[ids[i]] = src[i * stride + offset]` — the rectangle-to-window half of a
@@ -3390,7 +4213,7 @@ fn strided_rows(
         .arg(&offset_i)
         .arg(&dim_i)
         .arg(&rows_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems((rows * dim) as u32)) }.expect("strided rows");
+    unsafe { lb.launch(elem_cfg(gpu, (rows * dim) as u32)) }.expect("strided rows");
 }
 
 /// Masked softmax cross-entropy (the hierarchical decode loss). `mask[r] == false`
@@ -3483,7 +4306,7 @@ pub fn masked_softmax_ce_u32_into(
             shared_mem_bytes: 0,
         }
     } else {
-        LaunchConfig::for_num_elems(r as u32)
+        elem_cfg(gpu, r as u32)
     };
     unsafe { lb.launch(cfg) }.expect("masked_softmax_ce");
     match acc {
@@ -3613,7 +4436,7 @@ pub fn revcumsum_dlogsig(gpu: &Gpu, dfc: &GTensor<f32>, f: &GTensor<f32>) -> GTe
         .arg(&mut df.buf)
         .arg(&ti)
         .arg(&bhi);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("revcumsum_dlogsig");
+    unsafe { lb.launch(elem_cfg(gpu, bh as u32)) }.expect("revcumsum_dlogsig");
     df
 }
 
@@ -3662,7 +4485,7 @@ pub fn mul_into(gpu: &Gpu, a: &GTensor<f32>, b: &GTensor<f32>, out: &mut GTensor
     let f = gpu.kernels.get("mul");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut out.buf).arg(&a.buf).arg(&b.buf).arg(&n_i);
-    unsafe { lb.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("mul");
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("mul");
 }
 
 // Fused chunkwise mLSTM (TFLA). See the kernel block in `gpu/kernels.rs`.
@@ -4230,7 +5053,7 @@ fn state_slot_copy(
         .arg(&idx_i)
         .arg(&stride_i)
         .arg(&g_i);
-    unsafe { b.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("state_slot_copy");
+    unsafe { b.launch(elem_cfg(gpu, n as u32)) }.expect("state_slot_copy");
 }
 
 /// Seed slot `idx` of a `[BH, slots, ...]` array from a `[BH, ...]` state.
@@ -4690,7 +5513,7 @@ mod tests {
                 .arg(&c_i)
                 .arg(&inv)
                 .arg(&r_i);
-            unsafe { lb.launch(LaunchConfig::for_num_elems(r as u32)) }.expect("slow ce");
+            unsafe { lb.launch(elem_cfg(&gpu, r as u32)) }.expect("slow ce");
             assert_close(&fast.to_host(&gpu).data, &slow.to_host(&gpu).data);
         }
 
@@ -4718,7 +5541,7 @@ mod tests {
                 .arg(&mut dig_s.buf)
                 .arg(&li)
                 .arg(&bhl);
-            unsafe { lb.launch(LaunchConfig::for_num_elems((bh * l) as u32)) }.expect("slow ab");
+            unsafe { lb.launch(elem_cfg(&gpu, (bh * l) as u32)) }.expect("slow ab");
 
             assert_close(&dfc_f.to_host(&gpu).data, &dfc_s.to_host(&gpu).data);
             assert_close(&dig_f.to_host(&gpu).data, &dig_s.to_host(&gpu).data);
@@ -4757,7 +5580,7 @@ mod tests {
             let func = gpu.kernels.get("cumsum_logsig");
             let mut lb = gpu.stream.launch_builder(&func);
             lb.arg(&f.buf).arg(&mut slow_fc.buf).arg(&ti).arg(&bhi);
-            unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slow cumsum");
+            unsafe { lb.launch(elem_cfg(&gpu, bh as u32)) }.expect("slow cumsum");
 
             let mut slow_df = GTensor::uninit(&gpu, &[bh, t]);
             let func = gpu.kernels.get("revcumsum_dlogsig");
@@ -4767,7 +5590,7 @@ mod tests {
                 .arg(&mut slow_df.buf)
                 .arg(&ti)
                 .arg(&bhi);
-            unsafe { lb.launch(LaunchConfig::for_num_elems(bh as u32)) }.expect("slow revcumsum");
+            unsafe { lb.launch(elem_cfg(&gpu, bh as u32)) }.expect("slow revcumsum");
 
             assert_close(&fast_fc.data, &slow_fc.to_host(&gpu).data);
             assert_close(&fast_df.data, &slow_df.to_host(&gpu).data);
@@ -5320,6 +6143,7 @@ mod tests {
                 &gpu,
                 &GTensor::from_host(&gpu, &dy),
                 &fwd_gpu,
+                &out_gpu,
                 &gamma_d,
                 &mut dg_gpu,
                 group,
@@ -5374,6 +6198,7 @@ mod tests {
             &gpu,
             &GTensor::from_host(&gpu, &dy),
             &fwd_gpu,
+            &out_gpu,
             &dgamma_t,
             &mut dg_gpu,
             group,

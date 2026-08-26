@@ -68,10 +68,12 @@ fn main() {
     let mut per_step = build(false);
     let mut fused = build(true);
 
-    let want = per_step.forward_alloc(&gpu, &x).to_host(&gpu);
-    let got = fused.forward_alloc(&gpu, &x).to_host(&gpu);
-    let want_dx = per_step.backward_alloc(&gpu, &gy).to_host(&gpu);
-    let got_dx = fused.backward_alloc(&gpu, &gy).to_host(&gpu);
+    let y_per = per_step.forward_alloc(&gpu, &x);
+    let y_fused = fused.forward_alloc(&gpu, &x);
+    let want = y_per.to_host(&gpu);
+    let got = y_fused.to_host(&gpu);
+    let want_dx = per_step.backward_alloc(&gpu, &y_per, &gy).to_host(&gpu);
+    let got_dx = fused.backward_alloc(&gpu, &y_fused, &gy).to_host(&gpu);
 
     // Relative to the tensor's own scale: a max-abs alone says nothing without
     // knowing how big the values are.

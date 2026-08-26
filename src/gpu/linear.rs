@@ -88,15 +88,20 @@ impl Linear {
         (params, self.x.capacity() * 4 + self.gemm.retained_bytes())
     }
 
-    /// Release the saved forward input and the bf16 GEMM staging.
+    /// Release the saved forward input and the bf16 staging of the *activations*.
     ///
     /// Neither is read outside a forward→backward pair, but both are kept across
     /// calls (to keep the allocator and the cast off the hot path) and both reuse by
     /// **capacity** — so in a stack with varying window sizes they settle at the
     /// largest window ever seen.
+    ///
+    /// The cached bf16 **weight** deliberately survives: it is parameter-sized, so it
+    /// is not what a varying rectangle grows, and only an optimizer step can make it
+    /// stale. Dropping it here made the encoder and decoder re-narrow every weight in
+    /// the stack once per length group — half of all `cast_f32_to_bf16` traffic.
     pub fn drop_saved_act(&mut self, gpu: &Gpu) {
         self.x = GTensor::zeros(gpu, &[0, self.input]);
-        self.gemm.clear();
+        self.gemm.clear_operands();
     }
 
     /// Force this layer's GEMMs back to fp32.
@@ -153,6 +158,16 @@ impl Linear {
             self.x = x.dup(gpu);
         }
         self.forward_raw(gpu, x, y);
+    }
+
+    /// The input [`forward`](Self::forward) saved, `[B, in]`.
+    ///
+    /// A layer feeding this one can read its own output back from here rather than
+    /// keeping a second copy — which is how the `RmsNorm` in front of a head recovers
+    /// the `y` its backward needs. Empty until the first `forward`, and stale after a
+    /// [`forward_shared`](Self::forward_shared), which saves nothing.
+    pub fn saved_x(&self) -> &GTensor<f32> {
+        &self.x
     }
 
     /// `Y = X · W + b` for a caller-owned input, saving **nothing**.
@@ -261,6 +276,52 @@ impl Linear {
                 .run_staged_lhs(gpu, ops::MmForm::Nn, x_b, &self.w, out, 1.0);
         } else {
             ops::matmul_nn_into(gpu, x, &self.w, out, 1.0);
+        }
+    }
+
+    /// [`forward_shared`](Self::forward_shared) where `x` is a slab — already at the
+    /// width the GEMM wants, so nothing is narrowed here at all.
+    ///
+    /// The fp32 variant falls through to the ordinary path; a bf16 slab into an
+    /// fp32-pinned layer is a build nobody constructs (`set_fp32` is only ever applied
+    /// to logit heads, which take no slab) and is rejected rather than silently widened.
+    pub fn forward_slab_lhs(&mut self, gpu: &Gpu, x: &ops::SlabBuf, out: &mut GTensor<f32>) {
+        match x {
+            ops::SlabBuf::F32(t) => self.forward_shared(gpu, t, out),
+            ops::SlabBuf::Bf16(b) => {
+                assert!(self.bf16, "Linear::forward_slab_lhs — layer is fp32-pinned");
+                assert_eq!(
+                    out.dims(),
+                    [b.dims()[0], self.output],
+                    "Linear::forward_slab_lhs — output shape"
+                );
+                if !self.x.is_empty() {
+                    self.x = GTensor::uninit(gpu, &[0, self.input]);
+                }
+                ops::broadcast_row(gpu, out, &self.b);
+                self.gemm
+                    .run_staged_lhs(gpu, ops::MmForm::Nn, b, &self.w, out, 1.0);
+            }
+        }
+    }
+
+    /// [`backward_with_x`](Self::backward_with_x) where the saved input is a slab.
+    /// The backward twin of [`forward_slab_lhs`](Self::forward_slab_lhs).
+    pub fn backward_slab_x(
+        &mut self,
+        gpu: &Gpu,
+        x: &ops::SlabBuf,
+        dy: &GTensor<f32>,
+        dx: &mut GTensor<f32>,
+    ) {
+        match x {
+            ops::SlabBuf::F32(t) => self.backward_with_x(gpu, t, dy, dx),
+            ops::SlabBuf::Bf16(b) => {
+                assert!(self.bf16, "Linear::backward_slab_x — layer is fp32-pinned");
+                self.gemm
+                    .run_backward_staged_x(gpu, b, dy, &self.w, &mut self.dw, dx);
+                ops::add_col_sum(gpu, &mut self.db, dy);
+            }
         }
     }
 
@@ -571,6 +632,60 @@ mod tests {
             2e-3
         } else {
             1e-5
+        }
+    }
+
+    /// `drop_saved_act` releases the narrowed *activations* and keeps the narrowed
+    /// weight — and the weight it keeps must still follow the optimizer.
+    ///
+    /// The encoder and decoder call this at every length-group boundary, so a layer
+    /// there sees drop/forward/backward many times between two steps. Keeping the
+    /// weight is what makes that cheap; the danger it introduces is the mirror of
+    /// [`weight_cache_follows_optimizer_steps`](Self::weight_cache_follows_optimizer_steps):
+    /// a cache that now survives a boundary it used to be cleared at.
+    #[test]
+    fn drop_saved_act_keeps_the_weight_and_still_follows_a_step() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        if !ops::gemm_bf16_enabled(&gpu) {
+            return; // no weight cache to keep
+        }
+        let (b, i, o) = (4usize, 6usize, 5usize);
+        let cpu = CpuLinear::new(i, o);
+        let mut gl = Linear::from_parts(&gpu, &cpu.w, &cpu.b);
+        gl.freeze_bias();
+        let x = GTensor::from_host(&gpu, &Tensor::random(&[b, i], 0.5));
+        let dy = GTensor::from_host(&gpu, &Tensor::random(&[b, o], 1.0));
+
+        let _ = gl.forward_alloc(&gpu, &x);
+        gl.drop_saved_act(&gpu);
+        // The weight is [i, o] = 30 elements at 2 bytes; the activations are gone.
+        assert_eq!(
+            gl.retained_bytes().1,
+            i * o * 2,
+            "drop_saved_act kept something other than exactly the narrowed weight"
+        );
+
+        // ...and the survivor is still live, not frozen at its pre-step value.
+        for t in 1..=3 {
+            let before = gl.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let _ = gl.backward_alloc(&gpu, &dy);
+            let mut c = AdamCfg::new(1e-2, 0.0);
+            c.t = t;
+            gl.step(&gpu, &c);
+            gl.drop_saved_act(&gpu);
+            let after = gl.forward_alloc(&gpu, &x).to_host(&gpu).data;
+            let changed = before
+                .iter()
+                .zip(&after)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                changed > 1e-5,
+                "step {t}: the forward did not move — a weight kept across \
+                 drop_saved_act went stale"
+            );
         }
     }
 

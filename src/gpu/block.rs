@@ -17,7 +17,7 @@
 //! a generic GPU `Cell`.
 
 use super::{
-    Buf, GTensor, Gpu, Pool,
+    Buf, GTensor, Gpu, Pool, SlabSlot,
     arena::{self, ParamSlot},
     linear::Linear,
     mlstm::MLstm,
@@ -143,7 +143,16 @@ pub trait Cell {
         out: &mut GTensor<f32>,
         cache: &mut TrainingCache,
     );
-    fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>);
+    /// `y` is this cell's own forward output — which, because a cell ends in a
+    /// post-norm, is that norm's output and so what its backward rebuilds `x̂` from.
+    /// A cell that keeps its post-norm's output internally ignores it.
+    fn backward(
+        &mut self,
+        gpu: &Gpu,
+        y: &GTensor<f32>,
+        dy: &GTensor<f32>,
+        dx: &mut GTensor<f32>,
+    );
     fn zero_grad(&mut self, gpu: &Gpu);
     /// Every parameter with its gradient and AdamW moments, in a fixed order.
     /// A model binds these into its [`ParamArena`](super::arena::ParamArena).
@@ -230,8 +239,14 @@ impl Cell for SLstm {
     ) {
         SLstm::forward(self, gpu, x, out, cache)
     }
-    fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
-        SLstm::backward(self, gpu, dy, dx)
+    fn backward(
+        &mut self,
+        gpu: &Gpu,
+        y: &GTensor<f32>,
+        dy: &GTensor<f32>,
+        dx: &mut GTensor<f32>,
+    ) {
+        SLstm::backward(self, gpu, y, dy, dx)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {
         SLstm::zero_grad(self, gpu)
@@ -474,7 +489,7 @@ pub struct Block<C: Cell> {
     carry: bool,
     /// Chunks forwarded in the current sweep and not yet unwound. Drives the stash:
     /// the first chunk has nothing to preserve, every later one does. Counted rather
-    /// than inferred from the `Buf` slots, which `FfnSaved::put_back` refills.
+    /// than inferred from the `Buf` slots, which `BlockSaved::put_back` refills.
     fwd_chunks: usize,
 }
 
@@ -495,16 +510,27 @@ pub struct Block<C: Cell> {
 struct Act {
     /// Scratch for every temporary, recycled by size within the call.
     pool: Pool,
+    // The two norm outputs on the residual path. Each is what its norm's backward
+    // rebuilds `x̂` from (see `RmsNorm::backward`), which is why neither norm stores an
+    // `[N, H]` of its own — these ARE that tensor, and they are parkable besides.
+    xn1: Buf,      // [N, H] pre_norm1(x) — also the cell's input
+    cell_out: Buf, // [N, H] the cell's output, i.e. its post-norm's output
     // The SwiGLU operands, read by backward, so they outlive the forward.
     gate_pre: Buf, // [N, U] pre-activation for SiLU'
     gate_act: Buf, // [N, U] SiLU(gate_pre)
     value: Buf,    // [N, U]
     // The FFN projections' saved inputs, held here rather than inside the three
     // `Linear`s (which would keep `zn` twice — see `forward`). Backward hands these
-    // back through `Linear::backward_with_x`.
-    zn: Buf,    // [N, H] pre_norm2(z) — input to lin_gate AND lin_value
+    // back through `Linear::backward_with_x`. `zn` doubles as pre_norm2's `y`.
+    /// `[N, H]` pre_norm2(z), at the slab width. Every reader of it takes it narrow —
+    /// the two projections' GEMMs, their backwards, and pre_norm2's own backward (which
+    /// rebuilds `x̂ = y/γ` from it) — so materializing it fp32 meant a `cast_f32_to_bf16`
+    /// pass per reader over a tensor the norm could have produced narrow in the first
+    /// place. Measured as 1.18-1.26x on norm-plus-cast (`examples/rms_bench.rs`); the
+    /// norm kernel alone is a wash, it is the deleted cast that pays.
+    zn: SlabSlot,
     mixed: Buf, // [N, U] SwiGLU output — input to lin_down
-    /// Host parking for the five buffers above, when offload is enabled.
+    /// Host parking for the seven buffers above, when offload is enabled.
     ///
     /// The backbone sweeps block by block, so a block's activations sit unread from
     /// its own forward until backward unwinds back to it — 15 blocks of compute at
@@ -514,14 +540,14 @@ struct Act {
     /// The parked tensors between `restore` and their consumption in backward. Only
     /// non-empty inside `backward`.
     restored: Vec<offload::Parked>,
-    /// Earlier chunks' FFN activations, oldest first, when the sweep is chunked.
+    /// Earlier chunks' activations, oldest first, when the sweep is chunked.
     ///
-    /// The five `Buf` slots above hold one chunk's worth, so without this chunk c+1's
+    /// The seven `Buf` slots above hold one chunk's worth, so without this chunk c+1's
     /// forward overwrites what chunk c's backward reads. Each chunk's set moves here
     /// as the next one's forward starts, and backward pops them right to left. Empty
     /// on the unchunked path, and on the offload path (where the park holds a
     /// generation per chunk instead).
-    chunk_saved: Vec<FfnSaved>,
+    chunk_saved: Vec<BlockSaved>,
 }
 
 impl Act {
@@ -533,23 +559,32 @@ impl Act {
     ///
     /// Offload is opt-in per block via [`Block::enable_offload`], not a property of
     /// construction: only the backbone qualifies. See that method for why.
-    fn new(_gpu: &Gpu) -> Self {
-        Default::default()
+    fn new(gpu: &Gpu) -> Self {
+        // `zn` narrows only when BOTH switches allow it. `slab_bf16` (GPU_NO_BF16) is
+        // what the RMSNorm kernels were built for; `gemm_bf16_enabled` is what the two
+        // projections that read it accept. They are separate flags and either one off
+        // means this value has an fp32 reader, so it stays fp32.
+        Self {
+            zn: SlabSlot::new(gpu.kernels.slab_bf16 && ops::gemm_bf16_enabled(gpu)),
+            ..Default::default()
+        }
     }
 }
 
-/// The five FFN activations backward reads, moved out of the block for the duration
-/// of the call.
+/// The seven activations a block's backward reads, moved out of the block for the
+/// duration of the call.
 ///
 /// They come from one of two places — the owned [`Buf`] slots, or the tensors
 /// [`HostPark`](offload::HostPark) just restored — and backward should not care which.
 /// Moving them out (rather than borrowing) is what lets the `Linear`s and the pool be
 /// borrowed mutably at the same time.
-struct FfnSaved {
+struct BlockSaved {
+    xn1: GTensor<f32>,
+    cell_out: GTensor<f32>,
     gate_pre: GTensor<f32>,
     gate_act: GTensor<f32>,
     value: GTensor<f32>,
-    zn: GTensor<f32>,
+    zn: ops::SlabBuf,
     mixed: GTensor<f32>,
     /// Whether these came from the owned `Buf`s and must go back into them.
     owned: bool,
@@ -615,14 +650,16 @@ impl<C: Cell> Block<C> {
     pub fn drop_saved_act(&mut self) {
         let a = &mut self.act;
         for b in [
+            &mut a.xn1,
+            &mut a.cell_out,
             &mut a.gate_pre,
             &mut a.gate_act,
             &mut a.value,
-            &mut a.zn,
             &mut a.mixed,
         ] {
             b.clear();
         }
+        a.zn.clear();
         a.restored.clear();
         // These caches are being abandoned, not consumed, so the bookkeeping that
         // tracks what is owed a backward goes with them — otherwise a stack that
@@ -649,6 +686,8 @@ impl<C: Cell> Block<C> {
         }
         let a = &self.act;
         act += a.pool.retained_bytes()
+            + a.xn1.retained_bytes()
+            + a.cell_out.retained_bytes()
             + a.gate_pre.retained_bytes()
             + a.gate_act.retained_bytes()
             + a.value.retained_bytes()
@@ -665,7 +704,9 @@ impl<C: Cell> Block<C> {
     /// three are held inside the sub-layers and survive both.
     pub fn act_breakdown(&self) -> [usize; 5] {
         let a = &self.act;
-        let ffn = a.gate_pre.retained_bytes()
+        let saved = a.xn1.retained_bytes()
+            + a.cell_out.retained_bytes()
+            + a.gate_pre.retained_bytes()
             + a.gate_act.retained_bytes()
             + a.value.retained_bytes()
             + a.zn.retained_bytes()
@@ -679,7 +720,7 @@ impl<C: Cell> Block<C> {
             .map(|l| l.retained_bytes().1)
             .sum();
         [
-            ffn,
+            saved,
             a.pool.retained_bytes(),
             norms,
             proj,
@@ -693,8 +734,9 @@ impl<C: Cell> Block<C> {
     }
 
     /// Release every activation this block holds, everywhere — the FFN buffers and
-    /// pool, the cell's caches, and the saved inputs and bf16 staging inside the
-    /// norms and projections.
+    /// pool, the cell's caches, and the saved inputs and narrowed activations inside
+    /// the norms and projections. The projections' cached bf16 *weights* stay: they
+    /// are parameter-sized, so they are not what a rectangle grows.
     ///
     /// [`drop_saved_act`](Self::drop_saved_act) deliberately keeps the last group; this
     /// does not. For a window boundary, not the hot path.
@@ -724,35 +766,40 @@ impl<C: Cell> Block<C> {
     }
 }
 
-impl FfnSaved {
+impl BlockSaved {
     /// Move the saved activations out of wherever forward left them.
     fn take(act: &mut Act) -> Self {
         if act.restored.is_empty() {
             let take = |b: &mut Buf, what: &str| b.take().expect(what);
             Self {
+                xn1: take(&mut act.xn1, "forward before backward: xn1"),
+                cell_out: take(&mut act.cell_out, "forward before backward: cell_out"),
                 gate_pre: take(&mut act.gate_pre, "forward before backward: gate_pre"),
                 gate_act: take(&mut act.gate_act, "forward before backward: gate_act"),
                 value: take(&mut act.value, "forward before backward: value"),
-                zn: take(&mut act.zn, "forward before backward: zn"),
+                zn: act.zn.take().expect("forward before backward: zn"),
                 mixed: take(&mut act.mixed, "forward before backward: mixed"),
                 owned: true,
             }
         } else {
             assert_eq!(
                 act.restored.len(),
-                5,
+                7,
                 "Block::backward — restored buffer count"
             );
-            // Every FFN activation is fp32, so each comes back as `Parked::F32`;
-            // `f32()` panics if the park ever hands one back at the wrong width.
+            // All but `zn` are fp32, so each comes back as `Parked::F32`; `f32()`
+            // panics if the park ever hands one back at the wrong width. `zn` rides at
+            // the slab width and converts back to whichever it was written at.
             let mut it = act.restored.drain(..);
-            let mut next = |what: &str| it.next().expect(what).f32();
+            let mut next = |what: &str| it.next().expect(what);
             Self {
-                gate_pre: next("restored gate_pre"),
-                gate_act: next("restored gate_act"),
-                value: next("restored value"),
-                zn: next("restored zn"),
-                mixed: next("restored mixed"),
+                xn1: next("restored xn1").f32(),
+                cell_out: next("restored cell_out").f32(),
+                gate_pre: next("restored gate_pre").f32(),
+                gate_act: next("restored gate_act").f32(),
+                value: next("restored value").f32(),
+                zn: next("restored zn").into(),
+                mixed: next("restored mixed").f32(),
                 owned: false,
             }
         }
@@ -766,6 +813,8 @@ impl FfnSaved {
         if !self.owned {
             return;
         }
+        act.xn1.put(self.xn1);
+        act.cell_out.put(self.cell_out);
         act.gate_pre.put(self.gate_pre);
         act.gate_act.put(self.gate_act);
         act.value.put(self.value);
@@ -821,21 +870,21 @@ impl<C: Cell> Block<C> {
         }
     }
 
-    /// Forward over `[B, T, H]` → `y` `[B, T, H]`.
-    /// `x` and `y` must not alias: the input is read straight from the caller's buffer
+    /// Forward over `[B, T, H]` → `out` `[B, T, H]`.
+    /// `input` and `out` must not alias: the input is read straight from the caller's buffer
     /// rather than copied, so writing the output over it would corrupt the residual.
     /// Every caller ping-pongs a pair, which satisfies this.
     pub fn forward(
         &mut self,
         gpu: &Gpu,
-        x: &GTensor<f32>,
-        y: &mut GTensor<f32>,
+        input: &GTensor<f32>,
+        out: &mut GTensor<f32>,
         cache: &mut TrainingCache,
     ) {
-        assert_eq!(x.rank, 3, "Block::forward expects [B, T, H]");
-        let (b, t, h) = (x.shape[0], x.shape[1], x.shape[2]);
+        assert_eq!(input.rank, 3, "Block::forward expects [B, T, H]");
+        let (b, t, h) = (input.shape[0], input.shape[1], input.shape[2]);
         assert_eq!(h, self.hidden, "Block::forward — hidden mismatch");
-        assert_eq!(y.dims(), x.dims(), "Block::forward — output shape");
+        assert_eq!(out.dims(), input.dims(), "Block::forward — output shape");
         let (n, u) = (b * t, self.up);
         self.seq.push((b, t));
         // Whole-block span; `glue` is this minus the cell and FFN spans, i.e. the
@@ -871,7 +920,7 @@ impl<C: Cell> Block<C> {
         // them. With offload on, the park already holds a generation per chunk and the
         // slots are empty here.
         if self.carry && a.park.is_none() && self.fwd_chunks > 0 {
-            let prev = FfnSaved::take(a);
+            let prev = BlockSaved::take(a);
             a.chunk_saved.push(prev);
         }
         if self.carry {
@@ -880,28 +929,28 @@ impl<C: Cell> Block<C> {
 
         // The input seen as [N, H]: it feeds both the norm path and the residual, and
         // neither writes to it. A view rather than a pooled copy — the storage stays
-        // the caller's, so this must not outlive `x` and must not go back to the pool.
-        let x_flat = GTensor::view(gpu, &x.buf, 0, &[n, h]);
+        // the caller's, so this must not outlive `input` and must not go back to the pool.
+        let x_flat = GTensor::view(gpu, &input.buf, 0, &[n, h]);
 
-        // Residual 1: z = x + cell(pre_norm1(x)). The cell's output is already
+        // Residual 1: z = input + cell(pre_norm1(input)). The cell's output is already
         // normalized — each kind does it its own way, inside itself.
-        let mut xn1 = a.pool.take(gpu, &[n, h]);
-        self.pre_norm1.forward(gpu, &x_flat, &mut xn1);
-        xn1.reshape_to(&[b, t, h]);
-        let mut cell_out = a.pool.take(gpu, &[b, t, h]);
+        //
+        // Both intermediates go to owned slots rather than the pool: each is the OUTPUT
+        // of a norm whose backward needs it (pre_norm1's own, and the post-norm inside
+        // the cell), which is what lets those two norms save only `inv_rms`.
+        let Act { xn1, cell_out, .. } = a;
+        let xn1 = xn1.get(gpu, &[b, t, h]);
+        self.pre_norm1.forward(gpu, &x_flat, xn1);
+        let cell_out = cell_out.get(gpu, &[b, t, h]);
         let (cf, _cb) = self.cell.phase_buckets();
-        phase::timed(gpu, cf, || {
-            self.cell.forward(gpu, &xn1, &mut cell_out, cache)
-        });
-        a.pool.put(xn1);
+        phase::timed(gpu, cf, || self.cell.forward(gpu, xn1, cell_out, cache));
 
         // Downstream is position-wise [N, H].
         cell_out.reshape_to(&[n, h]);
         let mut z = a.pool.take(gpu, &[n, h]);
-        ops::add_into(gpu, &x_flat, &cell_out, &mut z);
-        a.pool.put(cell_out);
+        ops::add_into(gpu, &x_flat, a.cell_out.expect("cell wrote it"), &mut z);
 
-        // Residual 2: y = z + SwiGLU(pre_norm2(z)). The three SwiGLU operands are
+        // Residual 2: out = z + SwiGLU(pre_norm2(z)). The three SwiGLU operands are
         // the only values backward needs, so they alone go to permanent buffers.
         //
         // `zn` and `mixed` are owned here rather than pooled, because backward reads
@@ -909,7 +958,7 @@ impl<C: Cell> Block<C> {
         // block beats `Linear::forward` saving its own copy: `lin_gate` and
         // `lin_value` share `zn`, so that path would hold it twice (4 MB per block at
         // the backbone's shape, 64 MB across 16 blocks) for one tensor.
-        self.pre_norm2.forward(gpu, &z, a.zn.get(gpu, &[n, h]));
+        self.pre_norm2.forward_slab(gpu, &z, a.zn.get(gpu, &[n, h]));
         // The saved buffers are disjoint `Buf` slots, but each `get`/`expect` borrows
         // `a` as a whole — so take the handles apart once, up front.
         let Act {
@@ -923,9 +972,9 @@ impl<C: Cell> Block<C> {
         let zn = zn.expect("normalized");
         phase::timed(gpu, phase::Bucket::FfnFwd, || {
             self.lin_gate
-                .forward_shared(gpu, zn, gate_pre.get(gpu, &[n, u]));
+                .forward_slab_lhs(gpu, zn, gate_pre.get(gpu, &[n, u]));
             self.lin_value
-                .forward_shared(gpu, zn, value.get(gpu, &[n, u]));
+                .forward_slab_lhs(gpu, zn, value.get(gpu, &[n, u]));
             ops::swiglu_forward_into(
                 gpu,
                 gate_pre.expect("projected"),
@@ -933,13 +982,13 @@ impl<C: Cell> Block<C> {
                 gate_act.get(gpu, &[n, u]),
                 mixed.get(gpu, &[n, u]),
             );
-            // `y = z + down(mixed)`: the residual rides in `lin_down`'s bias seed, so
+            // `out = z + down(mixed)`: the residual rides in `lin_down`'s bias seed, so
             // there is no separate add and no `down` buffer to hold its output.
-            y.reshape_to(&[n, h]);
+            out.reshape_to(&[n, h]);
             self.lin_down
-                .forward_shared_resid(gpu, mixed.expect("mixed"), &z, y);
+                .forward_shared_resid(gpu, mixed.expect("mixed"), &z, out);
         });
-        y.reshape_to(&[b, t, h]);
+        out.reshape_to(&[b, t, h]);
         a.pool.put(z);
         // With offload on, this block's saved activations go to the host now and the
         // device buffers are released. Backward restores them (see `restore_act`).
@@ -967,6 +1016,8 @@ impl<C: Cell> Block<C> {
     fn evict_act(&mut self, gpu: &Gpu) {
         let Act {
             park,
+            xn1,
+            cell_out,
             gate_pre,
             gate_act,
             value,
@@ -983,10 +1034,12 @@ impl<C: Cell> Block<C> {
         park.evict(
             gpu,
             vec![
+                take(xn1, "forward filled xn1"),
+                take(cell_out, "forward filled cell_out"),
                 take(gate_pre, "forward filled gate_pre"),
                 take(gate_act, "forward filled gate_act"),
                 take(value, "forward filled value"),
-                take(zn, "forward filled zn"),
+                offload::Parked::from(zn.take().expect("forward filled zn")),
                 take(mixed, "forward filled mixed"),
             ],
         );
@@ -1041,9 +1094,9 @@ impl<C: Cell> Block<C> {
         self.restore_act(gpu);
         // Take the saved set out of `self` entirely for the duration of this call, so
         // the `Linear`s and the pool below can be borrowed mutably alongside it. The
-        // buffers are returned to their slots at the end (`FfnSaved::put_back`), which
+        // buffers are returned to their slots at the end (`BlockSaved::put_back`), which
         // for the offload path means simply dropping them.
-        let saved = FfnSaved::take(&mut self.act);
+        let saved = BlockSaved::take(&mut self.act);
         self.fwd_chunks = self.fwd_chunks.saturating_sub(1);
         let a = &mut self.act;
         a.pool.assert_drained("Block::backward");
@@ -1073,13 +1126,14 @@ impl<C: Cell> Block<C> {
             &mut d_value,
         );
         a.pool.put(d_mixed);
-        // Both projections read the one saved `zn` (see `forward`).
+        // Both projections read the one saved `zn`, which the forward already wrote at
+        // the width their GEMMs want — so neither narrows anything here.
         let mut d_zn_g = a.pool.take(gpu, &[n, h]);
-        self.lin_gate
-            .backward_with_x(gpu, &saved.zn, &d_gate, &mut d_zn_g);
         let mut d_zn_v = a.pool.take(gpu, &[n, h]);
+        self.lin_gate
+            .backward_slab_x(gpu, &saved.zn, &d_gate, &mut d_zn_g);
         self.lin_value
-            .backward_with_x(gpu, &saved.zn, &d_value, &mut d_zn_v);
+            .backward_slab_x(gpu, &saved.zn, &d_value, &mut d_zn_v);
         let mut d_zn = a.pool.take(gpu, &[n, h]);
         ops::add_into(gpu, &d_zn_g, &d_zn_v, &mut d_zn);
         if let Some(t0) = ffn_t0 {
@@ -1092,7 +1146,8 @@ impl<C: Cell> Block<C> {
         // norm's dx and the incoming dy sum into d_z. `d_z_mlp` is separate because
         // `add_into`'s destination must not be one of its operands.
         let mut d_z_mlp = a.pool.take(gpu, &[n, h]);
-        self.pre_norm2.backward(gpu, &d_zn, &mut d_z_mlp);
+        // `zn` is pre_norm2's own output — see `RmsNorm::backward`.
+        self.pre_norm2.backward_slab(gpu, &d_zn, &saved.zn, &mut d_z_mlp);
         let mut d_z = a.pool.take(gpu, &[n, h]);
         ops::add_into(gpu, &d_z_mlp, &dy_flat, &mut d_z);
         a.pool.put_all([d_zn, d_z_mlp]);
@@ -1105,12 +1160,14 @@ impl<C: Cell> Block<C> {
         let mut d_cell_in = a.pool.take(gpu, &[b, t, h]);
         let (_cf, cb) = self.cell.phase_buckets();
         phase::timed(gpu, cb, || {
-            self.cell.backward(gpu, &d_cell_out, &mut d_cell_in)
+            self.cell
+                .backward(gpu, &saved.cell_out, &d_cell_out, &mut d_cell_in)
         });
         a.pool.put(d_cell_out);
         d_cell_in.reshape_to(&[n, h]);
         let mut d_xn1 = a.pool.take(gpu, &[n, h]);
-        self.pre_norm1.backward(gpu, &d_cell_in, &mut d_xn1);
+        self.pre_norm1
+            .backward(gpu, &d_cell_in, &saved.xn1, &mut d_xn1);
         // x feeds pre_norm1 (cell path) and the z = x + cn residual.
         dx.reshape_to(&[n, h]);
         ops::add_into(gpu, &d_xn1, &d_z, dx);
@@ -1122,7 +1179,7 @@ impl<C: Cell> Block<C> {
         saved.put_back(a);
         // Chunked sweep: the slots now hold the chunk just unwound, which nothing will
         // read again. Replace them with the chunk to its left — the next to unwind —
-        // so `FfnSaved::take` finds that chunk's own activations. The allocations the
+        // so `BlockSaved::take` finds that chunk's own activations. The allocations the
         // line above returned are dropped here, releasing them a chunk earlier than
         // the next forward would.
         if let Some(prev) = a.chunk_saved.pop() {

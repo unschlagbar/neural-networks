@@ -112,10 +112,13 @@ impl Flat {
         let rms = self.rms.as_ref().expect("forward before backward");
         let d_pre = ops::softcap_backward(gpu, dlogits, logits, self.cap);
         let d_rmsout = self.head.backward_alloc(gpu, &d_pre);
+        // `head` saved its own input, which is the norm's output — what the norm's
+        // backward rebuilds `x̂` from, so nothing else has to keep it.
         let d_h = ops::rms_norm_backward(
             gpu,
             &d_rmsout,
             rms,
+            self.head.saved_x(),
             &self.gamma,
             &mut self.dgamma,
             self.hidden,

@@ -79,7 +79,7 @@ fn main() {
         for _ in 0..reps {
             for _ in 0..3 {
                 cell.forward(&gpu, &x, &mut y, &mut cache);
-                cell.backward(&gpu, &dy, &mut dx);
+                cell.backward(&gpu, &y, &dy, &mut dx);
             }
             gpu.stream.synchronize().unwrap();
 
@@ -89,7 +89,7 @@ fn main() {
                 cell.forward(&gpu, &x, &mut y, &mut cache);
                 gpu.stream.synchronize().unwrap();
                 let t0 = Instant::now();
-                cell.backward(&gpu, &dy, &mut dx);
+                cell.backward(&gpu, &y, &dy, &mut dx);
                 issue += t0.elapsed().as_secs_f64();
                 gpu.stream.synchronize().unwrap();
                 wall += t0.elapsed().as_secs_f64();

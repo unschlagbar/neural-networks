@@ -4,8 +4,8 @@
 //! Pure normalization (`y = γ ⊙ x / rms(x)`, row-wise) with a learned scale that
 //! trains on undecayed AdamW (norm scales are never weight-decayed). Wraps the
 //! grouped `rms_norm_forward`/`backward` ops with the single-group (plain) config
-//! `group == size`. Scale, grad, moments and the saved `x̂`/`inv_rms` all live on
-//! the device.
+//! `group == size`. Scale, grad, moments and the saved `inv_rms` all live on the
+//! device; `x̂` is never stored — backward rebuilds it from the forward output.
 
 use super::arena::{self, ParamKind, ParamSlot};
 use super::ops::{self, GpuRmsForward};
@@ -25,12 +25,17 @@ pub struct RmsNorm {
     /// Normalization group width: `== size` for plain RMSNorm, `== dhv` for the
     /// head-wise variant (`F/group` independent groups per row, one γ slice each).
     group: usize,
-    /// Saved `x̂` / `inv_rms`, reused across calls: both are shape-determined, so
-    /// a steady batch size means the forward reallocates nothing.
+    /// Saved `inv_rms`, one per normalization group, reused across calls.
+    ///
+    /// The only thing the forward keeps. `x̂` is NOT stored: backward is handed the
+    /// forward output and rebuilds `x̂ = y/γ`, which is what Apex's `memory_efficient`
+    /// path does and Liger's equivalent from the input side. Storing it costs `[N, F]`
+    /// against this `[N]` — at the backbone's shape three norms per block over a chunked
+    /// sweep came to 1.15 GB of device memory that nothing else could use.
     fwd: Option<GpuRmsForward>,
-    /// Earlier chunks' `x̂`/`inv_rms`, oldest first. The single `fwd` slot holds one
-    /// chunk's, so without this chunk c+1's forward overwrites what chunk c's backward
-    /// reads. Empty unless [`set_carry`](Self::set_carry) is on.
+    /// Earlier chunks' `inv_rms`, oldest first. The single `fwd` slot holds one chunk's,
+    /// so without this chunk c+1's forward overwrites what chunk c's backward reads.
+    /// Empty unless [`set_carry`](Self::set_carry) is on.
     chunk_saved: Vec<GpuRmsForward>,
     /// Whether this norm is inside a chunked sweep. See [`set_carry`](Self::set_carry).
     carry: bool,
@@ -71,29 +76,49 @@ impl RmsNorm {
     }
 
     /// `y = γ ⊙ (x / rms(x))`, row-wise, into the caller's `out` `[B, F]`. Saves
-    /// `x̂`/`inv_rms` for backward.
+    /// `inv_rms` for backward, and nothing else.
     ///
     /// `out` may alias `x` (the kernel reads each row before writing it), which
     /// is what lets a caller normalize a buffer in place.
     pub fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>) {
+        self.fit_saved(gpu, x);
+        let Self { gamma, group, fwd, .. } = self;
+        let saved = fwd.as_mut().expect("fit_saved filled it");
+        ops::rms_norm_forward_into(gpu, x, gamma, *group, EPS, out, saved);
+    }
+
+    /// [`forward`](Self::forward) writing a slab, for a caller whose only readers of
+    /// `y` take it narrow — the block's two pre-norms, whose output goes straight into
+    /// a GEMM. `x` stays fp32: it is the residual stream.
+    ///
+    /// Pair it with [`backward_slab`](Self::backward_slab); mixing the two widths
+    /// across a forward/backward pair reads the wrong bits.
+    pub fn forward_slab(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut ops::SlabBuf) {
+        self.fit_saved(gpu, x);
+        let Self { gamma, group, fwd, .. } = self;
+        let saved = fwd.as_mut().expect("fit_saved filled it");
+        ops::rms_norm_forward_into_slab(gpu, x, gamma, *group, EPS, out, saved);
+    }
+
+    /// Present `inv_rms` at the shape this call needs, setting the previous chunk's
+    /// aside first when the sweep is chunked.
+    fn fit_saved(&mut self, gpu: &Gpu, x: &GTensor<f32>) {
         // Position-wise: any rank is accepted and folded to `[N, F]` over the last
         // axis, so a caller holding `[B, T, H]` need not reshape.
         let (b, f) = x.as_2d();
         assert_eq!(f, self.size, "RmsNorm::forward — width mismatch");
         let total_groups = b * (f / self.group);
-        // Chunked sweep: the previous chunk's `x̂`/`inv_rms` are still owed a backward,
-        // so set them aside rather than letting the refit below reuse their buffers.
+        // Chunked sweep: the previous chunk's `inv_rms` is still owed a backward, so set
+        // it aside rather than letting the refit below reuse its buffer.
         if self.carry {
             if let Some(prev) = self.fwd.take() {
                 self.chunk_saved.push(prev);
             }
         }
-        // Refit the saved intermediates, reusing them whenever the shape holds.
         match &self.fwd {
-            Some(s) if s.x_hat.len() == b * f && s.inv_rms.len() == total_groups => {}
+            Some(s) if s.inv_rms.len() == total_groups => {}
             _ => {
                 self.fwd = Some(GpuRmsForward {
-                    x_hat: GTensor::uninit(gpu, &[b, f]),
                     inv_rms: gpu
                         .stream
                         .alloc_zeros::<f32>(total_groups)
@@ -101,9 +126,6 @@ impl RmsNorm {
                 })
             }
         }
-        let saved = self.fwd.as_mut().expect("just filled");
-        saved.x_hat.reshape_to(&[b, f]);
-        ops::rms_norm_forward_into(gpu, x, &self.gamma, self.group, EPS, out, saved);
     }
 
     /// Forward into a freshly allocated `[B, F]` — the by-value companion to
@@ -115,18 +137,52 @@ impl RmsNorm {
     }
 
     /// Backward into a freshly allocated `dX` `[B, F]`.
-    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>) -> GTensor<f32> {
+    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>, y: &GTensor<f32>) -> GTensor<f32> {
         let mut dx = GTensor::uninit(gpu, &[dy.rows(), dy.cols()]);
-        self.backward(gpu, dy, &mut dx);
+        self.backward(gpu, dy, y, &mut dx);
         dx
     }
 
     /// Given `dY` `[B, F]`, accumulate `dγ` and write `dX` `[B, F]` into `dx`.
-    pub fn backward(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
+    ///
+    /// `y` is this norm's own forward OUTPUT, which backward divides by γ to recover
+    /// `x̂`. Keeping the caller's `y` alive is the whole reason the forward can get away
+    /// with saving only `inv_rms`; every caller here holds it for another reason anyway.
+    pub fn backward(
+        &mut self,
+        gpu: &Gpu,
+        dy: &GTensor<f32>,
+        y: &GTensor<f32>,
+        dx: &mut GTensor<f32>,
+    ) {
+        self.backward_wos(gpu, dy, ops::WideOrSlab::F32(y), dx);
+    }
+
+    /// [`backward`](Self::backward) where `y` is the slab this norm's
+    /// [`forward_slab`](Self::forward_slab) wrote. Both readers of `y` — the kernel
+    /// and the `dγ` reduction — take it at that width.
+    pub fn backward_slab(
+        &mut self,
+        gpu: &Gpu,
+        dy: &GTensor<f32>,
+        y: &ops::SlabBuf,
+        dx: &mut GTensor<f32>,
+    ) {
+        self.backward_wos(gpu, dy, ops::WideOrSlab::Slab(y), dx);
+    }
+
+    fn backward_wos(
+        &mut self,
+        gpu: &Gpu,
+        dy: &GTensor<f32>,
+        y: ops::WideOrSlab<'_>,
+        dx: &mut GTensor<f32>,
+    ) {
         let (_, f) = dy.as_2d();
         assert_eq!(f, self.size, "RmsNorm::backward — width mismatch");
+        assert_eq!(y.as_2d(), dy.as_2d(), "RmsNorm::backward — y shape");
         let fwd = self.fwd.as_ref().expect("RmsNorm::backward before forward");
-        ops::rms_norm_backward_into(gpu, dy, fwd, &self.gamma, &mut self.dgamma, self.group, dx);
+        ops::rms_norm_backward_into(gpu, dy, fwd, y, &self.gamma, &mut self.dgamma, self.group, dx);
         // Chunks unwind right to left, so hand the slot to the chunk on the left.
         if let Some(prev) = self.chunk_saved.pop() {
             self.fwd = Some(prev);
@@ -156,9 +212,8 @@ impl RmsNorm {
     /// Device bytes held, split `(params, activations)`. Diagnostic — see
     /// [`Hierarchical::retained_report`](super::hierarchical::Hierarchical::retained_report).
     ///
-    /// The params are four `[F]` vectors — negligible. The activations are the saved
-    /// `x̂` `[B, F]` and `inv_rms`, which scale with the batch and are held across
-    /// calls, so a norm inside a per-word stage retains a full window's worth.
+    /// The params are four `[F]` vectors — negligible, and so is the activation side:
+    /// `inv_rms` is one float per normalization group, not per element.
     pub fn retained_bytes(&self) -> (usize, usize) {
         let params = [&self.gamma, &self.dgamma, &self.m, &self.v]
             .iter()
@@ -167,11 +222,11 @@ impl RmsNorm {
         let act = self
             .fwd
             .as_ref()
-            .map_or(0, |s| (s.x_hat.capacity() + s.inv_rms.len()) * 4);
+            .map_or(0, |s| s.inv_rms.len() * 4);
         (params, act)
     }
 
-    /// Keep one saved `x̂`/`inv_rms` per chunk, for a sweep whose chunks all forward
+    /// Keep one saved `inv_rms` per chunk, for a sweep whose chunks all forward
     /// before any of them unwinds. Off means the single slot is reused per call, which
     /// is what every unchunked caller wants.
     pub fn set_carry(&mut self, carry: bool) {
@@ -190,5 +245,68 @@ impl RmsNorm {
     /// AdamW step (norm scale is never decayed). Clears the grad.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
         arena::step_slots(gpu, &mut self.param_slots(), cfg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::GTensor;
+
+    /// The slab path must agree with the fp32 one to bf16's precision, and only to
+    /// that: `y` is the sole tensor whose width changes, so the gap is one rounding
+    /// of the forward output propagated through both readers of it.
+    ///
+    /// Worth pinning separately from the CPU parity tests because those run the fp32
+    /// entry points — a `_slab` kernel could be wrong in every element and they would
+    /// not notice.
+    #[test]
+    fn slab_path_matches_fp32_within_bf16() {
+        let Some(gpu) = crate::gpu::test_gpu() else {
+            return;
+        };
+        // A block-norm shape (group == width) and a head-norm one (group << width),
+        // which take different launch geometries.
+        for (rows, size, group) in [(64usize, 256usize, 256usize), (128, 128, 16)] {
+            let g = Tensor::random(&[size], 0.4);
+            let x = GTensor::from_host(&gpu, &Tensor::random(&[rows, size], 0.7));
+            let dy = GTensor::from_host(&gpu, &Tensor::random(&[rows, size], 0.9));
+
+            let mut wide = RmsNorm::from_parts_grouped(&gpu, &g, group);
+            let mut y_w = GTensor::uninit(&gpu, &[rows, size]);
+            wide.forward(&gpu, &x, &mut y_w);
+            let mut dx_w = GTensor::uninit(&gpu, &[rows, size]);
+            wide.backward(&gpu, &dy, &y_w, &mut dx_w);
+
+            let mut narrow = RmsNorm::from_parts_grouped(&gpu, &g, group);
+            let mut y_n = ops::SlabBuf::new(&gpu, &[rows, size]);
+            narrow.forward_slab(&gpu, &x, &mut y_n);
+            let mut dx_n = GTensor::uninit(&gpu, &[rows, size]);
+            narrow.backward_slab(&gpu, &dy, &y_n, &mut dx_n);
+
+            // bf16 keeps 8 mantissa bits, so a single rounding is ~4e-3 relative. The
+            // fp32 build makes the two paths the same kernel, hence the tighter bound.
+            let tol = if gpu.kernels.slab_bf16 { 1e-2 } else { 1e-6 };
+            for (name, a, b) in [
+                ("y", y_w.to_host(&gpu).data, {
+                    let mut s = GTensor::uninit(&gpu, &[rows, size]);
+                    y_n.as_f32(&gpu, &mut s).to_host(&gpu).data
+                }),
+                ("dx", dx_w.to_host(&gpu).data, dx_n.to_host(&gpu).data),
+                (
+                    "dgamma",
+                    wide.dgamma.to_host(&gpu).data,
+                    narrow.dgamma.to_host(&gpu).data,
+                ),
+            ] {
+                let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+                for (i, (p, q)) in a.iter().zip(&b).enumerate() {
+                    assert!(
+                        (p - q).abs() <= tol * scale,
+                        "{name}[{i}] at ({rows},{size},{group}): {p} vs {q}"
+                    );
+                }
+            }
+        }
     }
 }

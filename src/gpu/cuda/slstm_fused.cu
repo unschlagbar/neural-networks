@@ -96,8 +96,8 @@ extern "C" __global__ void slstm_gate_matvec_t(
 extern "C" __global__ void slstm_step_fused(
         float* g, const float* gh, const float* bcat, slab_t* h_prev,
         float* c_state, float* n_state, float* m_state, float* h_state,
-        slab_t* h_narrow, float* c_prev, float* n_prev, slab_t* zt, slab_t* ot,
-        float* i_prime, float* f_prime, float* c_out, float* n_out,
+        slab_t* h_narrow, state_t* c_entry, state_t* n_entry, slab_t* zt, slab_t* ot,
+        state_t* i_prime, state_t* f_prime, state_t* c_out, state_t* n_out,
         float* out, int t, int T, int H, int BH, int first) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= BH) return;
@@ -141,11 +141,17 @@ extern "C" __global__ void slstm_step_fused(
     float c = fp * cp + ip * z;
     float n = fp * np + ip;
 
-    c_prev[s] = cp;
-    n_prev[s] = np;
+    // The cell and normalizer entering the sweep. Backward wants c_{t-1} at every
+    // step, but for t > 0 that is `c_out` one timestep back — the same buffer at
+    // `s - H`. Only t = 0 has no predecessor in it, so only t = 0 is stored, as
+    // [B, H] rather than a second [B, T, H] history.
+    if (t == 0) {
+        state_st(c_entry, k, cp);
+        state_st(n_entry, k, np);
+    }
     slab_st(zt, s, z); slab_st(ot, s, o);
-    i_prime[s] = ip; f_prime[s] = fp;
-    c_out[s] = c; n_out[s] = n;
+    state_st(i_prime, s, ip); state_st(f_prime, s, fp);
+    state_st(c_out, s, c);  state_st(n_out, s, n);
     c_state[k] = c; n_state[k] = n; m_state[k] = m;
 
     // h = o·c/n — the exp(−m) in c and n cancels. See `slstm_cell_step`.
@@ -175,17 +181,19 @@ extern "C" __global__ void slstm_step_fused(
 //   d_h_recur    [B, H]      in   grad arriving from step t+1 through h
 //   o_act        [B, T, H]   in   saved sigmoid(o_pre)
 //   c_t, n_t     [B, T, H]   in   saved cell / normalizer AFTER this step
-//   c_prev,n_prev[B, T, H]   in   saved cell / normalizer BEFORE this step
+//   c_entry,n_entry [B, H]   in   cell / normalizer entering the sweep, i.e. the
+//                                 t = 0 predecessor; every later t reads c_t/n_t
+//                                 one timestep back
 //   z_act        [B, T, H]   in   saved tanh(z_pre)
 //   i_gate,f_gate[B, T, H]   in   saved stabilized exp() gate values i', f'
 //   d_c_recur    [B, H]      both cell grad carried backward across steps
 //   d_n_recur    [B, H]      both normalizer grad carried backward across steps
 //   t, T, H, BH              in   current step, sequence length, width, B*H
 extern "C" __global__ void slstm_step_fused_bwd(
-        const float* d_out, float* gates, float* d_gates_flat, const float* d_h_recur,
-        const slab_t* o_act, const float* c_t, const float* n_t,
-        const float* c_prev, const float* n_prev, const slab_t* z_act,
-        const float* i_gate, const float* f_gate,
+        const float* d_out, float* gates, slab_t* d_gates_flat, const float* d_h_recur,
+        const slab_t* o_act, const state_t* c_t, const state_t* n_t,
+        const state_t* c_entry, const state_t* n_entry, const slab_t* z_act,
+        const state_t* i_gate, const state_t* f_gate,
         float* d_c_recur, float* d_n_recur, int t, int T, int H, int BH) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= BH) return;
@@ -198,17 +206,21 @@ extern "C" __global__ void slstm_step_fused_bwd(
     // Total grad on h_t: from the layer above plus from step t+1.
     float d_h = d_out[s] + d_h_recur[k];
     float o = slab_ld(o_act, s);
-    float c = c_t[s];
-    float n = n_t[s];
+    float c = state_ld(c_t, s);
+    float n = state_ld(n_t, s);
     // h = o·c/n — no clamp, so dn has no branch: ∂h/∂n = −o·c/n².
     float d_o_pre = d_h * (c / n) * o * (1.0f - o);
     float d_c = d_h * o / n + d_c_recur[k];
     float d_n = d_h * o * (-c) / (n * n) + d_n_recur[k];
-    float f = f_gate[s];
-    float i = i_gate[s];
+    float f = state_ld(f_gate, s);
+    float i = state_ld(i_gate, s);
     float z = slab_ld(z_act, s);
     // Grads w.r.t. the stabilized gate values i', f', before their exp/sigmoid.
-    float d_f_gate = d_c * c_prev[s] + d_n * n_prev[s];
+    // c_{t-1}, n_{t-1}: the same history one timestep back, except at the sweep's
+    // first step, whose predecessor is the carried-in state.
+    float c_pr = (t == 0) ? state_ld(c_entry, k) : state_ld(c_t, s - H);
+    float n_pr = (t == 0) ? state_ld(n_entry, k) : state_ld(n_t, s - H);
+    float d_f_gate = d_c * c_pr + d_n * n_pr;
     float d_i_gate = d_c * z + d_n;
     float d_z_act = d_c * i;
 
@@ -218,10 +230,10 @@ extern "C" __global__ void slstm_step_fused_bwd(
     float d_i_pre = d_i_gate * i;
     float d_f_pre = d_f_gate * f * (1.0f - stable_sigmoid(f_pre));
 
-    gates[gate_off]         = d_z_pre;  d_gates_flat[flat_off]         = d_z_pre;
-    gates[gate_off + H]     = d_i_pre;  d_gates_flat[flat_off + H]     = d_i_pre;
-    gates[gate_off + 2 * H] = d_f_pre;  d_gates_flat[flat_off + 2 * H] = d_f_pre;
-    gates[gate_off + 3 * H] = d_o_pre;  d_gates_flat[flat_off + 3 * H] = d_o_pre;
+    gates[gate_off]         = d_z_pre;  slab_st(d_gates_flat, flat_off,         d_z_pre);
+    gates[gate_off + H]     = d_i_pre;  slab_st(d_gates_flat, flat_off + H,     d_i_pre);
+    gates[gate_off + 2 * H] = d_f_pre;  slab_st(d_gates_flat, flat_off + 2 * H, d_f_pre);
+    gates[gate_off + 3 * H] = d_o_pre;  slab_st(d_gates_flat, flat_off + 3 * H, d_o_pre);
 
     // Carry to step t−1: both paths are scaled by the forget gate.
     d_c_recur[k] = d_c * f;

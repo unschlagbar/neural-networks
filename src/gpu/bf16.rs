@@ -57,14 +57,35 @@
 //!
 //! | fp32 (pinned)                                   | bf16 (storage)                       |
 //! |-------------------------------------------------|--------------------------------------|
-//! | sLSTM `c`, `n`, `c_prev`, `n_prev`, `m_state`   | sLSTM `zt`, `ot`, `h_prev`, `x_saved` |
+//! | sLSTM `c`, `n`, `c_entry`, `n_entry`, `i'`, `f'` | sLSTM `zt`, `ot`, `h_prev`, `x_saved` |
 //! | mLSTM `mst`, `msv`, `psiv`, `qnv`, `cst`, `nst` | mLSTM `qh`, `kh`, `vh`, `o`, `yhat`, `ytil` |
 //! | gate logits `igh`, `fgh`, all cumulative sums   | the sLSTM gate buffer `g`            |
 //! | every weight, gradient and optimizer moment     |                                      |
 //!
 //! `i_prime`/`f_prime` sit on the fp32 side too: they are `exp(i - m)` and
 //! `exp(fm - m)`, i.e. the stabilizer's own outputs, and the backward multiplies a
-//! chain of `f_prime` together across timesteps where relative error compounds.
+//! chain of `f_prime` together across timesteps.
+//!
+//! ## Measured, 2026-08-25: the compounding does not happen
+//!
+//! The paragraph above predicts error growing with `T`. It does not, at our shapes.
+//! `SLSTM_BF16_STATE=1` narrows exactly this group (`Kernels::state_bf16`), and
+//! `examples/slstm_state_prec.rs` compares the two arms element for element:
+//!
+//! * `y` is **bit-identical**. The live carry (`c_state`/`n_state`/`m_state`, and the
+//!   fused kernel's registers) stays fp32; only the copies saved *for backward* narrow,
+//!   so the forward recurrence never reads a rounded value. This is the structural
+//!   difference from FlashRNN, which narrows the live state too.
+//! * gradients move by **~0.25% RMS relative** — one bf16 rounding, not `T` of them —
+//!   and the figure is the same at `T = 512` (backbone) and `T = 8` (encoder). An
+//!   error in `c`/`n` is *relative*, and backward's use of them is linear, so it does
+//!   not accumulate the way the `exp(eps)` argument suggests.
+//!
+//! What it buys is small: -12 MB device, -47 MB host pinned at 2048 words, and no
+//! step-time change. So the group stays fp32 by DEFAULT because the win does not pay
+//! for a 0.25% gradient perturbation — not because narrowing is unsafe. The `m`
+//! argument at the top of this section still stands on its own terms; what the
+//! measurement refutes is extending it to `c`, `n`, `i'` and `f'`.
 //!
 //! # The other half: bf16 GEMMs
 //!
@@ -106,7 +127,7 @@
 //! not shrink when blocks are freed — measure capacity (the largest window that
 //! fits) rather than reported usage.
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::PushKernelArg;
 
 use super::{GTensor, Gpu};
 
@@ -143,7 +164,7 @@ impl GTensor<u16> {
         let n_i32 = n as i32;
         let mut b = gpu.stream.launch_builder(&f);
         b.arg(&src.buf).arg(&mut self.buf).arg(&n_i32);
-        unsafe { b.launch(LaunchConfig::for_num_elems(n.div_ceil(4) as u32)) }
+        unsafe { b.launch(super::ops::elem_cfg(gpu, n.div_ceil(4) as u32)) }
             .expect("cast to bf16");
     }
 
@@ -161,7 +182,7 @@ impl GTensor<u16> {
         let n_i32 = n as i32;
         let mut b = gpu.stream.launch_builder(&f);
         b.arg(&self.buf).arg(&mut dst.buf).arg(&n_i32);
-        unsafe { b.launch(LaunchConfig::for_num_elems(n.div_ceil(4) as u32)) }
+        unsafe { b.launch(super::ops::elem_cfg(gpu, n.div_ceil(4) as u32)) }
             .expect("cast from bf16");
     }
 }
