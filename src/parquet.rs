@@ -437,16 +437,141 @@ struct FileMeta {
     /// columns were requested.
     chunks: Vec<Vec<ColumnChunk>>,
     num_rows: i64,
-    /// Max definition level per requested column: 0 = REQUIRED, 1 = OPTIONAL.
+    /// Max definition level per requested column: a value is present only where
+    /// its definition level reaches this.
     max_def_levels: Vec<u8>,
+    /// Max repetition level per requested column: 0 for a flat column, 1 inside
+    /// a list. A slot whose repetition level is 0 starts a new row.
+    max_rep_levels: Vec<u8>,
 }
 
-/// One schema element we care about (flat schema only).
+/// One schema element, as the footer describes it.
 struct SchemaElement {
     name: String,
     ty: Option<i64>,
     repetition: i64,
     num_children: i64,
+}
+
+/// One decoded column chunk. `values` holds only the slots that are present;
+/// `reps`/`defs` hold one level per slot and are filled only for a nested
+/// column, where slots and values are not the same thing.
+struct Column {
+    values: Vec<Vec<u8>>,
+    reps: Vec<u8>,
+    defs: Vec<u8>,
+}
+
+impl Column {
+    /// How many slots have been decoded — values for a flat column, level
+    /// entries for a nested one (where a null or empty list is a slot with no
+    /// value).
+    fn slots(&self, nested: bool) -> usize {
+        if nested { self.reps.len() } else { self.values.len() }
+    }
+}
+
+/// Bits needed to hold levels up to `max`; parquet packs levels at exactly this
+/// width.
+fn level_width(max: u8) -> u8 {
+    if max == 0 {
+        0
+    } else {
+        8 - (max as u8).leading_zeros() as u8
+    }
+}
+
+/// Decode `count` RLE levels, appending them to `out`.
+fn read_levels(section: &[u8], max_level: u8, count: usize, out: &mut Vec<u8>) -> Result<()> {
+    let mut dec = RleDecoder::new(section, level_width(max_level));
+    for _ in 0..count {
+        match dec.next()? {
+            Some(v) => out.push(v as u8),
+            None => return Err("levels: page ended early".into()),
+        }
+    }
+    Ok(())
+}
+
+/// Split the next length-prefixed level section off a v1 page body.
+fn take_v1_section<'a>(body: &mut &'a [u8], what: &str) -> Result<&'a [u8]> {
+    if body.len() < 4 {
+        return Err(format!("v1 page: truncated {what} levels"));
+    }
+    let n = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    if 4 + n > body.len() {
+        return Err(format!("v1 page: {what} levels run past page"));
+    }
+    let section = &body[4..4 + n];
+    *body = &body[4 + n..];
+    Ok(section)
+}
+
+/// A leaf column of the schema tree: its dotted path, its type, and the two
+/// level ceilings that describe where it sits in the nesting.
+///
+/// `max_def` counts the ancestors (itself included) that may be absent, so a
+/// value is present only at `def == max_def`. `max_rep` counts the repeated
+/// ancestors, so a slot with `rep == 0` starts a new row and a higher `rep`
+/// continues a list inside it. A flat REQUIRED column has both at 0.
+struct Leaf {
+    path: String,
+    ty: Option<i64>,
+    max_def: u8,
+    max_rep: u8,
+}
+
+impl Leaf {
+    /// The last path component — what a caller usually means by "the column".
+    fn name(&self) -> &str {
+        self.path.rsplit('.').next().unwrap_or(&self.path)
+    }
+}
+
+/// Walk the pre-order schema, accumulating levels, and collect the leaves.
+fn schema_leaves(schema: &[SchemaElement]) -> Vec<Leaf> {
+    fn walk(
+        schema: &[SchemaElement],
+        at: &mut usize,
+        prefix: &str,
+        def: u8,
+        rep: u8,
+        out: &mut Vec<Leaf>,
+    ) {
+        let Some(el) = schema.get(*at) else { return };
+        *at += 1;
+        // Repetition 0 = REQUIRED, 1 = OPTIONAL, 2 = REPEATED.
+        let def = def + u8::from(el.repetition != 0);
+        let rep = rep + u8::from(el.repetition == 2);
+        let path = if prefix.is_empty() {
+            el.name.clone()
+        } else {
+            format!("{prefix}.{}", el.name)
+        };
+        if el.num_children == 0 {
+            out.push(Leaf {
+                path,
+                ty: el.ty,
+                max_def: def,
+                max_rep: rep,
+            });
+            return;
+        }
+        for _ in 0..el.num_children {
+            walk(schema, at, &path, def, rep, out);
+        }
+    }
+
+    let mut out = Vec::new();
+    // Element 0 is the root: it names the message, not a column, so its own
+    // name is dropped from every path.
+    if let Some(root) = schema.first() {
+        let mut at = 1usize;
+        for _ in 0..root.num_children {
+            walk(schema, &mut at, "", 0, 0, &mut out);
+        }
+    }
+    out
 }
 
 fn parse_schema(t: &mut Thrift) -> Result<Vec<SchemaElement>> {
@@ -494,16 +619,20 @@ fn parse_column_chunk(t: &mut Thrift, columns: &[&str]) -> Result<Option<(usize,
             while let Some((mfid, mty)) = t.field(&mut mid)? {
                 match mfid {
                     3 => {
-                        // path_in_schema: list<string>. Flat schema, so a
-                        // single-element path equal to the column name.
+                        // path_in_schema: list<string>. A flat column is one
+                        // element; a leaf inside a list is its whole path
+                        // (`messages.list.element.role`), which the caller may
+                        // name either way.
                         let (n, _) = t.list_header()?;
                         let mut parts = Vec::with_capacity(n);
                         for _ in 0..n {
                             parts.push(String::from_utf8_lossy(t.bytes()?).into_owned());
                         }
-                        if parts.len() == 1 {
-                            which = columns.iter().position(|c| *c == parts[0]);
-                        }
+                        let joined = parts.join(".");
+                        let last = parts.last().cloned().unwrap_or_default();
+                        which = columns
+                            .iter()
+                            .position(|c| *c == joined.as_str() || *c == last.as_str());
                     }
                     4 => chunk.codec = t.zigzag()?,
                     5 => chunk.num_values = t.zigzag()?,
@@ -565,23 +694,22 @@ fn parse_footer(meta: &[u8], columns: &[&str]) -> Result<FileMeta> {
         }
     }
 
-    // Locate each column in the schema to learn its type and nullability.
-    // Element 0 is the root; the rest are the flat leaf columns.
+    // Locate each requested column among the schema's leaves. The schema is a
+    // pre-order tree, so a leaf carries the levels of everything above it: one
+    // definition level per optional-or-repeated ancestor, one repetition level
+    // per repeated ancestor. Those two numbers are what make a nested column
+    // decodable — see `Leaf`.
+    let leaves = schema_leaves(&schema);
     let mut max_def_levels = Vec::with_capacity(columns.len());
+    let mut max_rep_levels = Vec::with_capacity(columns.len());
     for column in columns {
-        let leaf = schema
+        let leaf = leaves
             .iter()
-            .skip(1)
-            .find(|e| &e.name == column)
+            .find(|l| l.path == *column || l.name() == *column)
             .ok_or_else(|| {
-                let names: Vec<&str> = schema.iter().skip(1).map(|e| e.name.as_str()).collect();
+                let names: Vec<&str> = leaves.iter().map(|l| l.path.as_str()).collect();
                 format!("column {column:?} not found; file has {names:?}")
             })?;
-        if leaf.num_children != 0 {
-            return Err(format!(
-                "column {column:?} is nested, which is not supported"
-            ));
-        }
         // Type 6 = BYTE_ARRAY.
         if leaf.ty != Some(6) {
             return Err(format!(
@@ -589,16 +717,8 @@ fn parse_footer(meta: &[u8], columns: &[&str]) -> Result<FileMeta> {
                 leaf.ty
             ));
         }
-        // Repetition 0 = REQUIRED, 1 = OPTIONAL, 2 = REPEATED.
-        max_def_levels.push(match leaf.repetition {
-            0 => 0,
-            1 => 1,
-            _ => {
-                return Err(format!(
-                    "column {column:?} is REPEATED, which is not supported"
-                ));
-            }
-        });
+        max_def_levels.push(leaf.max_def);
+        max_rep_levels.push(leaf.max_rep);
     }
 
     if chunks.is_empty() {
@@ -609,6 +729,7 @@ fn parse_footer(meta: &[u8], columns: &[&str]) -> Result<FileMeta> {
         chunks,
         num_rows,
         max_def_levels,
+        max_rep_levels,
     })
 }
 
@@ -621,8 +742,9 @@ struct PageHeader {
     compressed_size: i32,
     /// v1 data page: (num_values, encoding, def_level_encoding)
     v1: Option<(i32, i64, i64)>,
-    /// v2 data page: (num_values, num_nulls, encoding, def_levels_byte_len, is_compressed)
-    v2: Option<(i32, i32, i64, i32, bool)>,
+    /// v2 data page: (num_values, num_nulls, encoding, def_levels_byte_len,
+    /// rep_levels_byte_len, is_compressed)
+    v2: Option<(i32, i32, i64, i32, i32, bool)>,
     /// dictionary page: (num_values, encoding)
     dict: Option<(i32, i64)>,
 }
@@ -669,7 +791,8 @@ fn parse_page_header(buf: &[u8]) -> Result<(PageHeader, usize)> {
             8 if ty == T_STRUCT => {
                 // DataPageHeaderV2
                 let mut did = 0;
-                let (mut nv, mut nn, mut enc, mut dbl) = (0i32, 0i32, ENC_PLAIN, 0i32);
+                let (mut nv, mut nn, mut enc, mut dbl, mut rbl) =
+                    (0i32, 0i32, ENC_PLAIN, 0i32, 0i32);
                 // `is_compressed` defaults to true when absent.
                 let mut compressed = true;
                 while let Some((dfid, dty)) = t.field(&mut did)? {
@@ -678,11 +801,12 @@ fn parse_page_header(buf: &[u8]) -> Result<(PageHeader, usize)> {
                         2 => nn = t.zigzag()? as i32,
                         4 => enc = t.zigzag()?,
                         5 => dbl = t.zigzag()? as i32,
+                        6 => rbl = t.zigzag()? as i32,
                         7 => compressed = dty == T_BOOL_TRUE,
                         _ => t.skip(dty)?,
                     }
                 }
-                ph.v2 = Some((nv, nn, enc, dbl, compressed));
+                ph.v2 = Some((nv, nn, enc, dbl, rbl, compressed));
             }
             _ => t.skip(ty)?,
         }
@@ -696,8 +820,12 @@ fn parse_page_header(buf: &[u8]) -> Result<(PageHeader, usize)> {
 /// Decode a PLAIN-encoded BYTE_ARRAY block: a 4-byte little-endian length
 /// followed by that many bytes, repeated. Pushes offsets into `buf`.
 fn plain_byte_arrays(data: &[u8], limit: usize, out: &mut Vec<Vec<u8>>) -> Result<()> {
+    // `limit` counts the values of THIS page, while `out` accumulates the whole
+    // column chunk — a row group may hold several pages, and the second one
+    // must not be measured against the values the first already produced.
+    let target = out.len() + limit;
     let mut pos = 0;
-    while pos + 4 <= data.len() && out.len() < limit {
+    while pos + 4 <= data.len() && out.len() < target {
         let len =
             u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
@@ -711,6 +839,10 @@ fn plain_byte_arrays(data: &[u8], limit: usize, out: &mut Vec<Vec<u8>>) -> Resul
 }
 
 // ── Public reader ──────────────────────────────────────────────────────────
+
+/// Rows of a repeated group: `rows[row][element][leaf]`. See
+/// [`ParquetColumnReader::next_row_group_lists`].
+pub type ListRows = Vec<Vec<Vec<Vec<u8>>>>;
 
 /// Streams one or more BYTE_ARRAY columns out of a parquet file, one row group
 /// at a time. Row groups are the natural unit: each is independently encoded
@@ -821,9 +953,102 @@ impl ParquetColumnReader {
 
         let mut out = Vec::with_capacity(group.len());
         for (col, chunk) in group.into_iter().enumerate() {
-            out.push(self.decode_chunk(&chunk, self.meta.max_def_levels[col], index)?);
+            out.push(
+                self.decode_chunk(
+                    &chunk,
+                    self.meta.max_def_levels[col],
+                    self.meta.max_rep_levels[col],
+                    index,
+                )?
+                .values,
+            );
         }
         Ok(Some(out))
+    }
+
+    /// Decode a row group whose columns are the leaves of one repeated group —
+    /// the shape every chat corpus uses (`messages: list<struct<role, content>>`).
+    ///
+    /// Returns one entry per row: a list of elements, each holding one value per
+    /// requested leaf, in the order the leaves were requested. A row whose list
+    /// is empty or null comes back as an empty `Vec`, so rows stay aligned with
+    /// the file even when a record has no messages.
+    ///
+    /// The reconstruction is the standard one: walk the slots of the first leaf,
+    /// start a new row wherever the repetition level is 0, and take a value only
+    /// where the definition level reaches the leaf's maximum.
+    pub fn next_row_group_lists(&mut self) -> Result<Option<ListRows>> {
+        let Some(group) = self.meta.chunks.get(self.next_group).cloned() else {
+            return Ok(None);
+        };
+        let index = self.next_group;
+        self.next_group += 1;
+
+        let mut cols = Vec::with_capacity(group.len());
+        for (col, chunk) in group.into_iter().enumerate() {
+            let max_rep = self.meta.max_rep_levels[col];
+            if max_rep == 0 {
+                return Err(format!(
+                    "column {} is not inside a repeated group; read it with \
+                     next_row_group_columns",
+                    col
+                ));
+            }
+            cols.push(self.decode_chunk(
+                &chunk,
+                self.meta.max_def_levels[col],
+                max_rep,
+                index,
+            )?);
+        }
+
+        let slots = cols[0].reps.len();
+        for (i, c) in cols.iter().enumerate() {
+            if c.reps.len() != slots {
+                return Err(format!(
+                    "leaf {i} has {} slots but leaf 0 has {slots}: the columns of \
+                     one group must share their nesting",
+                    c.reps.len()
+                ));
+            }
+        }
+
+        let max_defs: Vec<u8> = (0..cols.len())
+            .map(|c| self.meta.max_def_levels[c])
+            .collect();
+        let mut taken = vec![0usize; cols.len()];
+        let mut rows: ListRows = Vec::new();
+        for slot in 0..slots {
+            if cols[0].reps[slot] == 0 {
+                rows.push(Vec::new());
+            }
+            let Some(row) = rows.last_mut() else {
+                return Err("first slot has repetition level > 0".into());
+            };
+            // Below its maximum definition level the element is absent: an empty
+            // or null list, which contributes no element to the row.
+            if cols[0].defs[slot] < max_defs[0] {
+                continue;
+            }
+            let mut element = Vec::with_capacity(cols.len());
+            for (c, col) in cols.iter().enumerate() {
+                let present = col.defs[slot] >= max_defs[c];
+                let value = if present {
+                    let v = col
+                        .values
+                        .get(taken[c])
+                        .ok_or_else(|| format!("leaf {c}: ran out of values at slot {slot}"))?
+                        .clone();
+                    taken[c] += 1;
+                    v
+                } else {
+                    Vec::new()
+                };
+                element.push(value);
+            }
+            row.push(element);
+        }
+        Ok(Some(rows))
     }
 
     /// Decode every page of one column chunk into its values.
@@ -831,8 +1056,9 @@ impl ParquetColumnReader {
         &mut self,
         chunk: &ColumnChunk,
         max_def_level: u8,
+        max_rep_level: u8,
         group_index: usize,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Column> {
         // One read for the whole chunk: pages are laid out contiguously from
         // the dictionary page (or first data page) onward.
         let start = chunk.start() as u64;
@@ -844,10 +1070,17 @@ impl ParquetColumnReader {
             .map_err(|e| format!("could not read row group {group_index}: {e}"))?;
 
         let mut dictionary: Vec<Vec<u8>> = Vec::new();
-        let mut values: Vec<Vec<u8>> = Vec::with_capacity(chunk.num_values.max(0) as usize);
+        let mut col = Column {
+            values: Vec::with_capacity(chunk.num_values.max(0) as usize),
+            reps: Vec::new(),
+            defs: Vec::new(),
+        };
+        // Levels are only worth keeping for a nested column: for a flat one the
+        // slots and the values are the same thing.
+        let nested = max_rep_level > 0;
         let mut pos = 0usize;
 
-        while pos < raw.len() && (values.len() as i64) < chunk.num_values {
+        while pos < raw.len() && (col.slots(nested) as i64) < chunk.num_values {
             let (ph, hdr_len) = parse_page_header(&raw[pos..])?;
             pos += hdr_len;
             let clen = ph.compressed_size as usize;
@@ -875,9 +1108,16 @@ impl ParquetColumnReader {
                         .ok_or_else(|| "v1 data page without header".to_string())?;
                     let data = decompress(chunk.codec, page, ph.uncompressed_size as usize)?;
 
-                    // v1 puts the definition levels inside the compressed
-                    // payload, length-prefixed when RLE-encoded.
+                    // v1 puts the level sections inside the compressed payload,
+                    // each length-prefixed: repetition levels first, then
+                    // definition levels, then the values.
                     let mut body = &data[..];
+                    if max_rep_level > 0 {
+                        let section = take_v1_section(&mut body, "repetition")?;
+                        if nested {
+                            read_levels(section, max_rep_level, nv as usize, &mut col.reps)?;
+                        }
+                    }
                     let mut non_null = nv as usize;
                     if max_def_level > 0 {
                         if dle != 3 {
@@ -885,48 +1125,62 @@ impl ParquetColumnReader {
                                 "definition level encoding {dle} is not supported (want RLE)"
                             ));
                         }
-                        if body.len() < 4 {
-                            return Err("v1 page: truncated definition levels".into());
-                        }
-                        let n = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
-                        if 4 + n > body.len() {
-                            return Err("v1 page: definition levels run past page".into());
-                        }
-                        non_null = count_non_null(&body[4..4 + n], nv as usize)?;
-                        body = &body[4 + n..];
+                        let section = take_v1_section(&mut body, "definition")?;
+                        non_null = if nested {
+                            let at = col.defs.len();
+                            read_levels(section, max_def_level, nv as usize, &mut col.defs)?;
+                            col.defs[at..].iter().filter(|&&d| d == max_def_level).count()
+                        } else {
+                            count_non_null(section, nv as usize)?
+                        };
                     }
 
-                    decode_values(enc, body, non_null, &dictionary, &mut values)?;
+                    decode_values(enc, body, non_null, &dictionary, &mut col.values)?;
                 }
                 PAGE_DATA_V2 => {
-                    let (nv, nn, enc, dbl, compressed) = ph
+                    let (nv, nn, enc, dbl, rbl, compressed) = ph
                         .v2
                         .ok_or_else(|| "v2 data page without header".to_string())?;
                     // v2 keeps the level sections uncompressed at the front of
-                    // the page; only the value section is compressed.
-                    let dbl = dbl as usize;
-                    if dbl > page.len() {
+                    // the page, repetition before definition, and their byte
+                    // lengths in the header rather than inline; only the value
+                    // section is compressed.
+                    let (dbl, rbl) = (dbl as usize, rbl as usize);
+                    if rbl + dbl > page.len() {
                         return Err("v2 page: level section runs past page".into());
                     }
-                    let value_bytes = &page[dbl..];
+                    if nested {
+                        if max_rep_level > 0 {
+                            read_levels(&page[..rbl], max_rep_level, nv as usize, &mut col.reps)?;
+                        }
+                        if max_def_level > 0 {
+                            read_levels(
+                                &page[rbl..rbl + dbl],
+                                max_def_level,
+                                nv as usize,
+                                &mut col.defs,
+                            )?;
+                        }
+                    }
+                    let value_bytes = &page[rbl + dbl..];
                     let data = if compressed {
                         decompress(
                             chunk.codec,
                             value_bytes,
-                            (ph.uncompressed_size as usize).saturating_sub(dbl),
+                            (ph.uncompressed_size as usize).saturating_sub(rbl + dbl),
                         )?
                     } else {
                         value_bytes.to_vec()
                     };
                     let non_null = (nv - nn).max(0) as usize;
-                    decode_values(enc, &data, non_null, &dictionary, &mut values)?;
+                    decode_values(enc, &data, non_null, &dictionary, &mut col.values)?;
                 }
                 // Index pages carry no values.
                 _ => {}
             }
         }
 
-        Ok(values)
+        Ok(col)
     }
 }
 
@@ -1048,6 +1302,86 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(dec.next().unwrap(), Some(1));
         }
+    }
+
+    fn el(name: &str, ty: Option<i64>, repetition: i64, num_children: i64) -> SchemaElement {
+        SchemaElement {
+            name: name.to_string(),
+            ty,
+            repetition,
+            num_children,
+        }
+    }
+
+    /// The schema of a chat corpus: `messages: list<struct<role, content>>`
+    /// beside a flat `source`. Repetition 0 = REQUIRED, 1 = OPTIONAL,
+    /// 2 = REPEATED; type 6 = BYTE_ARRAY.
+    #[test]
+    fn schema_leaves_computes_paths_and_levels() {
+        let schema = vec![
+            el("root", None, 0, 2),
+            el("messages", None, 1, 1),
+            el("list", None, 2, 1),
+            el("element", None, 0, 2),
+            el("role", Some(6), 1, 0),
+            el("content", Some(6), 1, 0),
+            el("source", Some(6), 1, 0),
+        ];
+        let leaves = schema_leaves(&schema);
+        let paths: Vec<&str> = leaves.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "messages.list.element.role",
+                "messages.list.element.content",
+                "source"
+            ],
+            "the root's own name must not appear in a path"
+        );
+        // messages (optional) + list (repeated) + role (optional) = 3 levels
+        // that may be absent; only `list` repeats.
+        assert_eq!((leaves[0].max_def, leaves[0].max_rep), (3, 1));
+        assert_eq!((leaves[1].max_def, leaves[1].max_rep), (3, 1));
+        // A flat optional column: present at def 1, never repeats.
+        assert_eq!((leaves[2].max_def, leaves[2].max_rep), (1, 0));
+        assert_eq!(leaves[0].name(), "role");
+    }
+
+    #[test]
+    fn level_width_is_the_bits_the_max_level_needs() {
+        assert_eq!(level_width(0), 0);
+        assert_eq!(level_width(1), 1);
+        assert_eq!(level_width(2), 2);
+        assert_eq!(level_width(3), 2);
+        assert_eq!(level_width(4), 3);
+    }
+
+    #[test]
+    fn plain_page_limit_is_relative_to_what_is_already_decoded() {
+        // A row group with two PLAIN pages: the second decodes into an `out`
+        // that already holds the first page's values.
+        let page = |vals: &[&str]| {
+            let mut d = Vec::new();
+            for s in vals {
+                d.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                d.extend_from_slice(s.as_bytes());
+            }
+            d
+        };
+        let mut out = Vec::new();
+        plain_byte_arrays(&page(&["a", "b"]), 2, &mut out).unwrap();
+        plain_byte_arrays(&page(&["c", "d", "e"]), 3, &mut out).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec()
+            ],
+            "a page after the first must not be truncated"
+        );
     }
 
     #[test]

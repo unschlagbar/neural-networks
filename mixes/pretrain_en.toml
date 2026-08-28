@@ -1,0 +1,82 @@
+#:schema ../datamix/mixture.schema.json
+# English pretraining corpus: FineWeb-Edu + FineMath + this machine's Rust code,
+# written as a FOLDER of shards so a training run can walk it file by file.
+#
+#   cargo run -p datamix --release -- check mixes/pretrain_en.toml   # stats only
+#   cargo run -p datamix --release -- build mixes/pretrain_en.toml
+#
+# Every source runs at `epochs = 1` and the weights are proportional to what
+# each source actually holds after filtering, so all of them are exhausted at
+# the same moment: every document appears EXACTLY ONCE, and no document is left
+# behind. Measured (see the report): FineWeb 11.64G tokens, FineMath 1.55G,
+# Rust 10.5M — 13.2G in total.
+
+[output]
+kind = "text"
+# The shards land as pretrain_en/shard.000.txt, shard.001.txt, ... Each is cut
+# at a document border, so a shard is a corpus in its own right.
+path = "data/mix/pretrain_en/shard.txt"
+shard_bytes = "512M"
+report = "data/mix/pretrain_en/report.md"
+seed = 11
+tokens = 0            # 0 = everything the weights allow without repeating
+holdout = 0.0005
+shuffle = true
+
+# Global gates only — anything that would be wrong for web prose lives on the
+# source that needs it. `max_line_bytes` in particular must NOT be global: a web
+# document is often one paragraph per line and would be wiped out by it.
+[filter]
+min_bytes = 200
+max_bytes = "400k"
+max_dup_line_ratio = 0.5
+dedup = "exact"
+
+# Shards 0-5 are already trained on; skip_files resumes at 000_00006.
+# Measured over shards 6-10: 2,176,013 documents read, 47 dropped — the corpus
+# is already cleaned upstream, so these filters are cheap insurance, not a sieve.
+[source.fineweb]
+kind = "parquet"
+path = "/home/unschlagbar/training_data/FineWeb"
+skip_files = 6
+languages = ["en"]
+min_alpha_ratio = 0.6
+weight = 88.19
+epochs = 1
+
+# Math prose is symbol-heavy (LaTeX, formulae), so the letter-ratio gate has to
+# be much looser than for web text or it eats the good documents.
+[source.finemath]
+kind = "parquet"
+path = "/home/unschlagbar/training_data/FineMath"
+min_alpha_ratio = 0.3
+weight = 11.75
+epochs = 1
+
+# The Rust sources are tiny next to the web corpora — 10.5M tokens once
+# deduplicated, 0.08% of the corpus. At `epochs = 1` that is what they are
+# worth; repeating them to buy a bigger share would put the same thousand files
+# in front of the model dozens of times.
+[source.rust-lib]
+kind = "dir"
+path = "data/rust-lib"
+ext = ["rs"]
+min_alpha_ratio = 0.4
+max_line_bytes = 2000
+dedup = "near"        # 62.8k files, ~1.2k unique
+weight = 0.042
+epochs = 1
+
+[source.rust-std]
+kind = "dir"
+path = "data/rust-std"
+ext = ["rs"]
+min_alpha_ratio = 0.4
+max_line_bytes = 2000
+dedup = "near"
+weight = 0.026
+epochs = 1
+
+# The Rust book markdown (data/mds) used to be a source here; the directory is
+# gone from this machine, so the section is dropped rather than failing the
+# build. Restore it by putting the .md files back and re-adding a `dir` source.

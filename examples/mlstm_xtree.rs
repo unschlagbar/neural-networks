@@ -64,13 +64,15 @@ fn main() {
     };
     let mut ys = Vec::new();
     let mut dxs = Vec::new();
+    // Each chunk's input outlives its forward: backward reads it again.
+    let xs: Vec<GTensor<f32>> = (0..chunks).map(|c| part(&xh, c)).collect();
     for c in 0..chunks {
         let mut y = GTensor::uninit(&gpu, &[b, step, d]);
-        cell.forward(&gpu, &part(&xh, c), &mut y, &cache);
+        cell.forward(&gpu, &xs[c], &mut y, &cache);
         ys.push(y);
     }
     for c in (0..chunks).rev() {
-        dxs.push(cell.backward_alloc(&gpu, &part(&gh, c), &cache));
+        dxs.push(cell.backward_alloc(&gpu, &xs[c], &part(&gh, c), &cache));
     }
 
     println!("t={t} chunks={chunks} d={d} heads={heads} dqk={dqk}");

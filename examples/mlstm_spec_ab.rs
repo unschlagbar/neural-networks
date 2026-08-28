@@ -84,13 +84,13 @@ fn main() {
             let mut y = GTensor::uninit(&gpu, &[b, t, d]);
             for _ in 0..3 {
                 dev.forward(&gpu, &x, &mut y, &cache);
-                let _ = dev.backward_alloc(&gpu, &g, &cache);
+                let _ = dev.backward_alloc(&gpu, &x, &g, &cache);
             }
             gpu.stream.synchronize().unwrap();
             let t0 = Instant::now();
             for _ in 0..iters {
                 dev.forward(&gpu, &x, &mut y, &cache);
-                let _ = dev.backward_alloc(&gpu, &g, &cache);
+                let _ = dev.backward_alloc(&gpu, &x, &g, &cache);
             }
             gpu.stream.synchronize().unwrap();
             t0.elapsed().as_secs_f64() / iters as f64 * 1e3

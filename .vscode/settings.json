@@ -1,0 +1,12 @@
+{
+    // Mixture files (mixes/*.toml) are validated against the datamix schema:
+    // unknown keys, wrong types and bad enum values are flagged while typing.
+    // The `#:schema` line at the top of each file does the same for editors
+    // that read it; this association covers the ones that do not.
+    "evenBetterToml.schema.associations": {
+        ".*/mixes/.*\\.toml$": "./datamix/mixture.schema.json"
+    },
+    "tombi.schema.catalog.paths": [
+        "./datamix/mixture.schema.json"
+    ]
+}

@@ -1,0 +1,145 @@
+#:schema ../datamix/mixture.schema.json
+# SFT corpus for the assistant: general instruction-following from SmolTalk,
+# plus the tool-calling skills no public corpus covers.
+#
+#   cargo run -p datamix --release -- ping  mixes/assistant_smoltalk.toml
+#   cargo run -p datamix --release -- build mixes/assistant_smoltalk.toml
+#   cargo run -p datamix --release -- verify data/mix/assistant_smoltalk.jsonl
+#
+# The `llm` sources call the local server and take roughly two seconds per
+# example, so the first build of 500 of them is ~15 minutes. Replies are cached
+# under target/datamix-llm-cache: rebuilding is free, and raising `count` only
+# pays for the new ones.
+
+[output]
+kind = "sft"
+path = "data/mix/assistant_smoltalk.jsonl"
+report = "data/mix/assistant_smoltalk_report.md"
+seed = 1234
+holdout = 0.02
+# No budget: take the largest corpus in which no source exceeds its `epochs`.
+# The build names the source that binds it.
+tokens = 0
+
+[llm]
+endpoint = "http://localhost:1234/v1"
+model = ""                            # whatever the server has loaded
+temperature = 1.0                     # generation wants variety; the judge overrides this
+max_tokens = 1200
+timeout = 600
+
+[filter]
+# The real cap is in WORDS — the unit the backbone unrolls in, one decoder
+# rollout each — and it matches SFT_MAX_WORDS / WORDS_PER_SEQ in src/config.rs.
+# Counted with the model's own splitter (the `wordseg` crate), so a record that
+# passes here is a record the trainer will accept. The token cap behind it is
+# only a guard against pathological words.
+max_words = 4096
+max_tokens = 28672
+min_bytes = 16
+dedup = "exact"
+
+# General instruction-following and multi-turn chat: 115k conversations,
+# 43.6M tokens inside the window once trimmed. Without this the model would only ever
+# have learned to emit tool calls.
+[source.smoltalk]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smol-smoltalk"
+weight = 65
+epochs = 1
+# Keep the exchanges that fit instead of dropping the conversation: two thirds
+# of SmolTalk is longer than the window, and the early turns of a long chat are
+# perfectly good training data.
+trim_turns = true
+
+# Templates: exhaustive coverage of every app, verb and tool result.
+[source.lamp]
+kind = "synth"
+path = "mixes/synth/lamp.syn"
+count = 4000
+epochs = 8
+weight = 12
+
+[source.apps]
+kind = "synth"
+path = "mixes/synth/apps.syn"
+count = 3000
+epochs = 1
+weight = 4
+
+[source.tools_in_context]
+kind = "synth"
+path = "mixes/synth/tools_in_context.syn"
+count = 0
+epochs = 8
+weight = 4
+
+# Generated: phrasing the templates cannot reach. `seeds` renders whole examples
+# in the output format — seeding with instructions alone makes the model invent
+# its own tool syntax. Every generated example is then vetted against the tool
+# contract, at temperature 0.
+[source.lamp_llm]
+kind = "llm"
+weight = 9
+count = 300
+batch = 10
+seeds = 4
+epochs = 1
+dedup = "near"
+system = "You generate training data for a small home-assistant model. You answer ONLY with JSON lines, one object per line, keys: instruction, context, response. No prose, no code fences."
+seed_file = "mixes/synth/lamp.syn"
+prompt = """
+Here are real examples from the training set, in the exact format you must \
+answer in:
+
+{seed}
+Write {n} MORE lines in exactly that format. Vary the phrasing hard: indirect \
+requests ("it's too dark in here"), typos, curt commands, two rooms in one \
+sentence. Use ONLY the tool names, argument names \
+and application identifiers that appear above, with the same <tool>...</tool> \
+wrapper. Never invent a tool, an argument or a result.
+
+Do NOT answer or perform the requests themselves — you are writing training \
+data about them. Output nothing but {n} JSON lines, one object per line, each \
+with the keys instruction, context and response.
+"""
+judge = """
+You are checking training examples for a home-assistant model. There is \
+exactly ONE lamp; it has no colour and no brightness. The ONLY tools that \
+exist are: lamp.set(on=true|false) and lamp.state(). A tool result is one of: \
+on, off, already_on, already_off. Answer "no" if the response calls anything \
+else, passes a room, a colour or a brightness, invents a result, if the \
+<tool>...</tool> wrapper is malformed or duplicated, or if the reply \
+contradicts the result it was given. Otherwise answer "yes".
+"""
+
+[source.apps_llm]
+kind = "llm"
+weight = 6
+count = 200
+batch = 10
+seeds = 4
+epochs = 1
+dedup = "near"
+system = "You generate training data for a small desktop-assistant model. You answer ONLY with JSON lines, one object per line, keys: instruction, context, response. No prose, no code fences."
+seed_file = "mixes/synth/apps.syn"
+prompt = """
+Here are real examples from the training set, in the exact format you must \
+answer in:
+
+{seed}
+Write {n} MORE lines in exactly that format, varying the phrasing hard. Use \
+ONLY the tool names, argument names and application identifiers shown above.
+
+Do NOT answer or perform the requests themselves — you are writing training \
+data about them. Output nothing but {n} JSON lines, one object per line, each \
+with the keys instruction, context and response.
+"""
+judge = """
+You are checking training examples for a desktop-assistant model. The ONLY \
+tools that exist are: app.launch(name), app.quit(name), browser.open(url), \
+media.control(action), system.screenshot(). Answer "no" if the response calls \
+anything else, invents an argument, if the <tool>...</tool> wrapper is \
+malformed or duplicated, or if the call does not do what the instruction \
+asked. Otherwise answer "yes".
+"""

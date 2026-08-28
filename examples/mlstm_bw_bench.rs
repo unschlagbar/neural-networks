@@ -103,7 +103,7 @@ fn main() {
     for (x, g, cell, y) in cells.iter_mut() {
         for _ in 0..warmup {
             cell.forward(&gpu, x, y, &cache);
-            let _ = cell.backward_alloc(&gpu, g, &cache);
+            let _ = cell.backward_alloc(&gpu, x, g, &cache);
         }
     }
     gpu.stream.synchronize().unwrap();
@@ -127,7 +127,7 @@ fn main() {
             let t0 = Instant::now();
             for _ in 0..iters {
                 cell.forward(&gpu, x, y, &cache);
-                let _ = cell.backward_alloc(&gpu, g, &cache);
+                let _ = cell.backward_alloc(&gpu, x, g, &cache);
             }
             gpu.stream.synchronize().unwrap();
             let both = t0.elapsed().as_secs_f64() / iters as f64 * 1e3;

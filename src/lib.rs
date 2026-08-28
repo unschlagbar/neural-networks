@@ -18,12 +18,14 @@ pub mod prepare_set;
 pub mod pretrain_progress;
 pub mod sampling;
 pub mod saving;
-pub mod segment;
 pub mod sequential;
+// The corpus definitions live in their own crate so `datamix` counts exactly
+// the words this model trains on; re-exported so `crate::segment::…` and
+// `crate::tokenizer_utf8::…` keep resolving.
+pub use wordseg::{segment, tokenizer_utf8};
 pub mod sft;
 pub mod sft_progress;
 pub mod tensor;
-pub mod tokenizer_utf8;
 pub mod training;
 pub mod wake_word;
 pub mod word_encoder;

@@ -1,0 +1,12 @@
+[package]
+name = "datamix"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# CPU-only: the pipeline never touches the GPU, and `default-features = false`
+# keeps `cargo run -p datamix` building on a box without a CUDA toolkit.
+neural-networks = { path = "..", default-features = false }
+# The word split itself. A corpus is capped in *words* — the unit the backbone
+# unrolls in — so the counting has to be the model's own, not a lookalike.
+wordseg = { path = "../wordseg" }

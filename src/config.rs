@@ -8,10 +8,10 @@ pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 pub const WORDS_PER_SEQ: usize = 1024 * 4; // K — words per window / backbone unroll length
 pub const MIN_WORDS_PER_SEQ: usize = 8; // keep a trailing window only if >= this
 
-/// Cap on the bytes of a single word (see `crate::segment`). Words longer than
-/// this — a giant identifier, a base64 blob, a huge indent block — are chopped
-/// into pieces, which bounds the decoder's per-word unroll.
-pub const MAX_WORD_BYTES: usize = 16;
+// The word split's own constant: it defines what a word is, so it lives with
+// the splitter and is re-exported here for the call sites that read it as a
+// model dimension.
+pub use wordseg::MAX_WORD_BYTES;
 
 /// Safety cap on tokens per word-window. Deliberately generous: WORDS_PER_SEQ
 /// is meant to bind first — this only guards against a pathological run with no
@@ -32,7 +32,7 @@ pub const DECAY_WINDOWS: usize = 1_500_000;
 // Windows whose gradients are accumulated before one optimizer step. Muon
 // (matrices) is scale-invariant via the Frobenius normalization and aux-Adam
 // (vectors) via its second moment, so summed grads need no manual rescaling.
-pub const BATCH_SIZE: usize = 2;
+pub const BATCH_SIZE: usize = 8;
 pub const EPOCHS: usize = 1;
 
 pub const SAVE_EVERY: usize = 1000;
@@ -63,6 +63,15 @@ pub const TOP_P: f32 = 0.9;
 pub const CHAR_HIDDEN: usize = 256;
 pub const OUT_HIDDEN: usize = 256;
 pub const WORD_HIDDEN: usize = 1024;
+
+/// SwiGLU inner width for a block of width `hidden`: the `8·hidden/3` paper
+/// default rounded up to a multiple of 64, so every up/down projection GEMM has
+/// a tile-aligned inner dimension (128 -> 384, 1024 -> 2752).
+#[inline]
+pub fn up_of(hidden: usize) -> usize {
+    let up = hidden * 8 / 3;
+    up.div_ceil(64).max(1) * 64
+}
 
 /// Output-logit soft cap (xLSTM-7B uses 30): logits = cap · tanh(z / cap).
 /// Bounds the logits and removes the cross-entropy incentive for unbounded
@@ -176,7 +185,10 @@ pub const PARQUET_LANGUAGE_COLUMN: &str = "language";
 /// Corpus path. A `.parquet` extension selects the parquet reader (one row per
 /// document, column `text` — override with `PARQUET_TEXT_COLUMN`); anything else
 /// is read as plain text with `<|endoftext|>` document separators.
-pub const TRAIN_DATA: &str = "../../training_data/000_00003.parquet";
+// Default corpus offered when a run has no progress sidecar to continue from.
+// A directory is walked shard by shard (see `pretrain_progress::Corpus`); a
+// single file still works as a one-file corpus.
+pub const TRAIN_DATA: &str = "data/mix/pretrain_en";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
 // Post-training (SFT / instruction tuning)
@@ -184,7 +196,7 @@ pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 /// Instruction dataset (JSONL: `{instruction, context, response, category}`,
 /// databricks-dolly-15k layout). Formatted into masked chat windows by
 /// `crate::sft`; the loss counts only the response tokens.
-pub const SFT_DATA: &str = "/home/unschlagbar/training_data/databricks-dolly-15k.jsonl";
+pub const SFT_DATA: &str = "data/mix/assistant_qa.jsonl";
 /// Passes over the SFT set. A few epochs is typical for instruction tuning on a
 /// small set; too many overfits the ~15k examples.
 pub const SFT_EPOCHS: usize = 1;
@@ -192,13 +204,17 @@ pub const SFT_EPOCHS: usize = 1;
 /// fine-tuning nudges the pretrained weights instead of overwriting them.
 pub const SFT_LR: f32 = 5e-6;
 
-/// Cap on the token length of one SFT example. The per-example cache (encoder +
-/// decoder, one slot per token) is sized to the LONGEST example, so a single
-/// giant record (dolly's tail runs to ~27k tokens) would blow up memory for the
-/// whole run. Examples longer than this are dropped when the set is loaded —
-/// 2048 keeps ~93% of dolly while bounding the cache. Raise it if you have the
-/// RAM/VRAM; lower it if you still OOM.
-pub const SFT_MAX_TOKENS: usize = 2048;
+/// Cap on the **words** of one SFT example — the unit the model actually
+/// unrolls in: one backbone step and one decoder rollout per word. Matching
+/// `WORDS_PER_SEQ` makes an SFT window the same shape as a pretraining window,
+/// so a run that fits `hg` fits `hqg`.
+pub const SFT_MAX_WORDS: usize = WORDS_PER_SEQ;
+
+/// Safety cap on the tokens of one SFT example. `SFT_MAX_WORDS` is meant to
+/// bind first; this only guards against a pathological record whose words are
+/// all `MAX_WORD_BYTES` long. Sized like `MAX_WINDOW_TOKENS` for the same
+/// reason: the per-example cache holds one slot per token.
+pub const SFT_MAX_TOKENS: usize = MAX_WINDOW_TOKENS;
 
 // Wake Word
 

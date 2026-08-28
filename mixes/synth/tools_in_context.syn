@@ -1,0 +1,121 @@
+# Tool calls that are NOT the first thing in an empty conversation.
+#
+# Every tool example in the other two files opens its conversation, and a model
+# trained only on those learns "a tool call is what turn one looks like": give
+# it a context, or ask after two lines of small talk, and it answers in prose
+# instead of calling anything. These templates put the same calls everywhere
+# else they can occur — after chit-chat, under a system context, and with the
+# conversation carrying on afterwards.
+
+list chat = how's it going? ; All quiet here. What do you need? | you there? ; Always. What's up? | good morning ; Morning. What can I do? | anything to report? ; Nothing on my end. Go ahead.
+list after = what else can you do? ; Apps, the browser, music — ask and I'll try. | thanks ; Any time. | you're quick ; Not much to it. | what's your name again? ; Jarvis.
+list ctx = You are Jarvis, the assistant on this machine. | Keep your answers short. | You control one lamp and the desktop applications. | The user prefers brief replies.
+list app = Firefox ; firefox | Spotify ; spotify | the terminal ; kitty | VS Code ; code | Discord ; discord
+list installed = firefox, spotify, kitty, code, nautilus, discord, steam
+
+# Small talk first, tool call second.
+template
+user      = {chat.0}
+assistant = {chat.1}
+user      = {turn|switch} on the {light|lamp}
+assistant = <tool>lamp.set(on=true)</tool>
+tool      = on
+assistant = {Done|There you go}.
+category  = tools_in_context
+
+template
+user      = {chat.0}
+assistant = {chat.1}
+user      = {open|start} {app.0}
+assistant = <tool>app.launch(name="{app.1}")</tool>
+tool      = ok
+assistant = {app.0} is up.
+category  = tools_in_context
+
+# A filled <CONTEXT> slot must not stop it calling anything.
+template
+system    = {ctx.0}
+user      = {turn|switch} on the {light|lamp}
+assistant = <tool>lamp.set(on=true)</tool>
+tool      = on
+assistant = {Done|Light's on}.
+category  = tools_in_context
+
+template
+system    = {ctx.0}
+user      = {open|start} {app.0}
+assistant = <tool>app.launch(name="{app.1}")</tool>
+tool      = ok
+assistant = {app.0} is {up|open}.
+category  = tools_in_context
+
+template
+system    = {ctx.0}
+user      = {chat.0}
+assistant = {chat.1}
+user      = is the {light|lamp} on?
+assistant = <tool>lamp.state()</tool>
+tool      = off
+assistant = {It's off.|No — off right now.} {Want it on?|}
+category  = tools_in_context
+
+# The conversation carries on after a call: prose follows a tool result without
+# another call being needed.
+template
+user      = {turn|switch} on the {light|lamp}
+assistant = <tool>lamp.set(on=true)</tool>
+tool      = on
+assistant = {Done|There you go}.
+user      = {after.0}
+assistant = {after.1}
+category  = tools_in_context
+
+template
+user      = {open|start} {app.0}
+assistant = <tool>app.launch(name="{app.1}")</tool>
+tool      = ok
+assistant = {app.0} is up.
+user      = {after.0}
+assistant = {after.1}
+category  = tools_in_context
+
+# Prose, then a call, then prose again — three registers in one conversation.
+template
+user      = {chat.0}
+assistant = {chat.1}
+user      = {open|start} {app.0}
+assistant = <tool>app.launch(name="{app.1}")</tool>
+tool      = ok
+assistant = {Open|Up now}.
+user      = {after.0}
+assistant = {after.1}
+category  = tools_in_context
+
+# Two different tools in one conversation, neither of them in turn one.
+template
+user      = {chat.0}
+assistant = {chat.1}
+user      = {turn|switch} on the {light|lamp}
+assistant = <tool>lamp.set(on=true)</tool>
+tool      = on
+assistant = {Done|There you go}.
+user      = {and|now} {open|start} {app.0}
+assistant = <tool>app.launch(name="{app.1}")</tool>
+tool      = ok
+assistant = {app.0} too. {Anything else?|}
+category  = tools_in_context
+
+# The recovery chain, reached mid-conversation rather than from a cold start.
+template
+system    = {ctx.0}
+user      = {chat.0}
+assistant = {chat.1}
+user      = {open|start} the music app
+assistant = <tool>app.launch(name="musicapp")</tool>
+tool      = not_found
+assistant = <tool>app.list()</tool>
+tool      = {installed.0}
+assistant = <tool>app.launch(name="spotify")</tool>
+tool      = ok
+assistant = {That'd be Spotify — it's up.|Spotify, that is. Opened it.}
+category  = tools_in_context

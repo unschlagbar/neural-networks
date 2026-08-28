@@ -202,10 +202,10 @@ impl SequentialBuilder {
 
     /// Multi-Head-mLSTM-Block im Stil von xLSTM-7B
     /// (zwei separate Residuals + RMSNorm + SwiGLU).
-    /// up_size = 8·hidden / 3 (paper default).
+    /// up_size = `config::up_of(hidden)`.
     pub fn mlstm_block(mut self, num_heads: usize, dqk: usize) -> Self {
         let hidden = self.output_size;
-        let up = (hidden * 8) / 3;
+        let up = crate::config::up_of(hidden);
         let layer = MLSTMBlock::new(hidden, num_heads, dqk, up);
         self.layer(Box::new(layer), hidden);
         self
@@ -216,7 +216,7 @@ impl SequentialBuilder {
     ///
     /// Input and output are both `hidden` (that is the purpose of the residual —
     /// the block can be stacked freely). The internal SwiGLU width (`up_size`)
-    /// is chosen as `8·hidden / 3` (MLP params ≈ 8·H², analogous to GPT-NeoX
+    /// comes from `config::up_of` (MLP params ≈ 8·H², analogous to GPT-NeoX
     /// / LLaMA-style blocks).
     pub fn slstm_block(mut self, hidden: usize) -> Self {
         assert_eq!(
@@ -224,7 +224,7 @@ impl SequentialBuilder {
             "slstm_block erwartet input_size == hidden ({} != {})",
             self.output_size, hidden,
         );
-        let up = (hidden * 8) / 3;
+        let up = crate::config::up_of(hidden);
         let layer = SLSTMBlock::new(hidden, up);
         self.layer(Box::new(layer), hidden);
         self

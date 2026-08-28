@@ -1,0 +1,195 @@
+# Launching and controlling desktop applications.
+#
+# Tools and their results (nothing else exists):
+#   app.launch(name="…")  -> ok | already_running | not_found
+#   app.list()            -> the installed ids, comma separated
+#   app.quit(name="…")    -> ok | not_running
+#   browser.open(url="…") -> ok
+#   media.control(action="…") -> ok | nothing_playing
+#   system.screenshot()   -> saved
+#
+# `app.launch` is tried FIRST, always. `app.list` is the recovery step, not the
+# opening move: only a `not_found` justifies asking what exists. Having seen the
+# list the assistant either launches the thing under its real id, or says the
+# app is not on this machine — it never invents a third option.
+
+list installed = firefox, spotify, kitty, code, nautilus, discord, steam
+
+list app = Firefox ; firefox | Spotify ; spotify | the terminal ; kitty | VS Code ; code | the file manager ; nautilus | Discord ; discord | Steam ; steam
+list site = github ; https://github.com | youtube ; https://youtube.com | the rust docs ; https://doc.rust-lang.org | my mail ; https://mail.google.com
+
+# Field 0 is what a person says, 1 the id the assistant guesses from it, 2 the
+# id that is actually installed. The guess FAILS — that is what makes the list
+# call worth making.
+list vague = the music app ; musicapp ; spotify | my code editor ; codeeditor ; code | the files app ; filesapp ; nautilus | the chat app ; chatapp ; discord
+
+# Not on this machine under any name. The list call ends the search.
+list missing = Photoshop ; photoshop | Chrome ; chrome | Slack ; slack | Outlook ; outlook | Excel ; excel
+
+template
+user      = {open|start|launch|fire up} {app.0}
+assistant = <tool>app.launch(name="{app.1}")</tool>
+tool      = ok
+assistant = {app.0} is {up|open}.
+category  = apps
+
+template
+user      = {open|start} {app.0}
+assistant = <tool>app.launch(name="{app.1}")</tool>
+tool      = already_running
+assistant = {Already running|It's already open} — {switched you to it|it's there}.
+category  = apps
+
+# The recovery chain, near-match branch: the guess misses, the list has the real
+# id, so it launches that and says which one it opened.
+template
+user      = {open|start|pull up} {vague.0}
+assistant = <tool>app.launch(name="{vague.1}")</tool>
+tool      = not_found
+assistant = <tool>app.list()</tool>
+tool      = {installed.0}
+assistant = <tool>app.launch(name="{vague.2}")</tool>
+tool      = ok
+assistant = {That'd be|That's} {vague.2} — {opened it|it's up now}.
+category  = apps
+
+# Recovery chain, dead end: the list settles it, and it says so rather than
+# guessing at something else.
+template
+user      = {open|start|launch} {missing.0}
+assistant = <tool>app.launch(name="{missing.1}")</tool>
+tool      = not_found
+assistant = <tool>app.list()</tool>
+tool      = {installed.0}
+assistant = {missing.0} {isn't installed here|isn't on this machine}. {I checked everything available.|What's here is Firefox, Spotify, the terminal, VS Code, the file manager, Discord and Steam.}
+category  = apps
+
+template
+user      = {close|quit|kill} {app.0}
+assistant = <tool>app.quit(name="{app.1}")</tool>
+tool      = ok
+assistant = {Closed|Shut it down|Done}.
+category  = apps
+
+template
+user      = {close|quit} {app.0}
+assistant = <tool>app.quit(name="{app.1}")</tool>
+tool      = not_running
+assistant = {It wasn't running|That one isn't open} {anyway|to begin with}.
+category  = apps
+
+template
+user      = {open|pull up} {site.0}{| in the browser}
+assistant = <tool>browser.open(url="{site.1}")</tool>
+tool      = ok
+assistant = {There you go|Opened {site.0}|Got it}.
+category  = apps
+
+list media = play ; play | pause ; pause | stop ; stop | skip ; next | next track ; next
+
+template
+user      = {media.0}{| the music| the track| it}
+assistant = <tool>media.control(action="{media.1}")</tool>
+tool      = ok
+assistant = {Done|Got it}.
+category  = apps
+
+template
+user      = {pause|skip|stop} {the music|it}
+assistant = <tool>media.control(action="pause")</tool>
+tool      = nothing_playing
+assistant = {Nothing's playing right now|There's nothing playing}. {Want me to start Spotify?|}
+category  = apps
+
+template
+user      = {take a screenshot|screenshot this|grab the screen}
+assistant = <tool>system.screenshot()</tool>
+tool      = saved
+assistant = {Saved|Got it|Done}.
+category  = apps
+
+template
+user      = what {apps|programs} {do i have|are installed|can you open}?
+assistant = <tool>app.list()</tool>
+tool      = {installed.0}
+assistant = Firefox, Spotify, the terminal, VS Code, the file manager, Discord and Steam.
+category  = apps
+
+# The other half of every offer above: what the model does when you accept.
+# Without these it proposes an action and then has nothing to follow it with.
+
+list yes = yes | yeah | please | go on | do it | yes please | sure
+list no  = no | no thanks | leave it | not now | nah
+
+template
+user      = {pause|stop} {the music|it}
+assistant = <tool>media.control(action="pause")</tool>
+tool      = nothing_playing
+assistant = {Nothing's playing|There's nothing playing}. {Want me to start Spotify?|Shall I put something on?}
+user      = {yes.0}
+assistant = <tool>app.launch(name="spotify")</tool>
+tool      = ok
+assistant = {Spotify's up.|There you go — Spotify.}
+category  = apps
+
+template
+user      = {pause|stop} {the music|it}
+assistant = <tool>media.control(action="pause")</tool>
+tool      = nothing_playing
+assistant = {Nothing's playing|There's nothing playing}. {Want me to start Spotify?|Shall I put something on?}
+user      = {no.0}
+assistant = {Right|Fine}. {Say the word if you change your mind.|I'll leave it.}
+category  = apps
+
+# A dead end is still an offer: it cannot reach the app, but it can reach the web.
+template
+user      = {open|start} {missing.0}
+assistant = <tool>app.launch(name="{missing.1}")</tool>
+tool      = not_found
+assistant = <tool>app.list()</tool>
+tool      = {installed.0}
+assistant = {missing.0} isn't installed here. {Want me to open it in the browser?|Shall I try the web version?}
+user      = {yes.0}
+assistant = <tool>browser.open(url="https://google.com/search?q={missing.1}")</tool>
+tool      = ok
+assistant = {Searched for it.|Opened a search for it.}
+category  = apps
+
+# Recovering from its own mistake. `assistant_context` turns are read but never
+# trained on, so the wrong call is context the model learns to answer, never an
+# output it learns to produce.
+
+# Field 0 is what was asked for, 1 its id, 2 the id it wrongly launched. The
+# wrong id is bound to the entry rather than drawn on its own, because a
+# separately drawn one lands on the right app often enough to make the masked
+# turn and the scored turn the same string — a "mistake" the model is then
+# trained on after all.
+list mixup = Spotify ; spotify ; firefox | the terminal ; kitty ; code | VS Code ; code ; kitty | Discord ; discord ; steam | Steam ; steam ; discord | the file manager ; nautilus ; firefox | Firefox ; firefox ; spotify
+
+template
+user             = {open|start} {mixup.0}
+assistant_context = <tool>app.launch(name="{mixup.2}")</tool>
+tool             = ok
+assistant_context = Opened {mixup.2}.
+user             = {i said {mixup.0}|no, {mixup.0}|that's the wrong one}
+assistant        = <tool>app.launch(name="{mixup.1}")</tool>
+tool             = ok
+assistant        = {Sorry about that|My mistake} — {mixup.0} {is up now|now}.
+category         = apps
+
+template
+user             = {open|start} {app.0}
+assistant_context = <tool>app.quit(name="{app.1}")</tool>
+tool             = not_running
+assistant        = <tool>app.launch(name="{app.1}")</tool>
+tool             = ok
+assistant        = {Sorry, I had that backwards|Wrong call, sorry} — {app.0} is up.
+category         = apps
+
+# A launch that simply fails. Nothing to recover to, so it says so.
+template
+user             = {open|start} {app.0}
+assistant        = <tool>app.launch(name="{app.1}")</tool>
+tool             = failed
+assistant        = {app.0} {wouldn't start|failed to launch}. {Want me to try again?|Something's wrong on its end.}
+category         = apps

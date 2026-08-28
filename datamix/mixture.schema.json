@@ -1,0 +1,502 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://local/datamix/mixture.schema.json",
+  "title": "datamix mixture",
+  "description": "Sources, weights and quality gates for one corpus build.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "output": {
+      "type": "object",
+      "description": "Where the corpus goes and how big it is.",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "description": "sft = JSONL for src/sft.rs; text = <|endoftext|>-separated for ChunkedWordDataSet; none = report only.",
+          "enum": [
+            "sft",
+            "text",
+            "none",
+            "report"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "description": "Output file. The eval holdout is written next to it as <path>.eval."
+        },
+        "report": {
+          "type": "string",
+          "description": "Markdown build report. Empty = printed only."
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Seeds every shuffle and draw; the same mixture always builds the same corpus."
+        },
+        "weight_by": {
+          "description": "What a source weight is a share of, and what the budget counts. records mixes by how many examples each source contributes, whatever their length.",
+          "enum": [
+            "tokens",
+            "records"
+          ]
+        },
+        "records": {
+          "description": "Record budget, used instead of tokens when weight_by = records. 0 = as large as the weights allow.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string",
+              "pattern": "^([0-9_]+[kKmMgG]?|unlimited|-)$"
+            }
+          ]
+        },
+        "tokens": {
+          "description": "Token budget. 0 = as large as the weights allow without any source exceeding its epochs.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string",
+              "pattern": "^([0-9_]+[kKmMgG]?|unlimited|-)$"
+            }
+          ]
+        },
+        "shuffle": {
+          "type": "boolean",
+          "description": "Shuffle records across sources (default true)."
+        },
+        "holdout": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 0.9,
+          "description": "Fraction diverted to <path>.eval."
+        },
+        "shard_bytes": {
+          "description": "Split the output into files of at most this size, at document borders. 0 = one file.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string",
+              "pattern": "^([0-9_]+[kKmMgG]?|unlimited|-)$"
+            }
+          ]
+        }
+      }
+    },
+    "filter": {
+      "$ref": "#/definitions/filters",
+      "description": "Quality defaults, inherited by every source."
+    },
+    "llm": {
+      "type": "object",
+      "description": "Local OpenAI-compatible server (LM Studio and friends). Only used by kind = \"llm\" sources and judge filters.",
+      "additionalProperties": false,
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "pattern": "^(http://)?[^/]+",
+          "description": "e.g. http://localhost:1234/v1 \u2014 http only."
+        },
+        "model": {
+          "type": "string",
+          "description": "Model id as the server reports it. Empty = whatever it has loaded."
+        },
+        "temperature": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_tokens": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Seconds to wait on one completion."
+        },
+        "retries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache": {
+          "type": "string",
+          "description": "Directory of cached replies. Empty disables caching."
+        },
+        "api_key": {
+          "type": "string"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "description": "One table per input: [source.NAME].",
+      "additionalProperties": {
+        "$ref": "#/definitions/source"
+      }
+    }
+  },
+  "definitions": {
+    "size": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^([0-9_]+[kKmMgG]?|unlimited|-)$"
+        }
+      ]
+    },
+    "filters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "min_bytes": {
+          "$ref": "#/definitions/size"
+        },
+        "max_bytes": {
+          "$ref": "#/definitions/size"
+        },
+        "max_tokens": {
+          "$ref": "#/definitions/size",
+          "description": "One UTF-8 byte is one token (the tokenizer is byte-level)."
+        },
+        "min_words": {
+          "$ref": "#/definitions/size"
+        },
+        "min_alpha_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Minimum share of letters/digits \u2014 kills base64 blobs and binary dumps."
+        },
+        "max_dup_line_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Maximum share of lines repeating an earlier line."
+        },
+        "max_line_bytes": {
+          "$ref": "#/definitions/size",
+          "description": "Longest single line \u2014 kills minified files."
+        },
+        "must_contain": {
+          "$ref": "#/definitions/strings",
+          "description": "Keep only documents matching one of these (case-insensitive)."
+        },
+        "must_not_contain": {
+          "$ref": "#/definitions/strings",
+          "description": "Drop documents matching any of these."
+        },
+        "dedup": {
+          "enum": [
+            "off",
+            "none",
+            "exact",
+            "near",
+            "fuzzy"
+          ],
+          "description": "near = MinHash over word 5-grams. On short formulaic records prefer exact."
+        },
+        "languages": {
+          "$ref": "#/definitions/strings",
+          "description": "ISO codes kept from a parquet language column. Empty = no filtering."
+        },
+        "judge": {
+          "type": "string",
+          "description": "Prompt sent to the local model with each record; kept only if the reply starts with judge_expect."
+        },
+        "judge_expect": {
+          "type": "string",
+          "description": "Word the judge's reply must start with (default \"yes\")."
+        },
+        "judge_model": {
+          "type": "string",
+          "description": "Model for the judge alone. Empty inherits [llm] model."
+        },
+        "judge_temperature": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Temperature for the judge alone (default 0). Judging is a classification, not a generation."
+        },
+        "trim_turns": {
+          "type": "boolean",
+          "description": "chat records: trim to the last whole exchange that fits max_tokens instead of dropping the conversation."
+        },
+        "max_words": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Cap on the words of one record, counted with the model's own splitter (wordseg). This is the unit the backbone unrolls in \u2014 match it to SFT_MAX_WORDS / WORDS_PER_SEQ."
+        }
+      }
+    },
+    "strings": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "file",
+            "dir",
+            "parquet",
+            "chat",
+            "chat_parquet",
+            "dolly",
+            "sft",
+            "jsonl",
+            "synth",
+            "llm",
+            "generate"
+          ],
+          "description": "file/dir = text on disk; parquet = a text column; chat = parquet whose messages column is a list<struct<role, content>>; dolly/jsonl = JSONL records; synth = template expansion; llm = generated by the local model."
+        },
+        "path": {
+          "type": "string",
+          "description": "Input path. Required for every kind except llm."
+        },
+        "weight": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Share of the output tokens, relative to the other weights."
+        },
+        "epochs": {
+          "type": "number",
+          "minimum": 0,
+          "description": "How often this source may repeat to reach its share."
+        },
+        "ext": {
+          "$ref": "#/definitions/strings",
+          "description": "dir only: extensions to read, without the dot. Empty = every file."
+        },
+        "separator": {
+          "type": "string",
+          "description": "file/dir: document separator (default <|endoftext|>). Empty = the whole file is one document."
+        },
+        "text_column": {
+          "type": "string",
+          "description": "parquet: text column; jsonl: the field to read."
+        },
+        "language_column": {
+          "type": "string",
+          "description": "parquet: the language column used by `languages`."
+        },
+        "count": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "synth: examples to draw (0 = every combination). llm: examples to generate."
+        },
+        "category": {
+          "type": "string",
+          "description": "Category tag for records that carry none (default: the source name)."
+        },
+        "system": {
+          "type": "string",
+          "description": "llm: system prompt."
+        },
+        "prompt": {
+          "type": "string",
+          "description": "llm: user prompt. {seed} = a rendered seed_file instruction, {n} = the batch size."
+        },
+        "batch": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "llm: examples asked for per call."
+        },
+        "seed_file": {
+          "type": "string",
+          "description": "llm: .syn file whose rendered instructions seed {seed}."
+        },
+        "model": {
+          "type": "string",
+          "description": "llm: per-source override of [llm] model."
+        },
+        "temperature": {
+          "type": "number",
+          "description": "llm: per-source override of [llm] temperature. Negative = inherit."
+        },
+        "min_bytes": {
+          "$ref": "#/definitions/size"
+        },
+        "max_bytes": {
+          "$ref": "#/definitions/size"
+        },
+        "max_tokens": {
+          "$ref": "#/definitions/size"
+        },
+        "min_words": {
+          "$ref": "#/definitions/size"
+        },
+        "min_alpha_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "max_dup_line_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "max_line_bytes": {
+          "$ref": "#/definitions/size"
+        },
+        "must_contain": {
+          "$ref": "#/definitions/strings"
+        },
+        "must_not_contain": {
+          "$ref": "#/definitions/strings"
+        },
+        "dedup": {
+          "enum": [
+            "off",
+            "none",
+            "exact",
+            "near",
+            "fuzzy"
+          ]
+        },
+        "languages": {
+          "$ref": "#/definitions/strings"
+        },
+        "judge": {
+          "type": "string"
+        },
+        "judge_expect": {
+          "type": "string"
+        },
+        "skip_files": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "dir/parquet over a directory: skip this many files of the sorted listing (resume a corpus you already trained on)."
+        },
+        "max_files": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "dir/parquet over a directory: read at most this many files after the skip. 0 = all."
+        },
+        "role_column": {
+          "type": "string",
+          "description": "chat: the role leaf of the messages column (name or dotted path). Default \"role\"."
+        },
+        "content_column": {
+          "type": "string",
+          "description": "chat: the content leaf of the messages column. Default \"content\"."
+        },
+        "select_column": {
+          "type": "string",
+          "description": "chat: a flat column naming each row's subset (SmolTalk's \"source\"). Requires select_values."
+        },
+        "select_values": {
+          "description": "chat: keep only rows whose select_column holds one of these. Requires select_column.",
+          "anyOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "seeds": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "llm: how many seed examples to render into {seed} per call (default 3). They are rendered in the exact output format, so they pin the syntax as well as the subject."
+        },
+        "judge_model": {
+          "type": "string",
+          "description": "Model for the judge alone. Empty inherits [llm] model."
+        },
+        "judge_temperature": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Temperature for the judge alone (default 0). Judging is a classification, not a generation."
+        },
+        "trim_turns": {
+          "type": "boolean",
+          "description": "chat records: trim to the last whole exchange that fits max_tokens instead of dropping the conversation."
+        },
+        "max_words": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Cap on the words of one record, counted with the model's own splitter (wordseg). This is the unit the backbone unrolls in \u2014 match it to SFT_MAX_WORDS / WORDS_PER_SEQ."
+        }
+      }
+    }
+  }
+}

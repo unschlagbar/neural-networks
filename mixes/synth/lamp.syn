@@ -1,0 +1,248 @@
+# The lamp. There is exactly ONE, it switches on and off, and it has no colour
+# and no brightness — so `lamp.set` takes only `on`, and there is no room
+# argument anywhere.
+#
+# Tools and their results (nothing else exists):
+#   lamp.set(on=true|false)  -> on | off | already_on | already_off
+#   lamp.state()             -> on | off
+#
+# The assistant's tool-call turn is the CALL ALONE. What it says afterwards is
+# a separate turn, written after it has read the result — that is the point of
+# the result: "already on" is only sayable once the tool has said so.
+
+list warm = Done | Got it | There you go | All set
+list ack  = Already on, actually | It's on already | That one's already going
+
+template
+user      = {turn|switch|flip} on the {light|lamp}{|, please| for me}
+assistant = <tool>lamp.set(on=true)</tool>
+tool      = on
+assistant = {warm.0} — {light|lamp}'s on.
+category  = lamp
+
+template
+user      = {turn|switch|flip} {off the|the} {light|lamp} off
+assistant = <tool>lamp.set(on=false)</tool>
+tool      = off
+assistant = {warm.0}, {light|lamp} off.
+category  = lamp
+
+# The result is the whole reason this conversation is different from the one
+# above: same call, same words from the user, different answer.
+template
+user      = {turn|switch} on the {light|lamp}
+assistant = <tool>lamp.set(on=true)</tool>
+tool      = already_on
+assistant = {ack.0}. {Want it off instead?|Leaving it as it is.|Anything else?}
+category  = lamp
+
+template
+user      = {turn|switch} off the {light|lamp}
+assistant = <tool>lamp.set(on=false)</tool>
+tool      = already_off
+assistant = {It's already off|Already off} — {nothing to do|you're covered there}.
+category  = lamp
+
+template
+user      = {is the|is my} {light|lamp} {on|still on}?
+assistant = <tool>lamp.state()</tool>
+tool      = on
+assistant = {Yes, it's on|It is, yes}.
+category  = lamp
+
+template
+user      = {is the|is my} {light|lamp} {on|still on}?
+assistant = <tool>lamp.state()</tool>
+tool      = off
+assistant = {No, it's off|It's off right now}. {Want me to turn it on?|Say the word and I'll switch it on.}
+category  = lamp
+
+# Indirect: the request is a feeling, not a command. This is what makes it read
+# as attentive rather than as a command parser.
+template
+user      = it's {too dark|really dark|so dark} in here
+assistant = <tool>lamp.set(on=true)</tool>
+tool      = on
+assistant = {Better?|That should help.|Light's on — better?}
+category  = lamp
+
+template
+user      = {it's too bright|that's too bright|my eyes|too bright in here}
+assistant = <tool>lamp.set(on=false)</tool>
+tool      = off
+assistant = {Off it goes.|Killed the light.} {Let me know if you want it back.|}
+category  = lamp
+
+# Two turns: the follow-up refers back to what just happened, with no noun.
+template
+user      = {turn|switch} on the {light|lamp}
+assistant = <tool>lamp.set(on=true)</tool>
+tool      = on
+assistant = {warm.0}.
+user      = {actually, off again|never mind, turn it off|off again please}
+assistant = <tool>lamp.set(on=false)</tool>
+tool      = off
+assistant = {Off again.|Done — it's off.}
+category  = lamp
+
+template
+user      = {is the|is my} {light|lamp} on?
+assistant = <tool>lamp.state()</tool>
+tool      = off
+assistant = {It's off.|No, it's off.}
+user      = {turn it on then|on then|switch it on}
+assistant = <tool>lamp.set(on=true)</tool>
+tool      = on
+assistant = {warm.0}.
+category  = lamp
+
+# The lamp cannot do this. Saying so plainly beats inventing a tool for it.
+template
+user      = {dim the|turn down the} {light|lamp}{| a bit| to 40%}
+assistant = I {can't dim it|can only switch it on and off} — {it's a plain on/off lamp|there's no dimmer on it}. {Want it off?|I can turn it off if that helps.}
+category  = lamp
+
+template
+user      = {make the|turn the} {light|lamp} {red|blue|warm white|green}
+assistant = {It doesn't do colour|That lamp can't change colour} — {just on and off|on and off is all it has}.
+category  = lamp
+
+# An offer the model never follows through on is worse than no offer: every
+# "want the lamp off?" above ends its conversation, so on its own the data
+# teaches it to propose an action and then stall. These are the other half —
+# the acceptance, and the call it implies.
+
+list yes = yes | yeah | please | go on | do it | yes please | sure | that'd be good
+list no  = no | no thanks | leave it | it's fine | nah | leave it on
+
+template
+user      = i'm {exhausted|shattered|so tired|done in}
+assistant = {That's rough|Long day, then}. {Want the lamp off and some quiet?|Want me to kill the light?}
+user      = {yes.0}
+assistant = <tool>lamp.set(on=false)</tool>
+tool      = off
+assistant = {Done. Rest up.|Light's off. Get some rest.|Off. Goodnight.}
+category  = lamp
+
+template
+user      = i'm {exhausted|so tired|done in}
+assistant = {That's rough|Long day, then}. {Want the lamp off and some quiet?|Want me to kill the light?}
+user      = {no.0}
+assistant = {Fair enough|Alright}. {I'm here if you change your mind.|Say the word later.}
+category  = lamp
+
+template
+user      = {goodnight|good night|heading to bed|i'm off to bed}
+assistant = {Night|Sleep well}. {Want the lamp off?|Shall I kill the light?}
+user      = {yes.0}
+assistant = <tool>lamp.set(on=false)</tool>
+tool      = off
+assistant = {Off. Sleep well.|Done — goodnight.}
+category  = lamp
+
+template
+user      = {is the|is my} {light|lamp} on?
+assistant = <tool>lamp.state()</tool>
+tool      = off
+assistant = {It's off.|No, it's off.} {Want me to turn it on?|Shall I switch it on?}
+user      = {yes.0}
+assistant = <tool>lamp.set(on=true)</tool>
+tool      = on
+assistant = {Done|There you go}.
+category  = lamp
+
+template
+user      = {is the|is my} {light|lamp} on?
+assistant = <tool>lamp.state()</tool>
+tool      = off
+assistant = {It's off.|No, it's off.} {Want me to turn it on?|Shall I switch it on?}
+user      = {no.0}
+assistant = {Right|Understood}. {Leaving it.|I'll leave it be.}
+category  = lamp
+
+template
+user      = {turn|switch} on the {light|lamp}
+assistant = <tool>lamp.set(on=true)</tool>
+tool      = already_on
+assistant = {Already on|It's on already}. {Want it off instead?|Shall I switch it off?}
+user      = {yes.0}
+assistant = <tool>lamp.set(on=false)</tool>
+tool      = off
+assistant = {Off it is.|Done — off.}
+category  = lamp
+
+template
+user      = {turn|switch} on the {light|lamp}
+assistant = <tool>lamp.set(on=true)</tool>
+tool      = already_on
+assistant = {Already on|It's on already}. {Want it off instead?|Shall I switch it off?}
+user      = {no.0}
+assistant = {Right|Fine}. {Leaving it as it is.|Nothing to do, then.}
+category  = lamp
+
+template
+user      = {dim the|turn down the} {light|lamp}{| a bit}
+assistant = I can't dim it — {it's a plain on/off lamp|there's no dimmer on it}. {Want it off?|I can turn it off if that helps.}
+user      = {yes.0}
+assistant = <tool>lamp.set(on=false)</tool>
+tool      = off
+assistant = {Off, then.|Done.}
+category  = lamp
+
+# Recovering from its own mistake.
+#
+# `assistant_context` is an assistant turn the model READS but is never trained
+# to produce. That is what makes these safe: the conversation contains a wrong
+# call, so the model learns what a wrong call looks like from the inside and
+# what to do next — without a single gradient step teaching it to make one.
+# Only the correction carries loss.
+
+template
+user             = {turn|switch} the {light|lamp} on
+assistant_context = <tool>lamp.set(on=false)</tool>
+tool             = already_off
+assistant        = <tool>lamp.set(on=true)</tool>
+tool             = on
+assistant        = {Sorry, I had that backwards|My mistake — wrong way round}. {It's on now.|Light's on.}
+category         = lamp
+
+template
+user             = {turn|switch} the {light|lamp} off
+assistant_context = <tool>lamp.set(on=true)</tool>
+tool             = already_on
+assistant        = <tool>lamp.set(on=false)</tool>
+tool             = off
+assistant        = {That was backwards, sorry|Wrong way round — sorry}. {It's off now.|Light's off.}
+category         = lamp
+
+# The user is the one who catches it. This is the exchange that actually
+# happened: it acted, reported success, and had to be told it was wrong.
+template
+user             = {turn|switch} the {light|lamp} on
+assistant_context = <tool>lamp.set(on=false)</tool>
+tool             = off
+assistant_context = There you go, light off.
+user             = {i wanted it on|no, ON|i said on|that's the opposite}
+assistant        = <tool>lamp.set(on=true)</tool>
+tool             = on
+assistant        = {Sorry about that|My mistake} — {it's on now|on now}.
+category         = lamp
+
+template
+user             = it's {too dark|dark} in here
+assistant_context = <tool>lamp.set(on=false)</tool>
+tool             = off
+assistant_context = Done.
+user             = {that made it worse|now it's darker|the opposite of what i wanted}
+assistant        = <tool>lamp.set(on=true)</tool>
+tool             = on
+assistant        = {You're right, sorry|Sorry — misread that}. {Light's on.|On now.}
+category         = lamp
+
+# It catches itself: the result does not match what it was asked for.
+template
+user             = {is the|is my} {light|lamp} on?
+assistant_context = <tool>lamp.set(on=true)</tool>
+tool             = on
+assistant        = {You asked me to check, not to change it — sorry|Sorry, I switched it instead of checking}. {It's on now.|It's on.}
+category         = lamp

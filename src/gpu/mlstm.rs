@@ -88,16 +88,13 @@ fn chunk_len() -> usize {
 struct SavedFused {
     b: usize,
     t: usize,
-    /// The four large per-`N` tensors, `None` exactly while they are parked on the host.
+    /// The three large per-`N` tensors, `None` exactly while they are parked on the
+    /// host.
     ///
     /// `Option` rather than a `parked: bool` flag: backward reads these through
     /// `expect`, so a missing `restore_saved` is a named panic at the use site instead
     /// of a silent read of a stale buffer. They are `Some` for the whole of a
     /// non-offloaded run.
-    ///
-    /// The flat `[N, in]` input `xf` is shared by both projections (see `forward`) —
-    /// held here rather than twice inside the `Linear`s.
-    xf: Option<GTensor<f32>>,
     // `q ‖ k ‖ v ‖ o` in bf16 storage, mirroring the reference's DTYPE tensors
     // (matQ/matK/matV plus the o-gate pre-activation) concatenated as its fused
     // `qkv_opreact` output. Holds the RAW `o`: `ogate_bwd` recomputes the sigmoid.
@@ -119,9 +116,6 @@ impl SavedFused {
     /// The parkable tensors, in the one order `evict`/`restore` both use.
     ///
     /// Panics if they are parked — every reader runs after `restore_saved`.
-    fn xf(&self) -> &GTensor<f32> {
-        self.xf.as_ref().expect("mLSTM: xf is parked on the host")
-    }
     fn yhat(&self) -> &GTensor<f32> {
         self.yhat
             .as_ref()
@@ -141,7 +135,7 @@ impl SavedFused {
     /// Device bytes held. Parked tensors count as zero — they are on the host, which
     /// is the whole point of parking them.
     fn retained_bytes(&self) -> usize {
-        let opt_f32: usize = [&self.xf, &self.yhat, &self.hconcat]
+        let opt_f32: usize = [&self.yhat, &self.hconcat]
             .iter()
             .filter_map(|s| s.as_ref())
             .map(|t| t.capacity() * 4)
@@ -327,6 +321,11 @@ impl MLstm {
     /// covering the whole sequence reduces to the single-chunk form.
     ///
     /// `out` is the caller's `[B, T, d]` buffer, written in place.
+    ///
+    /// `x` must stay alive and unchanged until this call's [`backward`](Self::backward),
+    /// which takes it back: the three projections read it for their `dW`, and this cell
+    /// keeps no copy of it. In a [`Block`](super::block::Block) that is the block's own
+    /// `xn1` — the pre-norm output it already holds for the norm's backward.
     pub fn forward(
         &mut self,
         gpu: &Gpu,
@@ -357,10 +356,10 @@ impl MLstm {
             dhv: self.dhv,
         };
 
-        // Backward needs this for every projection's dW, so it outlives the call and
-        // is not pooled (`assert_drained` in `backward_alloc` wants the pool whole).
-        let mut xf = GTensor::uninit(gpu, &[rows, inp]);
-        xf.copy_from(gpu, x);
+        // The input as `[N, in]`, which is the shape both projections want. A view:
+        // every projection's `dW` reads it again in backward, but the caller hands it
+        // back there (`backward`'s `x`), so this cell keeps no copy of its own.
+        let xf = GTensor::view(gpu, &x.buf, 0, &[rows, inp]);
         let l = self.fused_chunk(gpu, t);
 
         // Two projections, both off the same narrowed `xf`. `q ‖ k ‖ v ‖ o` lands in
@@ -421,7 +420,6 @@ impl MLstm {
         self.saved.push(SavedFused {
             b: batch,
             t,
-            xf: Some(xf),
             xh: Some(xh),
             gates,
             fused,
@@ -433,9 +431,9 @@ impl MLstm {
 
     /// Park this cell's saved activations on the host, if offload is enabled.
     ///
-    /// Called at the end of a fused forward. Only the four large per-`N` tensors ride:
-    /// `xf`/`o`/`yhat` (4 MB each at the backbone's shape) and the `q‖k‖v` slab (6 MB
-    /// on the bf16 path) — 18 MB of the cell's 21.5 MB. The rest (`gates` at 128 KB,
+    /// Called at the end of a fused forward. Only the three large per-`N` tensors ride:
+    /// `o`/`yhat` (4 MB each at the backbone's shape) and the `q‖k‖v` slab (6 MB
+    /// on the bf16 path). The rest (`gates` at 128 KB,
     /// and everything inside `fused`) is left resident: each is two orders of
     /// magnitude smaller, so moving it would add PCIe traffic and bookkeeping for
     /// nothing.
@@ -453,7 +451,6 @@ impl MLstm {
         park.evict(
             gpu,
             vec![
-                Parked::from(sv.xf.take().expect("evict before restore: xf")),
                 Parked::from(sv.yhat.take().expect("evict before restore: yhat")),
                 Parked::from(sv.xh.take().expect("evict before restore: q‖k‖v‖o")),
             ],
@@ -478,7 +475,6 @@ impl MLstm {
         };
         let mut it = park.restore(gpu).into_iter();
         let mut next = |what: &str| it.next().expect(what);
-        sv.xf = Some(next("parked xf").f32());
         sv.yhat = Some(next("parked yhat").f32());
         sv.xh = Some(next("parked q‖k‖v‖o").into());
     }
@@ -579,19 +575,6 @@ impl MLstm {
             Some(super::offload::HostPark::new(gpu, in_flight).expect("offload: host park"));
     }
 
-    /// Backward into a freshly allocated `dx` `[B, T, in]` — the by-value
-    /// companion to [`backward`](Self::backward).
-    pub fn backward_alloc_dx(
-        &mut self,
-        gpu: &Gpu,
-        dy: &GTensor<f32>,
-        cache: &TrainingCache,
-    ) -> GTensor<f32> {
-        let mut dx = GTensor::uninit(gpu, &[dy.shape[0], dy.shape[1], self.input_size]);
-        self.backward(gpu, dy, &mut dx, cache);
-        dx
-    }
-
     /// Backward over `[B, T, d]` → `dx` `[B, T, in]`. Accumulates all grads.
     ///
     /// Chunks are swept in reverse, carrying `dC`/`dn` (the grad wrt the state a
@@ -600,20 +583,11 @@ impl MLstm {
     pub fn backward(
         &mut self,
         gpu: &Gpu,
+        x: &GTensor<f32>,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
         cache: &TrainingCache,
     ) {
-        let out = self.backward_alloc(gpu, dy, cache);
-        dx.copy_from(gpu, &out);
-    }
-
-    pub fn backward_alloc(
-        &mut self,
-        gpu: &Gpu,
-        dy: &GTensor<f32>,
-        cache: &TrainingCache,
-    ) -> GTensor<f32> {
         // Bring the parked activations back into the cache first, so everything below
         // reads them as if they had never left. No-op unless offload is enabled.
         self.restore_saved(gpu);
@@ -621,7 +595,21 @@ impl MLstm {
         // them at the end of this call (rather than when the next forward overwrites
         // the field) keeps them from staying resident across the optimizer step.
         let sv = self.saved.pop().expect("MLstm::backward before forward");
-        self.backward_fused(gpu, dy, sv, cache)
+        self.backward_fused(gpu, x, dy, sv, dx, cache)
+    }
+
+    /// Backward into a freshly allocated `dx` `[B, T, in]` — the by-value
+    /// companion to [`backward`](Self::backward).
+    pub fn backward_alloc(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        dy: &GTensor<f32>,
+        cache: &TrainingCache,
+    ) -> GTensor<f32> {
+        let mut dx = GTensor::uninit(gpu, &[dy.shape[0], dy.shape[1], self.input_size]);
+        self.backward(gpu, x, dy, &mut dx, cache);
+        dx
     }
 
     /// Backward of the fused path: two kernels for the whole chunkwise core, with
@@ -629,13 +617,21 @@ impl MLstm {
     fn backward_fused(
         &mut self,
         gpu: &Gpu,
+        x: &GTensor<f32>,
         dy: &GTensor<f32>,
         sv: SavedFused,
+        dx: &mut GTensor<f32>,
         cache: &TrainingCache,
-    ) -> GTensor<f32> {
+    ) {
         let (d, h, dqk, dhv, inp) = (self.d, self.heads, self.dqk, self.dhv, self.input_size);
         let (b, t) = (sv.b, sv.t);
         let n = b * t;
+        assert!(
+            n * inp <= dx.capacity(),
+            "MLstm::backward — dx holds {} elements, needs {}",
+            dx.capacity(),
+            n * inp
+        );
 
         // The whole shell is temporaries: each value below dies as soon as the next
         // op has read it, so all of them come from the pool and go back.
@@ -707,23 +703,25 @@ impl MLstm {
         // their scale.
         //
         // dx is the sum of the three projection backwards, accumulated into one
-        // buffer with one pooled scratch — not a fresh [N, in] per term.
+        // buffer with one pooled scratch — not a fresh [N, in] per term. The
+        // accumulator is the caller's `dx` seen as `[N, in]`, so the sum lands where
+        // it is wanted instead of in scratch that then has to be copied out.
         //
-        // All three read the one shared `sv.xf` (see `forward`), so they take
-        // `backward_with_x` rather than each consulting a private saved copy.
-        // `sv.xf` is narrowed once for all three, as in forward.
-        let mut acc = GTensor::uninit(gpu, &[n, inp]);
+        // All three read the one `x` the caller kept from the forward, so they take
+        // `backward_with_x` rather than each consulting a private saved copy. It is
+        // narrowed once for all three, as in forward.
+        let mut acc = GTensor::view(gpu, &dx.buf, 0, &[n, inp]);
         let mut part = cache.temps.get::<f32>(gpu, &[n, inp]);
-        // One narrowing for both projections, as in forward.
-        let mut xf_b = cache.temps.get::<u16>(gpu, sv.xf().dims());
-        xf_b.store(gpu, sv.xf());
+        let xf = GTensor::view(gpu, &x.buf, 0, &[n, inp]);
+        let mut xf_b = cache.temps.get::<u16>(gpu, xf.dims());
+        xf_b.store(gpu, &xf);
         self.lin_qkvo
-            .backward_staged_x(gpu, sv.xf(), &xf_b, &dxh, &mut acc, cache);
+            .backward_staged_x(gpu, &xf, &xf_b, &dxh, &mut acc, cache);
         self.lin_gates
-            .backward_staged_x(gpu, sv.xf(), &xf_b, &dgates, &mut part, cache);
+            .backward_staged_x(gpu, &xf, &xf_b, &dgates, &mut part, cache);
         ops::add_assign(gpu, &mut acc, &part);
-        drop((xf_b, part, dxh, dgates));
-        acc.reshaped(&[b, t, inp])
+        drop((acc, xf_b, part, dxh, dgates));
+        dx.reshape_to(&[b, t, inp]);
     }
 
     /// Every parameter with its gradient and AdamW moments. The projection and
@@ -777,12 +775,13 @@ impl Cell for MLstm {
     fn backward(
         &mut self,
         gpu: &Gpu,
+        x: &GTensor<f32>,
         _y: &GTensor<f32>,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
         cache: &TrainingCache,
     ) {
-        MLstm::backward(self, gpu, dy, dx, cache)
+        MLstm::backward(self, gpu, x, dy, dx, cache)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {
         MLstm::zero_grad(self, gpu)
@@ -802,7 +801,7 @@ impl Cell for MLstm {
     }
     fn trim_to(&mut self, _rows: usize) {}
     fn drop_saved_act(&mut self) {
-        // The whole fused cache — the q‖k‖v slab, o, yhat, xf and the `MlstmFused`
+        // The whole fused cache — the q‖k‖v slab, o, yhat and the `MlstmFused`
         // internals. Safe to drop wholesale because the only caller re-forwards to
         // rebuild it (see `Block::drop_saved_act`).
         self.saved.clear();
@@ -855,8 +854,12 @@ mod tests {
 
     /// One temp cache per test, sized past every shape this module presents — the
     /// widest is `[b·t, heads·(2·dqk + 2·dhv)]` at `b·t = 400`, `dqk = dhv = 96`.
+    /// The chunk array is deliberately generous here: these tests drive `set_chunk`
+    /// down to 1, where the per-chunk state arrays hold `nc == t` states instead of the
+    /// `t/32` a real run sees. Production sizes it from the config — see
+    /// `Hierarchical::temp_chunk_elems`.
     fn test_cache(gpu: &Gpu) -> TrainingCache {
-        TrainingCache::new(gpu, 1 << 20, 1 << 16, 1 << 20)
+        TrainingCache::new(gpu, 1 << 20, 1 << 16, 1 << 24)
     }
     use super::*;
     use crate::nn2::mlstm::MLstm as CpuMLstm;
@@ -995,18 +998,14 @@ mod tests {
 
         // Forward
         let y_cpu = cpu.forward(&x);
+        let xd = GTensor::from_host(&gpu, &x);
         let mut y_dev = GTensor::uninit(&gpu, &[b, t, d]);
-        dev.forward(
-            &gpu,
-            &GTensor::from_host(&gpu, &x),
-            &mut y_dev,
-            &tc,
-        );
+        dev.forward(&gpu, &xd, &mut y_dev, &tc);
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, "y");
 
         // Backward
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g), &tc);
+        let dx_dev = dev.backward_alloc(&gpu, &xd, &GTensor::from_host(&gpu, &g), &tc);
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 3e-3, "dx");
 
         // One AdamW step; compare representative updated parameters.
@@ -1082,7 +1081,7 @@ mod tests {
             let mut yt = GTensor::uninit(&gpu, &[b, t, d]);
             dev.forward(&gpu, &dx, &mut yt, &tc);
             let y = yt.to_host(&gpu).data;
-            let dxo = dev.backward_alloc(&gpu, &dg, &tc).to_host(&gpu).data;
+            let dxo = dev.backward_alloc(&gpu, &dx, &dg, &tc).to_host(&gpu).data;
             let mut cfg = AdamCfg::new(1e-3, 0.01);
             cfg.t = 1;
             dev.step(&gpu, &cfg);
@@ -1151,7 +1150,7 @@ mod tests {
             let mut yt = GTensor::uninit(&gpu, &[b, t, d]);
             dev.forward(&gpu, &x, &mut yt, &tc);
             let y = yt.to_host(&gpu).data;
-            let dx = dev.backward_alloc(&gpu, &g, &tc).to_host(&gpu).data;
+            let dx = dev.backward_alloc(&gpu, &x, &g, &tc).to_host(&gpu).data;
             let mut cfg = AdamCfg::new(1e-3, 0.01);
             cfg.t = 1;
             dev.step(&gpu, &cfg);
@@ -1216,17 +1215,13 @@ mod tests {
         let g = Tensor::random_seeded(&[b, t, d], 1.0, 0xE4);
 
         let y_cpu = cpu.forward(&x);
+        let xd = GTensor::from_host(&gpu, &x);
         let mut yt = GTensor::uninit(&gpu, &[b, t, d]);
-        dev.forward(
-            &gpu,
-            &GTensor::from_host(&gpu, &x),
-            &mut yt,
-            &tc,
-        );
+        dev.forward(&gpu, &xd, &mut yt, &tc);
         assert_close_rel(&yt.to_host(&gpu).data, &y_cpu.data, 1e-2, "y");
 
         let dx_cpu = cpu.backward(&g);
-        let dx = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g), &tc);
+        let dx = dev.backward_alloc(&gpu, &xd, &GTensor::from_host(&gpu, &g), &tc);
         assert_close_rel(&dx.to_host(&gpu).data, &dx_cpu.data, 1e-2, "dx");
     }
 
@@ -1263,13 +1258,9 @@ mod tests {
         // relative bound is measuring the storage format, not the kernel. Sitting at
         // 5e-3 made this fail ~2 runs in 3 at 5.07e-3.
         let y_cpu = cpu.forward(&x);
+        let xd = GTensor::from_host(&gpu, &x);
         let mut y_dev = GTensor::uninit(&gpu, &[b, t, d]);
-        dev.forward(
-            &gpu,
-            &GTensor::from_host(&gpu, &x),
-            &mut y_dev,
-            &tc,
-        );
+        dev.forward(&gpu, &xd, &mut y_dev, &tc);
         assert_close_rel(&y_dev.to_host(&gpu).data, &y_cpu.data, 1e-2, "y");
 
         // dx is looser than y: it carries the bf16 q/k/v narrowing and the TF32 mma
@@ -1286,7 +1277,7 @@ mod tests {
         // a last-bit difference into a full-size one — 3.1e-2 here. `dx` is the
         // gradient check; a weight check on top of it only measures the optimizer.
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g), &tc);
+        let dx_dev = dev.backward_alloc(&gpu, &xd, &GTensor::from_host(&gpu, &g), &tc);
         assert_close_rel(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 1e-2, "dx");
     }
 
@@ -1312,17 +1303,13 @@ mod tests {
         let g = Tensor::random(&[b, t, d], 1.0);
 
         let y_cpu = cpu.forward(&x);
+        let xd = GTensor::from_host(&gpu, &x);
         let mut y_dev = GTensor::uninit(&gpu, &[b, t, d]);
-        dev.forward(
-            &gpu,
-            &GTensor::from_host(&gpu, &x),
-            &mut y_dev,
-            &tc,
-        );
+        dev.forward(&gpu, &xd, &mut y_dev, &tc);
         assert_close(&y_dev.to_host(&gpu).data, &y_cpu.data, 3e-3, "y");
 
         let dx_cpu = cpu.backward(&g);
-        let dx_dev = dev.backward_alloc(&gpu, &GTensor::from_host(&gpu, &g), &tc);
+        let dx_dev = dev.backward_alloc(&gpu, &xd, &GTensor::from_host(&gpu, &g), &tc);
         assert_close(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 3e-3, "dx");
 
         let mut cfg = AdamCfg::new(1e-3, 0.01);
@@ -1498,15 +1485,11 @@ mod tests {
         // 6-step call is a single internal chunk, `is_last` is true for it either way,
         // and the CARRY path under test is never reached.
         let mut whole = MLstm::from_cpu(&gpu, &proto);
+        let xd = GTensor::from_host(&gpu, &x);
         let mut y_whole = GTensor::uninit(&gpu, &[b, t, d]);
-        whole.forward(
-            &gpu,
-            &GTensor::from_host(&gpu, &x),
-            &mut y_whole,
-            &tc,
-        );
+        whole.forward(&gpu, &xd, &mut y_whole, &tc);
         let want = whole
-            .backward_alloc(&gpu, &GTensor::from_host(&gpu, &g), &tc)
+            .backward_alloc(&gpu, &xd, &GTensor::from_host(&gpu, &g), &tc)
             .to_host(&gpu)
             .data
             .to_vec();
@@ -1531,21 +1514,22 @@ mod tests {
             let mut part = MLstm::from_cpu(&gpu, &proto);
             part.set_carry(true);
             part.reset_state(&gpu);
-            for &(c0, len) in &parts {
+            // Each chunk's input outlives its forward: backward reads it again for
+            // the projections' `dW`.
+            let xs: Vec<GTensor<f32>> = parts
+                .iter()
+                .map(|&(c0, len)| cut(&x, c0, len, inp))
+                .collect();
+            for (i, &(_, len)) in parts.iter().enumerate() {
                 let mut y_part = GTensor::uninit(&gpu, &[b, len, d]);
-                part.forward(
-                    &gpu,
-                    &cut(&x, c0, len, inp),
-                    &mut y_part,
-                    &tc,
-                );
+                part.forward(&gpu, &xs[i], &mut y_part, &tc);
             }
             // Backward unwinds right to left, starting with no gradient from the right.
             part.reset_bptt(&gpu);
             let mut pieces: Vec<Vec<f32>> = vec![Vec::new(); parts.len()];
             for (i, &(c0, len)) in parts.iter().enumerate().rev() {
                 pieces[i] = part
-                    .backward_alloc(&gpu, &cut(&g, c0, len, d), &tc)
+                    .backward_alloc(&gpu, &xs[i], &cut(&g, c0, len, d), &tc)
                     .to_host(&gpu)
                     .data
                     .to_vec();

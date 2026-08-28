@@ -4,8 +4,13 @@ use crate::{
     config::{MAX_LEN, MAX_SEQ_LEN, TEMPERATURE, TOP_P},
     hierarchical::Hierarchical,
     sequential::Sequential,
+    sft::{Role, Turn},
     tokenizer_utf8::{BYTE_TOKENS, Utf8Tokenizer},
 };
+
+/// How many times one user turn may go round the call-result loop before the
+/// REPL gives up on it concluding.
+const MAX_TOOL_ROUNDS: usize = 6;
 
 /// Streams sampled byte tokens to stdout. A UTF-8 character spans several byte
 /// tokens, so bytes are held back until they form a complete character.
@@ -102,28 +107,81 @@ pub fn sample_chat(model_path: &str) {
     };
     model.make_cache(1, MAX_SEQ_LEN);
 
+    // The conversation so far. Each generated reply is appended as an
+    // `Assistant` turn, so the next prompt carries the whole history — the same
+    // layout the multi-turn training data has.
+    let mut turns: Vec<Turn> = Vec::new();
+
     loop {
-        println!("\nInstruction (empty line = quit):");
-        let mut instruction = String::new();
-        if stdin().read_line(&mut instruction).unwrap() == 0 || instruction.trim().is_empty() {
+        println!("\nYou (empty line = quit, 'new' = fresh conversation):");
+        let mut input = String::new();
+        if stdin().read_line(&mut input).unwrap() == 0 || input.trim().is_empty() {
             println!();
             return;
         }
+        let input = input.trim();
+        if input == "new" {
+            turns.clear();
+            println!("(conversation cleared)");
+            continue;
+        }
 
-        print!("Context (optional, blank for none): ");
-        stdout().flush().unwrap();
-        let mut context = String::new();
-        stdin().read_line(&mut context).unwrap();
+        // Context is asked for once, at the start of a conversation: it takes
+        // the <CONTEXT> slot of the first turn and conditions every reply after.
+        if turns.is_empty() {
+            print!("Context (optional, blank for none): ");
+            stdout().flush().unwrap();
+            let mut context = String::new();
+            stdin().read_line(&mut context).unwrap();
+            if !context.trim().is_empty() {
+                turns.push(Turn {
+                    role: Role::System,
+                    content: context.trim().to_string(),
+                });
+            }
+        }
 
-        let prompt = crate::sft::format_prompt(&tokenizer, instruction.trim(), context.trim());
-
-        print!(">>> ");
-        stdout().flush().unwrap();
-        let mut printer = Utf8Printer::default();
-        model.sample_chat(&prompt, MAX_LEN, TEMPERATURE, TOP_P, |token| {
-            printer.print(token, &tokenizer)
+        turns.push(Turn {
+            role: Role::User,
+            content: input.to_string(),
         });
-        println!();
+
+        // One user turn can take several rounds: a reply that is a tool call is
+        // not the answer, it is a request for a result. `app.launch` failing into
+        // `app.list` and back is three rounds, so the cap is what stops a model
+        // that has learned to call and never conclude.
+        for _ in 0..MAX_TOOL_ROUNDS {
+            let prompt = crate::sft::format_chat_prompt(&tokenizer, &turns);
+            print!(">>> ");
+            stdout().flush().unwrap();
+            let mut printer = Utf8Printer::default();
+            let reply = model.sample_chat(&prompt, MAX_LEN, TEMPERATURE, TOP_P, |token| {
+                printer.print(token, &tokenizer)
+            });
+            println!();
+            let reply = tokenizer.to_text(&reply);
+            turns.push(Turn {
+                role: Role::Assistant,
+                content: reply.clone(),
+            });
+            if !reply.contains("<tool>") {
+                break;
+            }
+            print!("result (blank = ok): ");
+            stdout().flush().unwrap();
+            let mut result = String::new();
+            if stdin().read_line(&mut result).unwrap() == 0 {
+                break;
+            }
+            let result = match result.trim() {
+                "" => "ok",
+                other => other,
+            };
+            turns.push(Turn {
+                role: Role::Tool,
+                content: result.to_string(),
+            });
+        }
     }
 }
 

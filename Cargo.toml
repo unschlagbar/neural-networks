@@ -1,3 +1,6 @@
+[workspace]
+members = ["datamix", "wordseg"]
+
 [package]
 name = "neural-networks"
 version = "0.1.0"
@@ -27,6 +30,7 @@ cuda = ["dep:cudarc", "dep:half"]
 default = ["cuda"]
 
 [dependencies]
+wordseg = { path = "wordseg" }
 iron_oxide = { path = "../iron_oxide", default-features = false }
 rand = "0.10.0"
 rayon = "1.11"

@@ -83,7 +83,7 @@ fn main() {
     let fwd = timed(&gpu, 2, 10, || {
         cell.forward(&gpu, &x, &mut y, &cache);
         // backward must consume the cache the forward built, or it grows unboundedly
-        let _ = cell.backward_alloc(&gpu, &dy, &cache);
+        let _ = cell.backward_alloc(&gpu, &x, &dy, &cache);
     });
     println!(
         "fwd+bwd (chunk {}):  {:>7.2} ms",
@@ -94,7 +94,7 @@ fn main() {
     // Forward alone, so the two halves can be separated.
     let f_only = timed(&gpu, 2, 10, || {
         cell.forward(&gpu, &x, &mut y, &cache);
-        let _ = cell.backward_alloc(&gpu, &dy, &cache);
+        let _ = cell.backward_alloc(&gpu, &x, &dy, &cache);
     });
     let _ = f_only;
 

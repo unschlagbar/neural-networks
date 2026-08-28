@@ -282,7 +282,7 @@ fn main() {
         let mut y_dev = GTensor::uninit(&gpu, &[b, t, d]);
         let gpu_s = gpu_time(&gpu, GPU_WARMUP, GPU_ITERS, || {
             dev.forward(&gpu, &dx_in, &mut y_dev, &cache);
-            let _dx = dev.backward_alloc(&gpu, &ddy, &cache);
+            let _dx = dev.backward_alloc(&gpu, &dx_in, &ddy, &cache);
             dev.step(&gpu, &cfg);
         });
 

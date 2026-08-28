@@ -1,0 +1,129 @@
+#:schema ../datamix/mixture.schema.json
+# SFT corpus for Jarvis: a warm, brief assistant that calls tools and reads
+# their results.
+#
+#   cargo run -p datamix --release -- build  mixes/assistant_qa.toml
+#   cargo run -p datamix --release -- verify data/mix/assistant_qa.jsonl
+#
+# Calls no LLM server: every source is a file or a template.
+#
+# SmolTalk is split by its `source` column rather than taken whole, because its
+# subsets are not variations on a theme — the mean assistant answer runs from
+# 123 bytes (explore-instruct-rewrite) to 1451 (smol-magpie-ultra-short), and
+# magpie alone is 59% of the conversations. Taken as one blob it teaches the
+# model to answer everything with a 1400-character essay, in the voice of a
+# synthetic persona. Split, its length is a knob.
+
+[output]
+kind = "sft"
+path = "data/mix/assistant_qa.jsonl"
+report = "data/mix/assistant_qa_report.md"
+seed = 1234
+holdout = 0.02
+# A weight is a share of the *examples*, not of the tokens: a tool exchange is
+# a few hundred bytes and a magpie answer is thousands, so token weights put
+# the model's register in the hands of whichever source is wordiest.
+#
+# Every source is `epochs = 1`: no example is ever trained on twice. Data is not
+# the constraint here, so a source that cannot fill its share gives what it has
+# and the corpus is smaller — repeating it would be paying in overfitting for a
+# number that only looks bigger.
+weight_by = "records"
+records = 0
+
+[filter]
+max_words = 4096
+max_tokens = 28672
+min_bytes = 16
+dedup = "exact"
+
+# Who it is and how it sounds when nothing needs doing. Without this, asked
+# "who are you?", the model answers from whatever persona data dominates.
+[source.persona]
+kind = "synth"
+path = "mixes/synth/persona.syn"
+count = 1500
+epochs = 1
+weight = 1
+
+[source.lamp]
+kind = "synth"
+path = "mixes/synth/lamp.syn"
+count = 3000
+epochs = 1
+weight = 0.35
+
+[source.apps]
+kind = "synth"
+path = "mixes/synth/apps.syn"
+count = 3000
+epochs = 1
+weight = 0.35
+
+# Tool calls that are not the first turn of an empty conversation: after small
+# talk, under a system context, with the conversation carrying on afterwards.
+[source.tools_in_context]
+kind = "synth"
+path = "mixes/synth/tools_in_context.syn"
+count = 4000
+epochs = 1
+weight = 0.3
+
+# Short, natural chat — the register everything else is measured against.
+# `explore-instruct-rewrite` only: 3017 conversations, 3009 distinct assistant
+# turns, most-repeated string twice. Short AND varied.
+[source.smoltalk_short]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smol-smoltalk"
+select_column = "source"
+select_values = ["explore-instruct-rewrite"]
+trim_turns = true
+epochs = 1
+weight = 3
+
+# `everyday-conversations`, kept small on purpose. 2241 of its 8595 assistant
+# turns are the single string "Hello! How can I help you today?" — 8x more
+# repeated than anything else in SmolTalk. `epochs = 1` does not protect against
+# that: no RECORD repeats, but thousands of them carry the same reply, and a
+# model trained on it answers every short prompt with a greeting. It still has
+# the multi-turn everyday register nothing else provides, so it stays — at a
+# weight that makes it a seasoning rather than the dish.
+[source.smoltalk_chitchat]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smol-smoltalk"
+select_column = "source"
+select_values = ["everyday-conversations"]
+trim_turns = true
+epochs = 1
+weight = 0.5
+
+# Rewriting, summarizing, constrained answers: real tasks, moderate length.
+[source.smoltalk_tasks]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smol-smoltalk"
+select_column = "source"
+select_values = ["smol-summarize-20k", "smol-contraints", "smollm-rewrite-30k"]
+trim_turns = true
+epochs = 1
+weight = 41
+
+# General knowledge and code, so trimming the essays does not cost it substance.
+[source.smoltalk_knowledge]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smol-smoltalk"
+select_column = "source"
+select_values = ["openhermes-50k", "self-oss-instruct"]
+trim_turns = true
+epochs = 1
+weight = 41.5
+
+# The long-form register, kept as a minority so it can still write at length
+# when asked, rather than by default.
+[source.smoltalk_long]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smol-smoltalk"
+select_column = "source"
+select_values = ["smol-magpie-ultra-short", "longalign", "smol-summarize-5k"]
+trim_turns = true
+epochs = 1
+weight = 12

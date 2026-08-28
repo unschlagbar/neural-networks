@@ -45,7 +45,7 @@
 // ends only, starts are implied — and no word is longer than `MAX_WORD_BYTES`,
 // which bounds the decoder unroll.
 
-use crate::config::MAX_WORD_BYTES;
+use crate::MAX_WORD_BYTES;
 use crate::tokenizer_utf8::BYTE_TOKENS;
 
 /// Whitespace runs longer than this are not glued onto the preceding word —

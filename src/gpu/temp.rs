@@ -81,7 +81,7 @@ pub const SLOTS: usize = 8;
 /// This array is the same mechanism at the other size — see [`widest_small`] for how
 /// one is sized. The whole array is a rounding error against a single stage-sized
 /// slot, so its count can be generous where [`SLOTS`] cannot.
-pub const SMALL_SLOTS: usize = 8;
+pub const SMALL_SLOTS: usize = 4;
 
 /// The widest *small* temporary a stage of `rows` x `heads` asks for, in elements.
 ///
@@ -129,7 +129,7 @@ pub fn widest_chunk(
 ///
 ///   * the `q‖k‖v‖o` slab and its delta, `heads·(2·dqk + 2·dhv)` wide — at the usual
 ///     `dqk = dhv = hidden/heads` that is `4·hidden`, the widest thing in the model;
-///   * the SwiGLU operands at `up_of(hidden)` = `8·hidden/3`;
+///   * the SwiGLU operands at `up_of(hidden)`;
 ///   * `extra`, for a stage with a wider tail than its hidden width — the decoder's
 ///     logits at `[rows, vocab]`.
 pub fn widest(rows: usize, hidden: usize, heads: usize, dqk: usize, extra: usize) -> usize {
@@ -290,6 +290,16 @@ impl TempCache {
     /// The same for the small array: `(peak, SMALL_SLOTS)`.
     pub fn small_high_water(&self) -> (usize, usize) {
         (self.small.high.get() as usize, SMALL_SLOTS)
+    }
+
+    /// The same for the chunk-state array: `(peak, CHUNK_SLOTS)`.
+    pub fn chunk_high_water(&self) -> (usize, usize) {
+        (self.chunk.high.get() as usize, CHUNK_SLOTS)
+    }
+
+    /// `f32` elements per chunk-state slot.
+    pub fn chunk_slot_elems(&self) -> usize {
+        self.chunk.elems
     }
 
     /// An uninitialised stage-sized temporary of shape `dims`, held until the guard

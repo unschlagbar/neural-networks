@@ -143,12 +143,15 @@ pub trait Cell {
         out: &mut GTensor<f32>,
         cache: &TrainingCache,
     );
-    /// `y` is this cell's own forward output — which, because a cell ends in a
-    /// post-norm, is that norm's output and so what its backward rebuilds `x̂` from.
-    /// A cell that keeps its post-norm's output internally ignores it.
+    /// `x` is this cell's forward input, handed back so a cell whose projections need
+    /// it for their `dW` keeps no copy of its own; a cell that saves its own (narrowed,
+    /// say) ignores it. `y` is this cell's own forward output — which, because a cell
+    /// ends in a post-norm, is that norm's output and so what its backward rebuilds
+    /// `x̂` from. A cell that keeps its post-norm's output internally ignores it.
     fn backward(
         &mut self,
         gpu: &Gpu,
+        x: &GTensor<f32>,
         y: &GTensor<f32>,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
@@ -243,11 +246,13 @@ impl Cell for SLstm {
     fn backward(
         &mut self,
         gpu: &Gpu,
+        _x: &GTensor<f32>,
         y: &GTensor<f32>,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
         cache: &TrainingCache,
     ) {
+        // `x` is unused: the cell saved its own, narrowed to the width its GEMMs read.
         SLstm::backward(self, gpu, y, dy, dx, cache)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {
@@ -1156,16 +1161,21 @@ impl<C: Cell> Block<C> {
         ops::add_into(gpu, &d_z_mlp, &dy_flat, &mut d_z);
         drop((d_zn, d_z_mlp));
 
-        // Residual 1. The cell receives a copy of d_z rather than d_z itself: its
-        // backward must not clobber d_z, which the dx residual still needs.
-        let mut d_cell_out = cache.temps.get::<f32>(gpu, &[n, h]);
-        d_cell_out.copy_from(gpu, &d_z);
-        d_cell_out.reshape_to(&[b, t, h]);
+        // Residual 1. Both cells read their `dy` and never write it, so d_z goes in
+        // as a `[B, T, H]` view — the dx residual below still needs it as `[N, H]`.
+        let d_cell_out = GTensor::view(gpu, &d_z.buf, 0, &[b, t, h]);
         let mut d_cell_in = cache.temps.get::<f32>(gpu, &[b, t, h]);
         let (_cf, cb) = self.cell.phase_buckets();
         phase::timed(gpu, cb, || {
             self.cell
-                .backward(gpu, &saved.cell_out, &d_cell_out, &mut d_cell_in, cache)
+                .backward(
+                    gpu,
+                    &saved.xn1,
+                    &saved.cell_out,
+                    &d_cell_out,
+                    &mut d_cell_in,
+                    cache,
+                )
         });
         drop(d_cell_out);
         d_cell_in.reshape_to(&[n, h]);

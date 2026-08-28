@@ -55,7 +55,7 @@ fn main() {
         cell.zero_grad(&gpu);
         let mut y = GTensor::uninit(&gpu, &[b, t, d]);
         cell.forward(&gpu, &x, &mut y, &cache);
-        let dx = cell.backward_alloc(&gpu, &g, &cache);
+        let dx = cell.backward_alloc(&gpu, &x, &g, &cache);
         let mut sig = vec![
             ("y", hash(&y.to_host(&gpu).data)),
             ("dx", hash(&dx.to_host(&gpu).data)),

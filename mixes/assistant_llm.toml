@@ -1,0 +1,155 @@
+#:schema ../datamix/mixture.schema.json
+# Assistant SFT, with a local model doing the work templates cannot: phrasing
+# variety on the way in, and quality control on the way out.
+#
+# Start the LM Studio server (or any OpenAI-compatible one), then:
+#   cargo run -p datamix --release -- ping   mixes/assistant_llm.toml
+#   cargo run -p datamix --release -- sample mixes/assistant_llm.toml -n 8
+#   cargo run -p datamix --release -- build  mixes/assistant_llm.toml
+#
+# Replies are cached under target/datamix-llm-cache, so a rebuild costs nothing
+# and only new prompts hit the server. Delete that directory to regenerate.
+
+[output]
+kind = "sft"
+path = "data/mix/assistant_llm.jsonl"
+report = "data/mix/assistant_llm_report.md"
+seed = 1234
+holdout = 0.02
+
+[llm]
+endpoint = "http://localhost:1234/v1"
+model = ""              # empty: whatever the server has loaded
+temperature = 1.0       # generation wants variety
+max_tokens = 1024
+timeout = 300
+
+[filter]
+# The real cap is in WORDS — the unit the backbone unrolls in — matching
+# SFT_MAX_WORDS / WORDS_PER_SEQ in src/config.rs, counted with the model's own
+# splitter. The token cap behind it only guards pathological words.
+max_words = 4096
+max_tokens = 28672
+min_bytes = 8
+# "exact" for hand-made data: short commands are formulaic, and "near" reads
+# "turn the light on" and "switch the lamp on" as one example.
+dedup = "exact"
+
+# The template sources stay: they guarantee coverage of every app, verb and result.
+[source.lamp]
+kind = "synth"
+path = "mixes/synth/lamp.syn"
+count = 4000
+epochs = 2
+weight = 2
+
+[source.apps]
+kind = "synth"
+path = "mixes/synth/apps.syn"
+count = 3000
+epochs = 4
+weight = 2
+
+[source.tools_in_context]
+kind = "synth"
+path = "mixes/synth/tools_in_context.syn"
+count = 0
+epochs = 4
+weight = 1
+
+# The generated sources buy phrasing the templates cannot: indirect requests,
+# typos, two commands in one sentence. seed_file renders one template
+# instruction into {seed} per call, so the model is anchored on the real tool
+# vocabulary instead of inventing its own.
+[source.lamp_llm]
+kind = "llm"
+weight = 2
+count = 600
+batch = 10
+dedup = "near"          # a generator repeats itself in ways "exact" misses
+seed_file = "mixes/synth/lamp.syn"
+system = """
+You generate training data for a small home-assistant model. You answer ONLY \
+with JSON lines, one object per line, keys: instruction, context, response. \
+No prose, no code fences.
+"""
+prompt = """
+Here is one example of a request and the tool call it maps to:
+{seed}
+
+Write {n} MORE examples for the same set of tools. Vary the phrasing hard: \
+indirect requests ("it's too dark in here"), typos, curt commands, two rooms \
+in one sentence, German as well as English. The response field must contain \
+the tool call in exactly the same syntax, optionally followed by one short \
+sentence of confirmation. Never invent a tool that is not in the example.
+"""
+
+[source.apps_llm]
+kind = "llm"
+weight = 2
+count = 400
+batch = 10
+dedup = "near"
+seed_file = "mixes/synth/apps.syn"
+system = """
+You generate training data for a small desktop-assistant model. You answer \
+ONLY with JSON lines, one object per line, keys: instruction, context, \
+response. No prose, no code fences.
+"""
+prompt = """
+Here is one example of a request and the tool call it maps to:
+{seed}
+
+Write {n} MORE examples for the same tools, varying the phrasing hard. Keep \
+the tool-call syntax identical. Never invent a tool that is not in the example.
+"""
+# Generated data is the data most worth vetting.
+judge = """
+You are checking training examples for a home/desktop assistant. Keep an \
+example only if the instruction is a plausible thing a person would say, the \
+response contains a well-formed <tool>...</tool> call that actually matches \
+the request, and there is no invented tool name or leftover prose from the \
+generator.
+"""
+
+# Multi-turn, generated: the model writes whole conversations. `messages` is
+# read straight through, so a generated conversation needs no other handling
+# than a generated single exchange.
+[source.followups_llm]
+kind = "llm"
+weight = 1
+count = 300
+batch = 5
+dedup = "near"
+seed_file = "mixes/synth/tools_in_context.syn"
+system = """
+You generate multi-turn training conversations for a small home-assistant \
+model. You answer ONLY with JSON lines, one conversation per line, each of the \
+form {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", \
+"content": "..."}, ...]}. No prose, no code fences.
+"""
+prompt = """
+Here is one conversation for the tools you must use:
+{seed}
+
+Write {n} MORE conversations of 2 to 4 exchanges each. The follow-up turns \
+must refer back to what was said earlier ("turn it off again", "the other one \
+too", "undo that") so the assistant has to resolve it. Keep the tool-call \
+syntax identical and never invent a tool.
+"""
+judge = """
+You are checking multi-turn training conversations for a home assistant. Keep \
+one only if every assistant turn answers the user turn before it with a \
+well-formed tool call in the given syntax, and the follow-ups genuinely depend \
+on the earlier turns.
+"""
+
+# Code summarization, from the repo itself: the file is the context, the model
+# writes the summary. `judge` throws away the ones it did badly.
+# [source.code_summaries]
+# kind = "llm"
+# weight = 1
+# count = 300
+# batch = 4
+# system = "You answer ONLY with JSON lines, keys: instruction, context, response."
+# prompt = "Write {n} examples where the instruction asks for a summary of a Rust function, the context is the function's source, and the response is a two-sentence summary."

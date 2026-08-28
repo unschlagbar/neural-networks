@@ -5134,9 +5134,10 @@ pub fn mlstm_fused_bw(
     // when nothing is carried in. At the backbone's shape that is a 38 MB memset
     // saved, and it is what lets `mlstm_bw_parallel` read slot k+1 unconditionally
     // instead of branching on being the rightmost chunk.
-    // Their own array, not stage-sized slots: one state per chunk *boundary*, so these
-    // grow as the chunk length SHRINKS, where every other temporary is bounded by
-    // `rows x width`. See `temp::widest_chunk`.
+    // Their own array: one state per chunk *boundary*, so unlike every other temporary
+    // these scale with `1/l` rather than with `rows x width`. Keeping them apart is what
+    // lets the stage-sized slots stay sized for `rows x width`. `l` is
+    // `min(chunk, FUSED_MAX_L, t)` — see `MLstm::fused_chunk` and `temp::widest_chunk`.
     let mut dcst = cache.get_chunk::<f32>(gpu, &[bh, nc + 1, dhv, dqk]);
     let mut dnst = cache.get_chunk::<f32>(gpu, &[bh, nc + 1, dqk]);
     // Seed slot NC with the gradient from the chunk to the right; `mlstm_bw_dC` reads

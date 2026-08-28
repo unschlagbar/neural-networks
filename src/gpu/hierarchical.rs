@@ -73,12 +73,12 @@ pub struct ModelCfg {
     pub cap: f32,
 }
 
-/// SwiGLU inner width, derived per block from its own hidden width — `8·h/3`,
-/// the paper default, exactly as `SequentialBuilder::{slstm,mlstm}_block` does.
-/// It therefore differs between stages (e.g. 128 → 341, 384 → 1024).
+/// SwiGLU inner width, derived per block from its own hidden width, exactly as
+/// `SequentialBuilder::{slstm,mlstm}_block` does. It therefore differs between
+/// stages (e.g. 128 → 320, 384 → 1024).
 #[inline]
 pub fn up_of(hidden: usize) -> usize {
-    hidden * 8 / 3
+    crate::config::up_of(hidden)
 }
 
 /// Per-word encoder: first block sLSTM, remaining blocks mLSTM (16 heads),
@@ -172,22 +172,6 @@ fn chunk_spans(n: usize, chunk: usize) -> Vec<(usize, usize)> {
         c0 += len;
     }
     debug_assert_eq!(c0, n, "chunk_spans: pieces do not tile the rows");
-    out
-}
-
-/// Rows `[c0, c0+len)` of a `[N, width]` tensor, as a fresh tensor.
-///
-/// A copy, not a view: the chunk is handed to blocks that write through their own
-/// buffers, and a view into the whole-window tensor would alias what the next chunk
-/// still needs.
-fn slice_rows(gpu: &Gpu, src: &GTensor<f32>, c0: usize, len: usize, width: usize) -> GTensor<f32> {
-    let mut out = GTensor::uninit(gpu, &[len, width]);
-    gpu.stream
-        .memcpy_dtod(
-            &src.buf.slice(c0 * width..(c0 + len) * width),
-            &mut out.buf.slice_mut(..len * width),
-        )
-        .expect("slice_rows");
     out
 }
 
@@ -514,7 +498,7 @@ impl Hierarchical {
     fn unbound(gpu: &Gpu, cfg: ModelCfg) -> Self {
         let bb_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.bb_blocks)
             .map(|i| {
-                if i.is_multiple_of(6) {
+                if i.is_multiple_of(8) {
                     Box::new(Block::from_cell(
                         gpu,
                         cfg.wh,
@@ -723,11 +707,14 @@ impl Hierarchical {
             if self.flags.mem {
                 let kib = |e: usize| e as f64 * 4.0 / 1024.0;
                 println!(
-                    "  temp slots: {} x {:.2} MiB + {} x {:.0} KiB = {:.2} MiB",
+                    "  temp slots: {} x {:.2} MiB + {} x {:.0} KiB + {} x {:.2} MiB \
+                     = {:.2} MiB",
                     temp::SLOTS,
                     kib(c.temps.slot_elems()) / 1024.0,
                     temp::SMALL_SLOTS,
                     kib(c.temps.small_slot_elems()),
+                    temp::CHUNK_SLOTS,
+                    kib(c.temps.chunk_slot_elems()) / 1024.0,
                     c.temps.bytes() as f64 / (1 << 20) as f64,
                 );
             }
@@ -752,7 +739,8 @@ impl Hierarchical {
             // slots are being held that nothing asks for.
             let (high, of) = cache.temps.high_water();
             let (shigh, sof) = cache.temps.small_high_water();
-            println!("  temp slots peak: {high}/{of}  small {shigh}/{sof}");
+            let (chigh, cof) = cache.temps.chunk_high_water();
+            println!("  temp peak: {high}/{of}  small {shigh}/{sof}  chunk {chigh}/{cof}");
         }
         self.cache = Some(cache);
 
@@ -814,7 +802,10 @@ impl Hierarchical {
     /// count follows its own `T`: the encoder and decoder run a short `tmax` (one
     /// chunk), the backbone `BACKBONE_CHUNK`.
     fn temp_chunk_elems(&self) -> usize {
-        let l = crate::config::MLSTM_CHUNK;
+        // NOT `MLSTM_CHUNK`: the cells cap it at `FUSED_MAX_L` (see
+        // `MLstm::fused_chunk`), and that cap is what actually runs — 32, not 256, so
+        // there are 8x as many chunk boundaries as the config constant suggests.
+        let l = crate::config::MLSTM_CHUNK.min(ops::FUSED_MAX_L);
         let enc_rows = max_group_rows(self.group_cap());
         let enc_tmax = crate::config::MAX_WORD_BYTES + 1;
         let bb_rows = match self.bb_chunk {
@@ -824,7 +815,18 @@ impl Hierarchical {
         };
         let (hc, wh) = (self.cfg.hc, self.cfg.wh);
         let eh = 16.min(hc);
-        temp::widest_chunk(enc_rows, enc_tmax, eh, hc / eh, hc / eh, l).max(temp::widest_chunk(
+        // Sweep every `tmax` a group can have rather than assuming the longest. A group
+        // is `n_g x tmax` rows under one row cap, so SHORT words mean *more* words per
+        // group — and it is `n_g` (not `tmax`) that this array is proportional to. The
+        // worst case is therefore the shortest word, not the longest.
+        // A word is at least one byte, plus the closing `[W]` step when `ENC_W_EOS`, so
+        // the shortest group is 2 steps and not 1 — which halves this array.
+        let tmin = 1 + usize::from(crate::config::ENC_W_EOS);
+        let enc = (tmin..=enc_tmax)
+            .map(|t| temp::widest_chunk(enc_rows, t, eh, hc / eh, hc / eh, l))
+            .max()
+            .unwrap_or(0);
+        enc.max(temp::widest_chunk(
             bb_rows,
             bb_rows,
             self.cfg.heads,
@@ -1002,28 +1004,27 @@ impl Hierarchical {
         // back through `backward_with_x` — otherwise `dW` accumulates from the last
         // chunk only, a silent wrong gradient rather than a crash.
         let mut back_in: Vec<GTensor<f32>> = Vec::with_capacity(spans.len());
-        let mut o_parts: Vec<GTensor<f32>> = Vec::with_capacity(spans.len());
+        // The chunks tile the output rows, so each writes its own slice of the window
+        // tensor and there is nothing left to concatenate afterwards.
+        let o = GTensor::uninit(gpu, &[dw, hc]);
+        debug_assert!(!self.bb_blocks.is_empty(), "backbone with no blocks");
         for &(c0, len) in &spans {
-            // This chunk's slice of the front projection's output, as its own tensor:
-            // the blocks write through their own buffers and a chunk's activations must
-            // not alias the whole-window one.
-            let mut hb = slice_rows(gpu, &bb_in, c0, len, wh).reshaped(&[1, len, wh]);
+            // A block never writes its input, so the first one reads this chunk's rows
+            // out of the window tensor directly; only the two buffers the rest
+            // alternate between are the chunk's own.
+            let src = GTensor::view(gpu, &bb_in.buf, c0 * wh, &[1, len, wh]);
+            let mut hb = GTensor::uninit(gpu, &[1, len, wh]);
             let mut hb_next = GTensor::uninit(gpu, &[1, len, wh]);
-            for blk in self.bb_blocks.iter_mut() {
-                blk.forward(gpu, &hb, &mut hb_next, cache);
+            for (i, blk) in self.bb_blocks.iter_mut().enumerate() {
+                let x = if i == 0 { &src } else { &hb };
+                blk.forward(gpu, x, &mut hb_next, cache);
                 mem::swap(&mut hb, &mut hb_next);
             }
             let flat = hb.reshaped(&[len, wh]);
-            let mut y = GTensor::uninit(gpu, &[len, hc]);
+            let mut y = GTensor::view(gpu, &o.buf, c0 * hc, &[len, hc]);
             self.bb_back.forward_shared(gpu, &flat, &mut y);
             back_in.push(flat);
-            o_parts.push(y);
         }
-        let o = if o_parts.len() == 1 {
-            o_parts.pop().expect("one chunk")
-        } else {
-            concat_rows(gpu, &o_parts, dw, hc)
-        };
         self.timer.mark(gpu, "backbone fwd");
         hash_dbg(gpu, "bb_in", &bb_in);
         hash_dbg(gpu, "o", &o);
@@ -1099,7 +1100,8 @@ impl Hierarchical {
             };
             dec_rows_max = dec_rows_max.max(rows);
             let dec_in = self.build_decoder_input(gpu, o, n_words, tmax, rows, n_chars);
-            let capped = self.decoder_stack_forward(gpu, dec_in, n_words, tmax, rows, cache);
+            let (capped, hdn) =
+                self.decoder_stack_forward(gpu, dec_in, n_words, tmax, rows, cache);
 
             let (_, d_capped) = ops::masked_softmax_ce_u32_into(
                 gpu,
@@ -1112,8 +1114,8 @@ impl Hierarchical {
 
             self.timer.accum(gpu, "decoder fwd");
 
-            let d_dec_in =
-                self.decoder_stack_backward(gpu, &d_capped, &capped, n_words, tmax, rows, cache);
+            let d_dec_in = self
+                .decoder_stack_backward(gpu, &d_capped, &capped, &hdn, n_words, tmax, rows, cache);
             self.scatter_decoder_grads(gpu, &d_dec_in, &mut d_o, n_words, tmax, n_chars);
 
             // This group is completely finished — forward AND backward — so nothing
@@ -1177,7 +1179,9 @@ impl Hierarchical {
     }
 
     /// Decoder blocks → norm → head → softcap, returning the capped `[rows, vocab]`
-    /// logits (kept: the softcap backward needs its own output).
+    /// logits (kept: the softcap backward needs its own output) and `dec_norm`'s
+    /// output — which is both the head's `x` and the norm's own `y`, so holding it
+    /// here spares the head a saved copy of its input.
     fn decoder_stack_forward(
         &mut self,
         gpu: &Gpu,
@@ -1186,7 +1190,7 @@ impl Hierarchical {
         tmax: usize,
         rows: usize,
         cache: &TrainingCache,
-    ) -> GTensor<f32> {
+    ) -> (GTensor<f32>, GTensor<f32>) {
         let hc = self.cfg.hc;
         let mut hd = dec_in.reshaped(&[n_g, tmax, hc]);
         let mut hd_next = GTensor::uninit(gpu, &[n_g, tmax, hc]);
@@ -1195,8 +1199,9 @@ impl Hierarchical {
             mem::swap(&mut hd, &mut hd_next);
         }
         let hdn = self.dec_norm.forward_alloc(gpu, &hd.reshaped(&[rows, hc]));
-        let logits = self.dec_head.forward_alloc(gpu, &hdn);
-        ops::softcap_forward(gpu, &logits, self.cfg.cap)
+        let mut logits = GTensor::uninit(gpu, &[rows, self.dec_head.output_size()]);
+        self.dec_head.forward_shared(gpu, &hdn, &mut logits);
+        (ops::softcap_forward(gpu, &logits, self.cfg.cap), hdn)
     }
 
     /// The mirror of [`decoder_stack_forward`](Self::decoder_stack_forward), returning
@@ -1206,6 +1211,7 @@ impl Hierarchical {
         gpu: &Gpu,
         d_capped: &GTensor<f32>,
         capped: &GTensor<f32>,
+        hdn: &GTensor<f32>,
         n_g: usize,
         tmax: usize,
         rows: usize,
@@ -1213,15 +1219,12 @@ impl Hierarchical {
     ) -> GTensor<f32> {
         let hc = self.cfg.hc;
         let d_logits = ops::softcap_backward(gpu, d_capped, capped, self.cfg.cap);
-        let d_hdn = self.dec_head.backward_alloc(gpu, &d_logits, cache);
-        // `dec_head` saved its own input, which is exactly `dec_norm`'s output — the
-        // tensor the norm's backward rebuilds `x̂` from, so nothing else has to keep it.
-        let d_hd_flat = {
-            let Self {
-                dec_head, dec_norm, ..
-            } = self;
-            dec_norm.backward_alloc(gpu, &d_hdn, dec_head.saved_x(), cache)
-        };
+        // `hdn` is the head's input and `dec_norm`'s own output — the tensor the norm's
+        // backward rebuilds `x̂` from — so one buffer serves both backwards.
+        let d_hdn = self
+            .dec_head
+            .backward_alloc_with_x(gpu, hdn, &d_logits, cache);
+        let d_hd_flat = self.dec_norm.backward_alloc(gpu, &d_hdn, hdn, cache);
         let mut d_hd = d_hd_flat.reshaped(&[n_g, tmax, hc]);
         let mut d_hd_next = GTensor::uninit(gpu, &[n_g, tmax, hc]);
         for blk in self.dec_blocks.iter_mut().rev() {
@@ -1298,7 +1301,6 @@ impl Hierarchical {
         let d_bb_out = self.bb_back_backward(gpu, &back_in, &spans, d_o, dw, cache);
 
         let mut d_parts: Vec<Option<GTensor<f32>>> = (0..spans.len()).map(|_| None).collect();
-        let mut d_bb_out = Some(d_bb_out);
         for (ci, &(c0, len)) in spans.iter().enumerate().rev() {
             // The last block is wanted first in every chunk, not just the first one:
             // the prefetch above covers only the leftmost pass, so without this each
@@ -1315,14 +1317,10 @@ impl Hierarchical {
                     blk.reset_bptt(gpu);
                 }
             }
-            let d_hb = if chunked {
-                let src = d_bb_out.as_ref().expect("d_bb_out");
-                slice_rows(gpu, src, c0, len, wh).reshaped(&[1, len, wh])
-            } else {
-                // Single chunk: hand the whole tensor over rather than copying it.
-                d_bb_out.take().expect("d_bb_out").reshaped(&[1, len, wh])
-            };
-            d_parts[ci] = Some(self.bb_blocks_backward(gpu, d_hb, len, cache));
+            // A block never writes its `dy`, so this chunk's rows are read straight out
+            // of the whole-window gradient.
+            let d_hb = GTensor::view(gpu, &d_bb_out.buf, c0 * wh, &[1, len, wh]);
+            d_parts[ci] = Some(self.bb_blocks_backward(gpu, &d_hb, len, cache));
         }
         let mut d_parts: Vec<GTensor<f32>> = d_parts
             .into_iter()
@@ -1358,12 +1356,16 @@ impl Hierarchical {
             return self.bb_back.backward_alloc_with_x(gpu, &back_in[0], d_o, cache);
         }
         let (hc, wh) = (self.cfg.hc, self.cfg.wh);
-        let mut parts: Vec<GTensor<f32>> = Vec::with_capacity(back_in.len());
+        // The chunks tile both sides: each reads its rows of `d_o` and writes its rows
+        // of the result, so neither end needs a copy.
+        let out = GTensor::uninit(gpu, &[dw, wh]);
         for (i, &(c0, len)) in spans.iter().enumerate() {
-            let d_o_c = slice_rows(gpu, d_o, c0, len, hc);
-            parts.push(self.bb_back.backward_alloc_with_x(gpu, &back_in[i], &d_o_c, cache));
+            let d_o_c = GTensor::view(gpu, &d_o.buf, c0 * hc, &[len, hc]);
+            let mut dx = GTensor::view(gpu, &out.buf, c0 * wh, &[len, wh]);
+            self.bb_back
+                .backward_with_x(gpu, &back_in[i], &d_o_c, &mut dx, cache);
         }
-        concat_rows(gpu, &parts, dw, wh)
+        out
     }
 
     /// One chunk's `[1, len, WH]` gradient down through the backbone blocks.
@@ -1375,20 +1377,24 @@ impl Hierarchical {
     fn bb_blocks_backward(
         &mut self,
         gpu: &Gpu,
-        d_hb: GTensor<f32>,
+        d_out: &GTensor<f32>,
         len: usize,
         cache: &TrainingCache,
     ) -> GTensor<f32> {
         let wh = self.cfg.wh;
-        let mut d_hb = d_hb;
+        let mut d_hb = GTensor::uninit(gpu, &[1, len, wh]);
         let mut d_hb_next = GTensor::uninit(gpu, &[1, len, wh]);
+        let last = self.bb_blocks.len() - 1;
         for i in (0..self.bb_blocks.len()).rev() {
+            // The topmost block reads the caller's gradient; below it, what the block
+            // above wrote.
+            let dy = if i == last { d_out } else { &d_hb };
             if i > 0 {
                 let (head, tail) = self.bb_blocks.split_at_mut(i);
                 head[i - 1].prefetch_act(gpu);
-                tail[0].backward(gpu, &d_hb, &mut d_hb_next, cache);
+                tail[0].backward(gpu, dy, &mut d_hb_next, cache);
             } else {
-                self.bb_blocks[0].backward(gpu, &d_hb, &mut d_hb_next, cache);
+                self.bb_blocks[0].backward(gpu, dy, &mut d_hb_next, cache);
             }
             mem::swap(&mut d_hb, &mut d_hb_next);
         }

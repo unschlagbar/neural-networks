@@ -1,0 +1,8 @@
+[package]
+name = "wordseg"
+version = "0.1.0"
+edition = "2024"
+
+# No dependencies: this is the definition of what a token and a word are, and
+# every crate that touches the corpus needs to agree on it byte for byte.
+[dependencies]

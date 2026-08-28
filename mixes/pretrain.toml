@@ -1,0 +1,56 @@
+#:schema ../datamix/mixture.schema.json
+# Pretraining corpus: Rust source plus prose, deduplicated and quality-filtered.
+#
+#   cargo run -p datamix --release -- check mixes/pretrain.toml
+#   cargo run -p datamix --release -- build mixes/pretrain.toml
+#
+# Point TRAIN_DATA in src/config.rs at the output. The documents are joined with
+# <|endoftext|>, which ChunkedWordDataSet splits on and never tokenizes — no
+# end-of-document token is trained, exactly as with the current corpus.
+
+[output]
+kind = "text"
+path = "data/mix/pretrain.txt"
+report = "data/mix/pretrain_report.md"
+seed = 7
+tokens = 0            # 0 = as large as the weights allow without over-repeating
+shard_bytes = 0       # >0 splits into pretrain.000.txt, pretrain.001.txt, ...
+holdout = 0.005
+
+[filter]
+min_bytes = 200
+max_bytes = "400k"
+max_line_bytes = 2000     # minified / generated files
+max_dup_line_ratio = 0.35 # log dumps, repeated headers
+dedup = "near"
+
+[source.rust-std]
+kind = "dir"
+path = "data/rust-std"
+ext = ["rs"]
+weight = 1
+epochs = 1
+
+# 62.8k files, of which only ~1.2k are unique — `dedup` is what makes this
+# source usable at all (see the report's rejection breakdown).
+[source.rust-lib]
+kind = "dir"
+path = "data/rust-lib"
+ext = ["rs"]
+weight = 3
+min_alpha_ratio = 0.4
+
+[source.book]
+kind = "dir"
+path = "data/mds"
+ext = ["md"]
+weight = 1
+epochs = 2          # small and high quality: worth seeing twice
+
+[source.speeches]
+kind = "file"
+path = "data/political_speeches.txt"
+# The file carries no document markers, so a paragraph is the document. With
+# separator = "" the whole file would be one document and max_bytes would drop it.
+separator = "\n\n"
+weight = 1

@@ -101,14 +101,27 @@ pub fn train_hierarchical(model_path: &str) {
             build_hierarchical_model(vocab, tokenizer)
         }
     };
-    println!("Streaming dataset from '{TRAIN_DATA}' in {CHUNK_BYTES}-byte chunks ...");
-    let mut data = ChunkedWordDataSet::open(
-        tokenizer,
-        TRAIN_DATA,
-        WORDS_PER_SEQ,
-        MIN_WORDS_PER_SEQ,
-        MAX_WINDOW_TOKENS,
-        CHUNK_BYTES,
+    // A resumed run already knows which corpus it walks; only a new one asks.
+    // Pointing a resume at a different corpus by accident is exactly the
+    // mistake the sidecar exists to prevent.
+    let corpus_root = match crate::pretrain_progress::load(model_path) {
+        Some(p) => {
+            println!("Found a progress file — continuing on '{}'.", p.corpus);
+            p.corpus
+        }
+        None => crate::pretrain_progress::ask_corpus(TRAIN_DATA),
+    };
+    let corpus = match crate::pretrain_progress::Corpus::open(&corpus_root) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Cannot read corpus '{corpus_root}': {e}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "Corpus '{}': {} file(s), streamed in {CHUNK_BYTES}-byte chunks",
+        corpus.root,
+        corpus.len()
     );
     println!(
         "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, optimizer={:?}, log every {LOG_EVERY} steps",
@@ -124,40 +137,66 @@ pub fn train_hierarchical(model_path: &str) {
 
     // Where the last run stopped, from the sidecar next to the checkpoint. The
     // step count cannot answer this: it spans every corpus the weights have seen.
-    let mut progress =
-        crate::pretrain_progress::resume_or_fresh(model_path, TRAIN_DATA, model.step, EPOCHS);
-    // Every run must stamp its window count into the sidecar, otherwise the
-    // resume it writes cannot be validated later. `windows == 0` marks a count
-    // that was never taken — unmeasured, not mismatched.
-    let prep_start = Instant::now();
-    let total = data.count_windows();
-    println!(
-        "  {total} windows total (counting pass took {:.1?})",
-        prep_start.elapsed()
-    );
-    if !progress.is_fresh() && progress.windows != 0 && total != progress.windows {
-        // A resume offset is only meaningful against the window count it was
-        // measured with, so verify it before skipping anything.
-        println!(
-            "  corpus has {total} windows but the progress file recorded {} — \
-             starting a fresh pass.",
-            progress.windows
-        );
-        progress = crate::pretrain_progress::PretrainProgress::fresh(TRAIN_DATA, model.step);
-    }
-    progress.windows = total;
+    let start =
+        crate::pretrain_progress::resume_or_fresh(model_path, &corpus, model.step, EPOCHS);
+    let mut progress = start.progress;
     let start_epoch = progress.epoch;
+    let start_file = start.file;
     let start_done = progress.done;
+    if start_epoch > EPOCHS {
+        return;
+    }
 
     for epoch in start_epoch..=EPOCHS {
         println!("── Epoch {epoch} ───────────────────────────────────────");
+        let epoch_start = Instant::now();
+        // Only the resumed epoch resumes mid-corpus; later epochs run whole.
+        let first_file = if epoch == start_epoch { start_file } else { 0 };
 
-        // Only the resumed epoch skips; later epochs run whole.
-        let mut skip = if epoch == start_epoch { start_done } else { 0 };
+        for file_index in first_file..corpus.len() {
+        let path = corpus.path_of(file_index).display().to_string();
+        println!(
+            "── File {}/{}: {path} ─────────────────",
+            file_index + 1,
+            corpus.len()
+        );
+        let mut data = ChunkedWordDataSet::open(
+            tokenizer,
+            &path,
+            WORDS_PER_SEQ,
+            MIN_WORDS_PER_SEQ,
+            MAX_WINDOW_TOKENS,
+            CHUNK_BYTES,
+        );
+        // Only the file the run stopped inside skips; the rest run whole.
+        let mut skip = if epoch == start_epoch && file_index == start_file {
+            start_done
+        } else {
+            0
+        };
+        // Every run must stamp its window count into the sidecar, otherwise the
+        // resume it writes cannot be validated later.
+        let prep_start = Instant::now();
+        let total = data.count_windows();
+        println!(
+            "  {total} windows (counting pass took {:.1?})",
+            prep_start.elapsed()
+        );
+        if skip > 0 && progress.windows != 0 && total != progress.windows {
+            println!(
+                "  file has {total} windows but the progress file recorded {} — \
+                 starting this file from the beginning.",
+                progress.windows
+            );
+            skip = 0;
+        }
         if skip > 0 {
             println!("  Resuming from window {skip} (step {})", model.step);
         }
         progress.epoch = epoch;
+        progress.files_done = file_index;
+        progress.file = corpus.name_of(file_index);
+        progress.windows = total;
         progress.done = skip;
 
         let start = Instant::now();
@@ -180,32 +219,50 @@ pub fn train_hierarchical(model_path: &str) {
             skip = 0;
         }
 
-        let epoch_time = start.elapsed();
-        total_time += epoch_time;
+        let file_time = start.elapsed();
+        total_time += file_time;
 
         match model.save(model_path) {
             Ok(()) => {
                 println!(
-                    "  ✓ end-of-epoch save to '{model_path}'  (epoch {epoch_time:.0?}, total {total_time:.0?})"
+                    "  ✓ end-of-file save to '{model_path}'  (file {file_time:.0?}, total {total_time:.0?})"
                 );
                 println!("    trained on: {}", model.seen.save_line());
-                // The recorded position is the START of the next epoch, so a
-                // stop here resumes without redoing the epoch just finished.
-                progress.epoch = epoch + 1;
+                // The file is finished: the recorded position is the START of
+                // the next one, so a stop here does not re-read it.
+                progress.files_done = file_index + 1;
+                progress.file = corpus.name_of(file_index + 1);
                 progress.done = 0;
+                progress.windows = 0;
                 progress.step = model.step;
                 if let Err(e) = crate::pretrain_progress::save(model_path, &progress) {
                     eprintln!("  ✗ progress save failed: {e}");
                 }
             }
-            Err(e) => eprintln!("  ✗ end-of-epoch save failed: {e}"),
+            Err(e) => eprintln!("  ✗ end-of-file save failed: {e}"),
+        }
+        } // files
+
+        println!("Epoch {epoch} took {:.1?}", epoch_start.elapsed());
+        // The recorded position is the START of the next epoch, so a stop here
+        // resumes without redoing the epoch just finished.
+        progress.epoch = epoch + 1;
+        progress.files_done = 0;
+        progress.file = corpus.name_of(0);
+        progress.done = 0;
+        progress.step = model.step;
+        if let Err(e) = crate::pretrain_progress::save(model_path, &progress) {
+            eprintln!("  ✗ progress save failed: {e}");
         }
     }
 
-    // The run consumed all its epochs: drop the sidecar so the next invocation
-    // starts at the beginning of whatever corpus it is pointed at.
-    crate::pretrain_progress::clear(model_path);
-    println!("Run complete — progress file cleared; the next run starts a fresh pass.");
+    // The sidecar is left behind saying the corpus is done: it is the record of
+    // which shards these weights have seen, and deleting it is the user's call.
+    println!(
+        "Run complete — '{}' says the corpus is finished; delete it or point the \
+         next run at another corpus.",
+        crate::pretrain_progress::progress_path(model_path).display()
+    );
 }
 
 /// CPU supervised fine-tuning (Q-A / instruction tuning) of a hierarchical

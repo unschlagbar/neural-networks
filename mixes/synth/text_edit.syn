@@ -1,0 +1,20 @@
+# Text editing / formatting. Each list entry is a matched pair: field 0 is the
+# text handed in, field 1 the text handed back. A template cannot rewrite, so
+# every rewrite here is one you wrote — this file is the seed, real editing data
+# belongs in a JSONL source next to it.
+
+list spell = i cant beleive its allready thursday ; I can't believe it's already Thursday | teh reciept is in the draw ; The receipt is in the drawer | he dont know were it is ; He doesn't know where it is
+
+list wordy = At this point in time we are currently unable to proceed. ; We cannot proceed yet. | It is important to note that the file was not found. ; The file was not found. | In the event that it fails, please try again. ; If it fails, try again.
+
+template
+instruction = {fix the spelling|correct the typos|clean up the spelling}
+context = {spell.0}
+response = {spell.1}
+category = text_edit
+
+template
+instruction = {make this shorter|tighten this up|say this in fewer words}
+context = {wordy.0}
+response = {wordy.1}
+category = text_edit
