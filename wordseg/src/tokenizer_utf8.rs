@@ -14,7 +14,26 @@
 /// markers, appended *after* them so an existing byte/`<W>`/`<END>` id never
 /// shifts. A pretrained checkpoint has a smaller vocab than this list implies;
 /// `crate::grow_vocab` widens its tables to make room for the new rows.
-pub const SPECIAL_TOKENS: &[&str] = &["<W>", "<END>", "<CONTEXT>", "<SEP>"];
+///
+/// From `MARKUP_START` on the specials are *markup*: unlike the structural
+/// markers above them they also occur verbatim in the training data, so
+/// `to_tokens_markup` folds each literal occurrence into its token and
+/// `to_text_markup` writes it back out unchanged.
+pub const SPECIAL_TOKENS: &[&str] = &[
+    "<W>",
+    "<END>",
+    "<CONTEXT>",
+    "<SEP>",
+    "<tool>",
+    "</tool>",
+    "<result>",
+    "</result>",
+    "<think>",
+    "</think>",
+];
+
+/// Index into `SPECIAL_TOKENS` of the first markup special.
+pub const MARKUP_START: usize = 4;
 
 /// Number of specials present in a model trained *before* SFT (only `<W>` and
 /// `<END>`). A pretrained checkpoint therefore has `256 + PRETRAIN_SPECIALS`
@@ -34,6 +53,16 @@ pub const END_TOKEN: u16 = BYTE_TOKENS as u16 + 1;
 pub const CONTEXT_TOKEN: u16 = BYTE_TOKENS as u16 + 2;
 /// `<SEP>` — SFT marker separating the prompt from the assistant response.
 pub const SEP_TOKEN: u16 = BYTE_TOKENS as u16 + 3;
+/// `<tool>` … `</tool>` — an assistant-side tool call. Written by the model.
+pub const TOOL_OPEN_TOKEN: u16 = BYTE_TOKENS as u16 + 4;
+pub const TOOL_CLOSE_TOKEN: u16 = BYTE_TOKENS as u16 + 5;
+/// `<result>` … `</result>` — what a call returned. Prompt-side: read, never
+/// produced, so it is followed by a `<SEP>` like any other prompt turn.
+pub const RESULT_OPEN_TOKEN: u16 = BYTE_TOKENS as u16 + 6;
+pub const RESULT_CLOSE_TOKEN: u16 = BYTE_TOKENS as u16 + 7;
+/// `<think>` … `</think>` — an assistant reasoning block preceding the answer.
+pub const THINK_OPEN_TOKEN: u16 = BYTE_TOKENS as u16 + 8;
+pub const THINK_CLOSE_TOKEN: u16 = BYTE_TOKENS as u16 + 9;
 
 #[derive(Clone, Copy, Default)]
 pub struct Utf8Tokenizer;
@@ -46,6 +75,63 @@ impl Utf8Tokenizer {
     /// Encode `text` into a token sequence (one token per UTF-8 byte).
     pub fn to_tokens(&self, text: &str) -> Vec<u16> {
         text.bytes().map(u16::from).collect()
+    }
+
+    /// Encode `text`, folding every literal markup marker (`<tool>`,
+    /// `</result>`, …) into its own token instead of its bytes. Identical to
+    /// [`Self::to_tokens`] for text that contains none.
+    pub fn to_tokens_markup(&self, text: &str) -> Vec<u16> {
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let marker = (bytes[i] == b'<')
+                .then(|| {
+                    SPECIAL_TOKENS[MARKUP_START..]
+                        .iter()
+                        .position(|name| bytes[i..].starts_with(name.as_bytes()))
+                })
+                .flatten();
+            match marker {
+                Some(k) => {
+                    out.push((BYTE_TOKENS + MARKUP_START + k) as u16);
+                    i += SPECIAL_TOKENS[MARKUP_START + k].len();
+                }
+                None => {
+                    out.push(u16::from(bytes[i]));
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Decode a token sequence, spelling markup markers back out as text and
+    /// skipping the structural ones (`<W>`, `<END>`, `<SEP>`, `<CONTEXT>`). The
+    /// inverse of [`Self::to_tokens_markup`].
+    pub fn to_text_markup(&self, tokens: &[u16]) -> String {
+        let mut out = String::new();
+        let mut run: Vec<u16> = Vec::new();
+        for &t in tokens {
+            match (t as usize).checked_sub(BYTE_TOKENS) {
+                None => run.push(t),
+                Some(s) if s >= MARKUP_START => {
+                    out.push_str(&self.to_text(&run));
+                    run.clear();
+                    out.push_str(SPECIAL_TOKENS[s]);
+                }
+                Some(_) => {}
+            }
+        }
+        out.push_str(&self.to_text(&run));
+        out
+    }
+
+    /// Whether `token` is a markup marker — a special that is part of the text
+    /// the model writes, not a structural boundary.
+    pub fn is_markup(&self, token: u16) -> bool {
+        (token as usize) >= BYTE_TOKENS + MARKUP_START
+            && (token as usize) < self.vocab_size()
     }
 
     /// Decode a token sequence back into text. Special tokens are skipped;
@@ -128,8 +214,8 @@ impl Utf8Tokenizer {
         SEP_TOKEN
     }
 
-    /// Bytes a fixed-size token window may be cut at (used by the flat model's
-    /// window builder — the hierarchical word split lives in `crate::segment`).
+    /// Bytes a fixed-size token window may be cut at. The word split the models
+    /// actually train on lives in `crate::segment`.
     pub fn boundary_tokens(&self) -> Vec<u16> {
         [
             b' ', b'.', b'!', b'?', b',', b';', b':', b'\n', b'{', b'}', b'(', b')',
@@ -176,6 +262,25 @@ mod tests {
         // No encoded text can collide with a special token.
         assert!(tok.to_tokens("Größe 🦀 日本語").iter().all(|&t| t < 256));
         assert_eq!(tok.display(W_TOKEN), "<W>");
+    }
+
+    #[test]
+    fn markup_markers_are_single_tokens() {
+        let tok = Utf8Tokenizer::new();
+        let text = "<think>the lamp</think><tool>lamp.set(on=true)</tool>";
+        let tokens = tok.to_tokens_markup(text);
+        assert_eq!(tokens.iter().filter(|&&t| t == THINK_OPEN_TOKEN).count(), 1);
+        assert_eq!(tokens.iter().filter(|&&t| t == TOOL_CLOSE_TOKEN).count(), 1);
+        assert!(!tok.to_text(&tokens).contains("<tool>"));
+        assert_eq!(tok.to_text_markup(&tokens), text);
+    }
+
+    #[test]
+    fn markup_encoding_leaves_plain_text_alone() {
+        let tok = Utf8Tokenizer::new();
+        for s in ["a < b && c > d", "Vec<String>", "</notatool>", "日本語 🦀"] {
+            assert_eq!(tok.to_tokens_markup(s), tok.to_tokens(s));
+        }
     }
 
     #[test]

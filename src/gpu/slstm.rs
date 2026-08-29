@@ -102,9 +102,9 @@ const FUSED_MAX_B: usize = 32;
 fn grad_bf16(gpu: &Gpu) -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SLSTM_BF16_GRAD").as_deref() == Ok("1")) && gpu.kernels.has_bf16
+    *ON.get_or_init(|| std::env::var("SLSTM_BF16_GRAD").as_deref() == Ok("1"))
+        && gpu.kernels.has_bf16
 }
-
 
 /// The time-fused T-loop (`slstm_fused_time` / `_bwd`): the whole forward or
 /// backward sequence as ONE cooperative launch instead of two launches per
@@ -1873,7 +1873,7 @@ mod tests {
         let w: Vec<Tensor> = (0..4)
             .map(|g| Tensor::random(&[2 * h, h], s * (1.0 + g as f32 * 0.05)))
             .collect();
-        let bi: Vec<Tensor> = (0..4).map(|g| Tensor::random(&[h], 0.2)).collect();
+        let bi: Vec<Tensor> = (0..4).map(|_g| Tensor::random(&[h], 0.2)).collect();
         let x = GTensor::from_host(&gpu, &Tensor::random(&[b, t, h], 0.5));
 
         let build = || {
@@ -2010,7 +2010,9 @@ mod tests {
                 );
             }
         };
-        let want_dx = per_step.backward_alloc(&gpu, &y_per, &gy, &tc).to_host(&gpu);
+        let want_dx = per_step
+            .backward_alloc(&gpu, &y_per, &gy, &tc)
+            .to_host(&gpu);
         let got_dx = fused.backward_alloc(&gpu, &y_fused, &gy, &tc).to_host(&gpu);
         close_rel(0.0, &want_dx.data, &got_dx.data, "dx");
         // Measured separation at B = 1/64/256: the degenerate input-gate slice sits at
@@ -2110,7 +2112,9 @@ mod tests {
                 );
             }
         };
-        let want_dx = per_step.backward_alloc(&gpu, &y_per, &gy, &tc).to_host(&gpu);
+        let want_dx = per_step
+            .backward_alloc(&gpu, &y_per, &gy, &tc)
+            .to_host(&gpu);
         let got_dx = batched.backward_alloc(&gpu, &y_bat, &gy, &tc).to_host(&gpu);
         close_rel(&want_dx.data, &got_dx.data, "dx");
         for gi in 0..4 {
@@ -2145,7 +2149,9 @@ mod tests {
         let t: usize = chunks.iter().sum();
         let sc = 1.0 / (h as f32).sqrt();
         let w: Vec<Tensor> = (0..4)
-            .map(|g| Tensor::random_seeded(&[2 * h, h], sc * (1.0 + g as f32 * 0.05), 41 + g as u64))
+            .map(|g| {
+                Tensor::random_seeded(&[2 * h, h], sc * (1.0 + g as f32 * 0.05), 41 + g as u64)
+            })
             .collect();
         let bi: Vec<Tensor> = (0..4)
             .map(|g| Tensor::random_seeded(&[h], 0.2, 61 + g as u64))
@@ -2373,19 +2379,28 @@ mod tests {
         let cell = SLstm::new_rand(&gpu, 6, 6);
 
         // Backbone: one sequence, a whole chunk of words. Fuses.
-        assert!(cell.fuses_at(1, crate::config::BACKBONE_CHUNK), "backbone must fuse");
+        assert!(
+            cell.fuses_at(1, crate::config::BACKBONE_CHUNK),
+            "backbone must fuse"
+        );
 
         // Encoder/decoder: a word is at most MAX_WORD_BYTES + 1 steps, and the batch is
         // the whole length group. Must not fuse — on either count.
         for t in 1..=(crate::config::MAX_WORD_BYTES + 1) {
             for b in [120, 227, 512, 1024, crate::config::GROUP_MAX_ROWS] {
-                assert!(!cell.fuses_at(b, t), "encoder shape B={b} T={t} must not fuse");
+                assert!(
+                    !cell.fuses_at(b, t),
+                    "encoder shape B={b} T={t} must not fuse"
+                );
             }
         }
 
         // The batch axis alone decides it at a length that clears FUSED_MIN_T.
         assert!(cell.fuses_at(FUSED_MAX_B, 512), "B at the cap still fuses");
-        assert!(!cell.fuses_at(FUSED_MAX_B + 1, 512), "one past the cap must not");
+        assert!(
+            !cell.fuses_at(FUSED_MAX_B + 1, 512),
+            "one past the cap must not"
+        );
 
         // ...and the batched path is the other half of that split: it takes the
         // encoder/decoder groups the scalar one refuses, up to the batch where its
@@ -2393,11 +2408,20 @@ mod tests {
         // and the widest must not — a regression either way is otherwise silent.
         let enc = SLstm::new_rand(&gpu, crate::config::CHAR_HIDDEN, crate::config::CHAR_HIDDEN);
         for b in [120, 128, 186] {
-            assert!(enc.batches_at(&gpu, b), "encoder group B={b} must take the batched path");
+            assert!(
+                enc.batches_at(&gpu, b),
+                "encoder group B={b} must take the batched path"
+            );
         }
         for b in [292, 512, 1024, crate::config::GROUP_MAX_ROWS] {
-            assert!(!enc.batches_at(&gpu, b), "B={b} re-reads too much to be worth it");
+            assert!(
+                !enc.batches_at(&gpu, b),
+                "B={b} re-reads too much to be worth it"
+            );
         }
-        assert!(!enc.batches_at(&gpu, SB_MIN_B - 1), "a batch that cannot fill an mma tile");
+        assert!(
+            !enc.batches_at(&gpu, SB_MIN_B - 1),
+            "a batch that cannot fill an mma tile"
+        );
     }
 }

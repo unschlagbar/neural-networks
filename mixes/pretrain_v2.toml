@@ -1,0 +1,77 @@
+#:schema ../datamix/mixture.schema.json
+# English pretraining corpus v2: 75% web, 15% Rust code, 10% math.
+#
+#   cargo run -p datamix --release -- check mixes/pretrain_v2.toml   # stats only
+#   cargo run -p datamix --release -- build mixes/pretrain_v2.toml
+#
+# v1 (mixes/pretrain_en.toml) was 94.3% web, 5.6% math and 0.03% code, which is
+# far outside every published mix: LFM2 runs 5% code, Llama 3 17%, Nemotron-H
+# 20% in every phase, SmolLM2 24% by the end. The code here is real Rust from
+# StarCoderData instead of the vendored registry cache, whose 62.8k files
+# deduplicate down to 859.
+#
+# Sizing: FineWeb holds 25.84G tokens after filtering, so at a 75% share it caps
+# the corpus at ~34.4G and is the source that binds. Code (~10.1G) and math
+# (~4.1G) are both in surplus at their shares and report `capped` — that is
+# intended, not a warning: they are drawn down to their share and the rest is
+# left for a later run.
+
+[output]
+kind = "text"
+path = "data/mix/pretrain_v2/shard.txt"
+shard_bytes = "512M"
+report = "data/mix/pretrain_v2/report.md"
+seed = 13
+tokens = 0            # 0 = everything the weights allow without repeating
+holdout = 0.0005
+shuffle = true
+
+# Global gates only — anything that would be wrong for web prose lives on the
+# source that needs it. `max_line_bytes` in particular must NOT be global: a web
+# document is often one paragraph per line and would be wiped out by it.
+[filter]
+min_bytes = 200
+max_bytes = "400k"
+max_dup_line_ratio = 0.5
+dedup = "exact"
+
+[source.fineweb]
+kind = "parquet"
+path = "/home/unschlagbar/training_data/FineWeb"
+languages = ["en"]
+min_alpha_ratio = 0.6
+weight = 74.99
+epochs = 1
+
+# StarCoderData's Rust split: 9 shards, ~1.4M files, ~10.1G tokens. Already
+# near-deduplicated upstream, so `exact` catches what is left for a fraction of
+# the cost of a MinHash pass over 10G of source.
+[source.rust-code]
+kind = "parquet"
+path = "/home/unschlagbar/training_data/StarCoder-Rust"
+text_column = "content"
+min_alpha_ratio = 0.4
+max_line_bytes = 2000
+weight = 15
+epochs = 1
+
+# Math prose is symbol-heavy (LaTeX, formulae), so the letter-ratio gate has to
+# be much looser than for web text or it eats the good documents.
+[source.finemath]
+kind = "parquet"
+path = "/home/unschlagbar/training_data/FineMath"
+min_alpha_ratio = 0.3
+weight = 10
+epochs = 1
+
+# The standard library: 3.45M tokens, the highest-quality Rust on this machine
+# and disjoint from StarCoderData's crawl. Its weight is what it actually holds.
+[source.rust-std]
+kind = "dir"
+path = "data/rust-std"
+ext = ["rs"]
+min_alpha_ratio = 0.4
+max_line_bytes = 2000
+dedup = "near"
+weight = 0.009
+epochs = 1

@@ -498,7 +498,7 @@ impl Hierarchical {
     fn unbound(gpu: &Gpu, cfg: ModelCfg) -> Self {
         let bb_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.bb_blocks)
             .map(|i| {
-                if i.is_multiple_of(8) {
+                if (i + 2).is_multiple_of(6) {
                     Box::new(Block::from_cell(
                         gpu,
                         cfg.wh,
@@ -793,7 +793,13 @@ impl Hierarchical {
         let enc_dqk = (hc / enc_heads).max(1);
         temp::widest(enc_rows, hc, enc_heads, enc_dqk, 0)
             .max(temp::widest(bb_rows, wh, self.cfg.heads, self.cfg.dqk, 0))
-            .max(temp::widest(enc_rows, hc, enc_heads, enc_dqk, self.cfg.vocab))
+            .max(temp::widest(
+                enc_rows,
+                hc,
+                enc_heads,
+                enc_dqk,
+                self.cfg.vocab,
+            ))
     }
 
     /// `f32` elements per **chunk-state** temp slot. See [`temp::widest_chunk`].
@@ -845,8 +851,7 @@ impl Hierarchical {
             None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(WORDS_PER_SEQ).max(1),
             None => WORDS_PER_SEQ,
         };
-        temp::widest_small(enc_rows, 16)
-            .max(temp::widest_small(bb_rows, self.cfg.heads))
+        temp::widest_small(enc_rows, 16).max(temp::widest_small(bb_rows, self.cfg.heads))
     }
 
     /// Run one encoder group's rectangle through the block stack, leaving the result in
@@ -1100,8 +1105,7 @@ impl Hierarchical {
             };
             dec_rows_max = dec_rows_max.max(rows);
             let dec_in = self.build_decoder_input(gpu, o, n_words, tmax, rows, n_chars);
-            let (capped, hdn) =
-                self.decoder_stack_forward(gpu, dec_in, n_words, tmax, rows, cache);
+            let (capped, hdn) = self.decoder_stack_forward(gpu, dec_in, n_words, tmax, rows, cache);
 
             let (_, d_capped) = ops::masked_softmax_ce_u32_into(
                 gpu,
@@ -1353,7 +1357,9 @@ impl Hierarchical {
         cache: &TrainingCache,
     ) -> GTensor<f32> {
         if back_in.len() == 1 {
-            return self.bb_back.backward_alloc_with_x(gpu, &back_in[0], d_o, cache);
+            return self
+                .bb_back
+                .backward_alloc_with_x(gpu, &back_in[0], d_o, cache);
         }
         let (hc, wh) = (self.cfg.hc, self.cfg.wh);
         // The chunks tile both sides: each reads its rows of `d_o` and writes its rows
@@ -1890,16 +1896,15 @@ impl Hierarchical {
         let stacks = crate::hierarchical::Hierarchical::load_stacks(path)?;
 
         let err = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-        let to_block =
-            |gpu: &Gpu, l: &Box<dyn crate::nn_layer::NnLayer>| -> io::Result<Box<dyn BlockLike>> {
-                if let Some(s) = l.as_any().downcast_ref::<SLSTMBlock>() {
-                    Ok(Box::new(Block::<SLstm>::from_nn_block(gpu, s)))
-                } else if let Some(m) = l.as_any().downcast_ref::<MLSTMBlock>() {
-                    Ok(Box::new(Block::<MLstm>::from_nn_block(gpu, m)))
-                } else {
-                    Err(err("expected an sLSTM/mLSTM block in the checkpoint".into()))
-                }
-            };
+        let to_block = |gpu: &Gpu, l: &Box<dyn NnLayer>| -> io::Result<Box<dyn BlockLike>> {
+            if let Some(s) = l.as_any().downcast_ref::<SLSTMBlock>() {
+                Ok(Box::new(Block::<SLstm>::from_nn_block(gpu, s)))
+            } else if let Some(m) = l.as_any().downcast_ref::<MLSTMBlock>() {
+                Ok(Box::new(Block::<MLstm>::from_nn_block(gpu, m)))
+            } else {
+                Err(err("expected an sLSTM/mLSTM block in the checkpoint".into()))
+            }
+        };
 
         // Encoder: Embedding + blocks
         let enc = &stacks.encoder_chars.layers;
@@ -1951,7 +1956,7 @@ impl Hierarchical {
             .map(|l| to_block(gpu, l))
             .collect::<io::Result<_>>()?;
         let rms = dl[norm_idx].as_any().downcast_ref::<RMSNorm>().unwrap();
-        let dec_norm = super::rms_norm::RmsNorm::from_parts(gpu, &tensor_from_slice(&rms.gamma));
+        let dec_norm = RmsNorm::from_parts(gpu, &tensor_from_slice(&rms.gamma));
         let head = dl
             .iter()
             .find_map(|l| l.as_any().downcast_ref::<LinearNBLayer>())
@@ -1959,10 +1964,10 @@ impl Hierarchical {
         let dec_head = {
             // fp32, matching the freshly-built model above — a checkpoint must not
             // load into a different numeric path than it was created with.
-            let mut h = super::linear::Linear::from_parts(
+            let mut h = Linear::from_parts(
                 gpu,
                 &tensor_from_matrix(&head.weights),
-                &crate::tensor::Tensor::zeros(&[vocab]),
+                &Tensor::zeros(&[vocab]),
             );
             h.set_fp32();
             head_optimizer_convention(&mut h);

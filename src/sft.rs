@@ -29,8 +29,11 @@
 //   {user} <SEP> <tool>app.launch(...)</tool> <END> <result>ok</result> <SEP> {asst} <END>
 //   └ mask 0 ───┘└ mask 1 ────────────────────────┘└ mask 0 ─────────┘└ mask 1 ┘
 //
-// `<result>` is plain text, not a token: the tool syntax is a convention of the
-// data, so a new tool protocol never costs a vocab entry.
+// `<tool>`, `</tool>`, `<result>`, `</result>`, `<think>` and `</think>` are
+// markup tokens: the data writes them as text and `to_tokens_markup` folds each
+// into one token, so a call boundary is a single word the model either emits or
+// does not, never a spelling it can get subtly wrong. What goes *between* them
+// is still plain text — the call syntax stays a convention of the data.
 //
 // The whole sequence is encoded and decoded as usual — the backbone must read
 // the prompt to condition on it — but only the words at or after `<SEP>` (the
@@ -50,11 +53,12 @@ use std::{
 
 use crate::{
     segment,
-    tokenizer_utf8::{CONTEXT_TOKEN, END_TOKEN, SEP_TOKEN, Utf8Tokenizer},
+    tokenizer_utf8::{
+        CONTEXT_TOKEN, END_TOKEN, RESULT_CLOSE_TOKEN, RESULT_OPEN_TOKEN, SEP_TOKEN, Utf8Tokenizer,
+    },
 };
 
-/// Wrapper a tool result is rendered in. Plain text on purpose — see the
-/// module header.
+/// Wrapper a tool result is rendered in, as it appears in text form.
 pub const RESULT_OPEN: &str = "<result>";
 pub const RESULT_CLOSE: &str = "</result>";
 
@@ -94,14 +98,14 @@ fn build_tokens(
     context: &str,
     response: &str,
 ) -> (Vec<u16>, usize) {
-    let mut tokens = tok.to_tokens(instruction.trim());
+    let mut tokens = tok.to_tokens_markup(instruction.trim());
     if !context.trim().is_empty() {
         tokens.push(CONTEXT_TOKEN);
-        tokens.extend(tok.to_tokens(context.trim()));
+        tokens.extend(tok.to_tokens_markup(context.trim()));
     }
     tokens.push(SEP_TOKEN);
     let response_start = tokens.len();
-    tokens.extend(tok.to_tokens(response.trim()));
+    tokens.extend(tok.to_tokens_markup(response.trim()));
     tokens.push(END_TOKEN);
     (tokens, response_start)
 }
@@ -232,10 +236,10 @@ fn build_conversation(
                 if content.is_empty() {
                     continue;
                 }
-                tokens.extend(tok.to_tokens(content));
+                tokens.extend(tok.to_tokens_markup(content));
                 if !system.is_empty() {
                     tokens.push(CONTEXT_TOKEN);
-                    tokens.extend(tok.to_tokens(&system));
+                    tokens.extend(tok.to_tokens_markup(&system));
                     system.clear();
                 }
                 tokens.push(SEP_TOKEN);
@@ -247,7 +251,9 @@ fn build_conversation(
                 if content.is_empty() || open_prompt {
                     continue;
                 }
-                tokens.extend(tok.to_tokens(&format!("{RESULT_OPEN}{content}{RESULT_CLOSE}")));
+                tokens.push(RESULT_OPEN_TOKEN);
+                tokens.extend(tok.to_tokens_markup(content));
+                tokens.push(RESULT_CLOSE_TOKEN);
                 tokens.push(SEP_TOKEN);
                 open_prompt = true;
             }
@@ -256,7 +262,7 @@ fn build_conversation(
                     continue;
                 }
                 let start = tokens.len();
-                tokens.extend(tok.to_tokens(content));
+                tokens.extend(tok.to_tokens_markup(content));
                 tokens.push(END_TOKEN);
                 // The only difference: a context turn records no loss span, so
                 // it is read by the backbone and never predicted.
@@ -301,10 +307,10 @@ pub fn build_example_turns(tok: &Utf8Tokenizer, turns: &[Turn]) -> Option<SftExa
 /// prompt side of [`build_tokens`] with no response — feed it to
 /// [`Hierarchical::sample_chat`](crate::hierarchical::Hierarchical::sample_chat).
 pub fn format_prompt(tok: &Utf8Tokenizer, instruction: &str, context: &str) -> Vec<u16> {
-    let mut tokens = tok.to_tokens(instruction.trim());
+    let mut tokens = tok.to_tokens_markup(instruction.trim());
     if !context.trim().is_empty() {
         tokens.push(CONTEXT_TOKEN);
-        tokens.extend(tok.to_tokens(context.trim()));
+        tokens.extend(tok.to_tokens_markup(context.trim()));
     }
     tokens.push(SEP_TOKEN);
     tokens
@@ -334,7 +340,7 @@ fn segment_with_spans(tokens: &[u16], spans: &[(usize, usize)]) -> (Vec<Range<us
     let ends = segment::word_ends(tokens);
     let mut words = Vec::with_capacity(ends.len());
     let mut loss = Vec::with_capacity(ends.len());
-    let mut start = 0usize;
+    let mut start = 0;
     for &e in &ends {
         let end = e as usize;
         words.push(Range { start, end });
@@ -385,9 +391,9 @@ pub fn load_jsonl(
     let reader = BufReader::new(file);
 
     let mut examples = Vec::new();
-    let mut skipped = 0usize;
-    let mut too_long = 0usize;
-    let mut multi = 0usize;
+    let mut skipped = 0;
+    let mut too_long = 0;
+    let mut multi = 0;
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -397,7 +403,8 @@ pub fn load_jsonl(
         // record. Both end up as one window with the same per-word mask.
         let built = match parse_messages(&line) {
             Some(turns) => {
-                multi += usize::from(turns.iter().filter(|t| t.role == Role::Assistant).count() > 1);
+                multi +=
+                    usize::from(turns.iter().filter(|t| t.role == Role::Assistant).count() > 1);
                 build_example_turns(tok, &turns)
             }
             None => match parse_record(&line) {
@@ -451,7 +458,7 @@ fn parse_record(line: &str) -> Option<(String, String, String)> {
 fn key_position(line: &str, key: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let needle = format!("\"{key}\"");
-    let mut from = 0usize;
+    let mut from = 0;
     loop {
         let rel = line[from..].find(&needle)?;
         let mut i = from + rel + needle.len();
@@ -551,7 +558,7 @@ fn decode_json_string(bytes: &[u8], start: usize) -> Option<String> {
 
 /// Decode four hex digits at `at` into a code-point value.
 fn decode_hex4(bytes: &[u8], at: usize) -> Option<u32> {
-    let mut v = 0u32;
+    let mut v = 0;
     for k in 0..4 {
         let d = (*bytes.get(at + k)? as char).to_digit(16)?;
         v = v * 16 + d;
@@ -562,6 +569,7 @@ fn decode_hex4(bytes: &[u8], at: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenizer_utf8::TOOL_OPEN_TOKEN;
 
     #[test]
     fn parses_escapes_and_unicode() {
@@ -674,10 +682,22 @@ mod tests {
     fn each_assistant_turn_is_masked_in() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn { role: Role::User, content: "first question".into() },
-            Turn { role: Role::Assistant, content: "first answer".into() },
-            Turn { role: Role::User, content: "second question".into() },
-            Turn { role: Role::Assistant, content: "second answer".into() },
+            Turn {
+                role: Role::User,
+                content: "first question".into(),
+            },
+            Turn {
+                role: Role::Assistant,
+                content: "first answer".into(),
+            },
+            Turn {
+                role: Role::User,
+                content: "second question".into(),
+            },
+            Turn {
+                role: Role::Assistant,
+                content: "second answer".into(),
+            },
         ];
         let ex = build_example_turns(&tok, &turns).unwrap();
 
@@ -706,14 +726,38 @@ mod tests {
     fn a_tool_result_is_prompt_side() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn { role: Role::User, content: "turn on the light".into() },
-            Turn { role: Role::Assistant, content: "<tool>lamp.set(on=true)</tool>".into() },
-            Turn { role: Role::Tool, content: "already_on".into() },
-            Turn { role: Role::Assistant, content: "It's already on.".into() },
+            Turn {
+                role: Role::User,
+                content: "turn on the light".into(),
+            },
+            Turn {
+                role: Role::Assistant,
+                content: "<tool>lamp.set(on=true)</tool>".into(),
+            },
+            Turn {
+                role: Role::Tool,
+                content: "already_on".into(),
+            },
+            Turn {
+                role: Role::Assistant,
+                content: "It's already on.".into(),
+            },
         ];
         let ex = build_example_turns(&tok, &turns).unwrap();
-        let text = tok.to_text(&ex.tokens);
+        let text = tok.to_text_markup(&ex.tokens);
         assert!(text.contains("<result>already_on</result>"), "{text:?}");
+        // The wrappers are one token each, not their spelling in bytes.
+        assert_eq!(
+            ex.tokens
+                .iter()
+                .filter(|&&t| t == RESULT_OPEN_TOKEN)
+                .count(),
+            1
+        );
+        assert_eq!(
+            ex.tokens.iter().filter(|&&t| t == TOOL_OPEN_TOKEN).count(),
+            1
+        );
 
         // Two prompts (the user turn and the result), two scored replies.
         assert_eq!(ex.tokens.iter().filter(|&&t| t == SEP_TOKEN).count(), 2);
@@ -721,7 +765,10 @@ mod tests {
 
         for (w, &keep) in ex.words.iter().zip(&ex.loss) {
             let t = tok.to_text(&ex.tokens[w.start..w.end]);
-            assert!(!keep || !t.contains("already_on"), "the result must not be scored");
+            assert!(
+                !keep || !t.contains("already_on"),
+                "the result must not be scored"
+            );
         }
         // The call and the reply after the result both carry loss.
         let scored: String = ex
@@ -741,12 +788,18 @@ mod tests {
     fn a_context_assistant_turn_carries_no_loss() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn { role: Role::User, content: "turn the light on".into() },
+            Turn {
+                role: Role::User,
+                content: "turn the light on".into(),
+            },
             Turn {
                 role: Role::AssistantContext,
                 content: "<tool>lamp.set(on=false)</tool>".into(),
             },
-            Turn { role: Role::Tool, content: "already_off".into() },
+            Turn {
+                role: Role::Tool,
+                content: "already_off".into(),
+            },
             Turn {
                 role: Role::Assistant,
                 content: "<tool>lamp.set(on=true)</tool>".into(),
@@ -779,8 +832,14 @@ mod tests {
     fn a_conversation_of_only_context_turns_is_rejected() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn { role: Role::User, content: "hello".into() },
-            Turn { role: Role::AssistantContext, content: "wrong".into() },
+            Turn {
+                role: Role::User,
+                content: "hello".into(),
+            },
+            Turn {
+                role: Role::AssistantContext,
+                content: "wrong".into(),
+            },
         ];
         assert!(build_example_turns(&tok, &turns).is_none());
     }
@@ -790,21 +849,39 @@ mod tests {
     fn a_tool_result_without_a_call_is_dropped() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn { role: Role::User, content: "hello".into() },
-            Turn { role: Role::Tool, content: "ok".into() },
-            Turn { role: Role::Assistant, content: "hi".into() },
+            Turn {
+                role: Role::User,
+                content: "hello".into(),
+            },
+            Turn {
+                role: Role::Tool,
+                content: "ok".into(),
+            },
+            Turn {
+                role: Role::Assistant,
+                content: "hi".into(),
+            },
         ];
         let ex = build_example_turns(&tok, &turns).unwrap();
-        assert!(!tok.to_text(&ex.tokens).contains("<result>"));
+        assert!(!tok.to_text_markup(&ex.tokens).contains("<result>"));
     }
 
     #[test]
     fn a_system_message_takes_the_context_slot_and_carries_no_loss() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn { role: Role::System, content: "you are terse".into() },
-            Turn { role: Role::User, content: "hi".into() },
-            Turn { role: Role::Assistant, content: "hello".into() },
+            Turn {
+                role: Role::System,
+                content: "you are terse".into(),
+            },
+            Turn {
+                role: Role::User,
+                content: "hi".into(),
+            },
+            Turn {
+                role: Role::Assistant,
+                content: "hello".into(),
+            },
         ];
         let ex = build_example_turns(&tok, &turns).unwrap();
         assert_eq!(ex.tokens.iter().filter(|&&t| t == CONTEXT_TOKEN).count(), 1);
@@ -821,9 +898,18 @@ mod tests {
     fn a_dangling_user_turn_is_dropped() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn { role: Role::User, content: "answered".into() },
-            Turn { role: Role::Assistant, content: "yes".into() },
-            Turn { role: Role::User, content: "unanswered".into() },
+            Turn {
+                role: Role::User,
+                content: "answered".into(),
+            },
+            Turn {
+                role: Role::Assistant,
+                content: "yes".into(),
+            },
+            Turn {
+                role: Role::User,
+                content: "unanswered".into(),
+            },
         ];
         let ex = build_example_turns(&tok, &turns).unwrap();
         let text = tok.to_text(&ex.tokens);
@@ -834,7 +920,10 @@ mod tests {
     #[test]
     fn an_assistant_only_conversation_is_rejected() {
         let tok = Utf8Tokenizer::new();
-        let turns = vec![Turn { role: Role::Assistant, content: "unprompted".into() }];
+        let turns = vec![Turn {
+            role: Role::Assistant,
+            content: "unprompted".into(),
+        }];
         assert!(build_example_turns(&tok, &turns).is_none());
     }
 }

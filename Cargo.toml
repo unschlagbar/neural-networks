@@ -11,14 +11,6 @@ edition = "2024"
 lto = "fat"
 codegen-units = 1
 
-[[bench]]
-name = "lstm_training"
-harness = false
-
-[[bench]]
-name = "hierarchical_training"
-harness = false
-
 [dev-dependencies]
 criterion = "0.8.2"
 

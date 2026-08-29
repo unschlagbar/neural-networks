@@ -79,7 +79,7 @@ pub fn up_of(hidden: usize) -> usize {
 pub const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 24;
+pub const WORD_BLOCKS: usize = 28;
 
 /// Backbone sweep chunk length, in words. `0` disables chunking (one whole-sequence
 /// sweep, the pre-chunking behaviour).
@@ -188,7 +188,7 @@ pub const PARQUET_LANGUAGE_COLUMN: &str = "language";
 // Default corpus offered when a run has no progress sidecar to continue from.
 // A directory is walked shard by shard (see `pretrain_progress::Corpus`); a
 // single file still works as a one-file corpus.
-pub const TRAIN_DATA: &str = "data/mix/pretrain_en";
+pub const TRAIN_DATA: &str = "data/mix/pretrain_v2";
 pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
 // Post-training (SFT / instruction tuning)

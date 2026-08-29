@@ -5,7 +5,7 @@ use crate::{
     hierarchical::Hierarchical,
     sequential::Sequential,
     sft::{Role, Turn},
-    tokenizer_utf8::{BYTE_TOKENS, Utf8Tokenizer},
+    tokenizer_utf8::{BYTE_TOKENS, TOOL_OPEN_TOKEN, Utf8Tokenizer},
 };
 
 /// How many times one user turn may go round the call-result loop before the
@@ -26,7 +26,13 @@ impl Utf8Printer {
             return false;
         }
         if (token as usize) >= BYTE_TOKENS {
-            return true; // model-internal marker — never displayed
+            // Markup (`<tool>`, `<think>`, …) is part of the reply and is
+            // spelled out; the structural markers are model-internal.
+            if tokenizer.is_markup(token) {
+                print!("{}", tokenizer.display(token));
+                stdout().flush().unwrap();
+            }
+            return true;
         }
 
         self.pending.push(token as u8);
@@ -159,12 +165,14 @@ pub fn sample_chat(model_path: &str) {
                 printer.print(token, &tokenizer)
             });
             println!();
-            let reply = tokenizer.to_text(&reply);
+            let called_tool = reply.contains(&TOOL_OPEN_TOKEN);
+            // Markup is kept in the turn text so re-encoding the history
+            // reproduces the exact tokens the model just wrote.
             turns.push(Turn {
                 role: Role::Assistant,
-                content: reply.clone(),
+                content: tokenizer.to_text_markup(&reply),
             });
-            if !reply.contains("<tool>") {
+            if !called_tool {
                 break;
             }
             print!("result (blank = ok): ");

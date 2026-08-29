@@ -5,7 +5,7 @@
 //
 //   cargo run --release --example sft_mask_audit -- data/mix/assistant_qa.jsonl
 use neural_networks::sft;
-use neural_networks::tokenizer_utf8::Utf8Tokenizer;
+use neural_networks::tokenizer_utf8::{SEP_TOKEN, Utf8Tokenizer};
 
 fn main() {
     let path = std::env::args().nth(1).unwrap();
@@ -31,7 +31,7 @@ fn main() {
             .iter()
             .zip(&e.loss)
             .filter(|&(_, &k)| k)
-            .map(|(w, _)| tok.to_text(&e.tokens[w.start..w.end]))
+            .map(|(w, _)| tok.to_text_markup(&e.tokens[w.start..w.end]))
             .collect();
         if scored.contains(sft::RESULT_OPEN) {
             result_carries_loss += 1;
@@ -40,8 +40,8 @@ fn main() {
             if e.loss[i] {
                 loss_words += 1;
                 loss_rows += w.end - w.start + 1;
-                // 259 = <SEP>: a separator must never be a scored target.
-                if w.end - w.start == 1 && e.tokens[w.start] == 259 {
+                // A separator must never be a scored target.
+                if w.end - w.start == 1 && e.tokens[w.start] == SEP_TOKEN {
                     sep_carries_loss += 1;
                 }
             }
@@ -84,7 +84,7 @@ fn main() {
             .iter()
             .zip(&e.loss)
             .filter(|&(_, &k)| k)
-            .map(|(w, _)| tok.to_text(&e.tokens[w.start..w.end]))
+            .map(|(w, _)| tok.to_text_markup(&e.tokens[w.start..w.end]))
             .collect();
         let whole = tok.to_text(&e.tokens);
         for m in masked {
