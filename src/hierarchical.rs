@@ -49,8 +49,6 @@ pub struct Hierarchical {
     pub context_size: usize,
 
     pub tokenizer: Utf8Tokenizer,
-    /// The `[W]` marker id — the decoder's EOS target (and sampling stop token).
-    w_token: u16,
 
     /// `[start, end)` (half-open) token ranges over the window, one per word.
     /// Filled by `forward_over`, reused by `backwards_sequence`.
@@ -130,9 +128,8 @@ impl Hierarchical {
             "decoder.input_size must equal backbone.output_size (the context is injected as the first decoder step)"
         );
 
-        let w_token = tokenizer.w_token();
         // The encoder validates its own input size against vocab_size.
-        let encoder = WordEncoder::new(encoder_chars, vocab_size, w_token);
+        let encoder = WordEncoder::new(encoder_chars, vocab_size, tokenizer.w_token());
         assert_eq!(
             encoder.char_embedding().output_size(),
             context_size,
@@ -159,7 +156,6 @@ impl Hierarchical {
             vocab_size,
             context_size,
             tokenizer,
-            w_token,
             word_segments: Vec::new(),
             dec_ranges: Vec::new(),
             dec_targets: Vec::new(),
@@ -318,7 +314,7 @@ impl Hierarchical {
             for k in 0..dword_len {
                 self.dec_targets[dec_start + k] = tokens[next_word.start + k];
             }
-            self.dec_targets[dec_end - 1] = self.w_token;
+            self.dec_targets[dec_end - 1] = self.tokenizer.w_token();
 
             if self.trace_io {
                 self.trace_word(w, tokens, self.word_segments[w], next_word);
@@ -370,10 +366,10 @@ impl Hierarchical {
     /// Debug: print the encoder input and the decoder input/target strings for
     /// word `w`. Active only when `trace_io` is set.
     fn trace_word(&self, w: usize, tokens: &[u16], word: Range<usize>, next_word: Range<usize>) {
-        let wm = self.tokenizer.display(self.w_token);
+        let wm = self.tokenizer.display(self.tokenizer.w_token());
         let enc = format!(
             "{}{}",
-            self.tokenizer.display_tokens(&tokens[word.start..word.end]),
+            self.tokenizer.display_tokens(&tokens[word]),
             if ENC_W_EOS { wm.as_str() } else { "" }
         );
         let dec_in = format!(
@@ -381,11 +377,7 @@ impl Hierarchical {
             self.tokenizer
                 .display_tokens(&tokens[next_word.start..next_word.end - 1])
         );
-        let dec_tgt = format!(
-            "{}{wm}",
-            self.tokenizer
-                .display_tokens(&tokens[next_word.start..next_word.end])
-        );
+        let dec_tgt = format!("{}{wm}", self.tokenizer.display_tokens(&tokens[next_word]));
         println!("fwd[{w:>3}] enc {enc:?} | dec in {dec_in:?} → tgt {dec_tgt:?}");
     }
 
@@ -887,7 +879,7 @@ impl Hierarchical {
         }
 
         self.reset();
-        let w_tok = self.w_token as usize;
+        let w_tok = self.tokenizer.w_token() as usize;
 
         // Bootstrap the backbone from the prefix
         // Segment the prefix and encode every complete word to advance the
@@ -991,30 +983,67 @@ impl Hierarchical {
         max_len: usize,
         temperature: f32,
         top_p: f32,
-        mut callback: impl FnMut(u16) -> bool,
+        callback: impl FnMut(u16) -> bool,
     ) -> Vec<u16> {
+        self.chat_reset();
+        self.chat_feed(prompt);
+        // Empty prompt: seed a random byte so a context exists.
+        if prompt.is_empty() {
+            self.encode_word_advance(&[rand::random_range(0..BYTE_TOKENS) as u16]);
+        }
+        self.chat_continue(max_len, temperature, top_p, callback)
+    }
+
+    /// Drop the conversation the recurrent state is holding. The start of a
+    /// chat, and the only thing that erases one.
+    pub fn chat_reset(&mut self) {
         if !self.encoder.cache_ready() {
             self.make_cache(1, MAX_SEQ_LEN);
         }
         self.reset();
-        let w_tok = self.w_token as usize;
-        let end_tok = self.tokenizer.end_token();
+    }
 
-        // Encode EVERY word of the prompt (markers included) so the backbone has
-        // read the whole instruction before the first response word is decoded.
-        let ends = segment::word_ends(prompt);
-        let mut start = 0usize;
+    /// Encode `tokens` into the backbone **without** resetting: the recurrent
+    /// state is the conversation memory, so a continued chat only ever encodes
+    /// what is new. `tokens` must start on a word border — every turn border is
+    /// a special token, and a special token is always its own word, so a suffix
+    /// of a formatted conversation always does.
+    pub fn chat_feed(&mut self, tokens: &[u16]) {
+        if !self.encoder.cache_ready() {
+            self.make_cache(1, MAX_SEQ_LEN);
+        }
+        let ends = segment::word_ends(tokens);
+        let mut start = 0;
         for &e in &ends {
-            let word = &prompt[start..e as usize];
+            let word = &tokens[start..e as usize];
             start = e as usize;
             if !word.is_empty() {
                 self.encode_word_advance(word);
             }
         }
-        // Empty prompt: seed a random byte so a context exists.
-        if ends.is_empty() {
-            self.encode_word_advance(&[rand::random_range(0..BYTE_TOKENS) as u16]);
+    }
+
+    /// Generate one response from whatever the backbone is already carrying.
+    /// The response's own words are encoded as they complete, and the closing
+    /// `<END>` is encoded too, so the state left behind is the state that has
+    /// read the whole exchange — the next turn feeds only what follows it.
+    ///
+    /// The words of the response are split where the model emitted `[W]`, which
+    /// is what it just committed to; re-encoding the reply as text would instead
+    /// use `segment`'s split, and the two agree only as far as the model has
+    /// learned the segmentation.
+    pub fn chat_continue(
+        &mut self,
+        max_len: usize,
+        temperature: f32,
+        top_p: f32,
+        mut callback: impl FnMut(u16) -> bool,
+    ) -> Vec<u16> {
+        if !self.encoder.cache_ready() {
+            self.make_cache(1, MAX_SEQ_LEN);
         }
+        let w_tok = self.tokenizer.w_token() as usize;
+        let end_tok = self.tokenizer.end_token();
 
         let mut out = Vec::with_capacity(max_len);
         let mut word_chars: Vec<u16> = Vec::new();
@@ -1060,6 +1089,13 @@ impl Hierarchical {
             self.char2_input
                 .copy_from_slice(&self.encoder.char_embedding().weights[tok as usize]);
         }
+
+        // The reply is part of the conversation, so the state has to have read
+        // it: the tail word the model never closed with a [W], then `<END>`.
+        if !word_chars.is_empty() {
+            self.encode_word_advance(&word_chars);
+        }
+        self.encode_word_advance(&[end_tok]);
 
         out
     }
