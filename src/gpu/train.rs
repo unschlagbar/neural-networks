@@ -18,8 +18,8 @@ use rand::seq::SliceRandom;
 use crate::batches::ChunkedWordDataSet;
 use crate::config::{
     BATCH_SIZE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, LOG_EVERY, LOGIT_SOFTCAP, LR, MAX_WINDOW_TOKENS,
-    MIN_WORDS_PER_SEQ, SFT_DATA, SFT_EPOCHS, SFT_LR, SFT_MAX_TOKENS, TRAIN_DATA, WORD_BLOCKS,
-    WORD_HIDDEN, WORDS_PER_SEQ,
+    MIN_WORDS_PER_SEQ, SFT_DATA, SFT_EPOCHS, SFT_LR, SFT_MAX_TOKENS, TRAIN_DATA, VAL_DATA,
+    WORD_BLOCKS, WORD_HIDDEN, WORDS_PER_SEQ,
 };
 use crate::gpu::Gpu;
 use crate::gpu::hierarchical::{Hierarchical, ModelCfg};
@@ -310,6 +310,87 @@ pub fn train_hierarchical_gpu(model_path: &str) {
          next run at another corpus.",
         pretrain_progress::progress_path(state.save_path()).display()
     );
+}
+
+/// Forward validation of a GPU checkpoint: streams the whole validation set
+/// (`config::VAL_DATA`) through the model and reports mean decode char loss and
+/// word loss. The GPU twin of `training::validate_hierarchical`, mode `hvg`.
+///
+/// Runs `Hierarchical::eval_loss`, which stops at the decode loss: no backward
+/// phase runs, no gradient is produced and no optimizer step is taken, so the
+/// checkpoint is untouched.
+pub fn validate_hierarchical_gpu(model_path: &str) {
+    let gpu = match Gpu::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("No CUDA GPU available ({e}). Use 'hv' for the CPU validator.");
+            return;
+        }
+    };
+
+    let tokenizer = Utf8Tokenizer::new();
+    let w_token = tokenizer.w_token() as usize;
+
+    let mut model = match Hierarchical::load(&gpu, model_path, w_token) {
+        Ok(m) => {
+            println!("Loaded '{model_path}' (step {}).", m.step_count);
+            m
+        }
+        Err(e) => {
+            eprintln!("Could not load '{model_path}': {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Nothing will unwind this pass, so parking the backbone's activations on the
+    // host would only pay for a D2H no backward ever reads back.
+    model.set_offload(&gpu, false);
+
+    println!("Streaming validation set from '{VAL_DATA}' in {CHUNK_BYTES}-byte chunks ...");
+    let mut data = ChunkedWordDataSet::open(
+        tokenizer,
+        VAL_DATA,
+        WORDS_PER_SEQ,
+        MIN_WORDS_PER_SEQ,
+        MAX_WINDOW_TOKENS,
+        CHUNK_BYTES,
+    );
+
+    let start = Instant::now();
+    let mut c_total = 0.0;
+    let mut w_total = 0.0;
+    let mut windows = 0usize;
+    while let Some(chunk) = data.next_chunk() {
+        for batch in chunk.iter() {
+            let tokens: Vec<usize> = batch.tokens.iter().map(|&t| t as usize).collect();
+            let words = &batch.words;
+            if words.len() < 2 {
+                continue; // no decoded word in this window
+            }
+            c_total += model.eval_loss(&gpu, &tokens, words);
+            w_total += model.last_word_loss();
+            windows += 1;
+        }
+        println!(
+            "  {windows} windows  char {:.4}  word {:.4}  ({:.0?})",
+            c_total / windows.max(1) as f32,
+            w_total / windows.max(1) as f32,
+            start.elapsed(),
+        );
+    }
+
+    if windows == 0 {
+        eprintln!("no windows in validation set");
+        std::process::exit(2);
+    }
+    let c_loss = c_total / windows as f32;
+    let w_loss = w_total / windows as f32;
+    println!(
+        "\n── validation ({windows} windows, {:.0?}) ──",
+        start.elapsed()
+    );
+    println!("  Char loss = {c_loss:.4} nats   ppl = {:.3}", c_loss.exp());
+    println!("  Word loss = {w_loss:.4} nats   ppl = {:.3}", w_loss.exp());
 }
 
 /// GPU supervised fine-tuning (Q-A instruction tuning) of a pretrained

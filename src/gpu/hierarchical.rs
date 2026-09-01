@@ -630,7 +630,7 @@ impl Hierarchical {
     }
 
     pub fn forward_backward(&mut self, gpu: &Gpu, tokens: &[usize], words: &[Range<usize>]) -> f32 {
-        let loss = self.forward_backward_window(gpu, tokens, words, None);
+        let loss = self.run_window(gpu, tokens, words, None, true);
         gpu.stream.synchronize().expect("stream sync");
         loss
     }
@@ -649,7 +649,7 @@ impl Hierarchical {
         words: &[Range<usize>],
         word_loss: &[bool],
     ) -> f32 {
-        let loss = self.forward_backward_window(gpu, tokens, words, Some(word_loss));
+        let loss = self.run_window(gpu, tokens, words, Some(word_loss), true);
         // The window's temporaries have dropped by now, so their `cuMemFreeAsync`
         // frees are queued on the stream. CUDA's stream-ordered pool only hands
         // that memory back at a synchronization point — without one it just keeps
@@ -659,15 +659,58 @@ impl Hierarchical {
         loss
     }
 
+    /// Turn backbone activation offload off (or back on).
+    ///
+    /// Offload exists to keep the forward's activations off the device until the
+    /// backward reads them back. A forward-only pass never reads them back, so
+    /// parking them is a pure D2H cost — this is how [`eval_loss`](Self::eval_loss)'s
+    /// caller drops it. Turning it back on re-parks from the next forward.
+    pub fn set_offload(&mut self, gpu: &Gpu, on: bool) {
+        if on == self.flags.offload {
+            return;
+        }
+        self.flags.offload = on;
+        if on {
+            self.enable_backbone_offload(gpu);
+        } else {
+            for blk in self.bb_blocks.iter_mut() {
+                blk.disable_offload();
+            }
+        }
+    }
+
+    /// Pinned host bytes the backbone's activation parks hold. Diagnostic: a forward
+    /// whose backward never came shows up here as growth window after window, and it
+    /// is host memory, so it OOMs the process rather than the device.
+    pub fn parked_host_bytes(&self) -> usize {
+        self.bb_blocks.iter().map(|b| b.parked_host_bytes()).sum()
+    }
+
+    /// Forward-only evaluation of one window: the same encode → backbone → decode
+    /// as [`forward_backward`](Self::forward_backward), stopping at the loss. No
+    /// backward runs, so no gradient is produced and nothing is accumulated — the
+    /// three backward phases are roughly two thirds of a window's work.
+    ///
+    /// Activations are released before returning: nothing will unwind them, and the
+    /// backbone holds one row per word per block until something does.
+    pub fn eval_loss(&mut self, gpu: &Gpu, tokens: &[usize], words: &[Range<usize>]) -> f32 {
+        let loss = self.run_window(gpu, tokens, words, None, false);
+        self.drop_all_act(gpu);
+        gpu.stream.synchronize().expect("stream sync");
+        loss
+    }
+
     /// The five phases of a window, in order: encode the words, sweep the backbone,
-    /// decode (forward *and* backward) per length group, unwind the backbone, unwind
-    /// the encoder. Each phase is a method below; this is the order and the plumbing.
-    fn forward_backward_window(
+    /// decode (forward, and backward when `grad`) per length group, unwind the
+    /// backbone, unwind the encoder. Each phase is a method below; this is the order
+    /// and the plumbing. With `grad` false it stops after the decode forward.
+    fn run_window(
         &mut self,
         gpu: &Gpu,
         tokens: &[usize],
         words: &[Range<usize>],
         word_loss: Option<&[bool]>,
+        grad: bool,
     ) -> f32 {
         if words.len() < 2 {
             self.last_word_loss = 0.0;
@@ -728,10 +771,12 @@ impl Hierarchical {
 
         let bb_rows_max = bb.rows_max;
         let (loss, d_o, dec_rows_max) =
-            self.decode_groups(gpu, tokens, words, word_loss, &bb.o, &mut sc, &cache);
+            self.decode_groups(gpu, tokens, words, word_loss, &bb.o, &mut sc, &cache, grad);
 
-        let d_word_embeds = self.backbone_backward(gpu, bb, &d_o, dw, &cache);
-        self.encoder_backward(gpu, &d_word_embeds, &mut sc, &cache);
+        if let Some(d_o) = d_o {
+            let d_word_embeds = self.backbone_backward(gpu, bb, &d_o, dw, &cache);
+            self.encoder_backward(gpu, &d_word_embeds, &mut sc, &cache);
+        }
 
         self.scratch = Some(sc);
         if self.flags.mem {
@@ -1041,7 +1086,8 @@ impl Hierarchical {
         }
     }
 
-    /// PHASE 3 — decode every word, forward and straight back again, per length group.
+    /// PHASE 3 — decode every word, forward and (when `grad`) straight back again,
+    /// per length group.
     ///
     /// Word w's decode target is word w+1, so groups are keyed on the length of the
     /// DECODED word. The decoder's backward needs nothing from the backbone's, so a
@@ -1049,7 +1095,8 @@ impl Hierarchical {
     /// of decoder rows (and of the `[rows, vocab]` logits) is ever resident.
     ///
     /// Returns the window's mean CE, `d_o` (`[dw, HC]`, the gradient of the injected
-    /// context) and the largest group's row count for the pool trim.
+    /// context — `None` without `grad`) and the largest group's row count for the
+    /// pool trim.
     fn decode_groups(
         &mut self,
         gpu: &Gpu,
@@ -1059,7 +1106,8 @@ impl Hierarchical {
         o: &GTensor<f32>,
         sc: &mut Scratch,
         cache: &TrainingCache,
-    ) -> (f32, GTensor<f32>, usize) {
+        grad: bool,
+    ) -> (f32, Option<GTensor<f32>>, usize) {
         let hc = self.cfg.hc;
         let dw = words.len() - 1;
         let word_on = |w: usize| word_loss.is_none_or(|m| m[w]);
@@ -1081,7 +1129,7 @@ impl Hierarchical {
         };
         gpu.stream.memset_zeros(&mut acc).expect("zero loss_acc");
 
-        let mut d_o = GTensor::zeros(gpu, &[dw, hc]);
+        let mut d_o = grad.then(|| GTensor::zeros(gpu, &[dw, hc]));
         let mut dec_rows_max = 0usize;
         for g in 0..sc.dec.len() {
             let (n_words, tmax, rows, n_chars) = {
@@ -1118,9 +1166,12 @@ impl Hierarchical {
 
             self.timer.accum(gpu, "decoder fwd");
 
-            let d_dec_in = self
-                .decoder_stack_backward(gpu, &d_capped, &capped, &hdn, n_words, tmax, rows, cache);
-            self.scatter_decoder_grads(gpu, &d_dec_in, &mut d_o, n_words, tmax, n_chars);
+            if let Some(d_o) = d_o.as_mut() {
+                let d_dec_in = self.decoder_stack_backward(
+                    gpu, &d_capped, &capped, &hdn, n_words, tmax, rows, cache,
+                );
+                self.scatter_decoder_grads(gpu, &d_dec_in, d_o, n_words, tmax, n_chars);
+            }
 
             // This group is completely finished — forward AND backward — so nothing
             // here will be read again. Release the whole activation set rather than
@@ -2035,6 +2086,126 @@ fn linear_layer_to_gpu(gpu: &Gpu, l: &LinearLayer) -> Linear {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A forward-only window must not leave anything parked on the host.
+    ///
+    /// Offload evicts a block's activations to pinned host memory in the forward and
+    /// the backward reads them back. A forward with no backward therefore parks a
+    /// generation nothing ever collects, and since this is *host* memory it OOMs the
+    /// process, not the device — the pool and `mem_get_info` both stay flat while RSS
+    /// climbs. Windows vary in shape, so the check is across two different ones.
+    #[test]
+    fn eval_loss_parks_nothing_on_the_host() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let cfg = ModelCfg {
+            vocab: 9,
+            hc: 16,
+            wh: 24,
+            enc_blocks: 1,
+            // Both cell kinds: the backbone alternates them and each parks its own.
+            bb_blocks: 2,
+            dec_blocks: 1,
+            heads: 2,
+            dqk: 8,
+            w_token: 8,
+            cap: 30.0,
+        };
+        let mut model = Hierarchical::new(&gpu, cfg);
+        // Offload is on by default but off under GPU_NO_OFFLOAD, and this test is
+        // about the offload path.
+        model.set_offload(&gpu, true);
+
+        let window = |n: usize| {
+            let mut tokens = Vec::new();
+            let mut words = Vec::new();
+            for w in 0..n {
+                let start = tokens.len();
+                for k in 0..2 + w % 3 {
+                    tokens.push(1 + (w + k) % 7);
+                }
+                words.push(Range {
+                    start,
+                    end: tokens.len(),
+                });
+            }
+            (tokens, words)
+        };
+
+        let (t1, w1) = window(6);
+        let (t2, w2) = window(9);
+        let _ = model.eval_loss(&gpu, &t1, &w1);
+        let _ = model.eval_loss(&gpu, &t2, &w2);
+        // The pinned slots are recycled rather than freed, so the steady state is a
+        // constant, not zero: what a leak looks like is growth.
+        let steady = model.parked_host_bytes();
+        for _ in 0..3 {
+            let _ = model.eval_loss(&gpu, &t1, &w1);
+            let _ = model.eval_loss(&gpu, &t2, &w2);
+        }
+        assert_eq!(
+            model.parked_host_bytes(),
+            steady,
+            "eval_loss is leaving parked host memory behind"
+        );
+    }
+
+    /// `eval_loss` must report exactly what `forward_backward` reports — it is the
+    /// same forward, and a validation number that drifts from the training one is
+    /// worse than no number. Also pins that it leaves no gradient behind: a step
+    /// taken after an eval-only window must not move the weights.
+    #[test]
+    fn eval_loss_matches_forward_backward_and_leaves_no_grad() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let cfg = ModelCfg {
+            vocab: 9,
+            hc: 16,
+            wh: 24,
+            enc_blocks: 1,
+            bb_blocks: 2,
+            dec_blocks: 1,
+            heads: 2,
+            dqk: 8,
+            w_token: 8,
+            cap: 30.0,
+        };
+        let mut model = Hierarchical::new(&gpu, cfg);
+        let tokens = vec![1usize, 2, 3, 4, 5, 6, 7, 1, 2, 3];
+        let words = vec![
+            Range { start: 0, end: 3 },
+            Range { start: 3, end: 5 },
+            Range { start: 5, end: 8 },
+            Range { start: 8, end: 10 },
+        ];
+
+        // A trained-on model, so the comparison is not between two untrained noises.
+        let mut opt = AdamCfg::new(5e-3, 0.0);
+        for _ in 0..20 {
+            let _ = model.forward_backward(&gpu, &tokens, &words);
+            opt.t += 1;
+            model.step(&gpu, &opt);
+        }
+
+        // The loop ended on a step, so the accumulators are empty here.
+        let before = model.grad_signature(&gpu);
+        let eval = model.eval_loss(&gpu, &tokens, &words);
+        let eval_words = model.last_word_loss();
+        let eval_rows = model.last_rows();
+        assert_eq!(
+            model.grad_signature(&gpu),
+            before,
+            "eval_loss wrote into the gradient accumulators"
+        );
+
+        // Same weights: only `step` moves them, and none is taken in between.
+        let train = model.forward_backward(&gpu, &tokens, &words);
+        assert_eq!(eval, train, "eval loss differs from the training forward");
+        assert_eq!(model.last_word_loss(), eval_words, "word loss differs");
+        assert_eq!(model.last_rows(), eval_rows, "scored row count differs");
+    }
 
     /// The GPU hierarchical stack must actually learn: memorize one tiny window,
     /// driving the decode loss down. Exercises the full wiring — tied char table

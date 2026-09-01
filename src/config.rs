@@ -60,9 +60,9 @@ pub const TOP_P: f32 = 0.9;
 
 // Modell-Dimensions
 
-pub const CHAR_HIDDEN: usize = 256;
-pub const OUT_HIDDEN: usize = 256;
-pub const WORD_HIDDEN: usize = 1024;
+pub const CHAR_HIDDEN: usize = 192;
+pub const OUT_HIDDEN: usize = 192;
+pub const WORD_HIDDEN: usize = 512;
 
 /// SwiGLU inner width for a block of width `hidden`: the `8·hidden/3` paper
 /// default rounded up to a multiple of 64, so every up/down projection GEMM has
@@ -79,7 +79,7 @@ pub fn up_of(hidden: usize) -> usize {
 pub const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 28;
+pub const WORD_BLOCKS: usize = 12;
 
 /// Backbone sweep chunk length, in words. `0` disables chunking (one whole-sequence
 /// sweep, the pre-chunking behaviour).

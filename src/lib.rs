@@ -46,20 +46,22 @@ pub fn run() {
     let cmd = line.trim();
 
     match cmd {
-        "" => training::train_normal(&read_model_path("models/seq")),
-        "h" => training::train_hierarchical(&read_model_path("models/fix_bi")),
+        "" => training::train_normal(&read_model_path()),
+        "h" => training::train_hierarchical(&read_model_path()),
         #[cfg(feature = "cuda")]
-        "hg" => gpu::train::train_hierarchical_gpu(&read_model_path("models/hier_gpu")),
+        "hg" => gpu::train::train_hierarchical_gpu(&read_model_path()),
         #[cfg(feature = "cuda")]
-        "hqg" => gpu::train::train_sft_gpu(&read_model_path("models/hier_gpu_sft")),
-        "hq" => training::train_sft(&read_model_path("models/fix_bi_sft")),
+        "hqg" => gpu::train::train_sft_gpu(&read_model_path()),
+        "hq" => training::train_sft(&read_model_path()),
         "av" => grow_vocab::grow_model_interactive(),
-        "hp" => training::probe_hierarchical(&read_model_path("models/fix_bi")),
-        "hv" => training::validate_hierarchical(&read_model_path("models/fix_bi")),
-        "ht" => training::trace_hierarchical(&read_model_path("models/fix_bi")),
-        "s" => sampling::sample_normal(&read_model_path("models/seq")),
-        "hs" => sampling::sample_hierarchical(&read_model_path("models/fix_bi")),
-        "hqs" => sampling::sample_chat(&read_model_path("models/hier_gpu_sft")),
+        "hp" => training::probe_hierarchical(&read_model_path()),
+        "hv" => training::validate_hierarchical(&read_model_path()),
+        #[cfg(feature = "cuda")]
+        "hvg" => gpu::train::validate_hierarchical_gpu(&read_model_path()),
+        "ht" => training::trace_hierarchical(&read_model_path()),
+        "s" => sampling::sample_normal(&read_model_path()),
+        "hs" => sampling::sample_hierarchical(&read_model_path()),
+        "hqs" => sampling::sample_chat(&read_model_path()),
         "i" => inspect::inspect_model(),
         "wr" => wake_word::record::record_samples(),
         "wt" => wake_word::training::train_wake(),
@@ -67,7 +69,7 @@ pub fn run() {
         other => {
             eprintln!(
                 "Unknown mode {other:?}. Modes: '' train_normal | 'h' train_hierarchical | \
-                 'hv' validate_hierarchical | \
+                 'hv' validate_hierarchical | 'hvg' validate_hierarchical on GPU | \
                  'hg' train_hierarchical on GPU | \
                  'hq' SFT (Q-A) fine-tune on CPU | 'hqg' SFT fine-tune on GPU | \
                  'av' add SFT vocab to a model | \
@@ -82,14 +84,14 @@ pub fn run() {
 
 /// Prompts for a model name at runtime. Empty input keeps `default`. A bare name
 /// (no `/`) is resolved under `models/`, so typing `seq` selects `models/seq`.
-fn read_model_path(default: &str) -> String {
-    print!("Model name [{default}]: ");
+fn read_model_path() -> String {
+    print!("Model name: ");
     stdout().flush().ok();
     let mut line = String::new();
     stdin().lock().read_line(&mut line).unwrap();
     let name = line.trim();
     if name.is_empty() {
-        default.to_string()
+        String::new()
     } else if name.contains('/') {
         name.to_string()
     } else {

@@ -1390,6 +1390,18 @@ impl SLstm {
             Some(super::offload::HostPark::new(gpu, in_flight).expect("offload: host park"));
     }
 
+    /// Stop parking this cell's chunk caches, discarding anything already parked.
+    /// See `Block::disable_offload`.
+    pub fn disable_offload(&mut self) {
+        self.discard_parked();
+        self.park = None;
+    }
+
+    /// Pinned host bytes this cell's park holds. Diagnostic.
+    pub fn parked_host_bytes(&self) -> usize {
+        self.park.as_ref().map_or(0, |p| p.host_bytes())
+    }
+
     /// Start the parked chunk on its way back, without waiting. Called one block ahead
     /// of this cell's backward so the upload overlaps compute.
     pub fn prefetch_saved(&mut self, gpu: &Gpu) {
@@ -1443,6 +1455,7 @@ impl SLstm {
         self.slabs = None;
         self.x_saved = None;
         self.chunk_saved.clear();
+        self.discard_parked();
         self.post_norm.drop_saved_act();
 
         // `g`, `out_buf` and `dy_buf` are deliberately KEPT: the

@@ -188,6 +188,14 @@ pub trait Cell {
     /// in wherever the block does — subject to the same whole-forward-then-backward
     /// constraint.
     fn enable_offload(&mut self, _gpu: &Gpu, _in_flight: offload::SharedInFlight) {}
+    /// Stop parking this cell's activations, discarding anything already parked.
+    /// Default: do nothing, for a cell that never parked.
+    fn disable_offload(&mut self) {}
+    /// Pinned host bytes this cell's park holds. 0 for a cell that never parks.
+    /// Diagnostic — see [`Block::parked_host_bytes`].
+    fn parked_host_bytes(&self) -> usize {
+        0
+    }
     /// Start this cell's parked activations back to the device without waiting.
     /// Called one block ahead of its backward, so the upload overlaps compute.
     fn prefetch_act(&mut self, _gpu: &Gpu) {}
@@ -272,6 +280,12 @@ impl Cell for SLstm {
     }
     fn enable_offload(&mut self, gpu: &Gpu, in_flight: offload::SharedInFlight) {
         SLstm::enable_offload(self, gpu, in_flight)
+    }
+    fn disable_offload(&mut self) {
+        SLstm::disable_offload(self)
+    }
+    fn parked_host_bytes(&self) -> usize {
+        SLstm::parked_host_bytes(self)
     }
     fn prefetch_act(&mut self, gpu: &Gpu) {
         SLstm::prefetch_saved(self, gpu)
@@ -381,6 +395,12 @@ pub trait BlockLike {
     /// See [`Block::enable_offload`] — only valid for a whole-forward-then-backward
     /// stack, i.e. the backbone.
     fn enable_offload(&mut self, gpu: &Gpu, in_flight: offload::SharedInFlight);
+    /// Stop parking this block's activations and discard anything already parked.
+    /// See [`Block::disable_offload`].
+    fn disable_offload(&mut self);
+    /// Pinned host bytes this block's parks hold, its cell's included.
+    /// See [`Block::parked_host_bytes`].
+    fn parked_host_bytes(&self) -> usize;
     /// Start this block's parked activations on their way back to the device, without
     /// waiting. Call one block ahead of its backward so the upload overlaps compute;
     /// no-op when this block is not offloaded. See [`Block::prefetch_act`].
@@ -443,6 +463,12 @@ impl<C: Cell> BlockLike for Block<C> {
     }
     fn enable_offload(&mut self, gpu: &Gpu, in_flight: offload::SharedInFlight) {
         Block::enable_offload(self, gpu, in_flight)
+    }
+    fn disable_offload(&mut self) {
+        Block::disable_offload(self)
+    }
+    fn parked_host_bytes(&self) -> usize {
+        Block::parked_host_bytes(self)
     }
     fn prefetch_act(&mut self, gpu: &Gpu) {
         Block::prefetch_act(self, gpu)
@@ -756,18 +782,39 @@ impl<C: Cell> Block<C> {
         for l in [&mut self.lin_gate, &mut self.lin_value, &mut self.lin_down] {
             l.drop_saved_act(gpu);
         }
+        self.discard_parked();
         self.cell.drop_all_act(gpu);
     }
 
-    /// Turn offload back off. For the parity test, which runs both paths in one
-    /// process (the `GPU_NO_OFFLOAD` env gate resolves once and cannot be flipped).
-    #[cfg(test)]
-    fn disable_offload(&mut self) {
+    /// Pinned host bytes held by this block's park and its cell's — the parked
+    /// generations plus the recycled spare slots. Diagnostic: a forward whose backward
+    /// never came shows up here as growth window after window.
+    pub fn parked_host_bytes(&self) -> usize {
+        self.act.park.as_ref().map_or(0, |p| p.host_bytes()) + self.cell.parked_host_bytes()
+    }
+
+    /// Drop host generations left over from a forward whose backward never came, so
+    /// they do not accumulate across windows. No-op unless offload is on and a sweep
+    /// was abandoned.
+    fn discard_parked(&mut self) {
+        if let Some(park) = &mut self.act.park {
+            park.discard_all();
+        }
+    }
+
+    /// Turn offload back off, discarding whatever is parked.
+    ///
+    /// Used by a forward-only pass — parking buys nothing when no backward will read
+    /// it back — and by the parity test, which runs both paths in one process (the
+    /// `GPU_NO_OFFLOAD` env gate resolves once and cannot be flipped).
+    pub fn disable_offload(&mut self) {
         assert!(
             self.act.restored.is_empty(),
             "disable_offload between forward and backward"
         );
+        self.discard_parked();
         self.act.park = None;
+        self.cell.disable_offload();
     }
 }
 

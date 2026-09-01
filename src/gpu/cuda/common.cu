@@ -387,6 +387,14 @@ extern "C" __global__ void softmax_ce(const float* logits, const unsigned* targe
     }
 }
 
+// Per-element gradient clip. Written as comparisons rather than fminf/fmaxf so a NaN
+// gradient stays NaN instead of becoming ±clip, and so an infinite `clip` is a no-op.
+__device__ __forceinline__ float clip_grad(float g, float clip) {
+    if (g > clip) return clip;
+    if (g < -clip) return -clip;
+    return g;
+}
+
 // AdamW over a whole parameter arena in one launch (see gpu/arena.rs). One thread
 // per element; bc1/bc2 (the bias corrections) are precomputed on the host.
 //
@@ -402,12 +410,15 @@ extern "C" __global__ void softmax_ce(const float* logits, const unsigned* targe
 //     are bandwidth-bound, and no amount of batching moves that.
 // The step still drops from ~900 launches and ~900 memsets to one of each, and the
 // arena is what gives every parameter a stable address.
+//
+// `clip` bounds every gradient element to [-clip, clip] before it enters the moments,
+// matching `nn2::optim`; a non-finite `clip` disables it.
 extern "C" __global__ void adamw_arena(float* param, const float* grad, float* m, float* v,
                                        float lr, float b1, float b2, float eps, float wd,
-                                       float bc1, float bc2, int decay_end, int n) {
+                                       float bc1, float bc2, float clip, int decay_end, int n) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= n) return;
-    float g = grad[k];
+    float g = clip_grad(grad[k], clip);
     float mk = b1 * m[k] + (1.0f - b1) * g;
     float vk = b2 * v[k] + (1.0f - b2) * g * g;
     m[k] = mk; v[k] = vk;
@@ -423,10 +434,10 @@ extern "C" __global__ void adamw_arena(float* param, const float* grad, float* m
 // on its own and the parity tests step through.
 extern "C" __global__ void adamw(float* param, const float* grad, float* m, float* v,
                                  float lr, float b1, float b2, float eps, float wd,
-                                 float bc1, float bc2, int n) {
+                                 float bc1, float bc2, float clip, int n) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= n) return;
-    float g = grad[k];
+    float g = clip_grad(grad[k], clip);
     float mk = b1 * m[k] + (1.0f - b1) * g;
     float vk = b2 * v[k] + (1.0f - b2) * g * g;
     m[k] = mk; v[k] = vk;

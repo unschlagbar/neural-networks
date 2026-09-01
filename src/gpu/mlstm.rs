@@ -519,6 +519,18 @@ impl MLstm {
     /// whatever `carry` says.
     pub fn reset_state(&mut self, _gpu: &Gpu) {
         self.carry_state = None;
+        // A sweep that ended early (a caller that forwarded chunks and never unwound
+        // them) would otherwise leave its host generations to accumulate across steps.
+        self.saved.clear();
+        self.discard_parked();
+    }
+
+    /// Drop host generations left over from a sweep whose backward never came, so
+    /// they do not accumulate across windows.
+    fn discard_parked(&mut self) {
+        if let Some(park) = &mut self.park {
+            park.discard_all();
+        }
     }
 
     /// Drop the carried BPTT state, so the next backward starts with no incoming
@@ -555,6 +567,7 @@ impl MLstm {
     /// clears `saved`.
     pub fn drop_all_act(&mut self, gpu: &Gpu) {
         self.saved.clear();
+        self.discard_parked();
         for l in [&mut self.lin_qkvo, &mut self.lin_gates, &mut self.lin_out] {
             l.drop_saved_act(gpu);
         }
@@ -573,6 +586,18 @@ impl MLstm {
     pub fn enable_offload(&mut self, gpu: &Gpu, in_flight: super::offload::SharedInFlight) {
         self.park =
             Some(super::offload::HostPark::new(gpu, in_flight).expect("offload: host park"));
+    }
+
+    /// Stop parking this cell's activations, discarding anything already parked.
+    /// See `Block::disable_offload`.
+    pub fn disable_offload(&mut self) {
+        self.discard_parked();
+        self.park = None;
+    }
+
+    /// Pinned host bytes this cell's park holds. Diagnostic.
+    pub fn parked_host_bytes(&self) -> usize {
+        self.park.as_ref().map_or(0, |p| p.host_bytes())
     }
 
     /// Backward over `[B, T, d]` → `dx` `[B, T, in]`. Accumulates all grads.
@@ -795,6 +820,12 @@ impl Cell for MLstm {
     }
     fn enable_offload(&mut self, gpu: &Gpu, in_flight: super::offload::SharedInFlight) {
         MLstm::enable_offload(self, gpu, in_flight)
+    }
+    fn disable_offload(&mut self) {
+        MLstm::disable_offload(self)
+    }
+    fn parked_host_bytes(&self) -> usize {
+        MLstm::parked_host_bytes(self)
     }
     fn prefetch_act(&mut self, gpu: &Gpu) {
         MLstm::prefetch_saved(self, gpu)

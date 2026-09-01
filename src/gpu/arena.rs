@@ -150,6 +150,7 @@ impl ParamArena {
         let bc1 = 1.0 - cfg.beta1.powi(cfg.t as i32);
         let bc2 = 1.0 - cfg.beta2.powi(cfg.t as i32);
         let (lr, b1, b2, eps, wd) = (cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay);
+        let clip = cfg.clip;
         let (decay_end, n) = (self.decay_end as i32, self.step_end as i32);
         let f = gpu.kernels.get("adamw_arena");
         let mut lb = gpu.stream.launch_builder(&f);
@@ -164,6 +165,7 @@ impl ParamArena {
             .arg(&wd)
             .arg(&bc1)
             .arg(&bc2)
+            .arg(&clip)
             .arg(&decay_end)
             .arg(&n);
         unsafe { lb.launch(super::ops::elem_cfg(gpu, self.step_end as u32)) }
@@ -345,6 +347,51 @@ mod tests {
         for &i in &order {
             assert_eq!(addr(&packed[i][0]), want, "parameter {i} is out of place");
             want += (sizes[i] * std::mem::size_of::<f32>()) as u64;
+        }
+    }
+    /// The gradient clip must bite on the device exactly where the CPU reference
+    /// clips, and `clip = INFINITY` must leave the update untouched. Gradients here
+    /// straddle the bound in both directions — a kernel that dropped the clip agrees
+    /// with the reference only on the interior elements.
+    #[test]
+    fn arena_step_clips_gradients_like_the_cpu() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        use crate::nn2::optim::AdamState;
+
+        let n = 512;
+        let param: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).sin()).collect();
+        // Spread well past ±clip on both sides.
+        let grad: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin() * 40.0).collect();
+        assert!(grad.iter().any(|g| *g > 5.0) && grad.iter().any(|g| *g < -5.0));
+
+        for clip in [5.0, f32::INFINITY] {
+            let cfg = AdamCfg {
+                clip,
+                t: 1,
+                ..AdamCfg::new(0.5, 0.0)
+            };
+            let mut want = param.clone();
+            AdamState::new().step(&mut want, &grad, &cfg, false);
+
+            let mk = |d: &[f32]| GTensor::from_host(&gpu, &Tensor::new(&[n], d.to_vec()));
+            let mut t = [mk(&param), mk(&grad), mk(&vec![0.0; n]), mk(&vec![0.0; n])];
+            // The arena owns the allocation the tensors now view into, so it has to
+            // outlive the download.
+            let mut arena = {
+                let [p, g, m, v] = &mut t;
+                ParamArena::bind(&gpu, vec![ParamSlot::new(p, g, m, v, ParamKind::NoDecay)])
+            };
+            arena.step(&gpu, &cfg);
+            let got = t[0].to_host(&gpu).data;
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "clip {clip}, element {i} (grad {}): gpu {a} vs cpu {b}",
+                    grad[i]
+                );
+            }
         }
     }
 }

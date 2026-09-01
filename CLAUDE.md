@@ -32,6 +32,8 @@ The binary reads one line from stdin to select its mode:
 | `av` | `grow_vocab` — **only for old checkpoints**: adds the SFT chat markers to a checkpoint pretrained before they existed (grows the tied embedding + logit head to the current `vocab_size()`). New models are built with the full vocab and never need this |
 | `hq` | `train_sft` — CPU Q-A / instruction fine-tuning on `SFT_DATA`, loss masked to the response. The CPU twin of `hqg` |
 | `hqg` | `train_sft_gpu` — GPU Q-A / instruction fine-tuning on `SFT_DATA`, loss masked to the response (needs `--features cuda`). Works directly on any current checkpoint; only an old (smaller-vocab) one must be run through `av` first |
+| `hv` | `validate_hierarchical` — forward-only pass over `VAL_DATA` (CPU), reporting mean char and word loss; no backward, no weight update |
+| `hvg` | `validate_hierarchical_gpu` — the same validation on the GPU (needs `--features cuda`), through `Hierarchical::eval_loss`: forward only, no gradient, no step, backbone offload turned off. ~2.2-2.4x a training window (`examples/eval_win.rs`) |
 | `s` | `sample_normal` — interactive sampling from the flat model |
 | `hs` | `sample_hierarchical` — interactive sampling from the hierarchical model |
 | `hqs` | `sample_chat` — interactive Q-A sampling from an SFT model (prompts for an instruction + optional context, generates the response until `<END>`) |

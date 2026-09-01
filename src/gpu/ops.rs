@@ -1734,7 +1734,7 @@ pub fn adamw(
     let bc1 = 1.0 - cfg.beta1.powi(cfg.t as i32);
     let bc2 = 1.0 - cfg.beta2.powi(cfg.t as i32);
     let wd = if decay { cfg.weight_decay } else { 0.0 };
-    let (lr, b1, b2, eps) = (cfg.lr, cfg.beta1, cfg.beta2, cfg.eps);
+    let (lr, b1, b2, eps, clip) = (cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.clip);
     let f = gpu.kernels.get("adamw");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&mut param.buf)
@@ -1748,6 +1748,7 @@ pub fn adamw(
         .arg(&wd)
         .arg(&bc1)
         .arg(&bc2)
+        .arg(&clip)
         .arg(&n_i);
     unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("adamw");
 }
