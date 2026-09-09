@@ -27,18 +27,75 @@
 //! Weights only; the AdamW moments are not persisted, so a resumed run restarts
 //! them.
 
+use std::ops::Deref;
 use std::range::Range;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{io, mem};
 
 use cudarc::driver::CudaSlice;
 
 use super::arena::{ParamArena, ParamKind, ParamSlot};
+
+/// The three stages' optimizer state, one [`ParamArena`] each.
+///
+/// Separate arenas rather than one, because the arena step takes a single
+/// [`AdamCfg`] for the whole range it covers and the three stages do not want the
+/// same one. Under Adam a step moves each parameter by about `lr` whatever the
+/// gradient was, so the change it makes to a layer's *output* grows with fan-in:
+/// one rate across a `WORD_HIDDEN`-wide backbone and a `CHAR_HIDDEN`-wide encoder
+/// trains the narrow stacks at a fraction of the rate their width asks for
+/// (`ENCODER_LR_SCALE`, `DECODER_LR_SCALE`). It is also what makes the per-stack
+/// weight decays in `config` reach the GPU path at all — a single arena had one
+/// `weight_decay` and the encoder's and decoder's were only ever read by the CPU
+/// trainer.
+///
+/// Splitting costs three launches and three memsets per step instead of one of
+/// each, against ~11 GB of moment traffic. Every parameter still has a fixed
+/// device address for the life of the model.
+struct StageArenas {
+    encoder: ParamArena,
+    backbone: ParamArena,
+    decoder: ParamArena,
+}
+
+impl StageArenas {
+    /// The three, named, for the memory report.
+    fn stages(&self) -> [(&'static str, &ParamArena); 3] {
+        [
+            ("encoder", &self.encoder),
+            ("backbone", &self.backbone),
+            ("decoder", &self.decoder),
+        ]
+    }
+}
+
+/// This model's parameters split by the stage that owns them.
+pub struct StageSlots<'a> {
+    pub encoder: Vec<ParamSlot<'a>>,
+    pub backbone: Vec<ParamSlot<'a>>,
+    pub decoder: Vec<ParamSlot<'a>>,
+}
+
+/// `cfg` with one stage's learning rate and weight decay. Everything else — the
+/// betas, the clip, and the step count bias correction reads — belongs to the
+/// schedule and is shared, so the three stages stay on one curve and differ only
+/// by a factor.
+fn stage_cfg(cfg: &AdamCfg, lr_scale: f32, weight_decay: f32) -> AdamCfg {
+    AdamCfg {
+        lr: cfg.lr * lr_scale,
+        weight_decay,
+        ..*cfg
+    }
+}
+
 use super::block::Block;
 use super::temp;
 use super::word_groups::{DecoderGroups, EncoderGroups, GroupIds, max_group_rows};
 use super::{GTensor, Gpu, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm};
-use crate::config::{GROUP_MAX_ROWS, WORDS_PER_SEQ};
+use crate::config::{
+    BACKBONE_WEIGHT_DECAY, DECODER_LR_SCALE, DECODER_WEIGHT_DECAY, ENCODER_LR_SCALE,
+    ENCODER_WEIGHT_DECAY, GROUP_MAX_ROWS, WORDS_PER_SEQ,
+};
 use crate::format::{Meta, ModelKind, Seen, Writer};
 use crate::gpu::arena::TrainingCache;
 use crate::gpu::block::BlockLike;
@@ -114,24 +171,10 @@ impl WordEncoder {
     }
 }
 
-/// Whether the backbone sweep is chunked over the word axis.
-///
-/// The backbone holds one row per word in every block from that block's forward to its
-/// backward, so an unchunked sweep is O(words) resident per block and device memory
-/// scales with the window. Chunk-major makes that O(BACKBONE_CHUNK): each chunk passes
-/// through all blocks carrying the cells' recurrent state, and backward unwinds them
-/// right to left carrying the BPTT state the other way.
-///
-/// Two things this rests on, both pinned by tests:
-///
-///   * **Per-chunk activation storage.** Every cache a later chunk's forward would
-///     overwrite is one-per-chunk: the FFN's five buffers, both pre-norms, the cell's
-///     own cache and its head norm, and one `HostPark` generation per chunk under
-///     offload. `backbone_chunked_matches_unchunked` pins the gradients.
-///   * **The mLSTM's backward carry.** Under CARRY the last chunk's incoming state
-///     gradient is not zero — that chunk feeds the one to its right — and zeroing it
-///     gives a wrong gradient with a right-looking loss.
-///     `mlstm_chunked_backward_matches_whole` pins it.
+/// Whether the backbone sweep is chunked over the word axis: activations resident per
+/// block go from O(words) to O(BACKBONE_CHUNK). Requires per-chunk activation storage
+/// and a non-zero incoming state gradient on the last chunk under CARRY; pinned by
+/// `backbone_chunked_matches_unchunked` and `mlstm_chunked_backward_matches_whole`.
 const BACKBONE_CHUNKED_BACKWARD: bool = true;
 
 /// Backbone chunk length for a `words`-word window, or `words` (one chunk, the
@@ -280,7 +323,7 @@ struct PhaseTimer {
     t0: Instant,
     /// Spans that occur more than once per window (the decoder runs one length group
     /// at a time, forward and backward interleaved), summed and printed once.
-    acc: Vec<(&'static str, std::time::Duration)>,
+    acc: Vec<(&'static str, Duration)>,
 }
 
 impl PhaseTimer {
@@ -383,11 +426,11 @@ pub struct Hierarchical {
     pub dec_norm: RmsNorm,                   // HC — the only stage-level norm
     pub dec_head: Linear,                    // HC → vocab
 
-    /// Every parameter, gradient and AdamW moment in four contiguous allocations,
-    /// with each layer above holding windows into them, so every parameter has a
-    /// fixed device address. `None` only while a constructor is still assembling the
-    /// stack — see [`bind_params`](Self::bind_params) and [`super::arena`].
-    arena: Option<ParamArena>,
+    /// Every parameter, gradient and AdamW moment, with each layer above holding
+    /// windows into contiguous allocations so every parameter has a fixed device
+    /// address. `None` only while a constructor is still assembling the stack — see
+    /// [`bind_params`](Self::bind_params) and [`super::arena`].
+    arenas: Option<StageArenas>,
 
     /// Optimizer step count, persisted with the checkpoint so training resumes.
     pub step_count: usize,
@@ -539,8 +582,8 @@ impl Hierarchical {
             cfg,
             table: GTensor::from_host(gpu, &Tensor::random(&[cfg.vocab, cfg.hc], 0.02)),
             dtable: GTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
-            m_tbl: GTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
-            v_tbl: GTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
+            m_tbl: super::arena::unbacked(gpu),
+            v_tbl: super::arena::unbacked(gpu),
             encoder: WordEncoder::new(gpu, cfg.hc, cfg.enc_blocks),
             bb_chunk: None,
             group_cap: None,
@@ -559,7 +602,7 @@ impl Hierarchical {
                 head_optimizer_convention(&mut h);
                 h
             },
-            arena: None,
+            arenas: None,
             step_count: 0,
             seen: Seen::default(),
             timer: PhaseTimer::new(&flags),
@@ -575,16 +618,36 @@ impl Hierarchical {
         model
     }
 
-    /// Pack every parameter into one [`ParamArena`], leaving the layers holding
-    /// windows into it.
+    /// Pack every parameter into its stage's [`ParamArena`], leaving the layers
+    /// holding windows into them.
     ///
     /// Called from the constructors, before a forward has allocated anything: packing
     /// holds one arena buffer alongside the tensors it is replacing, and doing it here
     /// keeps that transient off the peak instead of stacking it on a window's
-    /// activations.
+    /// activations. One stage at a time for the same reason — the transient is one
+    /// stage's buffer rather than the whole model's.
     fn bind_params(&mut self, gpu: &Gpu) {
-        let arena = ParamArena::bind(gpu, self.param_slots());
-        self.arena = Some(arena);
+        let StageSlots {
+            encoder,
+            backbone,
+            decoder,
+        } = self.param_slots_by_stage();
+        let arenas = StageArenas {
+            encoder: ParamArena::bind(gpu, encoder),
+            backbone: ParamArena::bind(gpu, backbone),
+            decoder: ParamArena::bind(gpu, decoder),
+        };
+        if self.flags.mem {
+            let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+            for (name, arena) in arenas.stages() {
+                println!(
+                    "param arena [{name}]: {:.0} MB total, {:.0} MB moments",
+                    mb(arena.bytes()),
+                    mb(arena.moment_bytes())
+                );
+            }
+        }
+        self.arenas = Some(arenas);
     }
 
     /// Park the backbone blocks' saved activations on the host (unless
@@ -828,7 +891,7 @@ impl Hierarchical {
         let (hc, wh) = (self.cfg.hc, self.cfg.wh);
         let enc_rows = max_group_rows(self.group_cap());
         let bb_rows = match self.bb_chunk {
-            Some(c) => c.min(WORDS_PER_SEQ).max(1),
+            Some(c) => c.clamp(1, WORDS_PER_SEQ),
             None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(WORDS_PER_SEQ).max(1),
             None => WORDS_PER_SEQ,
         };
@@ -860,7 +923,7 @@ impl Hierarchical {
         let enc_rows = max_group_rows(self.group_cap());
         let enc_tmax = crate::config::MAX_WORD_BYTES + 1;
         let bb_rows = match self.bb_chunk {
-            Some(c) => c.min(WORDS_PER_SEQ).max(1),
+            Some(c) => c.clamp(1, WORDS_PER_SEQ),
             None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(WORDS_PER_SEQ).max(1),
             None => WORDS_PER_SEQ,
         };
@@ -892,7 +955,7 @@ impl Hierarchical {
     fn temp_small_elems(&self) -> usize {
         let enc_rows = max_group_rows(self.group_cap());
         let bb_rows = match self.bb_chunk {
-            Some(c) => c.min(WORDS_PER_SEQ).max(1),
+            Some(c) => c.clamp(1, WORDS_PER_SEQ),
             None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(WORDS_PER_SEQ).max(1),
             None => WORDS_PER_SEQ,
         };
@@ -1361,11 +1424,10 @@ impl Hierarchical {
             // the prefetch above covers only the leftmost pass, so without this each
             // later chunk opens with an unhidden upload. Issued before the slicing and
             // the BPTT reset below, which is the compute it hides behind.
-            if chunked {
-                if let Some(last) = self.bb_blocks.last_mut() {
-                    last.prefetch_act(gpu);
-                }
+            if chunked && let Some(last) = self.bb_blocks.last_mut() {
+                last.prefetch_act(gpu);
             }
+
             // The rightmost chunk starts with no gradient coming from its right.
             if chunked && ci + 1 == spans.len() {
                 for blk in self.bb_blocks.iter_mut() {
@@ -1810,14 +1872,16 @@ impl Hierarchical {
         }
     }
 
-    /// Every parameter with its gradient and AdamW moments, in stage order.
+    /// Every parameter with its gradient and AdamW moments, split by stage.
     ///
-    /// The single enumeration of this model's parameters: the arena binds it, and
+    /// The single enumeration of this model's parameters: the arenas bind it, and
     /// the checkpoint's `params_mut` / the diagnostics' `grads` read it back out.
-    pub fn param_slots(&mut self) -> Vec<ParamSlot<'_>> {
+    pub fn param_slots_by_stage(&mut self) -> StageSlots<'_> {
         // The tied char table feeds the encoder's embedding and the decoder's char
-        // slots; like every embedding-like table it trains undecayed.
-        let mut v = vec![ParamSlot::new(
+        // slots; like every embedding-like table it trains undecayed. It is packed
+        // with the encoder, whose table it is — the decoder-side gradient is reduced
+        // into it before the step, so only one stage may own it.
+        let mut encoder = vec![ParamSlot::new(
             &mut self.table,
             &mut self.dtable,
             &mut self.m_tbl,
@@ -1825,32 +1889,64 @@ impl Hierarchical {
             ParamKind::NoDecay,
         )];
         for b in self.encoder.blocks.iter_mut() {
-            v.extend(b.param_slots());
+            encoder.extend(b.param_slots());
         }
-        v.extend(self.bb_front.param_slots());
+
+        let mut backbone = self.bb_front.param_slots();
         for b in self.bb_blocks.iter_mut() {
-            v.extend(b.param_slots());
+            backbone.extend(b.param_slots());
         }
-        v.extend(self.bb_back.param_slots());
+        backbone.extend(self.bb_back.param_slots());
+
+        let mut decoder = Vec::new();
         for b in self.dec_blocks.iter_mut() {
-            v.extend(b.param_slots());
+            decoder.extend(b.param_slots());
         }
-        v.extend(self.dec_norm.param_slots());
-        v.extend(self.dec_head.param_slots());
-        v
+        decoder.extend(self.dec_norm.param_slots());
+        decoder.extend(self.dec_head.param_slots());
+
+        StageSlots {
+            encoder,
+            backbone,
+            decoder,
+        }
     }
 
-    /// AdamW across every stage: one launch over the parameter arena, one memset
-    /// over its gradients.
+    /// The same enumeration flattened, in stage order.
+    pub fn param_slots(&mut self) -> Vec<ParamSlot<'_>> {
+        let StageSlots {
+            mut encoder,
+            backbone,
+            decoder,
+        } = self.param_slots_by_stage();
+        encoder.extend(backbone);
+        encoder.extend(decoder);
+        encoder
+    }
+
+    /// AdamW across every stage: one launch and one gradient memset per arena.
+    ///
+    /// `cfg` carries the schedule — the rate the backbone trains at, the betas, the
+    /// clip and the step count bias correction reads. What each stage does with it is
+    /// [`stage_cfg`].
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
         // Walked for its side effect: handing out `&mut w` drops each layer's cached
         // bf16 weight. Skipping it leaves every later forward reading the pre-step
         // weight — training silently stops learning.
         drop(self.param_slots());
-        self.arena
+        let arenas = self
+            .arenas
             .as_mut()
-            .expect("parameters were never bound — see Hierarchical::bind_params")
-            .step(gpu, cfg);
+            .expect("parameters were never bound — see Hierarchical::bind_params");
+        arenas
+            .encoder
+            .step(gpu, &stage_cfg(cfg, ENCODER_LR_SCALE, ENCODER_WEIGHT_DECAY));
+        arenas
+            .backbone
+            .step(gpu, &stage_cfg(cfg, 1.0, BACKBONE_WEIGHT_DECAY));
+        arenas
+            .decoder
+            .step(gpu, &stage_cfg(cfg, DECODER_LR_SCALE, DECODER_WEIGHT_DECAY));
         self.step_count += 1;
     }
 
@@ -1947,7 +2043,7 @@ impl Hierarchical {
         let stacks = crate::hierarchical::Hierarchical::load_stacks(path)?;
 
         let err = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-        let to_block = |gpu: &Gpu, l: &Box<dyn NnLayer>| -> io::Result<Box<dyn BlockLike>> {
+        let to_block = |gpu: &Gpu, l: &dyn NnLayer| -> io::Result<Box<dyn BlockLike>> {
             if let Some(s) = l.as_any().downcast_ref::<SLSTMBlock>() {
                 Ok(Box::new(Block::<SLstm>::from_nn_block(gpu, s)))
             } else if let Some(m) = l.as_any().downcast_ref::<MLSTMBlock>() {
@@ -1968,7 +2064,7 @@ impl Hierarchical {
         let table = GTensor::from_host(gpu, &tensor_from_matrix(&emb.weights));
         let enc_blocks: Vec<Box<dyn BlockLike>> = enc[1..]
             .iter()
-            .map(|l| to_block(gpu, l))
+            .map(|l| to_block(gpu, l.deref()))
             .collect::<io::Result<_>>()?;
 
         // Backbone: Linear + blocks + Linear
@@ -1986,7 +2082,7 @@ impl Hierarchical {
         let bb_back = linear_layer_to_gpu(gpu, back);
         let bb_blocks: Vec<Box<dyn BlockLike>> = wm[1..wm.len() - 1]
             .iter()
-            .map(|l| to_block(gpu, l))
+            .map(|l| to_block(gpu, l.deref()))
             .collect::<io::Result<_>>()?;
 
         // heads/dqk read off the first mLSTM block (all mLSTM blocks share them).
@@ -2004,7 +2100,7 @@ impl Hierarchical {
             .ok_or_else(|| err("decoder is missing its RMSNorm".into()))?;
         let dec_blocks: Vec<Box<dyn BlockLike>> = dl[..norm_idx]
             .iter()
-            .map(|l| to_block(gpu, l))
+            .map(|l| to_block(gpu, l.deref()))
             .collect::<io::Result<_>>()?;
         let rms = dl[norm_idx].as_any().downcast_ref::<RMSNorm>().unwrap();
         let dec_norm = RmsNorm::from_parts(gpu, &tensor_from_slice(&rms.gamma));
@@ -2086,6 +2182,63 @@ fn linear_layer_to_gpu(gpu: &Gpu, l: &LinearLayer) -> Linear {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stage split must be a partition of the model, in the order the flat
+    /// enumeration reports. A slot that lands in two stages is stepped twice a step;
+    /// one that lands in none is never stepped at all and never has its gradient
+    /// cleared — and neither shows up as anything but slightly wrong training.
+    #[test]
+    fn the_stage_split_partitions_the_model() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let cfg = ModelCfg {
+            vocab: 9,
+            hc: 16,
+            wh: 24,
+            enc_blocks: 1,
+            bb_blocks: 2,
+            dec_blocks: 1,
+            heads: 2,
+            dqk: 8,
+            w_token: 8,
+            cap: 30.0,
+        };
+        let mut model = Hierarchical::new(&gpu, cfg);
+
+        let lens = |slots: Vec<ParamSlot<'_>>| -> Vec<usize> {
+            slots.iter().map(|s| s.param.len()).collect()
+        };
+        let StageSlots {
+            encoder,
+            backbone,
+            decoder,
+        } = model.param_slots_by_stage();
+        let (enc, bb, dec) = (lens(encoder), lens(backbone), lens(decoder));
+        for (name, stage) in [("encoder", &enc), ("backbone", &bb), ("decoder", &dec)] {
+            assert!(!stage.is_empty(), "{name} owns no parameters");
+        }
+
+        let split: Vec<usize> = enc.iter().chain(&bb).chain(&dec).copied().collect();
+        assert_eq!(split, lens(model.param_slots()));
+    }
+
+    /// A stage takes its own rate and decay off the schedule and nothing else: the
+    /// moments' betas and the step count bias correction reads are shared, so the
+    /// three stages stay on one curve.
+    #[test]
+    fn stage_cfg_changes_the_rate_and_the_decay_only() {
+        let mut base = AdamCfg::new(1e-4, 0.03);
+        base.t = 7;
+        let scaled = stage_cfg(&base, 4.0, 0.01);
+        assert_eq!(scaled.lr, 4e-4);
+        assert_eq!(scaled.weight_decay, 0.01);
+        assert_eq!(scaled.beta1, base.beta1);
+        assert_eq!(scaled.beta2, base.beta2);
+        assert_eq!(scaled.eps, base.eps);
+        assert_eq!(scaled.clip, base.clip);
+        assert_eq!(scaled.t, base.t);
+    }
 
     /// A forward-only window must not leave anything parked on the host.
     ///

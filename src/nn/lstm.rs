@@ -358,8 +358,8 @@ impl NnLayer for LSTMLayer {
     }
 
     fn accumulate_init_grad(&mut self) {
-        add_vec_in_place(&mut self.grads.h_init_grad.vec(), &self.dh_bptt);
-        add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
+        add_vec_in_place(self.grads.h_init_grad.vec(), &self.dh_bptt);
+        add_vec_in_place(self.grads.c_init_grad.vec(), &self.dc_bptt);
     }
 }
 

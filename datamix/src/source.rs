@@ -72,69 +72,157 @@ fn generate(
     // Stop chasing a model that has stopped producing parsable lines rather
     // than looping on it.
     let mut barren = 0usize;
+    // The last transport error seen, so a round that failed for one systematic
+    // reason can say so instead of reporting an empty parse.
+    let mut failure: Option<String> = None;
+
+    // `[llm] workers` completions in flight, the same way the rewrite runs them:
+    // one generation call is ~100 s of a 27B writing six conversations, and
+    // asking for them one at a time leaves seven of the server's eight slots
+    // idle for the whole build. Rounds rather than a queue, because `sink`
+    // judges and shards as it goes and that has to stay serial and in order —
+    // the parallelism is only worth having on the part that waits on the GPU.
+    let workers = llm.borrow().cfg.workers.max(1);
 
     while made < want && barren < 5 {
         // Seeds are rendered in the exact output format the model is being
         // asked to produce — the instruction alone would show it what to write
         // about but not how, and it will happily invent its own tool syntax.
-        let seed_text = match &seeds {
-            Some(syn) => syn
-                .expand(src.seeds, &mut rng, &src.category)
-                .iter()
-                .filter_map(|r| crate::mix::render(r, OutKind::Sft))
-                .collect::<Vec<_>>()
-                .concat(),
-            None => String::new(),
+        // Drawn per call, so the calls of one round do not all ask the same
+        // thing; drawn here, because `Rng` is not shared across threads.
+        let round = workers.min(want.saturating_sub(made).div_ceil(src.batch.max(1)));
+        let mut asks = Vec::with_capacity(round);
+        for _ in 0..round {
+            let seed_text = match &seeds {
+                Some(syn) => syn
+                    .expand(src.seeds, &mut rng, &src.category)
+                    .iter()
+                    .filter_map(|r| crate::mix::render(r, OutKind::Sft))
+                    .collect::<Vec<_>>()
+                    .concat(),
+                None => String::new(),
+            };
+            let batch = src.batch.max(1);
+            asks.push((
+                call,
+                src.prompt
+                    .replace("{seed}", &seed_text)
+                    .replace("{n}", &batch.to_string()),
+            ));
+            call += 1;
+        }
+
+        // The borrow is scoped to the round: `sink` below judges with the same
+        // client, and a worker holds its own clone.
+        let replies: Vec<Option<Result<String>>> = {
+            let base = llm.borrow().clone();
+            let out: std::sync::Mutex<Vec<Option<Result<String>>>> =
+                std::sync::Mutex::new((0..asks.len()).map(|_| None).collect());
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let counts: Vec<(usize, usize)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..asks.len().min(workers))
+                    .map(|_| {
+                        // Zeroed: the clone carries the client's running totals,
+                        // and they are added back below. Left as they are, each
+                        // round re-adds the whole history and the counter runs
+                        // away inside a few rounds.
+                        let mut c = base.clone();
+                        c.calls = 0;
+                        c.cached = 0;
+                        let (next, out, asks) = (&next, &out, &asks);
+                        scope.spawn(move || {
+                            loop {
+                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some((nonce, user)) = asks.get(i) else {
+                                    break;
+                                };
+                                // Keep the error, do not swallow it: a whole
+                                // round can fail for one systematic reason (a
+                                // prompt over the server's context, the model
+                                // unloaded) and a silent drop turns that into
+                                // "produced no parsable examples", which names
+                                // the wrong cause.
+                                match c.chat_as(
+                                    &src.system,
+                                    user,
+                                    *nonce,
+                                    &src.model,
+                                    src.temperature,
+                                ) {
+                                    Ok(reply) => out.lock().expect("replies")[i] = Some(Ok(reply)),
+                                    Err(e) => out.lock().expect("replies")[i] = Some(Err(e)),
+                                }
+                            }
+                            (c.calls, c.cached)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().filter_map(|h| h.join().ok()).collect()
+            });
+            let mut client = llm.borrow_mut();
+            for (calls, cached) in counts {
+                client.calls += calls;
+                client.cached += cached;
+            }
+            out.into_inner().expect("replies")
         };
-        let batch = src.batch.min(want - made);
-        let user = src
-            .prompt
-            .replace("{seed}", &seed_text)
-            .replace("{n}", &batch.to_string());
-        // The borrow is scoped to the call: `sink` below may judge with the
-        // same client.
-        let reply = llm.borrow_mut().chat_as(
-            &src.system,
-            &user,
-            call,
-            &src.model,
-            src.temperature,
-        )?;
-        call += 1;
 
         let before = made;
-        for line in reply.lines() {
-            let line = line.trim().trim_start_matches("```json").trim_matches('`');
-            // A `messages` array is a conversation, anything else a single
-            // exchange — the same two shapes the loader reads.
-            let rec = if let Some(turns) = neural_networks::sft::parse_messages(line) {
-                Record::Chat {
-                    turns,
-                    category: json::field(line, "category")
-                        .unwrap_or_else(|| src.category.clone()),
-                }
-            } else {
-                let Some(instruction) = json::field(line, "instruction") else {
+        let mut last_err = None;
+        for reply in replies.into_iter().flatten() {
+            let reply = match reply {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(e);
                     continue;
-                };
-                let Some(response) = json::field(line, "response") else {
-                    continue;
-                };
-                Record::Sft {
-                    instruction,
-                    response,
-                    context: json::field(line, "context").unwrap_or_default(),
-                    category: json::field(line, "category")
-                        .unwrap_or_else(|| src.category.clone()),
                 }
             };
-            made += 1;
-            if !sink(rec) {
-                return Ok(());
+            for line in reply.lines() {
+                let line = line.trim().trim_start_matches("```json").trim_matches('`');
+                // A `messages` array is a conversation, anything else a single
+                // exchange — the same two shapes the loader reads.
+                let rec = if let Some(turns) = neural_networks::sft::parse_messages(line) {
+                    Record::Chat {
+                        turns,
+                        category: json::field(line, "category")
+                            .unwrap_or_else(|| src.category.clone()),
+                    }
+                } else {
+                    let Some(instruction) = json::field(line, "instruction") else {
+                        continue;
+                    };
+                    let Some(response) = json::field(line, "response") else {
+                        continue;
+                    };
+                    Record::Sft {
+                        instruction,
+                        response,
+                        context: json::field(line, "context").unwrap_or_default(),
+                        category: json::field(line, "category")
+                            .unwrap_or_else(|| src.category.clone()),
+                    }
+                };
+                made += 1;
+                if !sink(rec) {
+                    return Ok(());
+                }
+                if made >= want {
+                    break;
+                }
             }
             if made >= want {
                 break;
             }
+        }
+        if let Some(e) = last_err {
+            // Carry the prompt size: a context error is only actionable if you
+            // know how big the thing that overflowed actually was.
+            let biggest = asks.iter().map(|(_, u)| u.len()).max().unwrap_or(0);
+            failure = Some(format!(
+                "{e} (system {} chars, largest user prompt {biggest} chars, max_tokens {})",
+                src.system.len(),
+                llm.borrow().cfg.max_tokens
+            ));
         }
         if made == before {
             barren += 1;
@@ -150,6 +238,16 @@ fn generate(
     }
     println!();
     if made == 0 {
+        // `cache_only` opens no socket, so a source with nothing cached has
+        // simply not been generated yet. That is an empty source, not a broken
+        // build — the whole point of the mode is to assemble what is paid for.
+        if llm.borrow().cfg.cache_only {
+            println!("      nothing cached for '{}' — contributing 0", src.name);
+            return Ok(());
+        }
+        if let Some(e) = failure {
+            return Err(format!("[source {}] every request failed: {e}", src.name));
+        }
         return Err(format!(
             "[source {}] produced no parsable examples — the model must answer \
              with one JSON object per line, keys instruction/context/response",
@@ -392,10 +490,10 @@ fn read_chat_parquet(src: &Source, sink: &mut impl FnMut(Record) -> bool) -> Res
                 for element in row {
                     let role = String::from_utf8_lossy(&element[0]);
                     let Some(role) = Role::parse(&role) else { continue };
-                    turns.push(Turn {
+                    turns.push(Turn::new(
                         role,
-                        content: String::from_utf8_lossy(&element[1]).into_owned(),
-                    });
+                        String::from_utf8_lossy(&element[1]).into_owned(),
+                    ));
                 }
                 if turns.is_empty() {
                     continue;

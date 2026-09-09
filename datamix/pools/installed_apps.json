@@ -1,0 +1,518 @@
+[
+ {
+  "id": "Alacritty",
+  "name": "Alacritty",
+  "comment": "A fast, cross-platform, OpenGL terminal emulator",
+  "categories": "System;TerminalEmulator;"
+ },
+ {
+  "id": "DaVinciControlPanelsSetup",
+  "name": "DaVinci Control Panels Setup",
+  "comment": "",
+  "categories": ""
+ },
+ {
+  "id": "DaVinciResolve",
+  "name": "DaVinci Resolve",
+  "comment": "Revolutionary new tools for editing, visual effects, color correction and professional audio post production, all in a single application!",
+  "categories": ""
+ },
+ {
+  "id": "assistant",
+  "name": "Qt Assistant",
+  "comment": "View documentation in Qt help file format",
+  "categories": "Qt;Development;Documentation;"
+ },
+ {
+  "id": "avahi-discover",
+  "name": "Avahi Zeroconf Browser",
+  "comment": "Browse for Zeroconf services available on your network",
+  "categories": "GNOME;System;"
+ },
+ {
+  "id": "blackmagicraw-player",
+  "name": "Blackmagic RAW Player",
+  "comment": "",
+  "categories": "Video"
+ },
+ {
+  "id": "blackmagicraw-speedtest",
+  "name": "Blackmagic RAW Speed Test",
+  "comment": "",
+  "categories": "Video"
+ },
+ {
+  "id": "blender",
+  "name": "Blender",
+  "comment": "3D modeling, animation, rendering and post-production",
+  "categories": "Graphics;3DGraphics;"
+ },
+ {
+  "id": "bssh",
+  "name": "Avahi SSH Server Browser",
+  "comment": "Browse for Zeroconf-enabled SSH Servers",
+  "categories": "GNOME;Network;"
+ },
+ {
+  "id": "btop",
+  "name": "btop++",
+  "comment": "Resource monitor that shows usage and stats for processor, memory, disks, network and processes",
+  "categories": "System;Monitor;ConsoleOnly;"
+ },
+ {
+  "id": "btrfs-assistant",
+  "name": "Btrfs Assistant",
+  "comment": "GUI management tool to make managing a Btrfs filesystem easier",
+  "categories": "System"
+ },
+ {
+  "id": "bvnc",
+  "name": "Avahi VNC Server Browser",
+  "comment": "Browse for Zeroconf-enabled VNC Servers",
+  "categories": "GNOME;Network;"
+ },
+ {
+  "id": "cachyos-hello",
+  "name": "CachyOS Hello",
+  "comment": "A tool providing access to documentation and support for new CachyOS users.",
+  "categories": "GNOME;GTK;System;"
+ },
+ {
+  "id": "cachyos-pi",
+  "name": "CachyOS Package Installer",
+  "comment": "Simple Software Application Package Installer",
+  "categories": "System"
+ },
+ {
+  "id": "cmake-gui",
+  "name": "CMake",
+  "comment": "Cross-platform buildsystem",
+  "categories": "Development;Building;"
+ },
+ {
+  "id": "code",
+  "name": "Visual Studio Code",
+  "comment": "Code Editing. Redefined.",
+  "categories": "TextEditor;Development;IDE;"
+ },
+ {
+  "id": "com.github.maoschanz.drawing",
+  "name": "Drawing",
+  "comment": "Simple drawing utility",
+  "categories": "Graphics;GNOME;GTK;"
+ },
+ {
+  "id": "com.obsproject.Studio",
+  "name": "OBS Studio",
+  "comment": "Free and Open Source Streaming/Recording Software",
+  "categories": "AudioVideo;Recorder;"
+ },
+ {
+  "id": "cups",
+  "name": "Manage Printing",
+  "comment": "CUPS Web Interface",
+  "categories": "System;Settings;Printing;HardwareSettings;X-Red-Hat-Base;"
+ },
+ {
+  "id": "designer",
+  "name": "Qt Widgets Designer",
+  "comment": "Design GUIs for Qt applications",
+  "categories": "Qt;Development;"
+ },
+ {
+  "id": "discord",
+  "name": "Discord",
+  "comment": "All-in-one voice and text chat for gamers that's free, secure, and works on both your desktop and phone.",
+  "categories": "Network;InstantMessaging;"
+ },
+ {
+  "id": "firefox",
+  "name": "Firefox",
+  "comment": "Fast and private browser",
+  "categories": "GNOME;GTK;Network;WebBrowser;"
+ },
+ {
+  "id": "gimp",
+  "name": "GNU Image Manipulation Program",
+  "comment": "Create images and edit photographs",
+  "categories": "Graphics;2DGraphics;RasterGraphics;GTK;"
+ },
+ {
+  "id": "jconsole-java-openjdk",
+  "name": "OpenJDK Java 26 Console",
+  "comment": "OpenJDK Java 26 Monitoring & Management Console",
+  "categories": "Application;System;"
+ },
+ {
+  "id": "jshell-java-openjdk",
+  "name": "OpenJDK Java 26 Shell",
+  "comment": "OpenJDK Java 26 Shell",
+  "categories": "Application;System;"
+ },
+ {
+  "id": "kdesystemsettings",
+  "name": "KDE System Settings",
+  "comment": "Configure KDE Plasma’s behavior and appearance",
+  "categories": "Qt;KDE;Settings;"
+ },
+ {
+  "id": "libreoffice-base",
+  "name": "LibreOffice Base",
+  "comment": "Manage databases, create queries and reports to track and manage your information.",
+  "categories": "Office;Database;X-Red-Hat-Base;"
+ },
+ {
+  "id": "libreoffice-calc",
+  "name": "LibreOffice Calc",
+  "comment": "Perform calculations, analyze information and manage lists in spreadsheets.",
+  "categories": "Office;Spreadsheet;X-Red-Hat-Base;"
+ },
+ {
+  "id": "libreoffice-draw",
+  "name": "LibreOffice Draw",
+  "comment": "Create and edit drawings, flow charts and logos.",
+  "categories": "Office;FlowChart;Graphics;2DGraphics;VectorGraphics;X-Red-Hat-Base;"
+ },
+ {
+  "id": "libreoffice-impress",
+  "name": "LibreOffice Impress",
+  "comment": "Create and edit presentations for slideshows, meetings and Web pages.",
+  "categories": "Office;Presentation;X-Red-Hat-Base;"
+ },
+ {
+  "id": "libreoffice-math",
+  "name": "LibreOffice Math",
+  "comment": "Create and edit scientific formulas and equations.",
+  "categories": "Office;Education;Science;Math;X-Red-Hat-Base;"
+ },
+ {
+  "id": "libreoffice-startcenter",
+  "name": "LibreOffice",
+  "comment": "Launch applications to create text documents, spreadsheets, presentations, drawings, formulas, and databases, or open recently used documents.",
+  "categories": "Office;X-Red-Hat-Base;X-SuSE-Core-Office;"
+ },
+ {
+  "id": "libreoffice-writer",
+  "name": "LibreOffice Writer",
+  "comment": "Create and edit text and graphics in letters, reports, documents and Web pages.",
+  "categories": "Office;WordProcessor;X-Red-Hat-Base;"
+ },
+ {
+  "id": "linguist",
+  "name": "Qt Linguist",
+  "comment": "Add translations to Qt applications",
+  "categories": "Qt;Development;"
+ },
+ {
+  "id": "lstopo",
+  "name": "Hardware Locality lstopo",
+  "comment": "Show hardware topology",
+  "categories": "System;Monitor;"
+ },
+ {
+  "id": "micro",
+  "name": "Micro",
+  "comment": "Edit text files in a terminal",
+  "categories": "Utility;TextEditor;Development;"
+ },
+ {
+  "id": "mpv",
+  "name": "mpv Media Player",
+  "comment": "Play movies and songs",
+  "categories": "AudioVideo;Audio;Video;Player;TV;"
+ },
+ {
+  "id": "nsight-compute",
+  "name": "NVIDIA Nsight Compute",
+  "comment": "",
+  "categories": "Development;Profiling;ParallelComputing"
+ },
+ {
+  "id": "nsight-systems",
+  "name": "NVIDIA Nsight Systems",
+  "comment": "",
+  "categories": "Development;Profiling;ParallelComputing"
+ },
+ {
+  "id": "nvidia-settings",
+  "name": "NVIDIA X Server Settings",
+  "comment": "Configure NVIDIA X Server Settings",
+  "categories": "Settings;HardwareSettings;"
+ },
+ {
+  "id": "octopi-cachecleaner",
+  "name": "Octopi CacheCleaner",
+  "comment": "",
+  "categories": "GNOME;GTK;System;"
+ },
+ {
+  "id": "octopi-notifier",
+  "name": "Octopi Notifier",
+  "comment": "",
+  "categories": "GNOME;GTK;System;"
+ },
+ {
+  "id": "octopi-repoeditor",
+  "name": "Octopi Repository Editor",
+  "comment": "",
+  "categories": "GNOME;GTK;System;"
+ },
+ {
+  "id": "octopi",
+  "name": "Octopi",
+  "comment": "Add or remove software installed on the system",
+  "categories": "System;Tools;"
+ },
+ {
+  "id": "orca-slicer",
+  "name": "OrcaSlicer",
+  "comment": "",
+  "categories": "Utility;"
+ },
+ {
+  "id": "org.cachyos.KernelManager",
+  "name": "CachyOS Kernel Manager",
+  "comment": "Manage kernels",
+  "categories": "Qt;System;"
+ },
+ {
+  "id": "org.cachyos.scx-manager",
+  "name": "SchedExt GUI Manager",
+  "comment": "Manage scx schedulers",
+  "categories": "Qt;System;"
+ },
+ {
+  "id": "org.gnome.Meld",
+  "name": "Meld",
+  "comment": "Compare and merge your files",
+  "categories": "GTK;Development;"
+ },
+ {
+  "id": "org.kde.ark",
+  "name": "Ark",
+  "comment": "Work with file archives",
+  "categories": "Qt;KDE;Utility;Archiving;Compression;X-KDE-Utilities-File;"
+ },
+ {
+  "id": "org.kde.dolphin",
+  "name": "Dolphin",
+  "comment": "Manage your files",
+  "categories": "Qt;KDE;System;FileTools;FileManager;"
+ },
+ {
+  "id": "org.kde.filelight",
+  "name": "Filelight",
+  "comment": "Show disk usage and delete unused files",
+  "categories": "Qt;KDE;Utility;"
+ },
+ {
+  "id": "org.kde.gwenview",
+  "name": "Gwenview",
+  "comment": "A simple image viewer",
+  "categories": "Qt;KDE;Graphics;Viewer;Photography;"
+ },
+ {
+  "id": "org.kde.haruna",
+  "name": "Haruna",
+  "comment": "Open source media player built with Qt/QML and libmpv",
+  "categories": "Qt;KDE;AudioVideo;Player;Video;TV;"
+ },
+ {
+  "id": "org.kde.kate",
+  "name": "Kate",
+  "comment": "KDE Advanced Text Editor",
+  "categories": "Qt;KDE;Development;TextEditor;"
+ },
+ {
+  "id": "org.kde.kcalc",
+  "name": "KCalc",
+  "comment": "Calculator which offers many mathematical functions, such as trigonometric functions, logic operations, and statistical calculations",
+  "categories": "Qt;KDE;Utility;Calculator;X-KDE-Utilities-Desktop;"
+ },
+ {
+  "id": "org.kde.kdeconnect.app",
+  "name": "KDE Connect",
+  "comment": "Make all your devices one",
+  "categories": "Qt;KDE;Network"
+ },
+ {
+  "id": "org.kde.kdeconnect.nonplasma",
+  "name": "KDE Connect Indicator",
+  "comment": "Display information about your devices",
+  "categories": "Qt;KDE;Network;"
+ },
+ {
+  "id": "org.kde.kdeconnect.sms",
+  "name": "KDE Connect SMS",
+  "comment": "Read and send SMS messages on connected devices",
+  "categories": "Qt;KDE;Network;InstantMessaging"
+ },
+ {
+  "id": "org.kde.kinfocenter",
+  "name": "Info Center",
+  "comment": "Learn about the system's hardware and status",
+  "categories": "Qt;KDE;System;Documentation;"
+ },
+ {
+  "id": "org.kde.kmenuedit",
+  "name": "Menu Editor",
+  "comment": "Edit how applications are presented in app launchers",
+  "categories": "Qt;KDE;System;"
+ },
+ {
+  "id": "org.kde.konsole",
+  "name": "Konsole",
+  "comment": "Use the command line",
+  "categories": "Qt;KDE;System;TerminalEmulator;"
+ },
+ {
+  "id": "org.kde.kwalletmanager",
+  "name": "KWalletManager",
+  "comment": "Store and manage your passwords",
+  "categories": "Qt;KDE;System;Security;"
+ },
+ {
+  "id": "org.kde.kwrite",
+  "name": "KWrite",
+  "comment": "KDE Text Editor",
+  "categories": "Qt;KDE;Utility;TextEditor;"
+ },
+ {
+  "id": "org.kde.partitionmanager",
+  "name": "KDE Partition Manager",
+  "comment": "Manage disks, partitions, and file systems",
+  "categories": "System;Filesystem;KDE;Qt;"
+ },
+ {
+  "id": "org.kde.plasma-systemmonitor",
+  "name": "System Monitor",
+  "comment": "Monitor app and system resource usage",
+  "categories": "Qt;KDE;System;"
+ },
+ {
+  "id": "org.kde.plasma.emojier",
+  "name": "Emoji Selector",
+  "comment": "Copy emojis to the clipboard",
+  "categories": "Qt;KDE;Utility;"
+ },
+ {
+  "id": "org.kde.spectacle",
+  "name": "Spectacle",
+  "comment": "Take screenshots and screen recordings",
+  "categories": "Qt;KDE;Utility;"
+ },
+ {
+  "id": "org.kicad.bitmap2component",
+  "name": "KiCad Image Converter",
+  "comment": "Create a component from a bitmap for use with KiCad",
+  "categories": "Science;Electronics;"
+ },
+ {
+  "id": "org.kicad.eeschema",
+  "name": "KiCad Schematic Editor (Standalone)",
+  "comment": "Standalone schematic editor for KiCad schematics",
+  "categories": "Science;Electronics;"
+ },
+ {
+  "id": "org.kicad.gerbview",
+  "name": "KiCad Gerber Viewer",
+  "comment": "View Gerber files",
+  "categories": "Science;Electronics;"
+ },
+ {
+  "id": "org.kicad.kicad",
+  "name": "KiCad",
+  "comment": "Suite of tools for schematic design and circuit board layout",
+  "categories": "Science;Electronics;"
+ },
+ {
+  "id": "org.kicad.pcbcalculator",
+  "name": "KiCad PCB Calculator",
+  "comment": "Calculator for various electronics-related computations",
+  "categories": "Science;Electronics;"
+ },
+ {
+  "id": "org.kicad.pcbnew",
+  "name": "KiCad PCB Editor (Standalone)",
+  "comment": "Standalone circuit board editor for KiCad boards",
+  "categories": "Science;Electronics;"
+ },
+ {
+  "id": "org.prismlauncher.PrismLauncher",
+  "name": "Prism Launcher",
+  "comment": "Discover, manage, and play Minecraft instances",
+  "categories": "Game;ActionGame;AdventureGame;Simulation;PackageManager;"
+ },
+ {
+  "id": "org.pulseaudio.pavucontrol",
+  "name": "Volume Control",
+  "comment": "Adjust the volume level",
+  "categories": "AudioVideo;Audio;Mixer;GTK;Settings;X-XFCE-SettingsDialog;X-XFCE-HardwareSettings;"
+ },
+ {
+  "id": "qdbusviewer",
+  "name": "Qt D-Bus Viewer",
+  "comment": "Debug D-Bus applications",
+  "categories": "Qt;Development;Debugger;"
+ },
+ {
+  "id": "qv4l2",
+  "name": "Qt V4L2 test Utility",
+  "comment": "Allow testing Video4Linux devices",
+  "categories": "AudioVideo;"
+ },
+ {
+  "id": "qvidcap",
+  "name": "Qt V4L2 video capture utility",
+  "comment": "Viewer for video capture",
+  "categories": "AudioVideo;"
+ },
+ {
+  "id": "renderdoc",
+  "name": "RenderDoc",
+  "comment": "A stand-alone graphics API debugger",
+  "categories": "Development;"
+ },
+ {
+  "id": "steam",
+  "name": "Steam",
+  "comment": "Application for managing and playing games on Steam",
+  "categories": "Network;FileTransfer;Game;"
+ },
+ {
+  "id": "supertux2",
+  "name": "SuperTux 2",
+  "comment": "Play a classic 2D platform game",
+  "categories": "Game;ArcadeGame;"
+ },
+ {
+  "id": "system-config-printer",
+  "name": "Print Settings",
+  "comment": "Configure printers",
+  "categories": "System;Settings;HardwareSettings;Printing;GTK;"
+ },
+ {
+  "id": "systemsettings",
+  "name": "System Settings",
+  "comment": "Configure the system’s behavior and appearance",
+  "categories": "Qt;KDE;Settings;"
+ },
+ {
+  "id": "vim",
+  "name": "Vim",
+  "comment": "Edit text files",
+  "categories": "Utility;TextEditor;"
+ },
+ {
+  "id": "Sid Meier's Civilization VII",
+  "name": "Sid Meier's Civilization VII",
+  "comment": "Play this game on Steam",
+  "categories": "Game;"
+ },
+ {
+  "id": "org.kde.konsole",
+  "name": "Terminal",
+  "comment": "Command line access",
+  "categories": "Qt;KDE;System;TerminalEmulator;"
+ }
+]

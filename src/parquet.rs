@@ -378,7 +378,7 @@ impl<'a> RleDecoder<'a> {
                 let bit = i * width;
                 let mut v = 0u64;
                 // Values are LSB-first and may straddle byte boundaries.
-                for k in 0..((width + (bit % 8) + 7) / 8) {
+                for k in 0..(width + (bit % 8)).div_ceil(8) {
                     let idx = bit / 8 + k;
                     if idx < data.len() {
                         v |= (data[idx] as u64) << (8 * k);
@@ -467,7 +467,11 @@ impl Column {
     /// entries for a nested one (where a null or empty list is a slot with no
     /// value).
     fn slots(&self, nested: bool) -> usize {
-        if nested { self.reps.len() } else { self.values.len() }
+        if nested {
+            self.reps.len()
+        } else {
+            self.values.len()
+        }
     }
 }
 
@@ -477,7 +481,7 @@ fn level_width(max: u8) -> u8 {
     if max == 0 {
         0
     } else {
-        8 - (max as u8).leading_zeros() as u8
+        8 - max.leading_zeros() as u8
     }
 }
 
@@ -994,12 +998,7 @@ impl ParquetColumnReader {
                     col
                 ));
             }
-            cols.push(self.decode_chunk(
-                &chunk,
-                self.meta.max_def_levels[col],
-                max_rep,
-                index,
-            )?);
+            cols.push(self.decode_chunk(&chunk, self.meta.max_def_levels[col], max_rep, index)?);
         }
 
         let slots = cols[0].reps.len();
@@ -1129,7 +1128,10 @@ impl ParquetColumnReader {
                         non_null = if nested {
                             let at = col.defs.len();
                             read_levels(section, max_def_level, nv as usize, &mut col.defs)?;
-                            col.defs[at..].iter().filter(|&&d| d == max_def_level).count()
+                            col.defs[at..]
+                                .iter()
+                                .filter(|&&d| d == max_def_level)
+                                .count()
                         } else {
                             count_non_null(section, nv as usize)?
                         };

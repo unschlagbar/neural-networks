@@ -46,6 +46,7 @@ pub(crate) fn elem_cfg(gpu: &Gpu, n: u32) -> LaunchConfig {
     }
 }
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use super::{GTensor, Gpu};
@@ -373,14 +374,13 @@ pub fn quantize_bf16_(gpu: &Gpu, t: &mut GTensor<f32>) {
     unsafe { b.launch(elem_cfg(gpu, n as u32)) }.expect("quantize_bf16_inplace");
 }
 
-
 thread_local! {
     /// Resolved batched geometry per `(kernel, H, B)`. Choosing one costs an NVRTC
     /// lookup and a driver occupancy query per `rpt` candidate, and the encoder asks the
     /// same twenty questions every window — so the answer is remembered, including a
     /// remembered `None`.
-    static BATCHED_GEOM: std::cell::RefCell<(Option<usize>, HashMap<(bool, usize, usize), Option<SbGeom>>)> =
-        std::cell::RefCell::new((None, HashMap::new()));
+    static BATCHED_GEOM: RefCell<(Option<usize>, HashMap<(bool, usize, usize), Option<SbGeom>>)> =
+        RefCell::new((None, HashMap::new()));
 }
 
 /// Memoize `resolve` per `(bwd, h, b)` on this thread and stream.
@@ -401,13 +401,6 @@ fn cached_geom(
         *s.1.entry((bwd, h, b)).or_insert_with(resolve)
     })
 }
-
-
-
-
-
-
-
 
 /// Reusable bf16 staging for a layer's GEMM operands.
 ///
@@ -1030,7 +1023,7 @@ pub fn broadcast_row(gpu: &Gpu, out: &mut GTensor<f32>, bias: &GTensor<f32>) {
     // One block per row, grid-strided so a tall output does not need a huge grid.
     // Threads cover the width, which is where the coalescing is.
     let threads = n.clamp(32, 256).next_power_of_two().min(1024) as u32;
-    let blocks = rows.min(65535).max(1) as u32;
+    let blocks = rows.clamp(1, 65535) as u32;
     let cfg = LaunchConfig {
         grid_dim: (blocks, 1, 1),
         block_dim: (threads, 1, 1),
@@ -1064,7 +1057,7 @@ pub fn broadcast_row_resid(
         .arg(&rows_i)
         .arg(&n_i);
     let threads = n.clamp(32, 256).next_power_of_two().min(1024) as u32;
-    let blocks = rows.min(65535).max(1) as u32;
+    let blocks = rows.clamp(1, 65535) as u32;
     let cfg = LaunchConfig {
         grid_dim: (blocks, 1, 1),
         block_dim: (threads, 1, 1),
@@ -1111,7 +1104,11 @@ pub fn add_col_sum_mul_div(
     div: &GTensor<f32>,
     cache: &super::temp::TempCache,
 ) {
-    assert_eq!(dy.as_2d(), mul.as_2d(), "add_col_sum_mul_div: operand shapes");
+    assert_eq!(
+        dy.as_2d(),
+        mul.as_2d(),
+        "add_col_sum_mul_div: operand shapes"
+    );
     assert_eq!(db.len(), div.len(), "add_col_sum_mul_div: divisor width");
     col_sum_into(gpu, db, dy, Some(mul), Some(div), cache);
 }
@@ -1128,7 +1125,6 @@ pub fn add_col_sum_mul_div(
 /// A single band (the whole row axis in one block) leaves the grid at `ceil(n / 32)`,
 /// which at these layer widths is 8–24 blocks and reads at a tenth of the machine's
 /// bandwidth. [`col_sum_bands`] decides when the second launch is worth paying for.
-
 /// An operand that may be stored fp32 or narrow, borrowed for one launch.
 ///
 /// RMSNorm's output is read by three different kernels (its own backward, the `dγ`
@@ -1191,7 +1187,7 @@ fn col_sum_into(
     // a narrower layer spends the freed threads on rows instead. Both extents stay
     // powers of two, which the kernel's reduction tree requires.
     const THREADS: usize = 512;
-    let bx = n.next_power_of_two().min(32).max(1);
+    let bx = n.next_power_of_two().clamp(1, 32);
     let by = (THREADS / bx).min(rows.next_power_of_two()).max(1);
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(bx) as u32, 1, 1),
@@ -1270,14 +1266,13 @@ fn col_sum_banded(
     {
         let mut part = cache.get::<f32>(gpu, &[bands, n]);
         let part = &mut *part;
-        let f = gpu.kernels.get(mul.pick("col_sum_part", "col_sum_part_slab"));
+        let f = gpu
+            .kernels
+            .get(mul.pick("col_sum_part", "col_sum_part_slab"));
         let mut lb = gpu.stream.launch_builder(&f);
         lb.arg(&mut part.buf).arg(&dy.buf);
         push_wos!(lb, mul);
-        lb.arg(&use_mul)
-            .arg(&rows_i)
-            .arg(&n_i)
-            .arg(&band_i);
+        lb.arg(&use_mul).arg(&rows_i).arg(&n_i).arg(&band_i);
         let part_cfg = LaunchConfig {
             grid_dim: (cfg.grid_dim.0, bands as u32, 1),
             block_dim: (bx as u32, by as u32, 1),
@@ -1304,9 +1299,6 @@ fn col_sum_banded(
         .expect("col_sum_merge");
     }
 }
-
-
-
 
 /// Gather rows of `table` (`[vocab, dim]`) by `ids` into a `[ids.len(), dim]`
 /// tensor.
@@ -1357,8 +1349,7 @@ pub fn embedding_gather_u32_into(
         .arg(&mut out.buf)
         .arg(&dim_i)
         .arg(&rows_i);
-    unsafe { lb.launch(elem_cfg(gpu, (rows * dim) as u32)) }
-        .expect("embedding_gather");
+    unsafe { lb.launch(elem_cfg(gpu, (rows * dim) as u32)) }.expect("embedding_gather");
 }
 
 /// Scatter-add: `dtable[ids[r]] += dy[r]`, deterministically (ids may repeat).
@@ -1431,8 +1422,7 @@ pub fn embedding_scatter_add_u32(
         .arg(&part.buf)
         .arg(&n_i)
         .arg(&slices_i);
-    unsafe { lb.launch(elem_cfg(gpu, (vocab * dim) as u32)) }
-        .expect("embedding_scatter_merge");
+    unsafe { lb.launch(elem_cfg(gpu, (vocab * dim) as u32)) }.expect("embedding_scatter_merge");
 }
 
 /// The one intermediate a GPU RMSNorm forward saves: `1/rms(x)` per normalization
@@ -1628,7 +1618,6 @@ pub fn rms_norm_backward(
 /// Grouped RMSNorm backward into a caller-owned `dx` — the no-allocation form of
 /// [`rms_norm_backward`]. `dgamma` is accumulated into (not overwritten); `dx` is
 /// written in full.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub fn rms_norm_backward_into(
     gpu: &Gpu,
@@ -1995,8 +1984,7 @@ pub fn slstm_unpack_dw(
         .arg(&inp_i)
         .arg(&h_i)
         .arg(&rows_i);
-    unsafe { lb.launch(elem_cfg(gpu, (rows * 4 * h) as u32)) }
-        .expect("slstm_unpack_dw");
+    unsafe { lb.launch(elem_cfg(gpu, (rows * 4 * h) as u32)) }.expect("slstm_unpack_dw");
 }
 
 /// Fill `t` with a constant.
@@ -2320,7 +2308,7 @@ fn fused_threads_override() -> Option<usize> {
         std::env::var("SLSTM_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .filter(|t: &usize| *t >= 32 && *t <= MAX_BLOCK_THREADS && t % 32 == 0)
+            .filter(|t: &usize| *t >= 32 && *t <= MAX_BLOCK_THREADS && t.is_multiple_of(32))
     })
 }
 
@@ -2697,7 +2685,10 @@ const SB_MAX_WH_REGS: usize = 64;
 /// fits (67.6 us against 54.0 at B=32), and 64 needs a 1024-thread block, whose
 /// 64-register budget spills the backward's `Wh` fragments (`ptxas -v`).
 fn sb_nj_for(h: usize, b: usize, max_blocks: usize) -> usize {
-    if let Some(n) = std::env::var("SLSTM_BATCH_NJ").ok().and_then(|v| v.parse().ok()) {
+    if let Some(n) = std::env::var("SLSTM_BATCH_NJ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         return n;
     }
     // `rpt` is 1 for every shape this path takes, so a block owns 16 rows.
@@ -2705,7 +2696,7 @@ fn sb_nj_for(h: usize, b: usize, max_blocks: usize) -> usize {
     let last = SB_NJ_CANDIDATES[SB_NJ_CANDIDATES.len() - 1];
     SB_NJ_CANDIDATES
         .into_iter()
-        .find(|&nj| h % nj == 0 && h / nj * rows <= max_blocks)
+        .find(|&nj| h.is_multiple_of(nj) && h / nj * rows <= max_blocks)
         .unwrap_or(last)
 }
 
@@ -2763,7 +2754,9 @@ const SB_RPT_CANDIDATES: [usize; 4] = [1, 2, 4, 8];
 /// the only handle on how many ROW blocks the grid has, and how the grid lands against
 /// the SM count is worth more here than anything inside a block.
 fn sb_rpt_override() -> Option<usize> {
-    std::env::var("SLSTM_BATCH_RPT").ok().and_then(|v| v.parse().ok())
+    std::env::var("SLSTM_BATCH_RPT")
+        .ok()
+        .and_then(|v| v.parse().ok())
 }
 
 /// Resolved launch geometry for [`slstm_batched_fwd`]: the grid is `(cb, blocks_y)`
@@ -2809,11 +2802,11 @@ pub fn slstm_batched_geometry(gpu: &Gpu, h: usize, b: usize) -> Option<SbGeom> {
 fn batched_fwd_geometry(gpu: &Gpu, h: usize, b: usize) -> Option<SbGeom> {
     // `SB_KT` must be even (the k-loop runs two accumulators), and the `Wh` fragments
     // are a register array of `2 * H / 16` entries.
-    if h % 32 != 0 || b == 0 || 2 * h / 16 > SB_MAX_WH_REGS {
+    if !h.is_multiple_of(32) || b == 0 || 2 * h / 16 > SB_MAX_WH_REGS {
         return None;
     }
     let nj = sb_nj_for(h, b, sb_fwd_max_blocks(gpu));
-    if nj < 2 || nj % 2 != 0 || h % nj != 0 || 16 * nj > MAX_BLOCK_THREADS {
+    if nj < 2 || !nj.is_multiple_of(2) || !h.is_multiple_of(nj) || 16 * nj > MAX_BLOCK_THREADS {
         return None;
     }
     let (cb, threads) = (h / nj, 16 * nj);
@@ -3079,8 +3072,7 @@ pub fn slstm_fused_time(
                 .arg(&mut m_state.buf)
                 .arg(&mut h_state.buf)
                 .arg(&mut hmir.buf)
-                .arg(&mut wtail.buf)
-                ;
+                .arg(&mut wtail.buf);
             push_slab!(lb, slabs.c_entry);
             push_slab!(lb, slabs.n_entry);
             push_slab!(lb, slabs.zt);
@@ -3089,10 +3081,7 @@ pub fn slstm_fused_time(
             push_slab!(lb, slabs.f_prime);
             push_slab!(lb, slabs.c);
             push_slab!(lb, slabs.n);
-            lb.arg(&mut out.buf)
-                .arg(&t_i)
-                .arg(&upb_i)
-                .arg(&carry_i);
+            lb.arg(&mut out.buf).arg(&t_i).arg(&upb_i).arg(&carry_i);
             // SAFETY: the geometry above guarantees the grid is co-resident (a cooperative
             // launch deadlocks otherwise) and that every block's shared slice fits.
             match unsafe { lb.launch_cooperative(cfg) } {
@@ -3117,13 +3106,13 @@ pub fn slstm_batched_bwd_geometry(gpu: &Gpu, h: usize, b: usize) -> Option<SbGeo
 }
 
 fn batched_bwd_geometry(gpu: &Gpu, h: usize, b: usize) -> Option<SbGeom> {
-    if h % 32 != 0 || b == 0 || 2 * h / 16 > SB_MAX_WH_REGS {
+    if !h.is_multiple_of(32) || b == 0 || 2 * h / 16 > SB_MAX_WH_REGS {
         return None;
     }
     let nj = sb_nj_for(h, b, sb_bwd_max_blocks(gpu));
     // A warp owns 8 units and the warps split the reduction four ways, so `nj` must be
     // a multiple of 8 — the forward only needs it even.
-    if nj % 8 != 0 || h % nj != 0 || 16 * nj > MAX_BLOCK_THREADS {
+    if !nj.is_multiple_of(8) || !h.is_multiple_of(nj) || 16 * nj > MAX_BLOCK_THREADS {
         return None;
     }
     let (cb, threads) = (h / nj, 16 * nj);
@@ -4686,7 +4675,7 @@ pub fn fused_threads(name: &str, l: usize, dqk: usize, dhv: usize) -> u32 {
 /// Whether the fused kernels can run this shape. Diagnostic — there is no longer a
 /// second path to fall back to, so a shape outside this is a bug, not a dispatch.
 pub fn mlstm_fused_supported(l: usize, dqk: usize, dhv: usize) -> bool {
-    l >= 1 && l <= FUSED_MAX_L && dqk >= 1 && dhv >= 1
+    (1..=FUSED_MAX_L).contains(&l) && dqk >= 1 && dhv >= 1
 }
 
 /// Peak per-block shared memory (bytes) any fused kernel needs at this blocking.
@@ -5278,11 +5267,11 @@ pub fn mlstm_fused_bw(
         Some(d) => (Some(d.dc), Some(d.dn)),
         None => (None, None),
     };
-    let dstate = MlstmDState {
+
+    MlstmDState {
         dc: read_state_slot_n(gpu, &dcst, bh, nc + 1, 0, dhv * dqk, prev_dc),
         dn: read_state_slot_n(gpu, &dnst, bh, nc + 1, 0, dqk, prev_dn),
-    };
-    dstate
+    }
 }
 
 #[cfg(test)]
@@ -6027,7 +6016,7 @@ mod tests {
             rms_norm_forward(&gpu, &GTensor::from_host(&gpu, &x), &dgamma_t, group, eps);
         let mut dg_gpu = GTensor::zeros(&gpu, &[f]);
         let dx_gpu = rms_norm_backward(
-                &gpu,
+            &gpu,
             &GTensor::from_host(&gpu, &dy),
             &fwd_gpu,
             &out_gpu,

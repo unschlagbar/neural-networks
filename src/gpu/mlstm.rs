@@ -224,7 +224,7 @@ impl MLstm {
         // weights, while the runtime never spends a pass rescaling k or dk.
         let inv_sqrt_dqk = 1.0 / (dqk as f32).sqrt();
         let scaled =
-            |t: &Tensor| Tensor::new(&t.dims(), t.data.iter().map(|v| v * inv_sqrt_dqk).collect());
+            |t: &Tensor| Tensor::new(t.dims(), t.data.iter().map(|v| v * inv_sqrt_dqk).collect());
         let (wk, bk) = (&scaled(wk), &scaled(bk));
         Self {
             input_size,
@@ -669,7 +669,9 @@ impl MLstm {
         // `dq‖dk‖dv‖do` is one buffer: `ogate_bwd` fills the `o` block here and
         // `mlstm_fused_bw` the other three below, between them writing every column,
         // so it comes in uninitialised and feeds `lin_qkvo`'s backward whole.
-        let mut dxh = cache.temps.get::<f32>(gpu, &[n, self.lin_qkvo.output_size()]);
+        let mut dxh = cache
+            .temps
+            .get::<f32>(gpu, &[n, self.lin_qkvo.output_size()]);
         let mut d_yhat = cache.temps.get::<f32>(gpu, &[n, d]);
         ops::ogate_bwd(
             gpu,
@@ -686,7 +688,8 @@ impl MLstm {
         let mut d_ytil = cache.temps.get::<f32>(gpu, &[n, d]);
         // `yhat` is the head norm's own output, kept for `ogate_bwd` — which is also
         // what its backward rebuilds `x̂` from, so the norm stores no `[N, d]` of its own.
-        self.headnorm.backward(gpu, &d_yhat, sv.yhat(), &mut d_ytil, cache);
+        self.headnorm
+            .backward(gpu, &d_yhat, sv.yhat(), &mut d_ytil, cache);
         drop(d_yhat);
 
         // `[N, 2·heads]` — a gate strip, not a rectangle, so it comes from the small

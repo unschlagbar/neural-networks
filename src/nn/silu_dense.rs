@@ -146,7 +146,7 @@ impl SiluDenseLayer {
         }
 
         self.grads.weights.matrix().add_outer(&cache.input, delta);
-        add_vec_in_place(&mut self.grads.biases.vec(), delta);
+        add_vec_in_place(self.grads.biases.vec(), delta);
 
         cache.dx.fill(0.0);
         for (i, dx) in cache.dx.iter_mut().enumerate() {

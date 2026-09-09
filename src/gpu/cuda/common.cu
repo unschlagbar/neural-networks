@@ -395,43 +395,12 @@ __device__ __forceinline__ float clip_grad(float g, float clip) {
     return g;
 }
 
-// AdamW over a whole parameter arena in one launch (see gpu/arena.rs). One thread
-// per element; bc1/bc2 (the bias corrections) are precomputed on the host.
-//
-// The arena packs decayed parameters first and frozen ones last, so `decay_end` and
-// `n` replace what would otherwise be a per-tensor decay flag and bounds.
-//
-// What this buys is launches, not bandwidth. Measured against the two things Apex's
-// fused AdamW does:
-//   - `float4` (its ILP=4 vectorized path): total adamw time 71.2 -> 71.1 ms, i.e. no
-//     change. A warp's scalar accesses already coalesce into full sectors.
-//   - multi-tensor apply: 66% of this model's per-tensor adamw launches were under
-//     4 us but only 10% of its time — the kernel time sits in mid-sized tensors that
-//     are bandwidth-bound, and no amount of batching moves that.
-// The step still drops from ~900 launches and ~900 memsets to one of each, and the
-// arena is what gives every parameter a stable address.
+// AdamW over one tensor, with `wd` fixed for all of it: what a layer used on its own
+// and the parity tests step through, and the fp32 reference the arena's quantized step
+// is measured against.
 //
 // `clip` bounds every gradient element to [-clip, clip] before it enters the moments,
 // matching `nn2::optim`; a non-finite `clip` disables it.
-extern "C" __global__ void adamw_arena(float* param, const float* grad, float* m, float* v,
-                                       float lr, float b1, float b2, float eps, float wd,
-                                       float bc1, float bc2, float clip, int decay_end, int n) {
-    int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= n) return;
-    float g = clip_grad(grad[k], clip);
-    float mk = b1 * m[k] + (1.0f - b1) * g;
-    float vk = b2 * v[k] + (1.0f - b2) * g * g;
-    m[k] = mk; v[k] = vk;
-    float mh = mk / bc1;
-    float vh = vk / bc2;
-    float p = param[k];
-    p -= lr * (k < decay_end ? wd : 0.0f) * p;
-    p -= lr * mh / (sqrtf(vh) + eps);
-    param[k] = p;
-}
-
-// The same update over one tensor, with `wd` fixed for all of it: what a layer used
-// on its own and the parity tests step through.
 extern "C" __global__ void adamw(float* param, const float* grad, float* m, float* v,
                                  float lr, float b1, float b2, float eps, float wd,
                                  float bc1, float bc2, float clip, int n) {
@@ -447,6 +416,151 @@ extern "C" __global__ void adamw(float* param, const float* grad, float* m, floa
     p -= lr * wd * p;
     p -= lr * mh / (sqrtf(vh) + eps);
     param[k] = p;
+}
+
+// 8-bit AdamW moments: blockwise dynamic quantization (Dettmers et al., arXiv 2110.02861).
+//
+// `m` and `v` are stored as one byte per parameter — an index into a 256-entry map of
+// normalized magnitudes — times one fp32 scale per ADAM_QBLOCK elements, that range's
+// absmax. Only the state carried BETWEEN steps is quantized: the update below is
+// computed from the freshly recomputed fp32 moments, so a step is exactly as accurate
+// as the state it starts from.
+//
+// The map is non-uniform, fine near the range absmax and coarse seven decades below
+// it, because the error that matters is relative: `v` enters as 1/sqrt(v), where an
+// element flushed to zero would produce an unbounded update. See `arena::dynamic_map`.
+//
+// One CUDA block per quantization range: re-quantizing needs the range's NEW absmax,
+// so the updated moments have to stay in registers across a block-wide reduction.
+#define ADAM_QBLOCK 2048
+#define ADAM_QTHREADS 256
+#define ADAM_QPT (ADAM_QBLOCK / ADAM_QTHREADS)
+#define ADAM_QWARPS (ADAM_QTHREADS / 32)
+
+// Nearest code in a sorted 256-entry map.
+__device__ __forceinline__ unsigned char q_encode(const float* map, float x) {
+    int lo = 0, hi = 255;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (map[mid] < x) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0 && (x - map[lo - 1]) < (map[lo] - x)) lo--;
+    return (unsigned char)lo;
+}
+
+// Block-wide max, broadcast to every thread. `s` is ADAM_QWARPS + 1 floats: the warp
+// partials and, separately, the broadcast slot — a caller reducing twice hands out
+// disjoint scratch rather than relying on where the second call's reads and writes
+// happen to fall.
+__device__ __forceinline__ float q_block_max(float v, float* s) {
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, off));
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (lane == 0) s[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        v = (lane < ADAM_QWARPS) ? s[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, off));
+        if (lane == 0) s[ADAM_QWARPS] = v;
+    }
+    __syncthreads();
+    return s[ADAM_QWARPS];
+}
+
+// Quantize one fp32 range into bytes plus per-ADAM_QBLOCK scales. Used when a model
+// binds its arena; the steady-state path re-quantizes inside adamw_arena_q8.
+extern "C" __global__ void quantize_blockwise(const float* x, unsigned char* q, float* scale,
+                                              const float* map, int n) {
+    __shared__ float red[ADAM_QWARPS + 1];
+    __shared__ float map_s[256];
+    for (int i = threadIdx.x; i < 256; i += ADAM_QTHREADS) map_s[i] = map[i];
+    __syncthreads();
+
+    int base = blockIdx.x * ADAM_QBLOCK;
+    float val[ADAM_QPT];
+    float a = 0.0f;
+    for (int i = 0; i < ADAM_QPT; ++i) {
+        int k = base + i * ADAM_QTHREADS + threadIdx.x;
+        val[i] = (k < n) ? x[k] : 0.0f;
+        a = fmaxf(a, fabsf(val[i]));
+    }
+    a = q_block_max(a, red);
+    if (threadIdx.x == 0) scale[blockIdx.x] = a;
+    float r = a > 0.0f ? 1.0f / a : 0.0f;
+    for (int i = 0; i < ADAM_QPT; ++i) {
+        int k = base + i * ADAM_QTHREADS + threadIdx.x;
+        if (k < n) q[k] = q_encode(map_s, val[i] * r);
+    }
+}
+
+// AdamW over a whole parameter arena in one launch (see gpu/arena.rs), with the
+// moments held as bytes. `smap` covers [-1, 1] for `m`, `umap` [0, 1] for `v`, which is
+// non-negative by construction and so spends no code on a sign. A scale of zero (the
+// initial state, and any range that is still all zeros) dequantizes to zero whatever
+// the byte holds.
+//
+// The arena packs decayed parameters first and frozen ones last, so `decay_end` and
+// `n` replace what would otherwise be a per-tensor decay flag and bounds.
+//
+// What the arena buys is launches, not bandwidth. Measured against the two things
+// Apex's fused AdamW does:
+//   - `float4` (its ILP=4 vectorized path): total adamw time 71.2 -> 71.1 ms, i.e. no
+//     change. A warp's scalar accesses already coalesce into full sectors.
+//   - multi-tensor apply: 66% of this model's per-tensor adamw launches were under
+//     4 us but only 10% of its time — the kernel time sits in mid-sized tensors that
+//     are bandwidth-bound, and no amount of batching moves that.
+// The step still drops from ~900 launches and ~900 memsets to one of each, and the
+// arena is what gives every parameter a stable address.
+extern "C" __global__ void adamw_arena_q8(float* param, const float* grad,
+                                          unsigned char* mq, unsigned char* vq,
+                                          float* ms, float* vs,
+                                          const float* smap, const float* umap,
+                                          float lr, float b1, float b2, float eps, float wd,
+                                          float bc1, float bc2, float clip,
+                                          int decay_end, int n) {
+    __shared__ float red[2 * (ADAM_QWARPS + 1)];
+    __shared__ float map_s[512];
+    for (int i = threadIdx.x; i < 256; i += ADAM_QTHREADS) {
+        map_s[i] = smap[i];
+        map_s[256 + i] = umap[i];
+    }
+
+    int base = blockIdx.x * ADAM_QBLOCK;
+    float sm = ms[blockIdx.x], sv = vs[blockIdx.x];
+    float mn[ADAM_QPT], vn[ADAM_QPT];
+    float am = 0.0f, av = 0.0f;
+    __syncthreads();
+
+    for (int i = 0; i < ADAM_QPT; ++i) {
+        int k = base + i * ADAM_QTHREADS + threadIdx.x;
+        float mk = 0.0f, vk = 0.0f;
+        if (k < n) {
+            float g = clip_grad(grad[k], clip);
+            mk = b1 * (map_s[mq[k]] * sm) + (1.0f - b1) * g;
+            vk = b2 * (map_s[256 + vq[k]] * sv) + (1.0f - b2) * g * g;
+            float mh = mk / bc1;
+            float vh = vk / bc2;
+            float p = param[k];
+            p -= lr * (k < decay_end ? wd : 0.0f) * p;
+            p -= lr * mh / (sqrtf(vh) + eps);
+            param[k] = p;
+        }
+        mn[i] = mk; vn[i] = vk;
+        am = fmaxf(am, fabsf(mk));
+        av = fmaxf(av, vk);
+    }
+
+    am = q_block_max(am, red);
+    av = q_block_max(av, red + ADAM_QWARPS + 1);
+    if (threadIdx.x == 0) { ms[blockIdx.x] = am; vs[blockIdx.x] = av; }
+    float rm = am > 0.0f ? 1.0f / am : 0.0f;
+    float rv = av > 0.0f ? 1.0f / av : 0.0f;
+    for (int i = 0; i < ADAM_QPT; ++i) {
+        int k = base + i * ADAM_QTHREADS + threadIdx.x;
+        if (k < n) {
+            mq[k] = q_encode(map_s, mn[i] * rm);
+            vq[k] = q_encode(map_s + 256, vn[i] * rv);
+        }
+    }
 }
 
 // sLSTM cell (recurrent core)

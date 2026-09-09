@@ -19,7 +19,61 @@ cargo build -p datamix --release
 ./target/release/datamix verify data/mix/assistant.jsonl # load it as training does
 ./target/release/datamix synth  mixes/synth/apps.syn -n 10
 ./target/release/datamix ping   mixes/assistant_llm.toml  # check the local LM server
+./target/release/datamix edit   data/sources/handmade.jsonl  # write records by hand
 ```
+
+## Writing records by hand
+
+The same file has two front ends: `datamix edit` below, and the **corpus page**
+in `harness` (the CORPUS chip in its status rail, or `HARNESS_PAGE=corpus`),
+which edits `data/sources/handmade.jsonl` directly and masks by selecting text in
+the turn itself.
+
+
+`datamix edit [file.jsonl] [--port 7878]` serves a small editor on
+`127.0.0.1` and reads and writes that file directly — nothing is downloaded,
+nothing is copied back by hand. It is the way to add the handful of examples no
+corpus and no template covers; point a `kind = "jsonl"` source at the file and
+it mixes in like any other.
+
+```toml
+[source.handmade]
+kind = "jsonl"
+path = "data/sources/handmade.jsonl"
+weight = 1
+```
+
+A record is either a conversation of role-tagged turns (`user`, `assistant`,
+`tool`, `system`) or a single instruction/context/response pair. Text is typed
+as text: the page escapes it into JSON itself, so a newline or a quote inside a
+turn needs no thought. Under the turns it renders the **wire form** — the same
+assembly `build_conversation` in `src/sft.rs` does, with `<CONTEXT>`, `<SEP>`,
+`<result>…</result>` and `<END>` where they will land, and whitespace shown as
+`·` / `¶` on request — and highlights the spans that carry loss.
+
+The loss mask is the **"train on this"** checkbox on each assistant turn. On,
+the turn is an `assistant` turn and its gradient trains the model. Off, it is
+written as `assistant_context`: laid out identically, `<END>` included, read by
+the backbone, and never a target. That is how a conversation can contain a
+wrong tool call the model then recovers from without the mistake being trained.
+
+Part of an answer can be masked the same way: select it and press **don't train
+selection**. The selection snaps out to word borders — the unit the mask is
+really applied in — and is written as a `no_loss` range on the message:
+
+```json
+{"role": "assistant", "content": "hmm, five. no wait, four.", "no_loss": [[0, 11]]}
+```
+
+The whole answer is still written and read; only the unmasked part carries
+gradient, which the wire form shows directly (`hmm, five. ` plain, `no wait,
+four.<END>` green). Masked ranges show up as struck-through chips under the
+turn — click one to train it again — and they follow the text when it is
+edited, so a mask does not have to be redrawn after a typo fix.
+
+Saving writes through a temp file and then loads the result with the training
+loader (`sft::load_jsonl`), so the status line is what `hqg` will actually see —
+including a record it drops and why.
 
 ## How a build runs
 
@@ -263,9 +317,42 @@ temperature = 1.0
 max_tokens = 1024
 timeout = 300                           # seconds for one completion
 retries = 2
-cache = "target/datamix-llm-cache"      # empty disables caching
+cache = "data/llm-cache"      # empty disables caching
 api_key = ""                            # only if your server wants one
+workers = 4                             # requests in flight; match the server's PARALLEL
 ```
+
+**Two jobs a local server does badly**, and the one knob that fixes both: a
+reasoning model spends most of every completion thinking. On Python→Rust
+rewrites of `assistant_qa` that was 60–90% of the budget, and two replies in
+four ran out of tokens mid-answer. None of `chat_template_kwargs`,
+`/no_think` or `reasoning.enabled` turns it off — LM Studio ignores all three.
+What works is taking the template over:
+
+```toml
+completion_stop = "<|im_end|>"
+completion_template = """<|im_start|>system
+{system}<|im_end|>
+<|im_start|>user
+{user}<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+"""
+```
+
+A non-empty `completion_template` switches every call to `/v1/completions`,
+where the prompt is passed verbatim — the only way to prefill the assistant
+turn. The model reads its own `<think></think>` as already closed and answers
+directly: **4.3 s per record against 43.6 s**, with no measured quality loss.
+The template is part of the cache key, so a deliberated answer and a prefilled
+one never share an entry. Leave it empty for a non-reasoning model.
+
+`workers` is how many requests are in flight. Set it to the server's parallel
+slot count (`lms ps` prints it as PARALLEL); past that the aggregate rate does
+not move — measured 99 tok/s at both 4 and 8.
 
 `datamix ping [mix.toml]` lists the server's loaded models and runs one
 completion — do that before a long build.
@@ -321,8 +408,127 @@ The judge runs *after* the cheap gates, on what survived them, and costs one
 round trip per record. Rejections appear in the report as `rejected by the
 judge`, like every other filter.
 
-**Caching.** Every completion is keyed on model, temperature, prompts and call
-index, and stored under `cache`. Rebuilding a mixture re-reads the cache and
+`kind = llm` sources generate in rounds of `[llm] workers`, the same pool the
+rewrite uses: one call is ~100 s of a 27B writing a batch of conversations, and
+one at a time leaves the rest of the server's slots idle — measured 2.8
+records/min serial against 16 in rounds of eight. The seeds are drawn per call,
+so the calls of one round do not all ask the same thing. What follows a round —
+the filters, the judge, the shard write — stays serial and in order.
+
+**Rewriting what a source already holds** (`transform`, in `[filter]` or in one
+source):
+
+```toml
+transform_when = ["```python", "```py", "python", "Python"]   # empty = every record
+transform_temperature = 0.2                                   # a translation, not a generation
+transform = """
+You convert Python programming data into Rust. You are given one conversation
+as {"messages": [...]}. Rewrite it so no trace of Python is left … Reply with
+ONLY the rewritten {"messages": [...]} JSON object.
+"""
+```
+
+Where `judge` decides whether a record survives, `transform` decides what it
+says. The record goes up in the same `{"messages": [...]}` shape the SFT loader
+reads, and the reply must come back with **the same turns in the same order with
+the same roles** — a reply that drops a turn or relabels one is refused and the
+record is dropped, counted in the report as `rewrite failed`. That check is not
+pedantry: an assistant turn relabelled as a user turn would silently move the
+SFT loss mask onto the prompt.
+
+A dolly-shaped record travels as the turns it stands for (`context` as the
+system turn), so one prompt handles both shapes.
+
+The rewrite is keyed on the record's own text, which is what makes it stick: the
+first build pays for it once and every later build reads the answers back
+without opening a socket — measured 66 s, then 0.005 s for byte-identical
+output. `transform_when` is what keeps a whole-corpus rewrite affordable; a
+record that matches none of its substrings never reaches the server. On
+`mixes/assistant_qa.toml` that is 24% of the records, ~52k of them, about 56
+hours on a 27B at four workers — a number worth knowing before you start, and
+resumable at any point because nothing is ever asked twice.
+
+**Making a rewrite into a corpus** (`transform_only`). A rewrite that expensive
+should not live only inside whatever corpus was built last. `transform_only =
+true` keeps ONLY the records the rewrite applied to, dropping everything
+`transform_when` did not match (counted as `outside the rewrite`), so a mixture
+can write the translations out as a corpus of their own. With `cache_only =
+true` beside it, that mixture opens no socket at all — it assembles exactly what
+has already been paid for. `mixes/rustified.toml` is that mixture:
+
+```
+cargo run -p datamix --release -- build mixes/rustified.toml
+  -> data/sources/rustified.jsonl        3,141 records, ~4.4M tokens
+```
+
+and every other mixture then reads the translations with three lines and no
+rewrite prompt of its own:
+
+```toml
+[source.rustified]
+kind = "dolly"          # `dolly`, not `jsonl`: it reads both record shapes
+path = "data/sources/rustified.jsonl"
+```
+
+The mixer balances *between* sources, so list every subset under ONE source
+here — splitting them meant the smallest yield capped the rest, and 3,141
+translated records came out as 286.
+
+The cache itself lives in `data/llm-cache`, deliberately outside `target/`: what
+accumulates there is the corpus, not a build artifact, and `cargo clean` used to
+take 56 hours of it.
+
+**Compiling what the rewrite produced** (`verify`, `verify_repair`):
+
+```toml
+verify = "rust"            # extract the ```rust blocks and run rustc; "" = off
+verify_repair = """
+You are fixing Rust code inside one training conversation... Fix only what the
+errors point at. Reply with ONLY the corrected {"messages": [...]} JSON object.
+"""
+```
+
+A model translating code makes the kind of mistake that reads fine and does not
+build — a string literal eaten by a substitution (`Node { name: ".to_string()" }`),
+a crate invented to stand in for a Python library. `rustc` settles that exactly,
+in ~0.3 s against the ~4 s the rewrite itself cost. A snippet is tried as a file
+of items and then wrapped in a function, because instruction data shows both a
+full `fn` and a bare statement; only the second needs the wrapper. No `rustc` on
+PATH skips the check rather than rejecting everything.
+
+When it fails and `verify_repair` is set, the record goes back up with rustc's
+own diagnostics attached — the compiler describes the defect better than any
+rule could — and is compiled again. Measured on 24 rewritten records: 63% built
+as they came back, one repair pass took that to 79%, and a second pass fixed
+nothing, which is why there is only one. What still fails is dropped, counted as
+`code does not compile`.
+
+**Cutting the boilerplate out of system turns** (`system_strip`, `system_fold`):
+
+```toml
+system_strip = ["You're an AI assistant for text re-writing.", "You are an AI assistant."]
+system_fold = false
+```
+
+A corpus's system turns are rarely as varied as they look: on `assistant_qa`
+they are 246 distinct strings of which twelve cover 32% of every record, and one
+identity sentence opens 13.6% of them. That is a prop — the model learns to
+answer with it in front of the prompt and is off its distribution the moment it
+is not there. `system_strip` cuts those sentences out; a turn that was *only*
+framing disappears.
+
+What it deliberately does not do is delete the turn. In ~23k records the system
+turn is not framing but the only instruction the record has ("Rewrite the input
+text to make it more professional", the user turn holding just the raw email);
+cutting it whole would leave a corpus of unanswerable examples. `system_fold =
+true` goes one step further and moves the surviving instruction into the first
+user turn, which is where inference puts it.
+
+Both run before the rewrite, because the record's own text is its cache key: a
+system turn edited afterwards would hash two ways and re-translate.
+
+**Caching.** Every completion is keyed on model, temperature, template, prompts
+and call index, and stored under `cache`. Rebuilding a mixture re-reads the cache and
 makes no calls; raising `count` only pays for the new calls. Delete the
 directory to regenerate from scratch.
 

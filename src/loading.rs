@@ -254,17 +254,17 @@ pub fn load_mlstm(
     let wi = read_matrix(r)?;
     let wf = read_matrix(r)?;
 
-    let bq: Box<[f32]> = read_f32_vec(r)?.into();
-    let bk: Box<[f32]> = read_f32_vec(r)?.into();
-    let bv: Box<[f32]> = read_f32_vec(r)?.into();
-    let bo: Box<[f32]> = read_f32_vec(r)?.into();
-    let bi: Box<[f32]> = read_f32_vec(r)?.into();
-    let bf: Box<[f32]> = read_f32_vec(r)?.into();
+    let bq: Box<[f32]> = read_f32_vec(r)?;
+    let bk: Box<[f32]> = read_f32_vec(r)?;
+    let bv: Box<[f32]> = read_f32_vec(r)?;
+    let bo: Box<[f32]> = read_f32_vec(r)?;
+    let bi: Box<[f32]> = read_f32_vec(r)?;
+    let bf: Box<[f32]> = read_f32_vec(r)?;
 
     let w_out_weights = read_matrix(r)?;
-    let w_out_biases: Box<[f32]> = read_f32_vec(r)?.into();
+    let w_out_biases: Box<[f32]> = read_f32_vec(r)?;
     let w_out = LinearLayer::from_loaded(output_size, output_size, w_out_weights, w_out_biases);
-    let head_norm_gamma: Box<[f32]> = read_f32_vec(r)?.into();
+    let head_norm_gamma: Box<[f32]> = read_f32_vec(r)?;
 
     Ok(MLSTMLayer::from_loaded(
         input_size,
@@ -291,8 +291,8 @@ pub fn load_mlstm(
 pub fn load_mlstm_block(r: &mut dyn Read, hidden_size: usize) -> std::io::Result<Box<dyn NnLayer>> {
     let up_size = read_u32(r)? as usize;
 
-    let pre_gamma: Box<[f32]> = read_f32_vec(r)?.into();
-    let post_gamma: Box<[f32]> = read_f32_vec(r)?.into();
+    let pre_gamma: Box<[f32]> = read_f32_vec(r)?;
+    let post_gamma: Box<[f32]> = read_f32_vec(r)?;
     let pre_norm = RMSNorm::from_loaded(hidden_size, pre_gamma);
     let post_norm = RMSNorm::from_loaded(hidden_size, post_gamma);
 
@@ -300,7 +300,7 @@ pub fn load_mlstm_block(r: &mut dyn Read, hidden_size: usize) -> std::io::Result
 
     let make_lin = |r: &mut dyn Read, rows, cols| -> std::io::Result<LinearLayer> {
         let w = read_matrix(r)?;
-        let b: Box<[f32]> = read_f32_vec(r)?.into();
+        let b: Box<[f32]> = read_f32_vec(r)?;
         Ok(LinearLayer::from_loaded(rows, cols, w, b))
     };
 

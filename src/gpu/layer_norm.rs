@@ -38,8 +38,8 @@ impl LayerNorm {
         Self {
             gamma: GTensor::from_host(gpu, gamma),
             dgamma: GTensor::zeros(gpu, &[size]),
-            m: GTensor::zeros(gpu, &[size]),
-            v: GTensor::zeros(gpu, &[size]),
+            m: arena::unbacked(gpu),
+            v: arena::unbacked(gpu),
             size,
         }
     }

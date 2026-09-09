@@ -87,11 +87,7 @@ pub fn run_detector() {
     let mut last_trigger = Instant::now();
     const COOLDOWN: Duration = Duration::from_millis(1000);
 
-    loop {
-        let Ok(hop) = audio_receiver.recv() else {
-            break;
-        };
-
+    while let Ok(hop) = audio_receiver.recv() {
         window.copy_within(frame_shift_native.., 0);
         window[overlap..].copy_from_slice(&hop);
 

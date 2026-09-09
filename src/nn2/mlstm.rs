@@ -259,7 +259,10 @@ pub struct MLstm {
 
 impl MLstm {
     pub fn new(input_size: usize, d: usize, heads: usize, dqk: usize) -> Self {
-        assert!(heads > 0 && d % heads == 0, "d must be divisible by heads");
+        assert!(
+            heads > 0 && d.is_multiple_of(heads),
+            "d must be divisible by heads"
+        );
         let dhv = d / heads;
         let d_qk = heads * dqk;
         let sq = |fi: usize, fo: usize| (6.0 / (fi as f32 + fo as f32)).sqrt();

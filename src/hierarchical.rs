@@ -5,7 +5,8 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterato
 use crate::{
     batches::WordBatch,
     config::{
-        BACKBONE_WEIGHT_DECAY, DECODER_WEIGHT_DECAY, ENC_W_EOS, ENCODER_WEIGHT_DECAY, MAX_SEQ_LEN,
+        BACKBONE_WEIGHT_DECAY, DECODER_LR_SCALE, DECODER_WEIGHT_DECAY, ENC_W_EOS, ENCODER_LR_SCALE,
+        ENCODER_WEIGHT_DECAY, MAX_SEQ_LEN,
     },
     format::{Meta, ModelKind, Reader, Seen, Writer},
     nn::{
@@ -721,9 +722,13 @@ impl Hierarchical {
 
             if let Some(lr) = state.step(loss) {
                 // Character stacks train as Adam (no decay); the backbone stays
-                // AdamW (decoupled decay on its interior projections).
-                self.encoder.step(lr, ENCODER_WEIGHT_DECAY); // marks its own replica pool dirty
-                self.char2_model.step(lr, DECODER_WEIGHT_DECAY);
+                // AdamW (decoupled decay on its interior projections). `lr` is the
+                // backbone's rate; the narrower stacks scale off it — see
+                // `ENCODER_LR_SCALE`.
+                self.encoder
+                    .step(lr * ENCODER_LR_SCALE, ENCODER_WEIGHT_DECAY); // marks its own replica pool dirty
+                self.char2_model
+                    .step(lr * DECODER_LR_SCALE, DECODER_WEIGHT_DECAY);
                 self.word_model.step(lr, BACKBONE_WEIGHT_DECAY);
                 self.dec_pool.mark_dirty();
             }
@@ -806,8 +811,10 @@ impl Hierarchical {
             state.log_metric("resp_ppl", loss.exp());
 
             if let Some(lr) = state.step(loss) {
-                self.encoder.step(lr, ENCODER_WEIGHT_DECAY);
-                self.char2_model.step(lr, DECODER_WEIGHT_DECAY);
+                self.encoder
+                    .step(lr * ENCODER_LR_SCALE, ENCODER_WEIGHT_DECAY);
+                self.char2_model
+                    .step(lr * DECODER_LR_SCALE, DECODER_WEIGHT_DECAY);
                 self.word_model.step(lr, BACKBONE_WEIGHT_DECAY);
                 self.dec_pool.mark_dirty();
             }

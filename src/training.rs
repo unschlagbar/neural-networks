@@ -137,8 +137,7 @@ pub fn train_hierarchical(model_path: &str) {
 
     // Where the last run stopped, from the sidecar next to the checkpoint. The
     // step count cannot answer this: it spans every corpus the weights have seen.
-    let start =
-        crate::pretrain_progress::resume_or_fresh(model_path, &corpus, model.step, EPOCHS);
+    let start = crate::pretrain_progress::resume_or_fresh(model_path, &corpus, model.step, EPOCHS);
     let mut progress = start.progress;
     let start_epoch = progress.epoch;
     let start_file = start.file;
@@ -154,93 +153,93 @@ pub fn train_hierarchical(model_path: &str) {
         let first_file = if epoch == start_epoch { start_file } else { 0 };
 
         for file_index in first_file..corpus.len() {
-        let path = corpus.path_of(file_index).display().to_string();
-        println!(
-            "── File {}/{}: {path} ─────────────────",
-            file_index + 1,
-            corpus.len()
-        );
-        let mut data = ChunkedWordDataSet::open(
-            tokenizer,
-            &path,
-            WORDS_PER_SEQ,
-            MIN_WORDS_PER_SEQ,
-            MAX_WINDOW_TOKENS,
-            CHUNK_BYTES,
-        );
-        // Only the file the run stopped inside skips; the rest run whole.
-        let mut skip = if epoch == start_epoch && file_index == start_file {
-            start_done
-        } else {
-            0
-        };
-        // Every run must stamp its window count into the sidecar, otherwise the
-        // resume it writes cannot be validated later.
-        let prep_start = Instant::now();
-        let total = data.count_windows();
-        println!(
-            "  {total} windows (counting pass took {:.1?})",
-            prep_start.elapsed()
-        );
-        if skip > 0 && progress.windows != 0 && total != progress.windows {
+            let path = corpus.path_of(file_index).display().to_string();
             println!(
-                "  file has {total} windows but the progress file recorded {} — \
-                 starting this file from the beginning.",
-                progress.windows
+                "── File {}/{}: {path} ─────────────────",
+                file_index + 1,
+                corpus.len()
             );
-            skip = 0;
-        }
-        if skip > 0 {
-            println!("  Resuming from window {skip} (step {})", model.step);
-        }
-        progress.epoch = epoch;
-        progress.files_done = file_index;
-        progress.file = corpus.name_of(file_index);
-        progress.windows = total;
-        progress.done = skip;
-
-        let start = Instant::now();
-        data.rewind();
-        while let Some(chunk) = data.next_chunk() {
-            // Fast-forward over already-trained windows when resuming.
-            if skip >= chunk.len() {
-                skip -= chunk.len();
-                continue;
-            }
-            if chunk.max_window_tokens() > cache_tokens {
-                cache_tokens = chunk.max_window_tokens();
-                model.make_cache(WORDS_PER_SEQ, cache_tokens);
-            }
-            let trained = chunk.len() - skip;
-            model.train(chunk.iter().skip(skip), &mut training_state);
-            // Chunk granularity: `train` consumes the iterator whole, so a stop
-            // mid-chunk resumes from the chunk boundary before it.
-            progress.done += trained;
-            skip = 0;
-        }
-
-        let file_time = start.elapsed();
-        total_time += file_time;
-
-        match model.save(model_path) {
-            Ok(()) => {
+            let mut data = ChunkedWordDataSet::open(
+                tokenizer,
+                &path,
+                WORDS_PER_SEQ,
+                MIN_WORDS_PER_SEQ,
+                MAX_WINDOW_TOKENS,
+                CHUNK_BYTES,
+            );
+            // Only the file the run stopped inside skips; the rest run whole.
+            let mut skip = if epoch == start_epoch && file_index == start_file {
+                start_done
+            } else {
+                0
+            };
+            // Every run must stamp its window count into the sidecar, otherwise the
+            // resume it writes cannot be validated later.
+            let prep_start = Instant::now();
+            let total = data.count_windows();
+            println!(
+                "  {total} windows (counting pass took {:.1?})",
+                prep_start.elapsed()
+            );
+            if skip > 0 && progress.windows != 0 && total != progress.windows {
                 println!(
-                    "  ✓ end-of-file save to '{model_path}'  (file {file_time:.0?}, total {total_time:.0?})"
+                    "  file has {total} windows but the progress file recorded {} — \
+                 starting this file from the beginning.",
+                    progress.windows
                 );
-                println!("    trained on: {}", model.seen.save_line());
-                // The file is finished: the recorded position is the START of
-                // the next one, so a stop here does not re-read it.
-                progress.files_done = file_index + 1;
-                progress.file = corpus.name_of(file_index + 1);
-                progress.done = 0;
-                progress.windows = 0;
-                progress.step = model.step;
-                if let Err(e) = crate::pretrain_progress::save(model_path, &progress) {
-                    eprintln!("  ✗ progress save failed: {e}");
-                }
+                skip = 0;
             }
-            Err(e) => eprintln!("  ✗ end-of-file save failed: {e}"),
-        }
+            if skip > 0 {
+                println!("  Resuming from window {skip} (step {})", model.step);
+            }
+            progress.epoch = epoch;
+            progress.files_done = file_index;
+            progress.file = corpus.name_of(file_index);
+            progress.windows = total;
+            progress.done = skip;
+
+            let start = Instant::now();
+            data.rewind();
+            while let Some(chunk) = data.next_chunk() {
+                // Fast-forward over already-trained windows when resuming.
+                if skip >= chunk.len() {
+                    skip -= chunk.len();
+                    continue;
+                }
+                if chunk.max_window_tokens() > cache_tokens {
+                    cache_tokens = chunk.max_window_tokens();
+                    model.make_cache(WORDS_PER_SEQ, cache_tokens);
+                }
+                let trained = chunk.len() - skip;
+                model.train(chunk.iter().skip(skip), &mut training_state);
+                // Chunk granularity: `train` consumes the iterator whole, so a stop
+                // mid-chunk resumes from the chunk boundary before it.
+                progress.done += trained;
+                skip = 0;
+            }
+
+            let file_time = start.elapsed();
+            total_time += file_time;
+
+            match model.save(model_path) {
+                Ok(()) => {
+                    println!(
+                        "  ✓ end-of-file save to '{model_path}'  (file {file_time:.0?}, total {total_time:.0?})"
+                    );
+                    println!("    trained on: {}", model.seen.save_line());
+                    // The file is finished: the recorded position is the START of
+                    // the next one, so a stop here does not re-read it.
+                    progress.files_done = file_index + 1;
+                    progress.file = corpus.name_of(file_index + 1);
+                    progress.done = 0;
+                    progress.windows = 0;
+                    progress.step = model.step;
+                    if let Err(e) = crate::pretrain_progress::save(model_path, &progress) {
+                        eprintln!("  ✗ progress save failed: {e}");
+                    }
+                }
+                Err(e) => eprintln!("  ✗ end-of-file save failed: {e}"),
+            }
         } // files
 
         println!("Epoch {epoch} took {:.1?}", epoch_start.elapsed());
@@ -274,7 +273,9 @@ pub fn train_hierarchical(model_path: &str) {
 /// checkpoint (pretrained before the markers existed) must be run through the
 /// `av` mode first — that mismatch is caught with a hint.
 pub fn train_sft(model_path: &str) {
-    use crate::config::{SFT_DATA, SFT_EPOCHS, SFT_LR, SFT_MAX_TOKENS};
+    use crate::config::{
+        SFT_BATCH_SIZE, SFT_DATA, SFT_EPOCHS, SFT_LR, SFT_MAX_TOKENS, SFT_WARMUP_WINDOWS,
+    };
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
@@ -330,12 +331,14 @@ pub fn train_sft(model_path: &str) {
     model.make_cache(max_words, max_tokens);
     println!(
         "SFT (CPU): {} examples, longest {max_words} words / {max_tokens} tokens. \
-         {SFT_EPOCHS} epochs, LR={SFT_LR}, batch={BATCH_SIZE} windows.",
+         {SFT_EPOCHS} epochs, LR={SFT_LR} over {SFT_WARMUP_WINDOWS} warmup windows, \
+         batch={SFT_BATCH_SIZE} windows.",
         examples.len()
     );
 
     let mut state = TrainingState::from_step(model.step);
     state.lr = SFT_LR;
+    state.batch_size = SFT_BATCH_SIZE;
     state.init_log(&format!("{model_path}_sft"), &["resp_ppl"]);
 
     // Where a previous, interrupted run stopped (or a fresh start). The shuffle
@@ -343,6 +346,9 @@ pub fn train_sft(model_path: &str) {
     // `done` examples skips exactly the ones already trained on.
     let mut progress =
         crate::sft_progress::resume_or_fresh(model_path, examples.len(), model.step, SFT_EPOCHS);
+    // Warmup counts from where this fine-tune began, not from the pretraining
+    // step the checkpoint carries; a resume continues the same ramp.
+    state.schedule = LrSchedule::sft(progress.origin);
     let start_epoch = progress.epoch;
     let start_done = progress.done;
 
@@ -696,10 +702,45 @@ fn horizon(f: f32) -> f32 {
     }
 }
 
+/// The LR curve a run follows. Positions are counted in windows since
+/// `origin`, so a fine-tune that resumes a checkpoint at step 400k still warms
+/// up from the start of its own run. `warmup_windows == 0` disables the ramp
+/// and `decay_windows == 0` the cosine, each leaving the rate at `lr`.
+#[derive(Clone, Copy, Debug)]
+pub struct LrSchedule {
+    pub origin: usize,
+    pub warmup_windows: usize,
+    pub decay_windows: usize,
+    pub min_lr: f32,
+}
+
+impl LrSchedule {
+    /// Pretraining: long warmup, cosine decay to `MIN_LR`, counted from step 0.
+    pub fn pretrain() -> Self {
+        Self {
+            origin: 0,
+            warmup_windows: WARMUP_WINDOWS,
+            decay_windows: DECAY_WINDOWS,
+            min_lr: MIN_LR,
+        }
+    }
+
+    /// Fine-tuning: short warmup from `origin`, then hold.
+    pub fn sft(origin: usize) -> Self {
+        Self {
+            origin,
+            warmup_windows: crate::config::SFT_WARMUP_WINDOWS,
+            decay_windows: 0,
+            min_lr: 0.0,
+        }
+    }
+}
+
 pub struct TrainingState {
     pub step: usize,
     pub batch_size: usize,
     pub lr: f32,
+    pub schedule: LrSchedule,
     current_lr: f32,
     warmup_lr: f32,
     decay_lr: f32,
@@ -735,6 +776,7 @@ impl TrainingState {
         Self {
             step,
             lr: LR,
+            schedule: LrSchedule::pretrain(),
             current_lr: LR,
             warmup_lr: LR,
             decay_lr: LR,
@@ -839,12 +881,21 @@ impl TrainingState {
         self.loss_steps += 1;
         self.steps_since_log += 1;
         if self.step.is_multiple_of(self.batch_size) {
-            // Schedule position is the number of windows seen, so the curve over
-            // the corpus is the same at any BATCH_SIZE.
-            let windows = self.step as f32;
-            self.warmup_lr = self.lr * (windows / WARMUP_WINDOWS as f32).min(1.0);
-            let t = (windows / DECAY_WINDOWS as f32).min(1.0);
-            self.decay_lr = MIN_LR + 0.5 * (self.lr - MIN_LR) * (1.0 + (PI * t).cos());
+            // Schedule position is the number of windows seen since the run
+            // started, so the curve over the corpus is the same at any batch size.
+            let sched = self.schedule;
+            let windows = self.step.saturating_sub(sched.origin) as f32;
+            self.warmup_lr = if sched.warmup_windows == 0 {
+                self.lr
+            } else {
+                self.lr * (windows / sched.warmup_windows as f32).min(1.0)
+            };
+            self.decay_lr = if sched.decay_windows == 0 {
+                self.lr
+            } else {
+                let t = (windows / sched.decay_windows as f32).min(1.0);
+                sched.min_lr + 0.5 * (self.lr - sched.min_lr) * (1.0 + (PI * t).cos())
+            };
             self.current_lr = self.warmup_lr.min(self.decay_lr);
             Some(self.current_lr)
         } else {
@@ -901,9 +952,7 @@ impl TrainingState {
             if !self.defer_log_flush {
                 let _ = writer.flush();
             }
-            for v in &mut self.extra_vals {
-                *v = (0.0, 0);
-            }
+            self.extra_vals.fill((0.0, 0));
         }
         self.last_log = Instant::now();
         self.steps_since_log = 0;

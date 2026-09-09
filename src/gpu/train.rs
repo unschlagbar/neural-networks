@@ -18,8 +18,8 @@ use rand::seq::SliceRandom;
 use crate::batches::ChunkedWordDataSet;
 use crate::config::{
     BATCH_SIZE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, LOG_EVERY, LOGIT_SOFTCAP, LR, MAX_WINDOW_TOKENS,
-    MIN_WORDS_PER_SEQ, SFT_DATA, SFT_EPOCHS, SFT_LR, SFT_MAX_TOKENS, TRAIN_DATA, VAL_DATA,
-    WORD_BLOCKS, WORD_HIDDEN, WORDS_PER_SEQ,
+    MIN_WORDS_PER_SEQ, SFT_BATCH_SIZE, SFT_DATA, SFT_EPOCHS, SFT_LR, SFT_MAX_TOKENS,
+    SFT_WARMUP_WINDOWS, TRAIN_DATA, VAL_DATA, WORD_BLOCKS, WORD_HIDDEN, WORDS_PER_SEQ,
 };
 use crate::gpu::Gpu;
 use crate::gpu::hierarchical::{Hierarchical, ModelCfg};
@@ -29,24 +29,6 @@ use crate::sft;
 use crate::sft_progress;
 use crate::tokenizer_utf8::Utf8Tokenizer;
 use crate::training::TrainingState;
-
-/// Architecture, taken from `config.rs` so the GPU model matches the CPU one.
-/// `heads`/`dqk` mirror `model.rs::build_hierarchical_model`.
-fn cfg_from_config(vocab: usize, w_token: usize) -> ModelCfg {
-    let heads = 8;
-    ModelCfg {
-        vocab,
-        hc: CHAR_HIDDEN,
-        wh: WORD_HIDDEN,
-        enc_blocks: 4,
-        bb_blocks: WORD_BLOCKS,
-        dec_blocks: 4,
-        heads,
-        dqk: WORD_HIDDEN / heads,
-        w_token,
-        cap: LOGIT_SOFTCAP,
-    }
-}
 
 pub fn train_hierarchical_gpu(model_path: &str) {
     let gpu = match Gpu::new() {
@@ -60,7 +42,20 @@ pub fn train_hierarchical_gpu(model_path: &str) {
     let tokenizer = Utf8Tokenizer::new();
     let vocab = tokenizer.vocab_size();
     let w_token = tokenizer.w_token() as usize;
-    let cfg = cfg_from_config(vocab, w_token);
+
+    let heads = 8;
+    let cfg = ModelCfg {
+        vocab,
+        hc: CHAR_HIDDEN,
+        wh: WORD_HIDDEN,
+        enc_blocks: 4,
+        bb_blocks: WORD_BLOCKS,
+        dec_blocks: 4,
+        heads,
+        dqk: WORD_HIDDEN / heads,
+        w_token,
+        cap: LOGIT_SOFTCAP,
+    };
 
     let mut model = match Hierarchical::load(&gpu, model_path, w_token) {
         Ok(m) => {
@@ -138,145 +133,147 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         let first_file = if epoch == start_epoch { start_file } else { 0 };
 
         for file_index in first_file..corpus.len() {
-        let path = corpus.path_of(file_index).display().to_string();
-        println!(
-            "── File {}/{}: {path} ─────────────────",
-            file_index + 1,
-            corpus.len()
-        );
-        let mut data = ChunkedWordDataSet::open(
-            tokenizer,
-            &path,
-            WORDS_PER_SEQ,
-            MIN_WORDS_PER_SEQ,
-            MAX_WINDOW_TOKENS,
-            CHUNK_BYTES,
-        );
-        // Only the file the run stopped inside skips; the rest run whole.
-        let mut skip = if epoch == start_epoch && file_index == start_file {
-            start_done
-        } else {
-            0
-        };
-        // Every run must stamp its window count into the sidecar, otherwise the
-        // resume it writes cannot be validated later. `windows == 0` marks a
-        // count that was never taken — unmeasured, not mismatched.
-        let t0 = Instant::now();
-        let total = data.count_windows();
-        println!(
-            "  {total} windows (counting pass took {:.1?})",
-            t0.elapsed()
-        );
-        if skip > 0 && progress.windows != 0 && total != progress.windows {
-            // A resume offset is only meaningful against the window count it
-            // was measured with, so verify it before skipping anything.
+            let path = corpus.path_of(file_index).display().to_string();
             println!(
-                "  file has {total} windows but the progress file recorded {} — \
-                 starting this file from the beginning.",
-                progress.windows
+                "── File {}/{}: {path} ─────────────────",
+                file_index + 1,
+                corpus.len()
             );
-            skip = 0;
-        }
-        if skip > 0 {
-            println!("  Resuming from window {skip} (step {})", model.step_count);
-        }
-        progress.epoch = epoch;
-        progress.files_done = file_index;
-        progress.file = corpus.name_of(file_index);
-        progress.windows = total;
-        progress.done = skip;
-
-        let mut tokens_since_print = 0;
-        let mut time = Instant::now();
-        data.rewind();
-
-        while let Some(chunk) = data.next_chunk() {
-            if skip >= chunk.len() {
-                skip -= chunk.len();
-                continue;
+            let mut data = ChunkedWordDataSet::open(
+                tokenizer,
+                &path,
+                WORDS_PER_SEQ,
+                MIN_WORDS_PER_SEQ,
+                MAX_WINDOW_TOKENS,
+                CHUNK_BYTES,
+            );
+            // Only the file the run stopped inside skips; the rest run whole.
+            let mut skip = if epoch == start_epoch && file_index == start_file {
+                start_done
+            } else {
+                0
+            };
+            // Every run must stamp its window count into the sidecar, otherwise the
+            // resume it writes cannot be validated later. `windows == 0` marks a
+            // count that was never taken — unmeasured, not mismatched.
+            let t0 = Instant::now();
+            let total = data.count_windows();
+            println!(
+                "  {total} windows (counting pass took {:.1?})",
+                t0.elapsed()
+            );
+            if skip > 0 && progress.windows != 0 && total != progress.windows {
+                // A resume offset is only meaningful against the window count it
+                // was measured with, so verify it before skipping anything.
+                println!(
+                    "  file has {total} windows but the progress file recorded {} — \
+                 starting this file from the beginning.",
+                    progress.windows
+                );
+                skip = 0;
             }
-            for batch in chunk.iter().skip(skip) {
-                // Counts every window the iterator yields, including the ones
-                // skipped below — `done` must stay aligned with the position
-                // `chunk.iter().skip(done)` resumes at.
-                progress.done += 1;
+            if skip > 0 {
+                println!("  Resuming from window {skip} (step {})", model.step_count);
+            }
+            progress.epoch = epoch;
+            progress.files_done = file_index;
+            progress.file = corpus.name_of(file_index);
+            progress.windows = total;
+            progress.done = skip;
 
-                // The dataset speaks u16 / Range; the model takes usize / (start, end).
-                let tokens: Vec<usize> = batch.tokens.iter().map(|&t| t as usize).collect();
-                let words = &batch.words;
-                if words.len() < 2 {
-                    continue; // no decoded word in this window
+            let mut tokens_since_print = 0;
+            let mut time = Instant::now();
+            data.rewind();
+
+            while let Some(chunk) = data.next_chunk() {
+                if skip >= chunk.len() {
+                    skip -= chunk.len();
+                    continue;
                 }
+                for batch in chunk.iter().skip(skip) {
+                    // Counts every window the iterator yields, including the ones
+                    // skipped below — `done` must stay aligned with the position
+                    // `chunk.iter().skip(done)` resumes at.
+                    progress.done += 1;
 
-                let loss = model.forward_backward(&gpu, &tokens, words);
-                model.seen.add_pretrain(tokens.len(), words.len());
-                tokens_since_print += tokens.len();
-                state.log_tokens(tokens.len());
-                state.log_metric("word_loss", model.last_word_loss());
-                // Bits per byte counts the decoded words' raw bytes only: the `[W]`
-                // rows are part of the model's cost but not of the text.
-                let dec_bytes: usize = words[1..].iter().map(|w| w.end - w.start).sum();
-                state.log_bpb(loss, model.last_rows(), dec_bytes);
+                    // The dataset speaks u16 / Range; the model takes usize / (start, end).
+                    let tokens: Vec<usize> = batch.tokens.iter().map(|&t| t as usize).collect();
+                    let words = &batch.words;
+                    if words.len() < 2 {
+                        continue; // no decoded word in this window
+                    }
 
-                // `state.step` returns Some(lr) only on a batch boundary, so grads
-                // accumulate over BATCH_SIZE windows before each optimizer step.
-                if let Some(lr) = state.step(loss) {
-                    opt.lr = lr;
-                    opt.t += 1;
-                    model.step(&gpu, &opt);
-                }
-                model.step_count = state.step;
+                    let loss = model.forward_backward(&gpu, &tokens, words);
+                    model.seen.add_pretrain(tokens.len(), words.len());
+                    tokens_since_print += tokens.len();
+                    state.log_tokens(tokens.len());
+                    state.log_metric("word_loss", model.last_word_loss());
+                    // Bits per byte counts the decoded words' raw bytes only: the `[W]`
+                    // rows are part of the model's cost but not of the text.
+                    let dec_bytes: usize = words[1..].iter().map(|w| w.end - w.start).sum();
+                    state.log_bpb(loss, model.last_rows(), dec_bytes);
 
-                if state.print() {
-                    let word_loss = state.metric_mean("word_loss");
-                    let loss = state.get_loss();
-                    println!(
-                        "{} | char loss {:.4} | ppl {:.4} | word loss {:.4} | lr {:.2e} | {} tok | {:.1?}",
-                        state.step,
-                        loss,
-                        loss.exp(),
-                        word_loss,
-                        opt.lr,
-                        tokens_since_print,
-                        time.elapsed(),
-                    );
-                    tokens_since_print = 0;
-                    time = Instant::now();
-                }
-                if state.save() {
-                    match model.save(&gpu, state.save_path(), &[]) {
-                        Ok(()) => {
-                            // Flush the log only now, so it never reflects a step
-                            // past the checkpoint just written.
-                            state.flush_log();
-                            println!("saved -> {}", state.save_path());
-                            if let Some(bpb) = state.take_bpb() {
-                                println!("  bpb {bpb:.4} (mean since last save)");
+                    // `state.step` returns Some(lr) only on a batch boundary, so grads
+                    // accumulate over BATCH_SIZE windows before each optimizer step.
+                    if let Some(lr) = state.step(loss) {
+                        opt.lr = lr;
+                        opt.t += 1;
+                        model.step(&gpu, &opt);
+                    }
+                    model.step_count = state.step;
+
+                    if state.print() {
+                        let word_loss = state.metric_mean("word_loss");
+                        let loss = state.get_loss();
+                        println!(
+                            "{} | char loss {:.4} | ppl {:.4} | word loss {:.4} | lr {:.2e} | {} tok | {:.1?}",
+                            state.step,
+                            loss,
+                            loss.exp(),
+                            word_loss,
+                            opt.lr,
+                            tokens_since_print,
+                            time.elapsed(),
+                        );
+                        tokens_since_print = 0;
+                        time = Instant::now();
+                    }
+                    if state.save() {
+                        match model.save(&gpu, state.save_path(), &[]) {
+                            Ok(()) => {
+                                // Flush the log only now, so it never reflects a step
+                                // past the checkpoint just written.
+                                state.flush_log();
+                                println!("saved -> {}", state.save_path());
+                                if let Some(bpb) = state.take_bpb() {
+                                    println!("  bpb {bpb:.4} (mean since last save)");
+                                }
+                                println!("  trained on: {}", model.seen.save_line());
+                                // Written after the weights, so the recorded position
+                                // never runs ahead of the checkpoint it describes.
+                                progress.step = state.step;
+                                if let Err(e) =
+                                    pretrain_progress::save(state.save_path(), &progress)
+                                {
+                                    eprintln!("progress save failed: {e}");
+                                }
                             }
-                            println!("  trained on: {}", model.seen.save_line());
-                            // Written after the weights, so the recorded position
-                            // never runs ahead of the checkpoint it describes.
-                            progress.step = state.step;
-                            if let Err(e) = pretrain_progress::save(state.save_path(), &progress) {
-                                eprintln!("progress save failed: {e}");
-                            }
+                            Err(e) => eprintln!("save failed: {e}"),
                         }
-                        Err(e) => eprintln!("save failed: {e}"),
                     }
                 }
+                skip = 0;
             }
-            skip = 0;
-        }
-        // The file is finished: the recorded position is the START of the next
-        // one, so a stop here resumes without re-reading it.
-        progress.files_done = file_index + 1;
-        progress.file = corpus.name_of(file_index + 1);
-        progress.done = 0;
-        progress.windows = 0;
-        progress.step = state.step;
-        if let Err(e) = pretrain_progress::save(state.save_path(), &progress) {
-            eprintln!("progress save failed: {e}");
-        }
+            // The file is finished: the recorded position is the START of the next
+            // one, so a stop here resumes without re-reading it.
+            progress.files_done = file_index + 1;
+            progress.file = corpus.name_of(file_index + 1);
+            progress.done = 0;
+            progress.windows = 0;
+            progress.step = state.step;
+            if let Err(e) = pretrain_progress::save(state.save_path(), &progress) {
+                eprintln!("progress save failed: {e}");
+            }
         } // files
 
         println!("Epoch {epoch} took {:.1?}", epoch_start.elapsed());
@@ -467,12 +464,14 @@ pub fn train_sft_gpu(model_path: &str) {
     // allocation is needed here (unlike the CPU path); max_* only informs logs.
     println!(
         "SFT: {} examples, longest {max_words} words / {max_tokens} tokens. \
-         {SFT_EPOCHS} epochs, LR={SFT_LR}, batch={BATCH_SIZE} windows.",
+         {SFT_EPOCHS} epochs, LR={SFT_LR} over {SFT_WARMUP_WINDOWS} warmup windows, \
+         batch={SFT_BATCH_SIZE} windows.",
         examples.len()
     );
 
     let mut state = TrainingState::from_step(model.step_count);
     state.lr = SFT_LR;
+    state.batch_size = SFT_BATCH_SIZE;
     state.init_log(&format!("{model_path}_sft"), &["resp_ppl"]);
     state.set_defer_log_flush(true);
 
@@ -483,6 +482,9 @@ pub fn train_sft_gpu(model_path: &str) {
     // skipping `done` examples really skips the ones already trained on.
     let mut progress =
         sft_progress::resume_or_fresh(model_path, examples.len(), model.step_count, SFT_EPOCHS);
+    // Warmup counts from where this fine-tune began, not from the pretraining
+    // step the checkpoint carries; a resume continues the same ramp.
+    state.schedule = crate::training::LrSchedule::sft(progress.origin);
     let start_epoch = progress.epoch;
     let start_done = progress.done;
 

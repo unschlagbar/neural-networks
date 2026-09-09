@@ -14,6 +14,7 @@ use std::time::Duration;
 use crate::config::{Llm, Result};
 use crate::json;
 
+#[derive(Clone)]
 pub struct Client {
     pub cfg: Llm,
     host: String,
@@ -95,8 +96,12 @@ impl Client {
         } else {
             temperature
         };
+        // The template is part of the key: a prefilled empty `<think>` is a
+        // different answer from the same model than a deliberated one, so the
+        // two must not share a cache entry.
         let key = hash(&format!(
-            "{model}\u{1}{temperature}\u{1}{nonce}\u{1}{system}\u{1}{user}"
+            "{model}\u{1}{temperature}\u{1}{nonce}\u{1}{}\u{1}{system}\u{1}{user}",
+            self.cfg.completion_template
         ));
         if let Some(dir) = &self.cache
             && let Ok(hit) = std::fs::read_to_string(format!("{dir}/{key:016x}.txt"))
@@ -105,30 +110,73 @@ impl Client {
             return Ok(hit);
         }
 
-        let mut messages = String::from("[");
-        if !system.trim().is_empty() {
-            messages.push_str(&format!(
-                "{{\"role\":\"system\",\"content\":\"{}\"}},",
-                json::escape(system)
-            ));
+        // Nothing beyond the cache: the caller wants a corpus out of what has
+        // already been generated, not a run that fills in the gaps.
+        if self.cfg.cache_only {
+            return Err("not in the cache (cache_only)".to_string());
         }
-        messages.push_str(&format!(
-            "{{\"role\":\"user\",\"content\":\"{}\"}}]",
-            json::escape(user)
-        ));
-        let body = format!(
-            "{{\"model\":\"{}\",\"messages\":{messages},\"temperature\":{},\
-             \"max_tokens\":{},\"stream\":false}}",
-            json::escape(&model),
-            temperature,
-            self.cfg.max_tokens,
-        );
+
+        // Two endpoints, one contract. With a template the prompt is rendered
+        // here and `/v1/completions` takes it verbatim — the only way to
+        // prefill the assistant turn, which is how a reasoning model is told
+        // its thinking is already done. Without one the server templates the
+        // messages itself.
+        let templated = !self.cfg.completion_template.is_empty();
+        let (endpoint, reply_field, body) = if templated {
+            let prompt = self
+                .cfg
+                .completion_template
+                .replace("{system}", system)
+                .replace("{user}", user);
+            let stop = self
+                .cfg
+                .completion_stop
+                .iter()
+                .map(|s| format!("\"{}\"", json::escape(s)))
+                .collect::<Vec<_>>()
+                .join(",");
+            (
+                "completions",
+                "text",
+                format!(
+                    "{{\"model\":\"{}\",\"prompt\":\"{}\",\"temperature\":{},\
+                     \"max_tokens\":{},\"stop\":[{stop}],\"stream\":false}}",
+                    json::escape(&model),
+                    json::escape(&prompt),
+                    temperature,
+                    self.cfg.max_tokens,
+                ),
+            )
+        } else {
+            let mut messages = String::from("[");
+            if !system.trim().is_empty() {
+                messages.push_str(&format!(
+                    "{{\"role\":\"system\",\"content\":\"{}\"}},",
+                    json::escape(system)
+                ));
+            }
+            messages.push_str(&format!(
+                "{{\"role\":\"user\",\"content\":\"{}\"}}]",
+                json::escape(user)
+            ));
+            (
+                "chat/completions",
+                "content",
+                format!(
+                    "{{\"model\":\"{}\",\"messages\":{messages},\"temperature\":{},\
+                     \"max_tokens\":{},\"stream\":false}}",
+                    json::escape(&model),
+                    temperature,
+                    self.cfg.max_tokens,
+                ),
+            )
+        };
 
         let mut last = String::new();
         for attempt in 0..=self.cfg.retries {
-            match self.request("POST", &format!("{}/chat/completions", self.base), Some(&body)) {
+            match self.request("POST", &format!("{}/{endpoint}", self.base), Some(&body)) {
                 Ok(resp) => {
-                    let content = json::field(&resp, "content").ok_or_else(|| {
+                    let content = json::field(&resp, reply_field).ok_or_else(|| {
                         format!("no message content in the reply: {}", head(&resp))
                     })?;
                     // Reasoning models fence their thinking; the corpus wants

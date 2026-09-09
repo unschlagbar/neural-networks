@@ -5,9 +5,11 @@
 //   datamix sample <mix.toml> [-n 10]  print records drawn from the mixture
 //   datamix synth  <file.syn> [-n 10] preview a template file's expansion
 //   datamix verify <out.jsonl>       load it exactly as `hqg` does and report
+//   datamix edit   [out.jsonl]       hand-write SFT records in a browser UI
 //   datamix ping   [mix.toml]          check the local LM server and list its models
 
 mod config;
+mod editor;
 mod filter;
 mod json;
 mod llm;
@@ -18,6 +20,7 @@ mod rng;
 mod shard;
 mod source;
 mod toml;
+mod verify;
 mod synth;
 
 use mix::{Options, human};
@@ -63,38 +66,16 @@ fn run() -> config::Result<()> {
         // The point of verifying here is that it runs the *training* loader,
         // not a second parser that might disagree with it.
         "verify" if !path.is_empty() => {
-            let tok = neural_networks::tokenizer_utf8::Utf8Tokenizer::new();
-            let max = neural_networks::config::SFT_MAX_TOKENS;
-            let examples =
-                neural_networks::sft::load_jsonl(&tok, &path, max).map_err(|e| e.to_string())?;
-            if examples.is_empty() {
-                return Err(format!("{path}: no usable examples"));
-            }
-            let tokens: usize = examples.iter().map(|e| e.tokens.len()).sum();
-            let words: usize = examples.iter().map(|e| e.words.len()).sum();
-            let resp: usize = examples.iter().map(|e| e.response_extent().1).sum();
-            let longest = examples.iter().map(|e| e.tokens.len()).max().unwrap_or(0);
-            // Every <SEP> is one exchange, so the count says how much of the
-            // corpus is actually multi-turn.
-            let sep = neural_networks::tokenizer_utf8::SEP_TOKEN;
-            let exchanges: usize = examples
-                .iter()
-                .map(|e| e.tokens.iter().filter(|&&t| t == sep).count())
-                .sum();
-            println!(
-                "{} examples · {} tokens · {} words · {} response words (loss-carrying)",
-                examples.len(),
-                human(tokens),
-                human(words),
-                human(resp)
-            );
-            println!(
-                "mean {:.0} tokens/example, longest {longest} (cap {max}), \
-                 {exchanges} exchanges ({:.2} turns/example)",
-                tokens as f64 / examples.len() as f64,
-                exchanges as f64 / examples.len() as f64
-            );
+            println!("{}", verify_report(&path)?);
             Ok(())
+        }
+        "edit" => {
+            let path = if path.is_empty() || path.starts_with('-') {
+                "data/sources/handmade.jsonl".to_string()
+            } else {
+                path
+            };
+            editor::serve(&path, flag_port(&args).unwrap_or(7878))
         }
         "ping" => {
             let cfg = if path.is_empty() {
@@ -163,11 +144,50 @@ fn run() -> config::Result<()> {
                  datamix sample <mix.toml> [-n 10]    print records drawn from the mixture\n  \
                  datamix synth  <file.syn> [-n 10]  preview a template file\n  \
                  datamix verify <out.jsonl>         load an SFT corpus the way training does\n  \
+                 datamix edit   [out.jsonl] [--port 7878]  hand-write SFT records in a browser\n  \
                  datamix ping   [mix.toml]            check the local LM server, list its models"
             );
             std::process::exit(2);
         }
     }
+}
+
+/// Load an SFT corpus with the *training* loader — not a second parser that
+/// might disagree with it — and describe what it got.
+pub fn verify_report(path: &str) -> config::Result<String> {
+    let tok = neural_networks::tokenizer_utf8::Utf8Tokenizer::new();
+    let max = neural_networks::config::SFT_MAX_TOKENS;
+    let examples = neural_networks::sft::load_jsonl(&tok, path, max).map_err(|e| e.to_string())?;
+    if examples.is_empty() {
+        return Err(format!("{path}: no usable examples"));
+    }
+    let tokens: usize = examples.iter().map(|e| e.tokens.len()).sum();
+    let words: usize = examples.iter().map(|e| e.words.len()).sum();
+    let resp: usize = examples.iter().map(|e| e.response_extent().1).sum();
+    let longest = examples.iter().map(|e| e.tokens.len()).max().unwrap_or(0);
+    // Every <SEP> is one exchange, so the count says how much of the corpus is
+    // actually multi-turn.
+    let sep = neural_networks::tokenizer_utf8::SEP_TOKEN;
+    let exchanges: usize = examples
+        .iter()
+        .map(|e| e.tokens.iter().filter(|&&t| t == sep).count())
+        .sum();
+    Ok(format!(
+        "{} examples · {} tokens · {} words · {} response words (loss-carrying)\n\
+         mean {:.0} tokens/example, longest {longest} (cap {max}), \
+         {exchanges} exchanges ({:.2} turns/example)",
+        examples.len(),
+        human(tokens),
+        human(words),
+        human(resp),
+        tokens as f64 / examples.len() as f64,
+        exchanges as f64 / examples.len() as f64
+    ))
+}
+
+fn flag_port(args: &[String]) -> Option<u16> {
+    let i = args.iter().position(|a| a == "--port" || a == "-p")?;
+    args.get(i + 1)?.parse().ok()
 }
 
 fn flag_n(args: &[String]) -> Option<usize> {

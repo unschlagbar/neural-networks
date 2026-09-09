@@ -130,8 +130,7 @@ impl Utf8Tokenizer {
     /// Whether `token` is a markup marker — a special that is part of the text
     /// the model writes, not a structural boundary.
     pub fn is_markup(&self, token: u16) -> bool {
-        (token as usize) >= BYTE_TOKENS + MARKUP_START
-            && (token as usize) < self.vocab_size()
+        (token as usize) >= BYTE_TOKENS + MARKUP_START && (token as usize) < self.vocab_size()
     }
 
     /// Decode a token sequence back into text. Special tokens are skipped;
@@ -217,12 +216,7 @@ impl Utf8Tokenizer {
     /// Bytes a fixed-size token window may be cut at. The word split the models
     /// actually train on lives in `crate::segment`.
     pub fn boundary_tokens(&self) -> Vec<u16> {
-        [
-            b' ', b'.', b'!', b'?', b',', b';', b':', b'\n', b'{', b'}', b'(', b')',
-        ]
-        .iter()
-        .map(|&b| u16::from(b))
-        .collect()
+        b" .!?,;:\n{}()".iter().map(|&b| u16::from(b)).collect()
     }
 
     /// Round-trip a string through encode → decode and check it matches.

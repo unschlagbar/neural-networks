@@ -179,7 +179,6 @@ pub struct EncGroup<'a> {
 
 /// Word `i`'s `[W]` step is rectangle row `(i + 1) * tmax - 1`: a group holds one word
 /// length, so the readout row needs no table. See [`super::ops::pack_rows_u32`].
-
 impl EncGroup<'_> {
     pub fn n_words(&self) -> usize {
         self.words.len()

@@ -316,11 +316,12 @@ impl<'a> Writer<'a> {
 
     /// Serialize the container to a file (atomically: temp file then rename).
     pub fn save(&self, path: &str) -> io::Result<()> {
-        if let Some(dir) = std::path::Path::new(path).parent() {
-            if !dir.as_os_str().is_empty() {
-                std::fs::create_dir_all(dir)?;
-            }
+        if let Some(dir) = std::path::Path::new(path).parent()
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir)?;
         }
+
         let tmp = format!("{path}.tmp");
         let mut model = BufWriter::new(File::create(&tmp)?);
         self.write_to(&mut model)?;

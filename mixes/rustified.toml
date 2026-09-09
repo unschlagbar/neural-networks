@@ -1,0 +1,116 @@
+#:schema ../datamix/mixture.schema.json
+# The Python->Rust rewrite, materialized as a corpus of its own.
+#
+#   cargo run -p datamix --release -- build  mixes/rustified.toml
+#   cargo run -p datamix --release -- verify data/sources/rustified.jsonl
+#
+# WHY THIS FILE EXISTS. The rewrite is ~56 h of local generation and it lived in
+# exactly two places, both of them derived: inside whatever corpus happened to
+# be built last, and inside the completion cache. Delete the corpus and the
+# translations were only recoverable by rebuilding it; run `cargo clean` under
+# the old cache path and they were gone outright.
+#
+# So it is written out once, here, as a plain JSONL of nothing but the rewritten
+# records, under `data/sources/` with the other ingredients (`data/mix/` is for
+# finished datasets only). Every other mixture reads that file with three lines:
+#
+#   [source.rustified]
+#   kind = "jsonl"
+#   path = "data/sources/rustified.jsonl"
+#
+# which is also what puts the translations in EVERY sft build rather than only
+# in the mixtures that carry a copy of the rewrite prompt below.
+#
+# `transform_only = true` is what makes it a corpus of the rewrite rather than a
+# copy of SmolTalk: a record `transform_when` never sent is dropped instead of
+# passed through. `cache_only = true` opens no socket — every translation this
+# writes has already been paid for. To translate MORE, set `cache_only = false`
+# and let it run; the records it has already done cost nothing on the way past.
+
+[output]
+kind = "sft"
+path = "data/sources/rustified.jsonl"
+report = "data/sources/rustified_report.md"
+seed = 1234
+# No holdout: this is an ingredient, and the mixture that eats it holds its own
+# evaluation split out. A holdout here would be held out twice.
+holdout = 0.0
+weight_by = "records"
+records = 0
+
+[llm]
+endpoint = "http://localhost:1234/v1"
+model = "unsloth/qwen3.8-27b"
+max_tokens = 4096
+timeout = 900
+workers = 16
+cache_only = true          # assemble from what is already translated; never call out
+completion_stop = "<|im_end|>"
+completion_template = """<|im_start|>system
+{system}<|im_end|>
+<|im_start|>user
+{user}<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+"""
+
+[filter]
+max_words = 4096
+max_tokens = 28672
+min_bytes = 16
+dedup = "exact"
+transform_only = true
+transform_when = [
+    "```python", "```py", "python", "Python",
+    "pip install", "numpy", "pandas", "matplotlib", "scikit", "PyTorch",
+    "Django", "Flask", "Jupyter", "virtualenv", "__init__",
+]
+transform_temperature = 0.2
+transform = """
+You convert Python programming data into Rust. You are given one conversation as {"messages": [...]}.
+
+Rewrite it so that no trace of Python is left and the exchange is about Rust instead. That means all of it: the user's request, any code inside the question, the assistant's prose, every code block, and any mention of Python libraries, tools or idioms by name. Where a Python library is named, use the Rust crate a Rust programmer would actually reach for.
+
+Hold everything else still. The same number of turns, in the same order, with the same roles. The same task, the same difficulty, the same level of detail, roughly the same length. If the original explains its reasoning step by step, so does yours.
+
+Write Rust the way it is actually written: ```rust fences, Result and ? for anything fallible rather than exceptions, iterators where a loop would be noise, &str and String used correctly, assert_eq! for the assertions. The code must be code that compiles.
+
+This is not only about code. An answer that merely *recommends* Python — "you could use Python for this", "the pandas library handles that", a `pip install` line — is the same defect as a Python code block, and gets the same treatment: recommend Rust and the crate a Rust programmer would actually reach for.
+
+Do not mention Python anywhere in the result, not even in passing and not to compare the two languages. The reader must have no way to tell the exchange was ever about anything else.
+
+The word is not always the language. A carpet python, a Colt Python, Monty Python and a #Python hashtag inside a quoted document are not programming and must be left exactly as they are — rewriting those would corrupt the text. If the conversation happens to contain no Python the language, return it unchanged.
+
+Reply with ONLY the rewritten {"messages": [...]} JSON object. No commentary, no code fence around it.
+"""
+verify = "rust"
+verify_repair = """
+You are fixing Rust code inside one training conversation. You are given the conversation as {"messages": [...]} and the exact rustc errors its code produces.
+
+Fix only what the errors point at. Keep the same turns, the same roles, the same prose and the same task. Do not switch language, do not add dependencies to work around an error, and do not delete the code to make the error go away. If the prose describes what the code does, keep the two in agreement.
+
+Reply with ONLY the corrected {"messages": [...]} JSON object. No commentary.
+"""
+
+# ONE source, not three. The mixer balances between sources, and balancing is
+# the last thing wanted here: every translated record is wanted, and splitting
+# the subsets up meant the smallest yield capped the rest (3.0k translated
+# records became 286 written). Listing every subset under one source removes
+# the choice — what comes out is whichever of SmolTalk's records carried Python
+# and has been translated, all of them.
+[source.smoltalk]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smol-smoltalk"
+select_column = "source"
+select_values = [
+    "openhermes-50k", "self-oss-instruct",
+    "smol-magpie-ultra-short", "longalign", "smol-summarize-5k",
+    "smol-summarize-20k", "smol-contraints", "smollm-rewrite-30k",
+    "explore-instruct-rewrite", "everyday-conversations",
+]
+trim_turns = true
+epochs = 1
+weight = 1

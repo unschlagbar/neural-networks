@@ -301,7 +301,7 @@ fn load_wav(path: &str) -> Option<Vec<f32>> {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn augment(audio: &mut Vec<f32>) {
+fn augment(audio: &mut [f32]) {
     let vol = random_range(0.5..1.5);
     let noise_amp = random_range(0.0..0.05);
     for s in audio.iter_mut() {
@@ -315,7 +315,7 @@ fn lr_cosine(epoch: usize, total: usize, lr_max: f32) -> f32 {
     lr_max * 0.5 * (1.0 + (PI * t).cos())
 }
 
-fn shuffle_seqs(v: &mut Vec<Sequence>) {
+fn shuffle_seqs(v: &mut [Sequence]) {
     let n = v.len();
     for i in (1..n).rev() {
         let j = random_range(0..=i);

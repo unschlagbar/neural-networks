@@ -1,0 +1,548 @@
+#:schema ../datamix/mixture.schema.json
+# The tool-calling corpus, built on its own and written to a durable JSONL that
+# every SFT mixture then reads as a plain `kind = "jsonl"` source.
+#
+#   cargo run -p datamix --release -- ping  mixes/tools.toml
+#   cargo run -p datamix --release -- build mixes/tools.toml
+#   cargo run -p datamix --release -- verify data/sources/tools.jsonl
+#
+# It writes to `data/sources/`, not `data/mix/`: this is an ingredient, read by
+# another mixture rather than by a trainer. `data/mix/` holds only finished
+# datasets.
+#
+# Why it is a corpus and not a set of sources inside assistant_qa.toml: this one
+# costs hours of local generation, and assistant_qa is rebuilt whenever a weight
+# moves. Built once into `data/sources/tools.jsonl`, the tool data is a file — the
+# assistant mixtures read it in milliseconds, and deleting one of their outputs
+# does not take the generation with it.
+#
+# WHAT THE TEMPLATES COULD NOT DO. `mixes/synth/*.syn` guarantees coverage: every
+# tool, every result, every verb, in the exact wire syntax. What it cannot give
+# is variety. A template's user turn is a command of four to nine words built by
+# drawing from a list of synonyms, so a model trained on it learns that a tool
+# call is what a short imperative maps to — and answers a two-word request or a
+# three-paragraph one in prose instead. Each generated source below is one axis
+# the templates hold fixed and real requests do not: how long the request is,
+# where in the conversation it sits, what framing surrounds it, what happens
+# when the first call is wrong, and which requests only look like tool requests.
+#
+# The synth files stay in the mix at a low weight. They are the format anchor
+# (they also seed every prompt here through `seed_file`), and they are the only
+# thing that guarantees every result string — `already_on`, `not_running`,
+# `nothing_playing` — is present at all.
+#
+# APPLICATIONS ARE NOT A FIXED SET. An earlier version of this corpus had a
+# universe of seven lowercase ids, and `app.list()` answered with the same
+# string in 24 of 25 examples — so the list was something to recall, not
+# something to read, and no id shaped like `org.kde.dolphin` was ever emitted,
+# while 33 of this machine's 86 installed applications are shaped exactly that
+# way. `mixes/synth/apps.syn` is now generated (scripts/gen_apps_syn.py) from
+# a real pool with a fresh list per example — 177 distinct `app.list()` answers
+# in 371 records, 145 distinct ids, lengths 6 to 46 — and the prompts below ask
+# the generator for a different plausible machine every time. The judge's app
+# rule is scoped to match: an unfamiliar id is not a defect, but LAUNCHING one
+# that no `app.list()` in the conversation ever mentioned is.
+
+[output]
+kind = "sft"
+path = "data/sources/tools.jsonl"
+report = "data/sources/tools_report.md"
+seed = 4242
+holdout = 0.02
+# Records, not tokens: a two-word lamp command and a 300-word buried request
+# differ by 100x in length, and weighting by tokens would hand the corpus to
+# whichever source rambles most — which is exactly the source whose register the
+# model must NOT generalise into a default.
+weight_by = "records"
+# A budget far above what the sources hold, so every source contributes
+# everything it has exactly once (`epochs = 1`) and nothing is discarded to keep
+# the weights in proportion. With `records = 0` the corpus stops at the point
+# the smallest source would need a second epoch — here that was `length_var` at
+# 476 records against weight 6, which capped a 7.7k-record staging area to about
+# 2.8k written.
+records = 1000000
+
+[llm]
+endpoint = "http://localhost:1234/v1"
+model = "unsloth/qwen3.8-27b"
+temperature = 1.0          # generation wants variety; the judge overrides to 0 below
+# 2048, not 4096, and the reason is the server's context rather than any
+# property of the data. LM Studio's `--context-length` is a POOL shared by the
+# concurrent requests, not a per-slot budget: N requests in flight each reserve
+# `prompt + max_tokens` out of it, so the constraint is
+#
+#     workers * (prompt + max_tokens)  <=  context-length
+#
+# At 8 workers, ~1500-token prompts and a 4096 reservation that is ~45k against
+# a 29366 pool, and every request comes back `HTTP 400: Context size has been
+# exceeded` — which reads as "the source produced no parsable examples" unless
+# the transport error is surfaced. 8 * (1500 + 2048) = 28.4k fits. Measured
+# ceiling for the shipped generation: p99 is 1506 tokens, so 2048 covers it, and
+# a truncated reply is read line by line so it costs one record, not the batch.
+#
+# Load the server to match:
+#   lms load unsloth/qwen3.8-27b --context-length 29366 --parallel 8 --gpu max
+max_tokens = 2048
+timeout = 900
+workers = 8
+cache_only = true       # assemble from data/llm-cache; set false to generate more
+completion_stop = "<|im_end|>"
+# The empty `<think>` prefill, the same one the Python->Rust rewrite uses: it is
+# the only switch LM Studio honours, and it is 10x. Variety here comes from the
+# temperature and from the drawn seeds, not from the model deliberating about
+# what to invent.
+completion_template = """<|im_start|>system
+{system}<|im_end|>
+<|im_start|>user
+{user}<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+"""
+
+[filter]
+max_words = 4096
+max_tokens = 28672
+min_bytes = 8
+# "exact", not "near": these records are short and formulaic by nature, and
+# `near` reads "turn the lamp on" and "switch the light on" as one example —
+# which is the variety this corpus exists to buy.
+dedup = "exact"
+# The generator's own scaffolding, when it leaks, leaks as these.
+must_not_contain = [
+    "As an AI language model",
+    "```json",
+    "Here are the",
+]
+
+# --- the format anchor -------------------------------------------------------
+# Guaranteed coverage of every tool, argument and result string, in the exact
+# wire syntax. Low weight: this is the floor, not the corpus.
+
+[source.lamp_templates]
+kind = "synth"
+path = "mixes/synth/lamp.syn"
+count = 2000
+epochs = 1
+weight = 3
+
+[source.apps_templates]
+kind = "synth"
+path = "mixes/synth/apps.syn"
+count = 2500
+epochs = 1
+weight = 3
+
+[source.math_templates]
+kind = "synth"
+path = "mixes/synth/math.syn"
+count = 2500
+epochs = 1
+weight = 3
+
+[source.context_templates]
+kind = "synth"
+path = "mixes/synth/tools_in_context.syn"
+count = 2500
+epochs = 1
+weight = 3
+
+# --- generated: the axes the templates cannot reach --------------------------
+
+# Length, both ends. This is the source that exists because 97% of the SFT
+# corpus's prompts are longer than 40 bytes: a model that has only ever seen a
+# tool call follow a nine-word imperative has no mapping for "lamp" on its own,
+# and none for a request that arrives after two paragraphs of preamble either.
+[source.length_var]
+kind = "llm"
+weight = 6
+count = 900
+batch = 6
+seeds = 3
+seed_file = "mixes/synth/lamp.syn"
+temperature = 1.1
+dedup = "near"          # a generator repeats itself in ways `exact` misses
+system = """
+You write training conversations for a small on-device assistant called Jarvis. You reply with ONE JSON object per line and nothing else: {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]}. No prose before or after, no code fences, no numbering.
+
+These are the ONLY tools that exist. Never write a call to anything else, and never change an argument name:
+
+  <tool>lamp.set(on=true)</tool>          -> on | off | already_on | already_off
+  <tool>lamp.state()</tool>               -> on | off
+  <tool>app.launch(name="firefox")</tool> -> ok | already_running | not_found | failed
+  <tool>app.list()</tool>                 -> the installed ids, comma separated
+  <tool>browser.open(url="https://…")</tool> -> ok
+  <tool>media.control(action="play")</tool>  -> ok | nothing_playing   (play|pause|stop|next|prev)
+  <tool>math.eval(expr="87.40 / 3")</tool> -> the value | error: …
+
+The set of installed applications is NOT fixed and is NOT known in advance. It differs from machine to machine, and the only way to learn it is `app.list()`. Invent a DIFFERENT, plausible list for every conversation you write — real desktop ids, in the shapes real ones have: reverse-DNS (`org.kde.dolphin`, `com.obsproject.Studio`), hyphenated (`btrfs-assistant`, `signal-desktop`), capitalized (`DaVinciResolve`, `Alacritty`) and plain (`firefox`, `blender`, `mpv`). A list looks like this, and yours must not look like this one:
+
+  steam, libreoffice-writer, org.cachyos.KernelManager, vim, org.kicad.bitmap2component, assistant, org.kde.kmenuedit, libreoffice-startcenter, blackmagicraw-speedtest, discord, cmake-gui, org.gnome.Meld, org.kde.konsole, org.kde.ark
+
+An id is not the word a person says. "Dolphin" is `org.kde.dolphin`, "OBS" is `com.obsproject.Studio`, "the file manager" could be any of several. So:
+  * if the name the person says IS a plausible id (`blender`, `firefox`), launch it directly
+  * if it is not, the guess comes back `not_found` and `app.list()` decides
+  * if the person gives a DESCRIPTION ("the file manager", "my photo editor"), there is nothing to guess from — call `app.list()` FIRST
+  * if the list does not have it, say so and stop. Never guess twice.
+
+There is exactly ONE lamp. It has no colour, no brightness and no room, so `lamp.set` takes `on` and nothing else. People still refer to it loosely — "the kitchen light", "the big light", "the lights" — and that is the same lamp and the same call; only a request for a property it does not have (a brightness, a colour, a second lamp) is one the assistant has to decline.
+
+The shape of every exchange: the assistant's tool-call turn contains the CALL ALONE, nothing before or after it. The tool's answer is a separate turn with role "tool" whose content is one of the result strings above and nothing else. What the assistant says to the person is a THIRD turn, written after it has read that result — that is the entire point of the result, and an assistant turn that both calls a tool and reports the outcome in one message is wrong.
+
+One line is one complete, self-contained JSON object. No trailing comma at the end of a line, no comma between lines, no array wrapping them, no `category` key outside the object, no bare turn object on a line of its own. If you cannot finish a conversation, leave the whole line out rather than writing half of it.
+
+Everything is in English.
+"""
+prompt = """
+Here are examples of the exact format, so you can see the wire shape:
+{seed}
+
+Write {n} MORE conversations for the same tools. The subject of this batch is LENGTH: how long the user's turn is must have nothing to do with whether a tool gets called.
+
+Make roughly half of them EXTREMELY short — one to three words, the way a person actually talks to a device they use every day. "lamp." "lights off" "spotify" "dolphin" "87.40 by three" "music" "is it on". Lower case, no punctuation, no please. These still map to exactly the same call as a full sentence would.
+
+Make the other half LONG — 80 to 250 words of a person thinking out loud, complaining about their day, explaining why they want the thing, giving three sentences of irrelevant background — with exactly one actionable request somewhere inside it, and not always at the end. The assistant reads past all of it, makes the one call, and answers in ONE short sentence. It does not summarise the person's preamble back at them and it does not match their length.
+
+Vary who is talking: curt, chatty, half-asleep, mid-sentence, typing with typos ("trun teh lamp off"), using a pronoun for something never named ("kill it"), or asking with a question instead of a command ("any chance you could...").
+"""
+judge_temperature = 0.0
+judge = """
+You are checking ONE training conversation for a small assistant. Answer `yes` or `no` — the verdict FIRST, then a dash and the one clause that decided it.
+
+The seven tools that exist, with their only arguments:
+  lamp.set(on=…)  lamp.state()  app.launch(name=…)  app.list()
+  browser.open(url=…)  media.control(action=…)  math.eval(expr=…)
+There is no fixed set of applications: it differs per machine and `app.list()` is the only way to learn it. Real ids look like `org.kde.dolphin`, `com.obsproject.Studio`, `btrfs-assistant`, `DaVinciResolve`, `firefox` — usually NOT the word the person said, so an unfamiliar id is not by itself a defect.
+The only things a "tool" turn may contain: on, off, already_on, already_off, ok, already_running, not_found, failed, not_running, saved, nothing_playing, the comma-separated application ids, a bare number, or a string starting `error:`.
+
+Answer no if any of these is true:
+- a call names a tool or an argument that is not in those lists
+- an application is LAUNCHED (the tool answers ok or already_running) whose id was never in an app.list() answer in this conversation, unless the person named that id themselves
+- an app.list() answer holds fewer than five ids, or is the toy set `firefox, spotify, kitty, code, nautilus, discord, steam`
+- a "tool" turn contains anything else
+- a turn holds a <tool> call together with other text, or holds two calls
+- the assistant claims an outcome the tool did not report
+- it is not in English, or generator scaffolding survived (a code fence, "here are", "as an AI")
+
+Otherwise answer yes. Nothing else is your concern — not tone, not length, not how interesting it is.
+"""
+
+# Position and framing. A tool call is not "what turn one looks like": it can
+# arrive under a filled system context, after four turns of unrelated chat, in
+# the middle of a technical discussion, or buried in a pasted document.
+[source.buried_var]
+kind = "llm"
+weight = 5
+count = 700
+batch = 4
+seeds = 2
+seed_file = "mixes/synth/tools_in_context.syn"
+temperature = 1.05
+dedup = "near"
+system = """
+You write training conversations for a small on-device assistant called Jarvis. You reply with ONE JSON object per line and nothing else: {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]}. A "system" message may be the first element. No prose before or after, no code fences, no numbering.
+
+These are the ONLY tools that exist. Never write a call to anything else, and never change an argument name:
+
+  <tool>lamp.set(on=true)</tool>          -> on | off | already_on | already_off
+  <tool>lamp.state()</tool>               -> on | off
+  <tool>app.launch(name="firefox")</tool> -> ok | already_running | not_found | failed
+  <tool>app.list()</tool>                 -> the installed ids, comma separated
+  <tool>browser.open(url="https://…")</tool> -> ok
+  <tool>media.control(action="play")</tool>  -> ok | nothing_playing   (play|pause|stop|next|prev)
+  <tool>math.eval(expr="87.40 / 3")</tool> -> the value | error: …
+
+The set of installed applications is NOT fixed and is NOT known in advance. It differs from machine to machine, and the only way to learn it is `app.list()`. Invent a DIFFERENT, plausible list for every conversation you write — real desktop ids, in the shapes real ones have: reverse-DNS (`org.kde.dolphin`, `com.obsproject.Studio`), hyphenated (`btrfs-assistant`, `signal-desktop`), capitalized (`DaVinciResolve`, `Alacritty`) and plain (`firefox`, `blender`, `mpv`). A list looks like this, and yours must not look like this one:
+
+  steam, libreoffice-writer, org.cachyos.KernelManager, vim, org.kicad.bitmap2component, assistant, org.kde.kmenuedit, libreoffice-startcenter, blackmagicraw-speedtest, discord, cmake-gui, org.gnome.Meld, org.kde.konsole, org.kde.ark
+
+An id is not the word a person says. "Dolphin" is `org.kde.dolphin`, "OBS" is `com.obsproject.Studio`, "the file manager" could be any of several. So:
+  * if the name the person says IS a plausible id (`blender`, `firefox`), launch it directly
+  * if it is not, the guess comes back `not_found` and `app.list()` decides
+  * if the person gives a DESCRIPTION ("the file manager", "my photo editor"), there is nothing to guess from — call `app.list()` FIRST
+  * if the list does not have it, say so and stop. Never guess twice.
+
+There is exactly ONE lamp. It has no colour, no brightness and no room, so `lamp.set` takes `on` and nothing else. People still refer to it loosely — "the kitchen light", "the big light", "the lights" — and that is the same lamp and the same call; only a request for a property it does not have (a brightness, a colour, a second lamp) is one the assistant has to decline.
+
+The assistant's tool-call turn contains the CALL ALONE. The tool's answer is a separate "tool" turn holding one result string. What the assistant says to the person comes after it, in a third turn, and is written from that result.
+
+One line is one complete, self-contained JSON object. No trailing comma at the end of a line, no comma between lines, no array wrapping them, no `category` key outside the object, no bare turn object on a line of its own. If you cannot finish a conversation, leave the whole line out rather than writing half of it.
+
+Everything is in English.
+"""
+prompt = """
+Here are examples of the exact format:
+{seed}
+
+Write {n} MORE conversations for the same tools. The subject of this batch is WHERE the tool call sits. Never put it in the first assistant turn: every conversation here must have something before the call — a system message, or at least one ordinary exchange. A single question-and-call conversation is not what this batch is for and will be thrown away.
+
+Use all of these, spread across the batch:
+- a filled "system" message — a persona, a house rule, a note about the user's preferences, a paragraph of unrelated project context — and then a request that still gets called on
+- three to six turns of ordinary conversation first (a question about Rust, a complaint about the weather, a recipe, a bug the person is chasing) and the tool call arriving mid-conversation, then the ordinary conversation resuming afterwards as if nothing special happened
+- a request pasted inside something else: an email the person is drafting, a log they pasted, a shopping list, a code block — where one line of it is the thing they actually want done
+- a follow-up that only makes sense from the earlier turns: "do that again", "the other one too", "put it back", "and split that by four", "now close it"
+- a conversation where the person asks for a thing, changes their mind mid-sentence, and the assistant acts on the version they landed on
+
+The assistant answers in ONE short sentence after each result, and picks the ordinary conversation back up in its own register. It never announces that it is about to use a tool.
+"""
+judge_temperature = 0.0
+judge = """
+You are checking ONE training conversation for a small assistant. Answer `yes` or `no` — the verdict FIRST, then a dash and the one clause that decided it.
+
+The seven tools that exist, with their only arguments:
+  lamp.set(on=…)  lamp.state()  app.launch(name=…)  app.list()
+  browser.open(url=…)  media.control(action=…)  math.eval(expr=…)
+There is no fixed set of applications: it differs per machine and `app.list()` is the only way to learn it. Real ids look like `org.kde.dolphin`, `com.obsproject.Studio`, `btrfs-assistant`, `DaVinciResolve`, `firefox` — usually NOT the word the person said, so an unfamiliar id is not by itself a defect.
+The only things a "tool" turn may contain: on, off, already_on, already_off, ok, already_running, not_found, failed, not_running, saved, nothing_playing, the comma-separated application ids, a bare number, or a string starting `error:`.
+
+Answer no if any of these is true:
+- a call names a tool or an argument that is not in those lists
+- an application is LAUNCHED (the tool answers ok or already_running) whose id was never in an app.list() answer in this conversation, unless the person named that id themselves
+- an app.list() answer holds fewer than five ids, or is the toy set `firefox, spotify, kitty, code, nautilus, discord, steam`
+- a "tool" turn contains anything else
+- a turn holds a <tool> call together with other text, or holds two calls
+- the assistant claims an outcome the tool did not report
+- it is not in English, or generator scaffolding survived (a code fence, "here are", "as an AI")
+
+Otherwise answer yes. Nothing else is your concern — not tone, not length, not how interesting it is.
+"""
+
+# Getting it wrong and recovering. The wrong call is written as an
+# `assistant_context` turn: the model reads it as context and is never trained
+# to produce it, so the corpus can contain the mistake without teaching it.
+# The judge keeps about a quarter of what this source generates — a recovery
+# chain has more ways to come out malformed than any other shape here — so the
+# count is what it must generate, not what it will yield.
+[source.recovery_var]
+kind = "llm"
+weight = 4
+count = 900
+batch = 4
+seeds = 1  # apps.syn entries now carry 46-id app.list() answers; two of them bloat the prompt and the imitation
+seed_file = "mixes/synth/apps.syn"
+temperature = 1.15
+# "exact", not "near": a recovery chain is formulaic by construction — the same
+# not_found, the same app.list answer, the same seven ids — so `near` reads two
+# recoveries that differ only in which application was missed as one record and
+# threw away two thirds of this source.
+dedup = "exact"
+system = """
+You write training conversations for a small on-device assistant called Jarvis. You reply with ONE JSON object per line and nothing else: {"messages": [{"role": "user", "content": "..."}, ...]}. No prose before or after, no code fences.
+
+The roles you may use are "system", "user", "assistant", "tool", and "assistant_context". An "assistant_context" turn is an assistant message the model READS but is never trained to produce — it is how a mistake can appear in the data without being taught. Every wrong call, and the sentence the assistant said about it, MUST use role "assistant_context". The correction and everything after it uses role "assistant".
+
+These are the ONLY tools that exist:
+
+  <tool>lamp.set(on=true)</tool>          -> on | off | already_on | already_off
+  <tool>lamp.state()</tool>               -> on | off
+  <tool>app.launch(name="firefox")</tool> -> ok | already_running | not_found | failed
+  <tool>app.list()</tool>                 -> the installed ids, comma separated
+  <tool>browser.open(url="https://…")</tool> -> ok
+  <tool>media.control(action="play")</tool>  -> ok | nothing_playing
+  <tool>math.eval(expr="87.40 / 3")</tool> -> the value | error: …
+
+The set of installed applications is NOT fixed and is NOT known in advance. It differs from machine to machine, and the only way to learn it is `app.list()`. Invent a DIFFERENT, plausible list for every conversation you write — real desktop ids, in the shapes real ones have: reverse-DNS (`org.kde.dolphin`, `com.obsproject.Studio`), hyphenated (`btrfs-assistant`, `signal-desktop`), capitalized (`DaVinciResolve`, `Alacritty`) and plain (`firefox`, `blender`, `mpv`). A list looks like this, and yours must not look like this one:
+
+  steam, libreoffice-writer, org.cachyos.KernelManager, vim, org.kicad.bitmap2component, assistant, org.kde.kmenuedit, libreoffice-startcenter, blackmagicraw-speedtest, discord, cmake-gui, org.gnome.Meld, org.kde.konsole, org.kde.ark
+
+An id is not the word a person says. "Dolphin" is `org.kde.dolphin`, "OBS" is `com.obsproject.Studio`, "the file manager" could be any of several. So:
+  * if the name the person says IS a plausible id (`blender`, `firefox`), launch it directly
+  * if it is not, the guess comes back `not_found` and `app.list()` decides
+  * if the person gives a DESCRIPTION ("the file manager", "my photo editor"), there is nothing to guess from — call `app.list()` FIRST
+  * if the list does not have it, say so and stop. Never guess twice.
+
+There is exactly ONE lamp. It has no colour, no brightness and no room, so `lamp.set` takes `on` and nothing else. People still refer to it loosely — "the kitchen light", "the big light", "the lights" — and that is the same lamp and the same call; only a request for a property it does not have (a brightness, a colour, a second lamp) is one the assistant has to decline.
+
+A tool-call turn contains the CALL ALONE. A "tool" turn holds one result string and nothing else.
+
+One line is one complete, self-contained JSON object. No trailing comma at the end of a line, no comma between lines, no array wrapping them, no `category` key outside the object, no bare turn object on a line of its own. If you cannot finish a conversation, leave the whole line out rather than writing half of it.
+
+Everything is in English.
+"""
+prompt = """
+Here are examples of the exact format, including the error-recovery ones:
+{seed}
+
+Write {n} MORE conversations. The subject of this batch is FAILING AND RECOVERING. Every one of them contains something going wrong, and the recovery is the part that is trained.
+
+Cover all of these across the batch:
+- `app.launch` returns not_found because the assistant guessed an id from what the person called the app ("the music app" -> musicapp). It calls `app.list`, reads the real ids, and launches the right one. It never guesses a second time without looking.
+- `app.list` comes back and the thing genuinely is not installed. It says so plainly and offers the browser instead, or offers nothing. It does not launch a different application it was not asked for.
+- `math.eval` returns an error because the expression carried a currency symbol, a percent sign, a comma decimal, a word, or an "x" for multiplication. The repair strips exactly what the error named. The wrong first call is `assistant_context`.
+- the assistant calls the wrong tool entirely — quits an app it was asked to open, turns the lamp on when asked to turn it off, checks the state when asked to change it — the user corrects it in one short line, and it fixes it without a paragraph of apology.
+- the assistant misreads WHICH thing was meant, opens the wrong application, and the person says "no, the other one".
+- `app.launch` returns `failed`: there is nothing to recover to, and it says that instead of retrying forever.
+- a result that contradicts what the assistant was about to say: already_on, already_off, not_running, nothing_playing. It reports what actually happened rather than what it expected.
+
+The correction is short. One clause of apology at most, then the action. Never a paragraph about what went wrong.
+"""
+judge_temperature = 0.0
+judge = """
+You are checking ONE training conversation for a small assistant. Answer `yes` or `no` — the verdict FIRST, then a dash and the one clause that decided it.
+
+The seven tools that exist, with their only arguments:
+  lamp.set(on=…)  lamp.state()  app.launch(name=…)  app.list()
+  browser.open(url=…)  media.control(action=…)  math.eval(expr=…)
+There is no fixed set of applications: it differs per machine and `app.list()` is the only way to learn it. Real ids look like `org.kde.dolphin`, `com.obsproject.Studio`, `btrfs-assistant`, `DaVinciResolve`, `firefox` — usually NOT the word the person said, so an unfamiliar id is not by itself a defect.
+The only things a "tool" turn may contain: on, off, already_on, already_off, ok, already_running, not_found, failed, not_running, saved, nothing_playing, the comma-separated application ids, a bare number, or a string starting `error:`.
+
+Answer no if any of these is true:
+- a call names a tool or an argument that is not in those lists
+- an application is LAUNCHED (the tool answers ok or already_running) whose id was never in an app.list() answer in this conversation, unless the person named that id themselves
+- an app.list() answer holds fewer than five ids, or is the toy set `firefox, spotify, kitty, code, nautilus, discord, steam`
+- a "tool" turn contains anything else
+- a turn holds a <tool> call together with other text, or holds two calls
+- the assistant claims an outcome the tool did not report
+- no turn in the conversation has the role "assistant_context" (the mistake has to be masked, and an unmasked mistake is a mistake the model is trained to make)
+- it is not in English, or generator scaffolding survived (a code fence, "here are", "as an AI")
+
+Otherwise answer yes. Nothing else is your concern — not tone, not length, not how interesting it is.
+"""
+
+# Arithmetic that arrives as a life question rather than as a sum. The template
+# file has twelve shapes of this; what it cannot produce is the thousandth one.
+[source.math_var]
+kind = "llm"
+weight = 5
+count = 800
+batch = 5
+seeds = 3
+seed_file = "mixes/synth/math.syn"
+temperature = 1.05
+dedup = "near"
+system = """
+You write training conversations for a small on-device assistant called Jarvis. You reply with ONE JSON object per line and nothing else: {"messages": [{"role": "user", "content": "..."}, ...]}. No prose before or after, no code fences.
+
+The arithmetic tool, and its only argument:
+
+  <tool>math.eval(expr="87.40 / 3")</tool>  -> the value, or `error: …`
+
+The expression is INFIX and BARE. Operators + - * / ^, parentheses, and the functions sqrt, abs, min, max, round, floor, ceil. No currency symbols, no percent signs, no thousands separators, no units, no words, no equals sign. A percentage is written as the multiplication it is: 30% off is `* 0.70`. Translating the request into bare arithmetic is the assistant's job; the units live in the sentence it writes afterwards.
+
+The other tools exist and may appear when the conversation calls for them: lamp.set(on=…), lamp.state(), app.launch(name="…"), app.list(), browser.open(url="…"), media.control(action="…"). Which applications are installed differs per machine and is only knowable through `app.list()`.
+
+A tool-call turn contains the CALL ALONE. A "tool" turn holds the value and nothing else. The sentence to the person is a separate turn written after the value is known.
+
+Every arithmetic result you write must be correct. Check it.
+
+One line is one complete, self-contained JSON object. No trailing comma at the end of a line, no comma between lines, no array wrapping them, no `category` key outside the object, no bare turn object on a line of its own. If you cannot finish a conversation, leave the whole line out rather than writing half of it.
+
+Everything is in English.
+"""
+prompt = """
+Here are examples of the exact format:
+{seed}
+
+Write {n} MORE conversations where the assistant has to do arithmetic. The subject of this batch is that the arithmetic is almost never presented AS arithmetic.
+
+Draw from all of these:
+- money in the wild: splitting a bill, a tip, a discount, VAT, a refund, what is left after rent, whether a purchase fits in what is in the account, a monthly cost turned into a yearly one
+- measurement: floor area for flooring or paint, litres of fuel for a distance, how much fits in a boot, cutting a length into pieces, tiles for a wall
+- time: how many hours a shift is, how long until something, an hourly rate over a week, a train that leaves in n minutes
+- cooking: scaling a recipe, halving it, dividing a tray between people
+- computing: how long a download takes at a rate, how many rows fit in a buffer, bytes to megabytes, a percentage of a benchmark improvement
+- comparisons, where the answer is a verdict and not a number: "is A cheaper than B", "am I short", "will it fit", "is that faster"
+- questions where the number is the SMALL part of the answer, and the sentence after it is what the person actually wanted to know
+- a second call built from the first result, where the person asks a follow-up ("and per person?", "and for a year?", "what about with the discount?")
+- requests that contain numbers but need NO arithmetic at all ("open firefox on monitor 2", "what does 404 mean", "play track 3") — no math.eval call in those
+
+Vary the length hard: some are three words ("87.40 by three"), some are a paragraph of context with the sum buried in it. The answer is short and states the unit; it does not show its working.
+"""
+judge_temperature = 0.0
+judge = """
+You are checking ONE training conversation for a small assistant. Answer `yes` or `no` — the verdict FIRST, then a dash and the one clause that decided it.
+
+The seven tools that exist, with their only arguments:
+  lamp.set(on=…)  lamp.state()  app.launch(name=…)  app.list()
+  browser.open(url=…)  media.control(action=…)  math.eval(expr=…)
+There is no fixed set of applications: it differs per machine and `app.list()` is the only way to learn it. Real ids look like `org.kde.dolphin`, `com.obsproject.Studio`, `btrfs-assistant`, `DaVinciResolve`, `firefox` — usually NOT the word the person said, so an unfamiliar id is not by itself a defect.
+The only things a "tool" turn may contain: on, off, already_on, already_off, ok, already_running, not_found, failed, not_running, saved, nothing_playing, the comma-separated application ids, a bare number, or a string starting `error:`.
+
+Answer no if any of these is true:
+- a call names a tool or an argument that is not in those lists
+- an application is LAUNCHED (the tool answers ok or already_running) whose id was never in an app.list() answer in this conversation, unless the person named that id themselves
+- an app.list() answer holds fewer than five ids, or is the toy set `firefox, spotify, kitty, code, nautilus, discord, steam`
+- a "tool" turn contains anything else
+- a turn holds a <tool> call together with other text, or holds two calls
+- the assistant claims an outcome the tool did not report
+- the arithmetic is wrong: work out the expression yourself, check the "tool" value against it, and check the number the assistant reports against that value
+- a math.eval expression carries a currency symbol, percent sign, comma decimal, thousands separator, unit or word, and the tool does NOT answer it with `error:`
+- it is not in English, or generator scaffolding survived (a code fence, "here are", "as an AI")
+
+Otherwise answer yes. Nothing else is your concern — not tone, not length, not how interesting it is.
+"""
+
+# The requests that look exactly like tool requests and have no tool behind
+# them. Without this source, everything a generalising model learns above turns
+# into a machine for inventing plausible calls: asked to set a timer it writes
+# `timer.set(...)`, which no runtime will answer. This is the source that makes
+# the rest safe.
+# Same yield as recovery_var, for the same reason: deciding what is declinable
+# is the hardest thing asked of the generator here.
+[source.no_tool_var]
+kind = "llm"
+weight = 4
+count = 900
+batch = 6
+seeds = 2
+seed_file = "mixes/synth/lamp.syn"
+temperature = 1.0
+dedup = "near"
+system = """
+You write training conversations for a small on-device assistant called Jarvis. You reply with ONE JSON object per line and nothing else: {"messages": [{"role": "user", "content": "..."}, ...]}. No prose before or after, no code fences.
+
+These are the ONLY tools that exist. There are no others, and there is no way to add one:
+
+  <tool>lamp.set(on=true)</tool>, <tool>lamp.state()</tool>
+  <tool>app.launch(name="…")</tool>, <tool>app.list()</tool>
+  <tool>browser.open(url="https://…")</tool>
+  <tool>media.control(action="play|pause|stop|next|prev")</tool>
+  <tool>math.eval(expr="…")</tool>
+
+One lamp, no colour, no brightness, no room. The installed applications differ per machine and are only knowable through `app.list()`.
+
+One line is one complete, self-contained JSON object. No trailing comma at the end of a line, no comma between lines, no array wrapping them, no `category` key outside the object, no bare turn object on a line of its own. If you cannot finish a conversation, leave the whole line out rather than writing half of it.
+
+Everything is in English.
+"""
+prompt = """
+Here are examples of the format:
+{seed}
+
+Write {n} MORE conversations where the person asks for something that SOUNDS like one of these tools and is not one. The assistant must say plainly that it cannot reach that, in one sentence, and offer the nearest thing it actually can do — or offer nothing, if there is no near thing. It must NEVER write a tool call for it, and it must never invent a tool name.
+
+Draw from all of these:
+- the lamp, but with a knob it does not have: dim it, make it warmer, set it to blue, half brightness, the one in the kitchen, all the lights, the lamp in the bedroom
+- home devices that are not the lamp: the thermostat, the kettle, the blinds, the door, the TV, the speakers' volume, the fan
+- the machine, past what it has: take a screenshot, CLOSE or quit a running application, set a timer, an alarm, a reminder, the volume, wifi off, bluetooth, brightness, reboot, empty the bin, mount a drive. Screenshots and quitting an app are worth covering often: they sound exactly like the things it CAN do, and there is no tool for either — it can launch an application but not close one.
+- messaging and the outside world: send an email, text someone, post this, order a pizza, book a table, call my mother
+- the future and the network: today's weather, the news, my calendar, the traffic, what time the shop shuts
+- files: delete this, rename that, find my tax return, back this up
+- a request where PART of it is doable and part is not — "turn the lamp on and set it to 30%", "open spotify and turn it up" — where the assistant does the half it can, with the real call, and says plainly it cannot do the other half
+
+Some of these should be one or two words, some a long ramble. Some should come after several turns of ordinary conversation. The refusal is short and specific about what is missing — "there's no brightness on this one, it's just on or off" — never a policy statement, never an apology paragraph, and never a suggestion that it might be able to do it later.
+"""
+judge_temperature = 0.0
+judge = """
+You are checking ONE training conversation for a small assistant. Answer `yes` or `no` — the verdict FIRST, then a dash and the one clause that decided it.
+
+The seven tools that exist, with their only arguments:
+  lamp.set(on=…)  lamp.state()  app.launch(name=…)  app.list()
+  browser.open(url=…)  media.control(action=…)  math.eval(expr=…)
+There is no fixed set of applications: it differs per machine and `app.list()` is the only way to learn it. Real ids look like `org.kde.dolphin`, `com.obsproject.Studio`, `btrfs-assistant`, `DaVinciResolve`, `firefox` — usually NOT the word the person said, so an unfamiliar id is not by itself a defect.
+The only things a "tool" turn may contain: on, off, already_on, already_off, ok, already_running, not_found, failed, not_running, saved, nothing_playing, the comma-separated application ids, a bare number, or a string starting `error:`.
+
+Answer no if any of these is true:
+- a call names a tool or an argument that is not in those lists
+- an application is LAUNCHED (the tool answers ok or already_running) whose id was never in an app.list() answer in this conversation, unless the person named that id themselves
+- an app.list() answer holds fewer than five ids, or is the toy set `firefox, spotify, kitty, code, nautilus, discord, steam`
+- a "tool" turn contains anything else
+- a turn holds a <tool> call together with other text, or holds two calls
+- the assistant claims an outcome the tool did not report
+- the assistant wrote a call, or invented a tool or argument, for the part it cannot actually do
+- it is not in English, or generator scaffolding survived (a code fence, "here are", "as an AI")
+
+Otherwise answer yes. Nothing else is your concern — not tone, not length, not how interesting it is.
+"""

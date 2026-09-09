@@ -103,7 +103,7 @@
         "endpoint": {
           "type": "string",
           "pattern": "^(http://)?[^/]+",
-          "description": "e.g. http://localhost:1234/v1 \u2014 http only."
+          "description": "e.g. http://localhost:1234/v1 — http only."
         },
         "model": {
           "type": "string",
@@ -139,6 +139,23 @@
         },
         "api_key": {
           "type": "string"
+        },
+        "completion_template": {
+          "type": "string",
+          "description": "Chat template written out, which switches every call to /v1/completions. {system} and {user} are substituted. Prefilling an empty <think></think> here turns a reasoning model's deliberation off. Empty uses /v1/chat/completions."
+        },
+        "completion_stop": {
+          "$ref": "#/definitions/strings",
+          "description": "Where a completion ends - the template's turn terminator, e.g. <|im_end|>."
+        },
+        "workers": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Requests in flight. Match the server's parallel slot count (LM Studio's PARALLEL)."
+        },
+        "cache_only": {
+          "type": "boolean",
+          "description": "Answer only out of the cache and never open a socket; a miss drops the record. Use it to assemble a corpus from a long rewrite that is still running."
         }
       }
     },
@@ -184,7 +201,7 @@
           "type": "number",
           "minimum": 0,
           "maximum": 1,
-          "description": "Minimum share of letters/digits \u2014 kills base64 blobs and binary dumps."
+          "description": "Minimum share of letters/digits — kills base64 blobs and binary dumps."
         },
         "max_dup_line_ratio": {
           "type": "number",
@@ -194,7 +211,7 @@
         },
         "max_line_bytes": {
           "$ref": "#/definitions/size",
-          "description": "Longest single line \u2014 kills minified files."
+          "description": "Longest single line — kills minified files."
         },
         "must_contain": {
           "$ref": "#/definitions/strings",
@@ -249,7 +266,47 @@
               "type": "string"
             }
           ],
-          "description": "Cap on the words of one record, counted with the model's own splitter (wordseg). This is the unit the backbone unrolls in \u2014 match it to SFT_MAX_WORDS / WORDS_PER_SEQ."
+          "description": "Cap on the words of one record, counted with the model's own splitter (wordseg). This is the unit the backbone unrolls in — match it to SFT_MAX_WORDS / WORDS_PER_SEQ."
+        },
+        "transform": {
+          "type": "string",
+          "description": "Rewrite every record through the local model before it is filtered: this is the system prompt, the record goes up as {\"messages\":[...]} and the reply must come back in the same shape. Cached on the record's own text, so a corpus rewritten once stays rewritten across every later build."
+        },
+        "transform_when": {
+          "$ref": "#/definitions/strings",
+          "description": "Only rewrite records whose text contains one of these. Empty rewrites all of them."
+        },
+        "transform_only": {
+          "type": "boolean",
+          "description": "Keep ONLY the records the rewrite applied to, dropping everything transform_when did not match. With cache_only this materializes a rewrite into a corpus of its own, which other mixtures read as a plain jsonl source."
+        },
+        "transform_model": {
+          "type": "string",
+          "description": "Model for the rewrite alone. Empty inherits the [llm] model."
+        },
+        "transform_temperature": {
+          "type": "number",
+          "description": "Temperature for the rewrite alone (default 0.2 - a translation, not a generation)."
+        },
+        "verify": {
+          "type": "string",
+          "enum": [
+            "",
+            "rust"
+          ],
+          "description": "Compile the code a rewritten record carries and drop what does not build. \"rust\" extracts its ```rust blocks and runs rustc; empty disables the check."
+        },
+        "verify_repair": {
+          "type": "string",
+          "description": "Prompt for one repair pass: the record and rustc's own errors go up, the corrected record comes back. Empty drops a failing record instead of trying to fix it."
+        },
+        "system_strip": {
+          "$ref": "#/definitions/strings",
+          "description": "Sentences cut out of a system turn before anything else. The corpus's system turns are a handful of repeated strings; an identity line the model never sees at inference is a prop it learns to lean on."
+        },
+        "system_fold": {
+          "type": "boolean",
+          "description": "After stripping, move what remains of the system turn to the front of the first user turn and drop the system turn. Deleting the turn outright is unsafe: often the remainder is the record's only instruction."
         }
       }
     },
@@ -455,8 +512,15 @@
         "select_values": {
           "description": "chat: keep only rows whose select_column holds one of these. Requires select_column.",
           "anyOf": [
-            { "type": "string" },
-            { "type": "array", "items": { "type": "string" } }
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
           ]
         },
         "seeds": {
@@ -494,7 +558,47 @@
               "type": "string"
             }
           ],
-          "description": "Cap on the words of one record, counted with the model's own splitter (wordseg). This is the unit the backbone unrolls in \u2014 match it to SFT_MAX_WORDS / WORDS_PER_SEQ."
+          "description": "Cap on the words of one record, counted with the model's own splitter (wordseg). This is the unit the backbone unrolls in — match it to SFT_MAX_WORDS / WORDS_PER_SEQ."
+        },
+        "transform": {
+          "type": "string",
+          "description": "Rewrite every record through the local model before it is filtered: this is the system prompt, the record goes up as {\"messages\":[...]} and the reply must come back in the same shape. Cached on the record's own text, so a corpus rewritten once stays rewritten across every later build."
+        },
+        "transform_when": {
+          "$ref": "#/definitions/strings",
+          "description": "Only rewrite records whose text contains one of these. Empty rewrites all of them."
+        },
+        "transform_only": {
+          "type": "boolean",
+          "description": "Keep ONLY the records the rewrite applied to, dropping everything transform_when did not match. With cache_only this materializes a rewrite into a corpus of its own, which other mixtures read as a plain jsonl source."
+        },
+        "transform_model": {
+          "type": "string",
+          "description": "Model for the rewrite alone. Empty inherits the [llm] model."
+        },
+        "transform_temperature": {
+          "type": "number",
+          "description": "Temperature for the rewrite alone (default 0.2 - a translation, not a generation)."
+        },
+        "verify": {
+          "type": "string",
+          "enum": [
+            "",
+            "rust"
+          ],
+          "description": "Compile the code a rewritten record carries and drop what does not build. \"rust\" extracts its ```rust blocks and runs rustc; empty disables the check."
+        },
+        "verify_repair": {
+          "type": "string",
+          "description": "Prompt for one repair pass: the record and rustc's own errors go up, the corrected record comes back. Empty drops a failing record instead of trying to fix it."
+        },
+        "system_strip": {
+          "$ref": "#/definitions/strings",
+          "description": "Sentences cut out of a system turn before anything else. The corpus's system turns are a handful of repeated strings; an identity line the model never sees at inference is a prop it learns to lean on."
+        },
+        "system_fold": {
+          "type": "boolean",
+          "description": "After stripping, move what remains of the system turn to the front of the first user turn and drop the system turn. Deleting the turn outright is unsafe: often the remainder is the record's only instruction."
         }
       }
     }

@@ -109,6 +109,53 @@ pub struct Filters {
     /// Trim a conversation to the last whole exchange that fits `max_tokens`
     /// instead of dropping it. Only affects `chat`-shaped records.
     pub trim_turns: bool,
+    /// Rewrite every record through the local model before it is filtered.
+    /// This is the system prompt; the record goes up as `{"messages": [...]}`
+    /// and the reply must come back in the same shape. Empty = no rewriting
+    /// (and no server needed).
+    ///
+    /// The rewrite is keyed on the record's own text, so it is cached like any
+    /// other completion: a corpus rewritten once stays rewritten across every
+    /// later `build` for free, and only records the sources have never yielded
+    /// before reach the server.
+    pub transform: String,
+    /// Rewrite only records whose text contains one of these. Empty = all of
+    /// them. The gate is what keeps a whole-corpus rewrite affordable: on
+    /// `assistant_qa` only 24% of records carry Python at all.
+    pub transform_when: Vec<String>,
+    pub transform_model: String,
+    pub transform_temperature: f32,
+    /// Keep ONLY the records the rewrite applied to, dropping everything
+    /// `transform_when` did not match. What it is for is materializing a
+    /// rewrite into a corpus of its own: with `cache_only`, a mixture then
+    /// writes exactly the records that have been translated and nothing else,
+    /// and every other mixture can read that file as a plain `jsonl` source
+    /// instead of carrying the rewrite prompt and re-deriving it.
+    pub transform_only: bool,
+    /// Sentences cut out of a system turn before anything else happens. The
+    /// corpus's system turns are 246 distinct strings of which twelve cover
+    /// 32% of the records, so most of what is in them is a constant the model
+    /// would learn to lean on and then never see at inference.
+    pub system_strip: Vec<String>,
+    /// After stripping, move whatever is left of the system turn to the front
+    /// of the first user turn and drop the system turn itself.
+    ///
+    /// Deleting the turn outright is not an option: in 23k records the system
+    /// turn is not framing but the *only* instruction ("Rewrite the input text
+    /// to make it more professional"), the user turn being the raw material.
+    /// Folding removes the constant while keeping the record answerable, and
+    /// puts the instruction where a user would actually type it.
+    pub system_fold: bool,
+    /// Compile the code a record carries and drop what does not build.
+    /// `"rust"` extracts its ```rust blocks and runs them through `rustc`;
+    /// empty disables the check. Runs on rewritten records only — it is the
+    /// gate on what the rewrite produced.
+    pub verify: String,
+    /// Prompt for one repair pass: the record and `rustc`'s own errors go up,
+    /// the corrected record comes back. Empty drops a failing record instead of
+    /// trying to fix it. One pass is worth having and two are not — measured
+    /// 63% -> 79% on the first attempt and nothing on the second.
+    pub verify_repair: String,
 }
 
 impl Default for Filters {
@@ -131,6 +178,15 @@ impl Default for Filters {
             judge_model: String::new(),
             judge_temperature: 0.0,
             trim_turns: false,
+            transform: String::new(),
+            transform_when: Vec::new(),
+            transform_model: String::new(),
+            transform_only: false,
+            transform_temperature: 0.2,
+            system_strip: Vec::new(),
+            system_fold: false,
+            verify: String::new(),
+            verify_repair: String::new(),
         }
     }
 }
@@ -222,8 +278,44 @@ pub struct Llm {
     pub timeout: usize,
     pub retries: usize,
     /// Directory of cached replies. Empty disables caching.
+    ///
+    /// Deliberately outside `target/`: what accumulates here is not a build
+    /// artifact but the corpus itself. The Python->Rust rewrite of SmolTalk is
+    /// ~56 h of local generation, and it exists nowhere else — a `cargo clean`
+    /// under the old default took it with it, and so did deleting a build.
+    /// From `data/` it survives both, and any mixture can reproduce its corpus
+    /// from it with `cache_only = true` in minutes.
     pub cache: String,
     pub api_key: String,
+    /// Chat template written out, which switches every call to
+    /// `/v1/completions`. `{system}` and `{user}` are substituted. Empty = use
+    /// `/v1/chat/completions` and let the server apply its own template.
+    ///
+    /// The reason to take the template over is the thinking budget. A reasoning
+    /// model spends most of a completion deliberating, which a mechanical
+    /// rewrite does not need — but no OpenAI-compatible field turns it off
+    /// (`chat_template_kwargs`, `/no_think` and `reasoning.enabled` are all
+    /// ignored by LM Studio). Prefilling an empty `<think></think>` in the
+    /// template does turn it off, because the model reads its own thinking as
+    /// already finished. Measured on Python→Rust rewrites of this corpus:
+    /// 4.3 s against 43.6 s per record, and no reply truncated mid-answer.
+    pub completion_template: String,
+    /// Where a completion ends — the template's turn terminator, e.g.
+    /// `<|im_end|>`. Only used on the `/v1/completions` path.
+    pub completion_stop: Vec<String>,
+    /// Answer only out of the cache and never open a socket: a cache miss is
+    /// an error, which drops the record rather than generating it.
+    ///
+    /// What it is for is assembling a corpus from a long rewrite that is still
+    /// running. The build is then minutes instead of days, and what it holds is
+    /// exactly what has been translated so far — a record whose rewrite has not
+    /// come back yet is left out, which is the safe direction: the whole point
+    /// of the rewrite is that the untranslated form must not reach the corpus.
+    pub cache_only: bool,
+    /// Requests in flight. Match the server's parallel slot count (LM Studio
+    /// prints it as PARALLEL in `lms ps`); past that the extra requests only
+    /// queue and the aggregate rate does not move.
+    pub workers: usize,
 }
 
 impl Default for Llm {
@@ -235,8 +327,12 @@ impl Default for Llm {
             max_tokens: 1024,
             timeout: 300,
             retries: 2,
-            cache: "target/datamix-llm-cache".to_string(),
+            cache: "data/llm-cache".to_string(),
             api_key: String::new(),
+            completion_template: String::new(),
+            completion_stop: Vec::new(),
+            cache_only: false,
+            workers: 1,
         }
     }
 }
@@ -497,6 +593,10 @@ fn llm_from(kv: &Kv, path: &str) -> Result<Llm> {
         retries: kv.num("retries", d.retries, path)?,
         cache: kv.str("cache", &d.cache, path)?,
         api_key: kv.str("api_key", &d.api_key, path)?,
+        completion_template: kv.str("completion_template", &d.completion_template, path)?,
+        completion_stop: kv.list("completion_stop", &d.completion_stop, path)?,
+        cache_only: kv.bool("cache_only", d.cache_only, path)?,
+        workers: kv.num("workers", d.workers, path)?.max(1),
     })
 }
 
@@ -535,6 +635,19 @@ fn filters_from(kv: &Kv, base: &Filters, path: &str) -> Result<Filters> {
         judge_expect: kv.str("judge_expect", &base.judge_expect, path)?,
         judge_model: kv.str("judge_model", &base.judge_model, path)?,
         judge_temperature: kv.float("judge_temperature", base.judge_temperature, path)?,
+        transform: kv.str("transform", &base.transform, path)?,
+        transform_when: kv.list("transform_when", &base.transform_when, path)?,
+        transform_model: kv.str("transform_model", &base.transform_model, path)?,
+        transform_only: kv.bool("transform_only", base.transform_only, path)?,
+        transform_temperature: kv.float(
+            "transform_temperature",
+            base.transform_temperature,
+            path,
+        )?,
+        system_strip: kv.list("system_strip", &base.system_strip, path)?,
+        system_fold: kv.bool("system_fold", base.system_fold, path)?,
+        verify: kv.str("verify", &base.verify, path)?,
+        verify_repair: kv.str("verify_repair", &base.verify_repair, path)?,
         trim_turns: kv.bool("trim_turns", base.trim_turns, path)?,
     })
 }
@@ -728,11 +841,36 @@ count = 5
     /// newlines and indentation.
     #[test]
     fn the_shipped_mixtures_parse() {
-        for (name, text) in [
-            ("pretrain.toml", include_str!("../../mixes/pretrain.toml")),
-            ("assistant_sft.toml", include_str!("../../mixes/assistant_sft.toml")),
-            ("assistant_llm.toml", include_str!("../../mixes/assistant_llm.toml")),
-            ("assistant_qa.toml", include_str!("../../mixes/assistant_qa.toml")),
+        // `joined` marks the mixtures whose prompts are written as one flowing
+        // paragraph wrapped with trailing backslashes. For those, a double
+        // space or a second line means the join failed and the model is being
+        // sent the source file's indentation. `mixes/tools.toml` is written the
+        // other way on purpose — its prompts are multi-paragraph specifications
+        // with a column-aligned table of the tool surface in them — so those
+        // checks would be asserting the opposite of what the file wants.
+        for (name, text, joined) in [
+            ("pretrain.toml", include_str!("../../mixes/pretrain.toml"), true),
+            (
+                "assistant_sft.toml",
+                include_str!("../../mixes/assistant_sft.toml"),
+                true,
+            ),
+            (
+                "assistant_llm.toml",
+                include_str!("../../mixes/assistant_llm.toml"),
+                true,
+            ),
+            (
+                "assistant_qa.toml",
+                include_str!("../../mixes/assistant_qa.toml"),
+                true,
+            ),
+            ("tools.toml", include_str!("../../mixes/tools.toml"), false),
+            (
+                "rustified.toml",
+                include_str!("../../mixes/rustified.toml"),
+                false,
+            ),
         ] {
             let m = parse(text, name).unwrap_or_else(|e| panic!("{e}"));
             assert!(!m.sources.is_empty(), "{name} has no sources");
@@ -741,6 +879,14 @@ count = 5
                     continue;
                 }
                 assert!(src.prompt.contains("{n}"), "{}: prompt lost {{n}}", src.name);
+                assert!(
+                    !src.system.is_empty(),
+                    "{}: a generator with no system prompt invents its own format",
+                    src.name
+                );
+                if !joined {
+                    continue;
+                }
                 assert!(
                     !src.prompt.contains("  "),
                     "{}: wrapped prompt kept its indentation: {:?}",

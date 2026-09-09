@@ -14,6 +14,8 @@
 //   epoch <usize>     1-based epoch the run was in
 //   done <usize>      examples completed WITHIN that epoch
 //   step <usize>      trainer step count, cross-checked against the checkpoint
+//   origin <usize>    step the run started at — the LR warmup counts from here,
+//                     so resuming continues the ramp instead of restarting it
 //   examples <usize>  size of the SFT set when the run started
 //
 // The file is written together with every checkpoint save, so the pair stays
@@ -37,6 +39,8 @@ pub struct SftProgress {
     pub done: usize,
     /// Trainer step count at the time of writing.
     pub step: usize,
+    /// Step the run started at; the LR warmup is counted from here.
+    pub origin: usize,
     /// Number of examples the run loaded, to detect a changed dataset.
     pub examples: usize,
 }
@@ -49,6 +53,7 @@ impl SftProgress {
             epoch: 1,
             done: 0,
             step,
+            origin: step,
             examples,
         }
     }
@@ -71,6 +76,7 @@ pub fn save(model_path: &str, p: &SftProgress) -> io::Result<()> {
     writeln!(f, "epoch {}", p.epoch)?;
     writeln!(f, "done {}", p.done)?;
     writeln!(f, "step {}", p.step)?;
+    writeln!(f, "origin {}", p.origin)?;
     writeln!(f, "examples {}", p.examples)?;
     Ok(())
 }
@@ -82,6 +88,7 @@ pub fn load(model_path: &str) -> Option<SftProgress> {
     let mut epoch = None;
     let mut done = None;
     let mut step = None;
+    let mut origin = None;
     let mut examples = None;
     let mut version = None;
     for line in text.lines() {
@@ -95,6 +102,7 @@ pub fn load(model_path: &str) -> Option<SftProgress> {
             "epoch" => epoch = val.parse::<usize>().ok(),
             "done" => done = val.parse::<usize>().ok(),
             "step" => step = val.parse::<usize>().ok(),
+            "origin" => origin = val.parse::<usize>().ok(),
             "examples" => examples = val.parse::<usize>().ok(),
             _ => {}
         }
@@ -107,6 +115,10 @@ pub fn load(model_path: &str) -> Option<SftProgress> {
         epoch: epoch?,
         done: done?,
         step: step?,
+        // Sidecars written before the warmup schedule existed carry no origin;
+        // treating the recorded step as the start leaves the rest of the run at
+        // full LR, which is what those runs were already doing.
+        origin: origin.unwrap_or(step?),
         examples: examples?,
     })
 }
@@ -179,6 +191,7 @@ mod tests {
             epoch: 3,
             done: 421,
             step: 90_210,
+            origin: 88_000,
             examples: 15_011,
         };
         save(&path, &p).unwrap();
@@ -199,6 +212,7 @@ mod tests {
             epoch: 2,
             done: 10,
             step: 100,
+            origin: 40,
             examples: 500,
         };
         save(&path, &p).unwrap();

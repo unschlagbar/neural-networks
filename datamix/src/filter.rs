@@ -25,6 +25,10 @@ pub enum Reject {
     Language,
     Duplicate,
     Judged,
+    Rewritten,
+    Uncompilable,
+    NotTransformed,
+    Unjudged,
 }
 
 impl Reject {
@@ -42,6 +46,10 @@ impl Reject {
             Reject::Language => "language",
             Reject::Duplicate => "duplicate",
             Reject::Judged => "rejected by the judge",
+            Reject::Rewritten => "rewrite failed",
+            Reject::Uncompilable => "code does not compile",
+            Reject::NotTransformed => "outside the rewrite",
+            Reject::Unjudged => "not yet judged (cache_only)",
         }
     }
 }

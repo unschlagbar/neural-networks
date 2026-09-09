@@ -115,6 +115,90 @@ fn build_tokens(
 pub struct Turn {
     pub role: Role,
     pub content: String,
+    /// Byte ranges of `content` that carry no loss: the model reads them and is
+    /// never trained to write them. Empty — the usual case — means the whole
+    /// turn is trained. This is `Role::AssistantContext` at sub-turn
+    /// resolution, and it is what lets one answer hold a wrong tool call and
+    /// its correction while only the correction is learned.
+    ///
+    /// Half-open, in bytes of the raw `content`. Order and overlap do not
+    /// matter (they are normalized when the turn is assembled), and a border
+    /// inside a word is rounded out to the word border by the segmentation —
+    /// words are the unit the mask is applied in.
+    pub no_loss: Vec<(usize, usize)>,
+}
+
+impl Turn {
+    pub fn new(role: Role, content: impl Into<String>) -> Turn {
+        Turn {
+            role,
+            content: content.into(),
+            no_loss: Vec::new(),
+        }
+    }
+
+    /// The same turn with part of its content excluded from the loss.
+    pub fn with_mask(mut self, no_loss: Vec<(usize, usize)>) -> Turn {
+        self.no_loss = no_loss;
+        self
+    }
+}
+
+/// Cut `content` into consecutive `(piece, carries_loss)` runs at the borders
+/// of `no_loss`. The pieces are cut from the *trimmed* text — what the template
+/// actually writes — so leading whitespace shifts every offset; borders that
+/// land inside a multi-byte character are pushed out to its edge, and
+/// overlapping ranges are merged. With no mask this is one piece, the whole
+/// turn, which is the path every ordinary record takes.
+fn mask_pieces<'a>(content: &'a str, no_loss: &[(usize, usize)]) -> Vec<(&'a str, bool)> {
+    let text = content.trim();
+    if no_loss.is_empty() || text.is_empty() {
+        return vec![(text, true)];
+    }
+    let off = content.len() - content.trim_start().len();
+    let mut ranges: Vec<(usize, usize)> = no_loss
+        .iter()
+        .map(|&(s, e)| {
+            (
+                floor_boundary(text, s.saturating_sub(off).min(text.len())),
+                ceil_boundary(text, e.saturating_sub(off).min(text.len())),
+            )
+        })
+        .filter(|&(s, e)| e > s)
+        .collect();
+    ranges.sort_unstable();
+
+    let mut pieces = Vec::new();
+    let mut at = 0usize;
+    for (s, e) in ranges {
+        let s = s.max(at);
+        if e <= s {
+            continue;
+        }
+        if s > at {
+            pieces.push((&text[at..s], true));
+        }
+        pieces.push((&text[s..e], false));
+        at = e;
+    }
+    if at < text.len() {
+        pieces.push((&text[at..], true));
+    }
+    pieces
+}
+
+fn floor_boundary(text: &str, mut i: usize) -> usize {
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_boundary(text: &str, mut i: usize) -> usize {
+    while i < text.len() && !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,9 +246,53 @@ pub fn parse_messages(line: &str) -> Option<Vec<Turn>> {
         ) else {
             continue;
         };
-        turns.push(Turn { role, content });
+        turns.push(Turn {
+            role,
+            content,
+            no_loss: json_pairs(obj, "no_loss"),
+        });
     }
     (!turns.is_empty()).then_some(turns)
+}
+
+/// Decode a `"key": [[a, b], [c, d]]` array of integer pairs. The values are
+/// read as a flat run of integers and paired up, so the nesting itself carries
+/// no meaning — an odd trailing number is dropped. Missing key, or anything but
+/// an array of numbers, gives an empty mask, which reads as "train the whole
+/// turn".
+fn json_pairs(obj: &str, key: &str) -> Vec<(usize, usize)> {
+    let Some(at) = key_position(obj, key) else {
+        return Vec::new();
+    };
+    let rest = obj[at..].trim_start();
+    if !rest.starts_with('[') {
+        return Vec::new();
+    }
+    let mut depth = 0usize;
+    let mut end = rest.len();
+    for (i, b) in rest.bytes().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let nums: Vec<usize> = rest[..end]
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    nums.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| (p[0], p[1]))
+        .collect()
 }
 
 /// The `{...}` objects of an array body, as slices. Brace depth is tracked
@@ -261,13 +389,24 @@ fn build_conversation(
                 if content.is_empty() || !open_prompt {
                     continue;
                 }
-                let start = tokens.len();
-                tokens.extend(tok.to_tokens_markup(content));
+                // Every piece is written; only the trained ones record a span.
+                // A context turn records none at all, so it is read by the
+                // backbone and never predicted.
+                let mut turn_spans = Vec::new();
+                for (piece, keep) in mask_pieces(&turn.content, &turn.no_loss) {
+                    let start = tokens.len();
+                    tokens.extend(tok.to_tokens_markup(piece));
+                    if keep && tokens.len() > start && turn.role == Role::Assistant {
+                        turn_spans.push((start, tokens.len()));
+                    }
+                }
                 tokens.push(END_TOKEN);
-                // The only difference: a context turn records no loss span, so
-                // it is read by the backbone and never predicted.
-                if turn.role == Role::Assistant {
-                    spans.push((start, tokens.len()));
+                // `<END>` closes a turn the model is being trained to produce,
+                // so it joins the loss whenever any part of the turn does —
+                // even when the tail of the answer is masked out.
+                if !turn_spans.is_empty() {
+                    turn_spans.push((tokens.len() - 1, tokens.len()));
+                    spans.append(&mut turn_spans);
                 }
                 open_prompt = false;
             }
@@ -676,28 +815,105 @@ mod tests {
         assert!(parse_messages(r#"{"instruction": "x", "response": "y"}"#).is_none());
     }
 
+    /// A `no_loss` range inside an assistant turn splits it: the masked text is
+    /// written, read and never trained, the rest of the same answer is.
+    #[test]
+    fn a_masked_range_splits_one_answer() {
+        let tok = Utf8Tokenizer::new();
+        let answer = "wrong guess. actually four.";
+        let cut = answer.find("actually").unwrap();
+        let turns = vec![
+            Turn::new(Role::User, "what is 2+2?"),
+            Turn::new(Role::Assistant, answer).with_mask(vec![(0, cut)]),
+        ];
+        let ex = build_example_turns(&tok, &turns).unwrap();
+
+        // The answer is present in full — masking removes gradient, not text.
+        assert!(tok.to_text_markup(&ex.tokens).contains(answer));
+
+        let text = |w: &Range<usize>| tok.to_text_markup(&ex.tokens[w.start..w.end]);
+        let trained: String = ex
+            .words
+            .iter()
+            .zip(&ex.loss)
+            .filter(|&(_, &on)| on)
+            .map(|(w, _)| text(w))
+            .collect();
+        assert!(trained.contains("actually"), "{trained:?}");
+        assert!(!trained.contains("wrong"), "{trained:?}");
+        // <END> closes an answer the model IS trained to produce.
+        assert!(*ex.loss.last().unwrap());
+    }
+
+    /// Masking every part of an answer leaves nothing to learn from, so the
+    /// turn behaves exactly like `assistant_context`.
+    #[test]
+    fn a_fully_masked_answer_trains_nothing() {
+        let tok = Utf8Tokenizer::new();
+        let answer = "an answer";
+        let masked = vec![
+            Turn::new(Role::User, "q"),
+            Turn::new(Role::Assistant, answer).with_mask(vec![(0, answer.len())]),
+        ];
+        assert!(build_example_turns(&tok, &masked).is_none());
+
+        // ... and it is still written: the same tokens as the context role.
+        let ctx = vec![
+            Turn::new(Role::User, "q"),
+            Turn::new(Role::AssistantContext, answer),
+            Turn::new(Role::User, "again"),
+            Turn::new(Role::Assistant, "ok"),
+        ];
+        let mut with_mask = ctx.clone();
+        with_mask[1].role = Role::Assistant;
+        with_mask[1].no_loss = vec![(0, answer.len())];
+        let a = build_example_turns(&tok, &ctx).unwrap();
+        let b = build_example_turns(&tok, &with_mask).unwrap();
+        assert_eq!(a.tokens, b.tokens);
+        assert_eq!(a.loss, b.loss);
+    }
+
+    /// Ranges are normalized, not trusted: out of order, overlapping, past the
+    /// end, or inside a multi-byte character, the token stream is unchanged and
+    /// the mask still covers what it names.
+    #[test]
+    fn ranges_are_normalized() {
+        let text = "  äöü one two three  ";
+        let pieces = mask_pieces(text, &[(9, 12), (5, 10), (100, 200)]);
+        let joined: String = pieces.iter().map(|&(p, _)| p).collect();
+        assert_eq!(joined, text.trim());
+        // The border at 5 falls inside 'ü' (bytes 4..6 of the trimmed text) and
+        // is pushed to its edge, so no piece splits a character.
+        assert!(pieces.iter().all(|&(p, _)| !p.is_empty()));
+        let masked: String = pieces
+            .iter()
+            .filter(|&&(_, keep)| !keep)
+            .map(|&(p, _)| p)
+            .collect();
+        assert!(masked.contains("one"), "{masked:?}");
+    }
+
+    #[test]
+    fn parses_a_no_loss_mask() {
+        let line = r#"{"messages": [{"role": "assistant", "content": "a b",
+            "no_loss": [[0, 2], [5, 9]]}]}"#;
+        let turns = parse_messages(line).unwrap();
+        assert_eq!(turns[0].no_loss, vec![(0, 2), (5, 9)]);
+        // A turn without the key is trained whole.
+        let plain = r#"{"messages": [{"role": "user", "content": "a"}]}"#;
+        assert!(parse_messages(plain).unwrap()[0].no_loss.is_empty());
+    }
+
     /// Every assistant turn carries loss, every user turn does not — the whole
     /// point of multi-turn masking.
     #[test]
     fn each_assistant_turn_is_masked_in() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn {
-                role: Role::User,
-                content: "first question".into(),
-            },
-            Turn {
-                role: Role::Assistant,
-                content: "first answer".into(),
-            },
-            Turn {
-                role: Role::User,
-                content: "second question".into(),
-            },
-            Turn {
-                role: Role::Assistant,
-                content: "second answer".into(),
-            },
+            Turn::new(Role::User, "first question"),
+            Turn::new(Role::Assistant, "first answer"),
+            Turn::new(Role::User, "second question"),
+            Turn::new(Role::Assistant, "second answer"),
         ];
         let ex = build_example_turns(&tok, &turns).unwrap();
 
@@ -726,22 +942,10 @@ mod tests {
     fn a_tool_result_is_prompt_side() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn {
-                role: Role::User,
-                content: "turn on the light".into(),
-            },
-            Turn {
-                role: Role::Assistant,
-                content: "<tool>lamp.set(on=true)</tool>".into(),
-            },
-            Turn {
-                role: Role::Tool,
-                content: "already_on".into(),
-            },
-            Turn {
-                role: Role::Assistant,
-                content: "It's already on.".into(),
-            },
+            Turn::new(Role::User, "turn on the light"),
+            Turn::new(Role::Assistant, "<tool>lamp.set(on=true)</tool>"),
+            Turn::new(Role::Tool, "already_on"),
+            Turn::new(Role::Assistant, "It's already on."),
         ];
         let ex = build_example_turns(&tok, &turns).unwrap();
         let text = tok.to_text_markup(&ex.tokens);
@@ -788,22 +992,10 @@ mod tests {
     fn a_context_assistant_turn_carries_no_loss() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn {
-                role: Role::User,
-                content: "turn the light on".into(),
-            },
-            Turn {
-                role: Role::AssistantContext,
-                content: "<tool>lamp.set(on=false)</tool>".into(),
-            },
-            Turn {
-                role: Role::Tool,
-                content: "already_off".into(),
-            },
-            Turn {
-                role: Role::Assistant,
-                content: "<tool>lamp.set(on=true)</tool>".into(),
-            },
+            Turn::new(Role::User, "turn the light on"),
+            Turn::new(Role::AssistantContext, "<tool>lamp.set(on=false)</tool>"),
+            Turn::new(Role::Tool, "already_off"),
+            Turn::new(Role::Assistant, "<tool>lamp.set(on=true)</tool>"),
         ];
         let ex = build_example_turns(&tok, &turns).unwrap();
         let text = tok.to_text(&ex.tokens);
@@ -832,14 +1024,8 @@ mod tests {
     fn a_conversation_of_only_context_turns_is_rejected() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn {
-                role: Role::User,
-                content: "hello".into(),
-            },
-            Turn {
-                role: Role::AssistantContext,
-                content: "wrong".into(),
-            },
+            Turn::new(Role::User, "hello"),
+            Turn::new(Role::AssistantContext, "wrong"),
         ];
         assert!(build_example_turns(&tok, &turns).is_none());
     }
@@ -849,18 +1035,9 @@ mod tests {
     fn a_tool_result_without_a_call_is_dropped() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn {
-                role: Role::User,
-                content: "hello".into(),
-            },
-            Turn {
-                role: Role::Tool,
-                content: "ok".into(),
-            },
-            Turn {
-                role: Role::Assistant,
-                content: "hi".into(),
-            },
+            Turn::new(Role::User, "hello"),
+            Turn::new(Role::Tool, "ok"),
+            Turn::new(Role::Assistant, "hi"),
         ];
         let ex = build_example_turns(&tok, &turns).unwrap();
         assert!(!tok.to_text_markup(&ex.tokens).contains("<result>"));
@@ -870,18 +1047,9 @@ mod tests {
     fn a_system_message_takes_the_context_slot_and_carries_no_loss() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn {
-                role: Role::System,
-                content: "you are terse".into(),
-            },
-            Turn {
-                role: Role::User,
-                content: "hi".into(),
-            },
-            Turn {
-                role: Role::Assistant,
-                content: "hello".into(),
-            },
+            Turn::new(Role::System, "you are terse"),
+            Turn::new(Role::User, "hi"),
+            Turn::new(Role::Assistant, "hello"),
         ];
         let ex = build_example_turns(&tok, &turns).unwrap();
         assert_eq!(ex.tokens.iter().filter(|&&t| t == CONTEXT_TOKEN).count(), 1);
@@ -898,18 +1066,9 @@ mod tests {
     fn a_dangling_user_turn_is_dropped() {
         let tok = Utf8Tokenizer::new();
         let turns = vec![
-            Turn {
-                role: Role::User,
-                content: "answered".into(),
-            },
-            Turn {
-                role: Role::Assistant,
-                content: "yes".into(),
-            },
-            Turn {
-                role: Role::User,
-                content: "unanswered".into(),
-            },
+            Turn::new(Role::User, "answered"),
+            Turn::new(Role::Assistant, "yes"),
+            Turn::new(Role::User, "unanswered"),
         ];
         let ex = build_example_turns(&tok, &turns).unwrap();
         let text = tok.to_text(&ex.tokens);
@@ -920,10 +1079,7 @@ mod tests {
     #[test]
     fn an_assistant_only_conversation_is_rejected() {
         let tok = Utf8Tokenizer::new();
-        let turns = vec![Turn {
-            role: Role::Assistant,
-            content: "unprompted".into(),
-        }];
+        let turns = vec![Turn::new(Role::Assistant, "unprompted")];
         assert!(build_example_turns(&tok, &turns).is_none());
     }
 }

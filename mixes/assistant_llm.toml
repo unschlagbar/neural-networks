@@ -7,7 +7,7 @@
 #   cargo run -p datamix --release -- sample mixes/assistant_llm.toml -n 8
 #   cargo run -p datamix --release -- build  mixes/assistant_llm.toml
 #
-# Replies are cached under target/datamix-llm-cache, so a rebuild costs nothing
+# Replies are cached under data/llm-cache, so a rebuild costs nothing
 # and only new prompts hit the server. Delete that directory to regenerate.
 
 [output]

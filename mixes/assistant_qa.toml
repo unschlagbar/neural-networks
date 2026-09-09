@@ -5,7 +5,21 @@
 #   cargo run -p datamix --release -- build  mixes/assistant_qa.toml
 #   cargo run -p datamix --release -- verify data/mix/assistant_qa.jsonl
 #
-# Calls no LLM server: every source is a file or a template.
+# This build opens no socket. The two corpora that cost generation time — the
+# Python->Rust rewrite and the tool-calling data — are built once by their own
+# mixtures and read back here as files:
+#
+#   mixes/rustified.toml -> data/sources/rustified.jsonl   (~56 h, once)
+#   mixes/tools.toml     -> data/sources/tools.jsonl       (hours, once)
+#
+# `data/sources/` holds ingredients — corpora that exist to be read by another
+# mixture. `data/mix/` holds only the finished datasets a trainer opens:
+# this file's output and `pretrain_v2/`.
+#
+# So they are in every build of this corpus rather than only in the ones that
+# carry a copy of the rewrite prompt, and deleting this corpus does not take
+# either of them with it. Rebuild those when you want more of them; this file
+# is then seconds.
 #
 # SmolTalk is split by its `source` column rather than taken whole, because its
 # subsets are not variations on a theme — the mean assistant answer runs from
@@ -29,13 +43,68 @@ holdout = 0.02
 # and the corpus is smaller — repeating it would be paying in overfitting for a
 # number that only looks bigger.
 weight_by = "records"
-records = 0
+# Weights below are literal PERCENTAGES of the corpus, and the budget is set
+# above what the sources can supply, so every source gives everything it has
+# once (`epochs = 1`) and the corpus is as large as the data allows. A source
+# that cannot fill its share is reported `capped` rather than repeated.
+records = 150000
+
+# No [llm] table: nothing in this mixture calls out. The generation lives in
+# mixes/rustified.toml and mixes/tools.toml.
 
 [filter]
 max_words = 4096
 max_tokens = 28672
 min_bytes = 16
 dedup = "exact"
+
+# Python out, Rust in. The model is meant to write Rust — the pretraining corpus
+# is StarCoder-Rust and rust-lib — while SmolTalk's code half is overwhelmingly
+# Python: 36,975 ```python fences against 104 ```rust ones, in 24% of the
+# records. Left alone that is what the model learns code *is*.
+#
+# The rewrite itself lives in mixes/rustified.toml, which writes the translated
+# records to data/sources/rustified.jsonl and is read back below as a source. What
+# stays here is the other half of the same decision: a SmolTalk record still
+# carrying Python must not come in UNtranslated. The gate that used to choose
+# what to send to the model is therefore now a blocklist, and it is the same
+# list — a record matching any of it is dropped, because the version of it that
+# belongs in this corpus is already in rustified.jsonl.
+#
+# It is deliberately wide. The word alone is enough: an answer that merely
+# recommends Python is the same defect as a Python code block, and so are the
+# ecosystem names that give it away when the word itself never appears. It also
+# drops the occasional carpet python and Monty Python sketch, which is a few
+# dozen records and not worth a cleverer rule.
+must_not_contain = [
+    "```python", "```py", "python", "Python",
+    "pip install", "numpy", "pandas", "matplotlib", "scikit", "PyTorch",
+    "Django", "Flask", "Jupyter", "virtualenv", "__init__",
+]
+
+# The corpus's system turns are 246 distinct strings, twelve of which cover
+# 32% of every record — "You're an AI assistant for text re-writing." alone
+# opens 13.6% of them. A constant that large is a prop: the model learns to
+# answer with it in front of the prompt, and at inference it is never there.
+#
+# Only the identity sentence goes. What follows it is usually the record's ONLY
+# instruction ("Rewrite the input text to make it more professional", with the
+# user turn holding just the raw email), so cutting the whole turn would leave
+# 23k records that cannot be answered from what is left. Where the framing is
+# all there was, the turn disappears on its own.
+#
+# `system_fold = true` would go further and move the surviving instruction into
+# the user turn, which is where inference puts it. Left off: it changes more
+# than was asked for.
+system_strip = [
+    "You are an AI rewriting assistant. You will be provided with a text and you need to rewrite it according to the user's instructions.",
+    "You are an AI assistant that helps people find information.",
+    "You are an AI assistant that follows instruction extremely well.",
+    "You are a helpful assistant, who always provide explanation.",
+    "You're an AI assistant for text re-writing.",
+    "You are an AI assistant.",
+]
+system_fold = false
 
 # Who it is and how it sounds when nothing needs doing. Without this, asked
 # "who are you?", the model answers from whatever persona data dominates.
@@ -44,30 +113,31 @@ kind = "synth"
 path = "mixes/synth/persona.syn"
 count = 1500
 epochs = 1
-weight = 1
+weight = 0.5
 
-[source.lamp]
-kind = "synth"
-path = "mixes/synth/lamp.syn"
-count = 3000
+# Everything the model knows about calling a tool: the templates that guarantee
+# coverage of every tool, argument and result string, and the generated data
+# that varies how long the request is, where in a conversation it arrives, what
+# happens when the first call is wrong, and which requests only look like tool
+# requests. Built by mixes/tools.toml.
+[source.tools]
+kind = "dolly"
+path = "data/sources/tools.jsonl"
 epochs = 1
-weight = 0.35
+# 3% of the corpus. A quarter of it was tool exchanges when the tool data was
+# weighted to be fully consumed, which teaches an assistant that mostly talks to
+# reach for a tool first. At 3% the corpus draws about 4.5k of the 6.5k records
+# in tools.jsonl; the rest keep in the file for a larger corpus later.
+weight = 3
 
-[source.apps]
-kind = "synth"
-path = "mixes/synth/apps.syn"
-count = 3000
+# The Python half of SmolTalk, translated into Rust. Built by
+# mixes/rustified.toml out of data/llm-cache; the blocklist in [filter] above is
+# what keeps the untranslated originals from coming in alongside it.
+[source.rustified]
+kind = "dolly"
+path = "data/sources/rustified.jsonl"
 epochs = 1
-weight = 0.35
-
-# Tool calls that are not the first turn of an empty conversation: after small
-# talk, under a system context, with the conversation carrying on afterwards.
-[source.tools_in_context]
-kind = "synth"
-path = "mixes/synth/tools_in_context.syn"
-count = 4000
-epochs = 1
-weight = 0.3
+weight = 3
 
 # Short, natural chat — the register everything else is measured against.
 # `explore-instruct-rewrite` only: 3017 conversations, 3009 distinct assistant
@@ -79,7 +149,7 @@ select_column = "source"
 select_values = ["explore-instruct-rewrite"]
 trim_turns = true
 epochs = 1
-weight = 3
+weight = 2
 
 # `everyday-conversations`, kept small on purpose. 2241 of its 8595 assistant
 # turns are the single string "Hello! How can I help you today?" — 8x more
@@ -95,7 +165,10 @@ select_column = "source"
 select_values = ["everyday-conversations"]
 trim_turns = true
 epochs = 1
-weight = 0.5
+# The only source in the corpus that goes past three exchanges: 80% of it is
+# four. Raised from 0.5 because answer quality decays with conversation depth
+# and 86.6% of the corpus was a single exchange — see smoltalk_long below.
+weight = 1.5
 
 # Rewriting, summarizing, constrained answers: real tasks, moderate length.
 [source.smoltalk_tasks]
@@ -105,7 +178,7 @@ select_column = "source"
 select_values = ["smol-summarize-20k", "smol-contraints", "smollm-rewrite-30k"]
 trim_turns = true
 epochs = 1
-weight = 41
+weight = 30
 
 # General knowledge and code, so trimming the essays does not cost it substance.
 [source.smoltalk_knowledge]
@@ -115,10 +188,18 @@ select_column = "source"
 select_values = ["openhermes-50k", "self-oss-instruct"]
 trim_turns = true
 epochs = 1
-weight = 41.5
+weight = 25
 
-# The long-form register, kept as a minority so it can still write at length
-# when asked, rather than by default.
+# Despite the name, this is the corpus's multi-turn source, not just its
+# long-form one: 98.3% of it is exactly three exchanges, where every other
+# SmolTalk subset here is a single one. Raised from 12 because the model's
+# answers degrade as a conversation gets longer, and 86.6% of the corpus was
+# teaching it only how to answer turn one.
+#
+# It cannot fix depth past three — nothing in this corpus reaches turn four, and
+# all ten of this SmolTalk copy's subsets are already in use, so deeper
+# conversations have to be generated rather than sourced. Raising the weight
+# costs no extra rewriting: the source reads the same 279k records either way.
 [source.smoltalk_long]
 kind = "chat"
 path = "/home/unschlagbar/training_data/smol-smoltalk"
@@ -126,4 +207,4 @@ select_column = "source"
 select_values = ["smol-magpie-ultra-short", "longalign", "smol-summarize-5k"]
 trim_turns = true
 epochs = 1
-weight = 12
+weight = 35

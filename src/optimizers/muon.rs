@@ -81,15 +81,15 @@ fn grow(v: &mut Vec<f32>, len: usize) {
 /// reduction despite float non-associativity (two AVX2 FMA chains in flight).
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0.0; 16];
-    let mut ca = a.chunks_exact(16);
-    let mut cb = b.chunks_exact(16);
-    for (x, y) in (&mut ca).zip(&mut cb) {
+    let ca = a.as_chunks::<16>();
+    let cb = b.as_chunks::<16>();
+    for (x, y) in ca.0.iter().zip(cb.0) {
         for l in 0..16 {
             acc[l] += x[l] * y[l];
         }
     }
     let mut sum: f32 = acc.iter().sum();
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (&x, &y) in ca.1.iter().zip(cb.1) {
         sum += x * y;
     }
     sum

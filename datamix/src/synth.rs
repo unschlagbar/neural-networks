@@ -280,10 +280,7 @@ impl Synth {
                 turns: t
                     .turns
                     .iter()
-                    .map(|(role, text)| Turn {
-                        role: *role,
-                        content: fill(text, &bind, rng),
-                    })
+                    .map(|(role, text)| Turn::new(*role, fill(text, &bind, rng)))
                     .collect(),
                 category,
             };

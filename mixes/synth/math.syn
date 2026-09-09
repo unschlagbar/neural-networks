@@ -1,0 +1,160 @@
+# Arithmetic. There is ONE math tool and it takes ONE argument: an infix
+# expression as a string.
+#
+#   math.eval(expr="…")  -> the value | error: <what it choked on>
+#
+# Why this layout and not another. Per-operation tools (`math.add(a, b)`) turn
+# `(87.40 - 12) / 3` into three chained calls and three chances to lose a
+# number. An RPN or JSON-AST argument is a syntax the pretraining corpus never
+# contains, so the model would have to learn it from these examples alone.
+# Infix in a quoted string is the one form already everywhere in the
+# pretraining data, and it is the same `name="…"` shape as `app.launch` — one
+# argument convention across the whole tool surface.
+#
+# The expression grammar: + - * / ^, parentheses, and sqrt/abs/min/max/
+# round/floor/ceil. No units, no currency symbols, no thousands separators and
+# no words — the assistant translates the request into bare arithmetic, and the
+# units live in the sentence it writes afterwards.
+#
+# `%` is not modulo, it is an error. The templates below teach `40% of 250` ->
+# `error: unexpected '%'` -> `250 * 0.40`, and a percent sign reaching this tool
+# is far likelier to be a person's phrasing than a request for a remainder.
+# `harness/src/tools/math.rs` implements exactly this grammar.
+#
+# The rule these templates teach: arithmetic is ALWAYS a call, even easy
+# arithmetic. A model that decides case by case whether a sum is easy enough to
+# do in its head gets it wrong exactly where it was most confident.
+#
+# Every number that has to agree across turns is a `list` field, never an inline
+# `{a|b}` choice: inline choices are drawn independently at each occurrence, so
+# the same alternation in the user turn and in the call would not match.
+
+list warm = Comes to | That's | Works out to | That'll be
+
+# 0 the amount as spoken, 1 how many share it, 2 the expression, 3 the result.
+list bill = 87.40 ; three ; 87.40 / 3 ; 29.13 | 124 ; four ; 124 / 4 ; 31 | 56.50 ; two ; 56.50 / 2 ; 28.25 | 213.75 ; five ; 213.75 / 5 ; 42.75
+
+# 0 the bill, 1 the tip percent, 2 the expression, 3 the total.
+list tip = 64 ; 15 ; 64 * 1.15 ; 73.60 | 48.20 ; 20 ; 48.20 * 1.20 ; 57.84 | 130 ; 18 ; 130 * 1.18 ; 153.40
+
+# 0 the old price, 1 the discount, 2 the expression, 3 the new price.
+list off = 89.99 ; 30 ; 89.99 * 0.70 ; 62.99 | 240 ; 15 ; 240 * 0.85 ; 204 | 55 ; 40 ; 55 * 0.60 ; 33
+
+# 0 and 1 the sides, 2 the expression, 3 the area.
+list room = 4.2 ; 3.6 ; 4.2 * 3.6 ; 15.12 | 5 ; 3.25 ; 5 * 3.25 ; 16.25 | 6.5 ; 4 ; 6.5 * 4 ; 26
+
+# 0 monthly pay, 1 the percent, 2 the expression, 3 the amount.
+list pay = 4200 ; 28 ; 4200 * 0.28 ; 1176 | 3150 ; 34 ; 3150 * 0.34 ; 1071 | 5800 ; 22 ; 5800 * 0.22 ; 1276
+
+# 0 what is in the account, 1 what is owed, 2 the expression, 3 the (negative)
+# result, 4 the shortfall spoken. The answer is a verdict, not the number.
+list short = 600 ; 725 ; 600 - 725 ; -125 ; 125 | 450 ; 510 ; 450 - 510 ; -60 ; 60 | 800 ; 940 ; 800 - 940 ; -140 ; 140
+
+# 0 km a week, 1 litres per 100, 2 the fuel expression, 3 the litres,
+# 4 the cost expression, 5 the cost. Two calls, the second built from the first
+# result — the reason the tool returns a number the assistant can reuse.
+list fuel = 520 ; 6.4 ; 520 * 6.4 / 100 ; 33.28 ; 33.28 * 1.75 ; 58.24 | 340 ; 7.1 ; 340 * 7.1 / 100 ; 24.14 ; 24.14 * 1.75 ; 42.25 | 780 ; 5.8 ; 780 * 5.8 / 100 ; 45.24 ; 45.24 * 1.75 ; 79.17
+
+# 0 what the recipe serves, 1 how many are coming, 2 the expression, 3 the factor.
+list recipe = 4 ; 6 ; 6 / 4 ; 1.5 | 6 ; 9 ; 9 / 6 ; 1.5 | 2 ; 5 ; 5 / 2 ; 2.5
+
+# 0 the question as asked, 1 the expression, 2 the answer.
+list plain = 6 times 14 ; 6 * 14 ; 84 | 218 plus 47 ; 218 + 47 ; 265 | 900 divided by 12 ; 900 / 12 ; 75 | 17 times 23 ; 17 * 23 ; 391
+
+# 0 what was asked, 1 the malformed expression written first, 2 what the tool
+# says about it, 3 the repair, 4 the answer.
+list slip = 12.50 three times ; 12,50 * 3 ; error: unexpected ',' ; 12.50 * 3 ; 37.50 | 40% of 250 ; 40% of 250 ; error: unexpected '%' ; 250 * 0.40 ; 100 | 18 dollars plus 6 ; $18 + $6 ; error: unexpected '$' ; 18 + 6 ; 24 | 3 times 7 ; 3 x 7 ; error: unexpected 'x' ; 3 * 7 ; 21
+
+# 0 the question, 1 the answer. Nothing here is arithmetic, and nothing here
+# calls a tool.
+list nomath = what's the capital of Norway ; Oslo. | who wrote Dune ; Frank Herbert. | what does RAII mean ; Resources are released when the value that owns them goes out of scope — no manual free. | how do you spell necessary ; N-E-C-E-S-S-A-R-Y — one c, two s's.
+
+# The plain case. Even here it calls: the habit is the point.
+template
+user      = what's {plain.0}?
+assistant = <tool>math.eval(expr="{plain.1}")</tool>
+tool      = {plain.2}
+assistant = {plain.2}.
+category  = math
+
+# Money, spoken. The request carries a currency symbol and the expression does
+# not — stripping the unit is the assistant's job, not the tool's.
+template
+user      = {we|the {bill.1} of us} {split|are splitting} a {bill|check} for ${bill.0}{| — how much each?|, what's my share?}
+assistant = <tool>math.eval(expr="{bill.2}")</tool>
+tool      = {bill.3}
+assistant = {warm.0} ${bill.3} each.
+category  = math
+
+template
+user      = {dinner was|the meal came to} ${tip.0} and I want to {leave|add} {tip.1}% {tip|on top} — what do I {pay|hand over}?
+assistant = <tool>math.eval(expr="{tip.2}")</tool>
+tool      = {tip.3}
+assistant = ${tip.3} {all in|with the tip}.
+category  = math
+
+template
+user      = {there's|it's} {off.1}% off {a jacket|a keyboard|the one I wanted} that was ${off.0}{|, what's it now?| — what do I pay?}
+assistant = <tool>math.eval(expr="{off.2}")</tool>
+tool      = {off.3}
+assistant = ${off.3}.
+category  = math
+
+# Arithmetic hidden inside a practical question. The user never says "multiply".
+template
+user      = {my|the} {room|floor} is {room.0} by {room.1} {metres|meters|m} — {how much paint do I need?|how many square metres is that?|is one tin enough?}
+assistant = <tool>math.eval(expr="{room.2}")</tool>
+tool      = {room.3}
+assistant = {room.3} square {metres|meters}. {One tin usually covers ten, so you're fine.|Check the tin — most cover about ten.}
+category  = math
+
+template
+user      = I {earn|take home|make} {pay.0} a month and {pay.1}% {goes on rent|of that is rent} — {how much is that?|what's rent costing me?}
+assistant = <tool>math.eval(expr="{pay.2}")</tool>
+tool      = {pay.3}
+assistant = {pay.3} a month.
+category  = math
+
+# The result is read, not repeated: the answer is a decision.
+template
+user      = {I've got|there's} {short.0} {left|in the account} and {rent's|the bill is} {short.1} — {am I short?|do I have enough?}
+assistant = <tool>math.eval(expr="{short.2}")</tool>
+tool      = {short.3}
+assistant = {You're short|Not quite|No — you're under} by {short.4}.
+category  = math
+
+# Repair. The tool's error is specific, so the second call is a fix and not a
+# guess. `error:` is the only thing this tool ever says that is not a number.
+# The wrong call is an `assistant_context` turn: read, never trained on.
+template
+user              = {what's|work out} {slip.0}
+assistant_context = <tool>math.eval(expr="{slip.1}")</tool>
+tool              = {slip.2}
+assistant         = <tool>math.eval(expr="{slip.3}")</tool>
+tool              = {slip.4}
+assistant         = {slip.4}.
+category          = math
+
+# Two numbers in one sentence. The second expression is built from the first
+# result, which is the whole reason the tool returns a value rather than prose.
+template
+user      = {I drive|it's} {fuel.0} km a week at {fuel.1} {litres|liters} per 100 — {what's that costing me at 1.75 a litre?|how much fuel, and what at 1.75?}
+assistant = <tool>math.eval(expr="{fuel.2}")</tool>
+tool      = {fuel.3}
+assistant = <tool>math.eval(expr="{fuel.4}")</tool>
+tool      = {fuel.5}
+assistant = {fuel.3} litres, {fuel.5} a week.
+category  = math
+
+template
+user      = {the recipe|it} {serves|is for} {recipe.0} and {I'm cooking for|there'll be} {recipe.1} — {scale it|what do I multiply by?}
+assistant = <tool>math.eval(expr="{recipe.2}")</tool>
+tool      = {recipe.3}
+assistant = {Multiply everything by|Everything times} {recipe.3}.
+category  = math
+
+# Not arithmetic. There is no tool for this and it does not invent one.
+template
+instruction = {nomath.0}?
+response    = {nomath.1}
+category    = math

@@ -140,17 +140,11 @@ pub fn sample_chat(model_path: &str) {
             let mut context = String::new();
             stdin().read_line(&mut context).unwrap();
             if !context.trim().is_empty() {
-                turns.push(Turn {
-                    role: Role::System,
-                    content: context.trim().to_string(),
-                });
+                turns.push(Turn::new(Role::System, context.trim().to_string()));
             }
         }
 
-        turns.push(Turn {
-            role: Role::User,
-            content: input.to_string(),
-        });
+        turns.push(Turn::new(Role::User, input.to_string()));
 
         // One user turn can take several rounds: a reply that is a tool call is
         // not the answer, it is a request for a result. `app.launch` failing into
@@ -168,10 +162,7 @@ pub fn sample_chat(model_path: &str) {
             let called_tool = reply.contains(&TOOL_OPEN_TOKEN);
             // Markup is kept in the turn text so re-encoding the history
             // reproduces the exact tokens the model just wrote.
-            turns.push(Turn {
-                role: Role::Assistant,
-                content: tokenizer.to_text_markup(&reply),
-            });
+            turns.push(Turn::new(Role::Assistant, tokenizer.to_text_markup(&reply)));
             if !called_tool {
                 break;
             }
@@ -185,10 +176,7 @@ pub fn sample_chat(model_path: &str) {
                 "" => "ok",
                 other => other,
             };
-            turns.push(Turn {
-                role: Role::Tool,
-                content: result.to_string(),
-            });
+            turns.push(Turn::new(Role::Tool, result.to_string()));
         }
     }
 }

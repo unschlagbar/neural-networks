@@ -158,7 +158,7 @@ fn build_mel_filters(
 
 // ── Radix-2 Cooley-Tukey FFT (in-place, DIT) ─────────────────────────────────
 
-fn fft_inplace(re: &mut Vec<f32>, im: &mut Vec<f32>) {
+fn fft_inplace(re: &mut [f32], im: &mut [f32]) {
     let n = re.len();
     debug_assert!(n.is_power_of_two());
     let log2n = n.trailing_zeros() as usize;

@@ -129,7 +129,7 @@ impl LinearLayer {
     ///
     /// `cache.dx` ← dL/d(input) = Wᵀ · delta.
     pub fn backward(&mut self, delta: &mut [f32], cache: &mut LinearCache) {
-        add_vec_in_place(&mut self.grads.biases.vec(), delta);
+        add_vec_in_place(self.grads.biases.vec(), delta);
 
         // Defer the weight-grad outer product: stash (input, delta) and fold
         // blocks in flush_grads, so gW is streamed once per block instead of

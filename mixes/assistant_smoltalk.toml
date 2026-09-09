@@ -8,7 +8,7 @@
 #
 # The `llm` sources call the local server and take roughly two seconds per
 # example, so the first build of 500 of them is ~15 minutes. Replies are cached
-# under target/datamix-llm-cache: rebuilding is free, and raising `count` only
+# under data/llm-cache: rebuilding is free, and raising `count` only
 # pays for the new ones.
 
 [output]

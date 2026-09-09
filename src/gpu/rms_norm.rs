@@ -60,8 +60,8 @@ impl RmsNorm {
         Self {
             gamma: GTensor::from_host(gpu, gamma),
             dgamma: GTensor::zeros(gpu, &[size]),
-            m: GTensor::zeros(gpu, &[size]),
-            v: GTensor::zeros(gpu, &[size]),
+            m: arena::unbacked(gpu),
+            v: arena::unbacked(gpu),
             size,
             group,
             fwd: None,
@@ -82,7 +82,9 @@ impl RmsNorm {
     /// is what lets a caller normalize a buffer in place.
     pub fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>) {
         self.fit_saved(gpu, x);
-        let Self { gamma, group, fwd, .. } = self;
+        let Self {
+            gamma, group, fwd, ..
+        } = self;
         let saved = fwd.as_mut().expect("fit_saved filled it");
         ops::rms_norm_forward_into(gpu, x, gamma, *group, EPS, out, saved);
     }
@@ -95,7 +97,9 @@ impl RmsNorm {
     /// across a forward/backward pair reads the wrong bits.
     pub fn forward_slab(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut ops::SlabBuf) {
         self.fit_saved(gpu, x);
-        let Self { gamma, group, fwd, .. } = self;
+        let Self {
+            gamma, group, fwd, ..
+        } = self;
         let saved = fwd.as_mut().expect("fit_saved filled it");
         ops::rms_norm_forward_into_slab(gpu, x, gamma, *group, EPS, out, saved);
     }
@@ -110,11 +114,12 @@ impl RmsNorm {
         let total_groups = b * (f / self.group);
         // Chunked sweep: the previous chunk's `inv_rms` is still owed a backward, so set
         // it aside rather than letting the refit below reuse its buffer.
-        if self.carry {
-            if let Some(prev) = self.fwd.take() {
-                self.chunk_saved.push(prev);
-            }
+        if self.carry
+            && let Some(prev) = self.fwd.take()
+        {
+            self.chunk_saved.push(prev);
         }
+
         match &self.fwd {
             Some(s) if s.inv_rms.len() == total_groups => {}
             _ => {
@@ -137,7 +142,13 @@ impl RmsNorm {
     }
 
     /// Backward into a freshly allocated `dX` `[B, F]`.
-    pub fn backward_alloc(&mut self, gpu: &Gpu, dy: &GTensor<f32>, y: &GTensor<f32>, cache: &TrainingCache) -> GTensor<f32> {
+    pub fn backward_alloc(
+        &mut self,
+        gpu: &Gpu,
+        dy: &GTensor<f32>,
+        y: &GTensor<f32>,
+        cache: &TrainingCache,
+    ) -> GTensor<f32> {
         let mut dx = GTensor::uninit(gpu, &[dy.rows(), dy.cols()]);
         self.backward(gpu, dy, y, &mut dx, cache);
         dx
@@ -154,8 +165,8 @@ impl RmsNorm {
         dy: &GTensor<f32>,
         y: &GTensor<f32>,
         dx: &mut GTensor<f32>,
-            cache: &TrainingCache,
-) {
+        cache: &TrainingCache,
+    ) {
         self.backward_wos(gpu, dy, ops::WideOrSlab::F32(y), dx, cache);
     }
 
@@ -168,8 +179,8 @@ impl RmsNorm {
         dy: &GTensor<f32>,
         y: &ops::SlabBuf,
         dx: &mut GTensor<f32>,
-            cache: &TrainingCache,
-) {
+        cache: &TrainingCache,
+    ) {
         self.backward_wos(gpu, dy, ops::WideOrSlab::Slab(y), dx, cache);
     }
 
@@ -179,8 +190,8 @@ impl RmsNorm {
         dy: &GTensor<f32>,
         y: ops::WideOrSlab<'_>,
         dx: &mut GTensor<f32>,
-            cache: &TrainingCache,
-) {
+        cache: &TrainingCache,
+    ) {
         let (_, f) = dy.as_2d();
         assert_eq!(f, self.size, "RmsNorm::backward — width mismatch");
         assert_eq!(y.as_2d(), dy.as_2d(), "RmsNorm::backward — y shape");
@@ -232,10 +243,7 @@ impl RmsNorm {
             .iter()
             .map(|t| t.capacity() * 4)
             .sum();
-        let act = self
-            .fwd
-            .as_ref()
-            .map_or(0, |s| s.inv_rms.len() * 4);
+        let act = self.fwd.as_ref().map_or(0, |s| s.inv_rms.len() * 4);
         (params, act)
     }
 

@@ -33,13 +33,13 @@ pub fn add_vec_in_place(x: &mut [f32], y: &[f32]) {
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let mut acc = [0.0f32; 8];
-    let ca = a.chunks_exact(8);
-    let cb = b.chunks_exact(8);
+    let ca = a.as_chunks::<8>();
+    let cb = b.as_chunks::<8>();
     let mut tail = 0.0;
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (x, y) in ca.1.iter().zip(cb.1) {
         tail += x * y;
     }
-    for (x8, y8) in ca.zip(cb) {
+    for (x8, y8) in ca.0.iter().zip(cb.0) {
         for l in 0..8 {
             // mul_add compiles to a packed FMA under target-cpu=native;
             // rustc never contracts `a * b + c` on its own.
@@ -56,9 +56,9 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 pub fn matvec_acc(w: &Matrix, x: &[f32], out: &mut [f32]) {
     debug_assert_eq!(w.rows(), x.len());
     debug_assert_eq!(w.cols(), out.len());
-    let mut rows = x.chunks_exact(4);
+    let rows = x.as_chunks::<4>();
     let mut i = 0;
-    for x4 in rows.by_ref() {
+    for x4 in rows.0 {
         let (r0, r1, r2, r3) = (&w[i], &w[i + 1], &w[i + 2], &w[i + 3]);
         for ((((o, &a), &b), &c), &e) in out.iter_mut().zip(r0).zip(r1).zip(r2).zip(r3) {
             // mul_add chains compile to packed FMAs under target-cpu=native.
@@ -66,7 +66,7 @@ pub fn matvec_acc(w: &Matrix, x: &[f32], out: &mut [f32]) {
         }
         i += 4;
     }
-    for &xi in rows.remainder() {
+    for &xi in rows.1 {
         for (o, &wv) in out.iter_mut().zip(&w[i]) {
             *o = xi.mul_add(wv, *o);
         }

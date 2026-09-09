@@ -1,0 +1,28 @@
+[1/9] staging 'persona'
+      1061 read, 1061 kept (78.5k tokens)
+[2/9] staging 'lamp'
+      1789 read, 1789 kept (207.5k tokens)
+[3/9] staging 'apps'
+      1249 read, 1249 kept (210.9k tokens)
+[4/9] staging 'tools_in_context'
+      1168 read, 1168 kept (187.4k tokens)
+[5/9] staging 'smoltalk_short'
+      shard 1/4: /home/unschlagbar/training_data/smol-smoltalk/train-00000-of-00004.parquet
+      shard 2/4: /home/unschlagbar/training_data/smol-smoltalk/train-00001-of-00004.parquet
+      shard 3/4: /home/unschlagbar/training_data/smol-smoltalk/train-00002-of-00004.parquet
+      shard 4/4: /home/unschlagbar/training_data/smol-smoltalk/train-00003-of-00004.parquet
+      3017 read, 3011 kept (940.1k tokens)
+[6/9] staging 'smoltalk_chitchat'
+      shard 1/4: /home/unschlagbar/training_data/smol-smoltalk/train-00000-of-00004.parquet
+      shard 2/4: /home/unschlagbar/training_data/smol-smoltalk/train-00001-of-00004.parquet
+      shard 3/4: /home/unschlagbar/training_data/smol-smoltalk/train-00002-of-00004.parquet
+      shard 4/4: /home/unschlagbar/training_data/smol-smoltalk/train-00003-of-00004.parquet
+      2252 read, 2252 kept (1.58M tokens)
+[7/9] staging 'smoltalk_tasks'
+      shard 1/4: /home/unschlagbar/training_data/smol-smoltalk/train-00000-of-00004.parquet
+      shard 2/4: /home/unschlagbar/training_data/smol-smoltalk/train-00001-of-00004.parquet
+      shard 3/4: /home/unschlagbar/training_data/smol-smoltalk/train-00002-of-00004.parquet
+      shard 4/4: /home/unschlagbar/training_data/smol-smoltalk/train-00003-of-00004.parquet
+      80362 read, 80229 kept (121.23M tokens)
+[8/9] staging 'smoltalk_knowledge'
+      shard 1/4: /home/unschlagbar/training_data/smol-smoltalk/train-00000-of-00004.parquet
