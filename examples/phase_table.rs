@@ -101,7 +101,7 @@ fn main() {
     let per = |ns: u64| ns as f64 / iters as f64 / 1e6; // ms per step
     let total_ms = wall.as_secs_f64() * 1e3 / iters as f64;
 
-    let rows: [(&str, f64, f64); 4] = [
+    let rows: [(&str, f64, f64); 3] = [
         (
             "sLSTM cell",
             per(phase::get(Bucket::SlstmCellFwd)),
@@ -116,11 +116,6 @@ fn main() {
             "SwiGLU FFN",
             per(phase::get(Bucket::FfnFwd)),
             per(phase::get(Bucket::FfnBwd)),
-        ),
-        (
-            "block glue (norms/resid/copies)",
-            per(phase::get(Bucket::GlueFwd)),
-            per(phase::get(Bucket::GlueBwd)),
         ),
     ];
     let acc_fwd: f64 = rows.iter().map(|r| r.1).sum();
@@ -151,7 +146,7 @@ fn main() {
         100.0 * acc_bwd / total_ms
     );
     println!(
-        "{:<34} {outside:>10.1} {:>7.1}%   (embedding, encoder/decoder plumbing,",
+        "{:<34} {outside:>10.1} {:>7.1}%   (norms, residuals, embedding, enc/dec plumbing,",
         "everything else",
         100.0 * outside / total_ms
     );
