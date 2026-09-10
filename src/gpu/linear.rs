@@ -345,14 +345,15 @@ impl Linear {
         x: &ops::SlabBuf,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
-            cache: &TrainingCache,
-) {
+        dx_beta: f32,
+        cache: &TrainingCache,
+    ) {
         match x {
-            ops::SlabBuf::F32(t) => self.backward_with_x(gpu, t, dy, dx, cache),
+            ops::SlabBuf::F32(t) => self.backward_with_x(gpu, t, dy, dx, dx_beta, cache),
             ops::SlabBuf::Bf16(b) => {
                 assert!(self.bf16, "Linear::backward_slab_x — layer is fp32-pinned");
                 self.gemm
-                    .run_backward_staged_x(gpu, b, dy, &self.w, &mut self.dw, dx);
+                    .run_backward_staged_x(gpu, b, dy, &self.w, &mut self.dw, dx, dx_beta);
                 ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
             }
         }
@@ -405,8 +406,46 @@ impl Linear {
         }
     }
 
+    /// [`backward_slab_x`](Self::backward_slab_x) where `dy` is a slab too. With both
+    /// narrow neither GEMM casts, and the bias sum reads the same bf16 `dy` they do.
+    pub fn backward_slab_xy(
+        &mut self,
+        gpu: &Gpu,
+        x: &ops::SlabBuf,
+        dy: &ops::SlabBuf,
+        dx: &mut GTensor<f32>,
+        dx_beta: f32,
+        cache: &TrainingCache,
+    ) {
+        match (x, dy) {
+            (ops::SlabBuf::Bf16(xb), ops::SlabBuf::Bf16(dyb)) => {
+                assert!(self.bf16, "Linear::backward_slab_xy — layer is fp32-pinned");
+                self.gemm
+                    .run_backward_narrow(gpu, xb, dyb, &self.w, &mut self.dw, dx, dx_beta);
+                ops::add_col_sum_slab(gpu, &mut self.db, dy, &cache.temps);
+            }
+            (_, ops::SlabBuf::F32(d)) => self.backward_slab_x(gpu, x, d, dx, dx_beta, cache),
+            (ops::SlabBuf::F32(_), ops::SlabBuf::Bf16(_)) => {
+                panic!("Linear::backward_slab_xy — bf16 dy against an fp32 input")
+            }
+        }
+    }
+
+    /// [`forward_slab_lhs`](Self::forward_slab_lhs) into a slab: a bf16 output takes
+    /// the bias in the GEMM epilogue, an fp32 one the ordinary seeded path.
+    pub fn forward_slab_slab(&mut self, gpu: &Gpu, x: &ops::SlabBuf, out: &mut ops::SlabBuf) {
+        match (x, out) {
+            (ops::SlabBuf::Bf16(xb), ops::SlabBuf::Bf16(o)) => self.forward_staged_bf16(gpu, xb, o),
+            (_, ops::SlabBuf::F32(o)) => self.forward_slab_lhs(gpu, x, o),
+            (ops::SlabBuf::F32(_), ops::SlabBuf::Bf16(_)) => {
+                panic!("Linear::forward_slab_slab — fp32 input into a bf16 output")
+            }
+        }
+    }
+
     /// [`backward_with_x`](Self::backward_with_x) where the saved input is already
     /// narrowed into bf16 by the caller.
+    #[allow(clippy::too_many_arguments)]
     pub fn backward_staged_x(
         &mut self,
         gpu: &Gpu,
@@ -414,8 +453,9 @@ impl Linear {
         x_b: &super::GTensor<u16>,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
-            cache: &TrainingCache,
-) {
+        dx_beta: f32,
+        cache: &TrainingCache,
+    ) {
         assert_eq!(
             dy.cols(),
             self.output,
@@ -428,12 +468,12 @@ impl Linear {
         );
         if self.bf16 {
             self.gemm
-                .run_backward_staged_x(gpu, x_b, dy, &self.w, &mut self.dw, dx);
+                .run_backward_staged_x(gpu, x_b, dy, &self.w, &mut self.dw, dx, dx_beta);
             ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
         } else {
             Self::grad_w(gpu, &mut self.gemm, self.bf16, x, dy, &mut self.dw);
             ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
-            self.grad_x(gpu, dy, dx);
+            self.grad_x(gpu, dy, dx, dx_beta);
         }
     }
 
@@ -465,7 +505,7 @@ impl Linear {
             cache: &TrainingCache,
 ) -> GTensor<f32> {
         let mut dx = GTensor::uninit(gpu, &[dy.rows(), self.input]);
-        self.backward_with_x(gpu, x, dy, &mut dx, cache);
+        self.backward_with_x(gpu, x, dy, &mut dx, 0.0, cache);
         dx
     }
 
@@ -482,7 +522,7 @@ impl Linear {
         // three tensors it touches, not `self`.
         Self::grad_w(gpu, &mut self.gemm, self.bf16, &self.x, dy, &mut self.dw);
         ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
-        self.grad_x(gpu, dy, dx);
+        self.grad_x(gpu, dy, dx, 0.0);
     }
 
     /// Backward for a caller-owned input: the companion to
@@ -493,16 +533,18 @@ impl Linear {
     /// `dy`. Both weight terms contract over the row axis
     /// (`dW = Xᵀ·dY`, `db = Σ_rows dY`) and both accumulate at `beta = 1`, so
     /// summing over row blocks gives the identical result — splitting `N` is a
-    /// reassociation, not a change of math. `dX = dY·Wᵀ` writes at `beta = 0`, which
-    /// stays correct because each block owns disjoint rows of `dx`.
+    /// reassociation, not a change of math. `dX = dY·Wᵀ` writes at `beta = dx_beta`:
+    /// 0 is correct under row blocks because each block owns disjoint rows of `dx`,
+    /// and 1 adds this layer's `dX` to one another layer reading the same input wrote.
     pub fn backward_with_x(
         &mut self,
         gpu: &Gpu,
         x: &GTensor<f32>,
         dy: &GTensor<f32>,
         dx: &mut GTensor<f32>,
-            cache: &TrainingCache,
-) {
+        dx_beta: f32,
+        cache: &TrainingCache,
+    ) {
         assert_eq!(
             dy.cols(),
             self.output,
@@ -527,12 +569,12 @@ impl Linear {
             // Both GEMMs read `dy`; narrowing it once for the pair drops a cast launch
             // per Linear backward.
             self.gemm
-                .run_backward(gpu, x, dy, &self.w, &mut self.dw, dx);
+                .run_backward(gpu, x, dy, &self.w, &mut self.dw, dx, dx_beta);
             ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
         } else {
             Self::grad_w(gpu, &mut self.gemm, self.bf16, x, dy, &mut self.dw);
             ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
-            self.grad_x(gpu, dy, dx);
+            self.grad_x(gpu, dy, dx, dx_beta);
         }
     }
 
@@ -555,13 +597,13 @@ impl Linear {
         }
     }
 
-    /// `dX = dY · Wᵀ` (overwriting, `beta = 0`). cuBLAS transposes `W(in×out)`
-    /// internally — no host transpose.
-    fn grad_x(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>) {
+    /// `dX = dY · Wᵀ + beta·dX`. cuBLAS transposes `W(in×out)` internally — no host
+    /// transpose.
+    fn grad_x(&mut self, gpu: &Gpu, dy: &GTensor<f32>, dx: &mut GTensor<f32>, beta: f32) {
         if self.bf16 {
-            self.gemm.run_wb(gpu, ops::MmForm::Nt, dy, &self.w, dx, 0.0);
+            self.gemm.run_wb(gpu, ops::MmForm::Nt, dy, &self.w, dx, beta);
         } else {
-            ops::matmul_nt_into(gpu, dy, &self.w, dx, 0.0);
+            ops::matmul_nt_into(gpu, dy, &self.w, dx, beta);
         }
     }
 
@@ -876,7 +918,7 @@ mod tests {
 
         let dx_saving = saving.backward_alloc(&gpu, &dy, &tc);
         let mut dx_shared = GTensor::uninit(&gpu, &[batch, input]);
-        shared.backward_with_x(&gpu, &x, &dy, &mut dx_shared, &tc);
+        shared.backward_with_x(&gpu, &x, &dy, &mut dx_shared, 0.0, &tc);
 
         eq(
             &dx_shared.to_host(&gpu).data,

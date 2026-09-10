@@ -24,7 +24,7 @@ fn main() {
 fn main() {
     use neural_networks::config::{
         BACKBONE_CHUNK, CHAR_HIDDEN, MAX_WINDOW_TOKENS, MAX_WORD_BYTES, OUT_HIDDEN, WORD_BLOCKS,
-        WORD_HIDDEN,
+        WORD_HIDDEN, WORDS_PER_SEQ,
     };
     use neural_networks::gpu::Gpu;
     use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
@@ -83,7 +83,7 @@ fn main() {
             ("ragged-odd", BACKBONE_CHUNK * 2 + 37, ragged, None, None),
             (
                 "bimodal-wide",
-                4400,
+                WORDS_PER_SEQ,
                 |w| if w % 2 == 0 { 2 } else { 11 },
                 None,
                 None,
@@ -141,6 +141,10 @@ fn main() {
         })
         .collect();
 
+    // Packed documents, as the trainer feeds them: the backbone cells restart at each
+    // start inside the window, which is its own set of kernel branches to keep stable.
+    let doc_starts = |words: usize| vec![0, words / 3, words / 2 + 1];
+
     let seed = std::env::temp_dir().join("window_determinism_seed.hier");
     let seed = seed.to_str().unwrap();
     Hierarchical::new(&gpu, cfg)
@@ -187,7 +191,9 @@ fn main() {
     for (name, tokens, spans, chunk, cap) in &windows {
         model.set_bb_chunk(*chunk);
         model.set_group_cap(*cap);
+        let docs = doc_starts(spans.len());
         let mut sig = || {
+            model.set_doc_starts(&docs);
             model.forward_backward(&gpu, tokens, spans);
             let s = model.grad_signature(&gpu);
             model.step(&gpu, &clear); // lr 0: zeroes the grads, leaves the weights
@@ -232,6 +238,7 @@ fn main() {
         for (t, (_, tokens, spans, chunk, cap)) in windows.iter().enumerate() {
             m.set_bb_chunk(*chunk);
             m.set_group_cap(*cap);
+            m.set_doc_starts(&doc_starts(spans.len()));
             let loss = m.forward_backward(&gpu, tokens, spans);
             let mut c = AdamCfg::new(3e-4, 0.01);
             c.t = t as u64 + 1;

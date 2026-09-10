@@ -121,23 +121,23 @@ fn main() {
         let bw6 = timed(&gpu, 20, 200, || {
                             for (i, (l, o)) in six.iter_mut().zip(outs.iter()).enumerate() {
                 if i == 0 {
-                    l.backward_staged_x(&gpu, &x, &xb, o, &mut acc, &cache);
+                    l.backward_staged_x(&gpu, &x, &xb, o, &mut acc, 0.0, &cache);
                 } else {
-                    l.backward_staged_x(&gpu, &x, &xb, o, &mut part, &cache);
+                    l.backward_staged_x(&gpu, &x, &xb, o, &mut part, 0.0, &cache);
                     ops::add_assign(&gpu, &mut acc, &part);
                 }
             }
         });
         let bw2 = timed(&gpu, 20, 200, || {
-                            lin_qkvo.backward_staged_x(&gpu, &x, &xb, &out_qkvo, &mut acc, &cache);
-            lin_if.backward_staged_x(&gpu, &x, &xb, &out_if, &mut part, &cache);
+                            lin_qkvo.backward_staged_x(&gpu, &x, &xb, &out_qkvo, &mut acc, 0.0, &cache);
+            lin_if.backward_staged_x(&gpu, &x, &xb, &out_if, &mut part, 0.0, &cache);
             ops::add_assign(&gpu, &mut acc, &part);
         });
         let bw3 = timed(&gpu, 20, 200, || {
-                            lin_qkv.backward_staged_x(&gpu, &x, &xb, &out_qkv, &mut acc, &cache);
-            lin_o.backward_staged_x(&gpu, &x, &xb, &out_o, &mut part, &cache);
+                            lin_qkv.backward_staged_x(&gpu, &x, &xb, &out_qkv, &mut acc, 0.0, &cache);
+            lin_o.backward_staged_x(&gpu, &x, &xb, &out_o, &mut part, 0.0, &cache);
             ops::add_assign(&gpu, &mut acc, &part);
-            lin_if.backward_staged_x(&gpu, &x, &xb, &out_if, &mut part, &cache);
+            lin_if.backward_staged_x(&gpu, &x, &xb, &out_if, &mut part, 0.0, &cache);
             ops::add_assign(&gpu, &mut acc, &part);
         });
 

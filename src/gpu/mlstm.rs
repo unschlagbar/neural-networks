@@ -63,8 +63,10 @@
 use std::sync::OnceLock;
 
 use super::arena::{self, ParamSlot};
-use super::block::Cell;
+use super::block::{Cell, Resets};
 use super::nn_convert::concat_cols;
+use super::offload::{Frame, ResidentFrames};
+use super::ops::{GpuRmsForward, SlabBuf};
 use super::{GTensor, Gpu, linear::Linear, ops, rms_norm::RmsNorm};
 use crate::gpu::arena::TrainingCache;
 use crate::nn2::optim::AdamCfg;
@@ -82,67 +84,25 @@ fn chunk_len() -> usize {
     })
 }
 
-/// Forward intermediates of the **fused** path. Far smaller than `Saved`: the
-/// per-chunk `[BH, L, L]` decay matrices do not exist — backward rebuilds them in
-/// shared memory (see `ops::MlstmFused`).
-struct SavedFused {
-    b: usize,
-    t: usize,
-    /// The three large per-`N` tensors, `None` exactly while they are parked on the
-    /// host.
-    ///
-    /// `Option` rather than a `parked: bool` flag: backward reads these through
-    /// `expect`, so a missing `restore_saved` is a named panic at the use site instead
-    /// of a silent read of a stale buffer. They are `Some` for the whole of a
-    /// non-offloaded run.
+/// What a forward saves for its backward, carved from a frame — see [`MLstm::carve`].
+///
+/// Far smaller than the op-at-a-time path's cache: the per-chunk `[BH, L, L]` decay
+/// matrices do not exist — backward rebuilds them in shared memory (see
+/// `ops::MlstmFused`).
+pub struct MlstmSaved {
     // `q ‖ k ‖ v ‖ o` in bf16 storage, mirroring the reference's DTYPE tensors
     // (matQ/matK/matV plus the o-gate pre-activation) concatenated as its fused
     // `qkv_opreact` output. Holds the RAW `o`: `ogate_bwd` recomputes the sigmoid.
-    xh: Option<ops::SlabBuf>,
+    xh: ops::SlabBuf,
     // fp32: `ĩ ‖ f̃`. The reference loads vecI/vecB `.to(tl.float32)` — they are
     // exponents feeding the stabilizer, where an absolute error becomes a
     // multiplicative one. See `gpu::bf16`.
-    // Left resident when parking: 128 KB against the 4 MB tensors above, so moving it
-    // would cost bookkeeping and PCIe for nothing.
     gates: GTensor<f32>,
     fused: ops::MlstmFused,
-    yhat: Option<GTensor<f32>>,
-    /// `lin_out`'s input, kept here rather than as the projection's private copy so a
-    /// chunked sweep's later chunk cannot overwrite it. Fed back via `backward_with_x`.
-    hconcat: Option<GTensor<f32>>,
-}
-
-impl SavedFused {
-    /// The parkable tensors, in the one order `evict`/`restore` both use.
-    ///
-    /// Panics if they are parked — every reader runs after `restore_saved`.
-    fn yhat(&self) -> &GTensor<f32> {
-        self.yhat
-            .as_ref()
-            .expect("mLSTM: yhat is parked on the host")
-    }
-    fn hconcat(&self) -> &GTensor<f32> {
-        self.hconcat
-            .as_ref()
-            .expect("mLSTM: hconcat is parked on the host")
-    }
-    fn xh(&self) -> &ops::SlabBuf {
-        self.xh
-            .as_ref()
-            .expect("mLSTM: q‖k‖v‖o is parked on the host")
-    }
-
-    /// Device bytes held. Parked tensors count as zero — they are on the host, which
-    /// is the whole point of parking them.
-    fn retained_bytes(&self) -> usize {
-        let opt_f32: usize = [&self.yhat, &self.hconcat]
-            .iter()
-            .filter_map(|s| s.as_ref())
-            .map(|t| t.capacity() * 4)
-            .sum();
-        let slabs: usize = self.xh.as_ref().map_or(0, |s| s.retained_bytes());
-        opt_f32 + slabs + self.gates.capacity() * 4 + self.fused.retained_bytes()
-    }
+    /// The head norm's output: read by `ogate_bwd`, what the norm's backward rebuilds
+    /// `x̂` from, and — with `o` — what `lin_out`'s input `σ(o) ⊙ yhat` is rebuilt from.
+    yhat: GTensor<f32>,
+    headnorm: GpuRmsForward,
 }
 
 pub struct MLstm {
@@ -170,19 +130,9 @@ pub struct MLstm {
     pub(super) lin_gates: Linear,
     pub(super) lin_out: Linear,
     pub(super) headnorm: RmsNorm, // head-wise (group == dhv)
-    /// Forward caches awaiting a backward, one per chunk in eviction order.
-    ///
-    /// A chunked sweep forwards every chunk before unwinding any, so chunk c's cache
-    /// must survive chunk c+1's forward; backward pops from the end (right to left).
-    /// The unchunked path is this with a single element.
-    saved: Vec<SavedFused>,
-    /// Host parking for the fused cache's large per-N tensors, when the surrounding
-    /// stack opted in (`Block::enable_offload` → `MLstm::enable_offload`).
-    ///
-    /// Same mechanism as the FFN's: written once in forward, read once in backward,
-    /// and in the backbone's block-major sweep those are a whole pass apart. Only the
-    /// big ones ride — see `evict_saved` for which and why.
-    park: Option<super::offload::HostPark>,
+    /// Frames of a cell used on its own. Inside a [`Block`](super::block::Block) the
+    /// block's frame holds this cell's cache and this stays empty.
+    frames: ResidentFrames,
     /// Continue the previous call's recurrence instead of starting at zero — set for a
     /// chunked sweep. See [`MLstm::set_carry`].
     carry: bool,
@@ -191,7 +141,23 @@ pub struct MLstm {
     carry_state: Option<ops::MlstmState>,
     /// BPTT state from the chunk to the right, for a chunked backward.
     carry_dstate: Option<ops::MlstmDState>,
+    /// Rows of the next call where a document starts. See [`set_resets`](Self::set_resets).
+    resets: Vec<usize>,
 }
+
+/// The forget-gate logit forced onto a document's first row, which makes the state
+/// arriving from the row before decay by `σ(-100) ≈ e^-100` — a restart, done inside
+/// the chunkwise kernels instead of by cutting the sequence there (`reset_fgate_value`
+/// in NX-AI's xlstm-jax, `blocks/mlstm/cell.py`).
+///
+/// Not their -25: theirs sits behind a ±15 soft cap on every gate logit, so the
+/// stabilizer `m` a document ends on is never far above the next row's `ĩ`. Ours are
+/// uncapped, and the old state survives as `e^(logit + m_prev − ĩ)`, which at -25 is
+/// visible once `m_prev − ĩ` nears 25. -100 cannot overflow either: every `expf` in the
+/// kernels takes a difference the stabilizer keeps non-positive. What it costs is the
+/// chunk-local log-forget cumsum, whose rows after the reset sit near -100 in fp32 —
+/// an absolute error of ~1e-5 in their decay exponents.
+pub const DOC_RESET_FGATE: f32 = -100.0;
 
 impl MLstm {
     /// Build from a CPU cell's host weights (all 15 parameter tensors uploaded).
@@ -242,11 +208,11 @@ impl MLstm {
             lin_gates: Linear::from_parts(gpu, &concat_cols(&[wi, wf]), &concat_cols(&[bi, bf])),
             lin_out: Linear::from_parts(gpu, w_out, b_out),
             headnorm: RmsNorm::from_parts_grouped(gpu, gamma, dhv),
-            saved: Vec::new(),
-            park: None,
+            frames: ResidentFrames::default(),
             carry: false,
             carry_state: None,
             carry_dstate: None,
+            resets: Vec::new(),
         }
     }
 
@@ -313,7 +279,61 @@ impl MLstm {
         l
     }
 
-    /// Forward over `[B, T, in]` → `[B, T, d]`.
+    /// Whether `ogate_fwd` writes `lin_out`'s input narrow: only when that GEMM reads
+    /// bf16 and the kernels can store it.
+    fn hconcat_narrow(&self, gpu: &Gpu) -> bool {
+        gpu.kernels.slab_bf16 && self.lin_out.is_bf16()
+    }
+
+    fn shape(&self, batch: usize, t: usize) -> ops::MlstmShape {
+        ops::MlstmShape {
+            batch,
+            heads: self.heads,
+            t,
+            dqk: self.dqk,
+            dhv: self.dhv,
+        }
+    }
+
+    /// This cell's saved tensors for a `[B, T, ·]` call, carved from `f` in the one order
+    /// its forward and backward share.
+    pub fn carve(&self, gpu: &Gpu, f: &mut Frame, b: usize, t: usize) -> MlstmSaved {
+        let rows = b * t;
+        MlstmSaved {
+            xh: f.slab(
+                gpu,
+                &[rows, self.lin_qkvo.output_size()],
+                gpu.kernels.slab_bf16,
+            ),
+            gates: f.f32(gpu, &[rows, self.lin_gates.output_size()]),
+            fused: ops::MlstmFused::carve(gpu, f, self.shape(b, t), self.fused_chunk(gpu, t)),
+            yhat: f.f32(gpu, &[rows, self.d]),
+            headnorm: self.headnorm.carve(gpu, f, rows),
+        }
+    }
+
+    /// Forward over `[B, T, in]` → `[B, T, d]`, saving into a frame of this cell's own.
+    /// See [`forward_saved`](Self::forward_saved).
+    pub fn forward(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        out: &mut GTensor<f32>,
+        cache: &TrainingCache,
+    ) {
+        let (b, t) = (x.shape[0], x.shape[1]);
+        let mut m = Frame::measure();
+        self.carve(gpu, &mut m, b, t);
+        if !self.carry {
+            self.frames.reset();
+        }
+        let mut f = self.frames.push(gpu, m.bytes());
+        let mut sv = self.carve(gpu, &mut f, b, t);
+        let xs = SlabBuf::F32(GTensor::view(gpu, &x.buf, 0, x.dims()));
+        self.forward_saved(gpu, &xs, out, &mut sv, cache);
+    }
+
+    /// Forward over `[B, T, in]` → `[B, T, d]`, saving into `sv`.
     ///
     /// Chunkwise: the sequence is cut into chunks of `chunk_len()`, each handled by
     /// the parallel (attention) form over its own `[BH, L, L]` decay matrix, with
@@ -322,25 +342,21 @@ impl MLstm {
     ///
     /// `out` is the caller's `[B, T, d]` buffer, written in place.
     ///
-    /// `x` must stay alive and unchanged until this call's [`backward`](Self::backward),
-    /// which takes it back: the three projections read it for their `dW`, and this cell
-    /// keeps no copy of it. In a [`Block`](super::block::Block) that is the block's own
-    /// `norm1_out` — the pre-norm output it already holds for the norm's backward.
-    pub fn forward(
+    /// `x` must stay alive and unchanged until this call's backward, which takes it
+    /// back: the projections read it for their `dW`, and this cell keeps no copy of it.
+    /// In a [`Block`](super::block::Block) that is the block's own `norm1_out`, a slab
+    /// at the projections' width, so neither direction narrows it.
+    pub fn forward_saved(
         &mut self,
         gpu: &Gpu,
-        x: &GTensor<f32>,
+        x: &SlabBuf,
         out: &mut GTensor<f32>,
+        sv: &mut MlstmSaved,
         cache: &TrainingCache,
     ) {
-        // Release the previous eviction before allocating anything here: freeing
-        // returns memory to the CUDA allocator, which must not hand it back while a
-        // copy is still reading it. See `InFlight::release`.
-        if let Some(park) = &self.park {
-            park.release_previous();
-        }
-        assert_eq!(x.rank, 3, "MLstm::forward expects [B, T, in]");
-        let (batch, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);
+        let xd = x.dims();
+        assert_eq!(xd.len(), 3, "MLstm::forward expects [B, T, in]");
+        let (batch, t, inp) = (xd[0], xd[1], xd[2]);
         assert_eq!(
             inp, self.input_size,
             "MLstm::forward — input width mismatch"
@@ -348,19 +364,12 @@ impl MLstm {
         let dim = self.d;
         assert_eq!(out.dims(), [batch, t, dim], "MLstm::forward — output shape");
         let rows = batch * t;
-        let shape = ops::MlstmShape {
-            batch,
-            heads: self.heads,
-            t,
-            dqk: self.dqk,
-            dhv: self.dhv,
-        };
+        let shape = self.shape(batch, t);
 
         // The input as `[N, in]`, which is the shape both projections want. A view:
         // every projection's `dW` reads it again in backward, but the caller hands it
         // back there (`backward`'s `x`), so this cell keeps no copy of its own.
-        let xf = GTensor::view(gpu, &x.buf, 0, &[rows, inp]);
-        let l = self.fused_chunk(gpu, t);
+        let xv = x.view(gpu, &[rows, inp]);
 
         // Two projections, both off the same narrowed `xf`. `q ‖ k ‖ v ‖ o` lands in
         // one slab at the kernels' own width and stays exactly where the GEMM wrote
@@ -371,121 +380,63 @@ impl MLstm {
         // sigmoid, which is bounded and Lipschitz. At `[rows, 2*H]` they are a factor
         // of `dqk` smaller than the slab, so narrowing them would buy nothing anyway.
         //
-        // Both outlive the call — backward reads them — so neither is pooled.
-        let mut xh = ops::SlabBuf::new(gpu, &[rows, self.lin_qkvo.output_size()]);
-        let mut gates = GTensor::uninit(gpu, &[rows, self.lin_gates.output_size()]);
-        // Both projections read the same narrowed `xf`, so it is staged once here
-        // rather than by each of them. A borrowed slot, at bf16's own width: the same
-        // array the fp32 temporaries come from, viewed narrow.
-        let mut xf_b = cache.temps.get::<u16>(gpu, xf.dims());
-        xf_b.store(gpu, &xf);
-        self.lin_qkvo.forward_staged_slab(gpu, &xf, &xf_b, &mut xh);
-        self.lin_gates.forward_staged(gpu, &xf, &xf_b, &mut gates);
-        drop(xf_b);
+        // Both projections read the same narrowed `xf`: an fp32 input is narrowed
+        // once here, into a borrowed slot, rather than by each of them.
+        let xf = xv.at_width(gpu, self.lin_qkvo.is_bf16(), &cache.temps);
+        self.lin_qkvo.forward_slab_slab(gpu, &xf.x, &mut sv.xh);
+        self.lin_gates.forward_slab_lhs(gpu, &xf.x, &mut sv.gates);
+        drop(xf);
+        // The frame keeps the forced logits, so backward's recompute sees the same gates.
+        self.force_forget(gpu, &mut sv.gates, batch);
         // k needs no rescale: 1/√dqk is folded into its columns of `lin_qkvo`. `o` is
         // squashed later, fused into the product that consumes it.
 
         // Carry the recurrent state in from the previous chunk when the surrounding
         // sweep is chunked; `None` (the unchunked case) starts it at zero inside
         // the kernel. The outgoing state is taken below, after the cache is built.
-        let fused = ops::mlstm_fused_fw(
+        let mut avec = cache
+            .temps
+            .get_small::<f32>(gpu, &[shape.bh(), sv.fused.nc, sv.fused.l]);
+        ops::mlstm_fused_fw_into(
             gpu,
-            &xh,
-            &gates,
-            l,
+            &sv.xh,
+            &sv.gates,
             if self.carry {
                 self.carry_state.as_ref()
             } else {
                 None
             },
             shape,
+            &mut sv.fused,
+            &mut avec,
         );
+        drop(avec);
         if self.carry {
-            self.carry_state = Some(fused.final_state(gpu, shape.bh(), self.dhv, self.dqk));
+            sv.fused
+                .final_state_into(gpu, shape.bh(), self.dhv, self.dqk, &mut self.carry_state);
         }
         // `ytil` comes out `[rows, d]` already; the head norm only needs it widened.
         let mut h_tilde = cache.temps.get::<f32>(gpu, &[rows, dim]);
-        let mut yhat = GTensor::uninit(gpu, &[rows, dim]);
-        self.headnorm
-            .forward(gpu, fused.ytil.as_f32(gpu, &mut h_tilde), &mut yhat);
-        drop(h_tilde);
-        // `hconcat` is kept in the cache rather than pooled, and `lin_out` takes it
-        // back through `backward_with_x`: a chunked sweep would otherwise have the
-        // next chunk's forward overwrite the private copy `forward` saves.
-        let mut hconcat = GTensor::uninit(gpu, &[rows, dim]);
-        ops::ogate_fwd(gpu, &xh, &yhat, &mut hconcat, self.o_off());
-        out.reshape_to(&[rows, dim]);
-        self.lin_out.forward_shared(gpu, &hconcat, out);
-        out.reshape_to(&[batch, t, dim]);
-        self.saved.push(SavedFused {
-            b: batch,
-            t,
-            xh: Some(xh),
-            gates,
-            fused,
-            yhat: Some(yhat),
-            hconcat: Some(hconcat),
-        });
-        self.evict_saved(gpu);
-    }
-
-    /// Park this cell's saved activations on the host, if offload is enabled.
-    ///
-    /// Called at the end of a fused forward. Only the three large per-`N` tensors ride:
-    /// `o`/`yhat` (4 MB each at the backbone's shape) and the `q‖k‖v` slab (6 MB
-    /// on the bf16 path). The rest (`gates` at 128 KB,
-    /// and everything inside `fused`) is left resident: each is two orders of
-    /// magnitude smaller, so moving it would add PCIe traffic and bookkeeping for
-    /// nothing.
-    ///
-    /// The slab parks at **its own width** — a bf16 slab comes back bf16, since the
-    /// precision split belongs at each value's production point, not here.
-    fn evict_saved(&mut self, gpu: &Gpu) {
-        use super::offload::Parked;
-        let Some(park) = &mut self.park else { return };
-        // The chunk just forwarded — the one this call is closing out.
-        let Some(sv) = self.saved.last_mut() else {
-            return;
-        };
-        // Fixed order, mirrored exactly by `restore_saved`.
-        park.evict(
+        self.headnorm.forward_saved(
             gpu,
-            vec![
-                Parked::from(sv.yhat.take().expect("evict before restore: yhat")),
-                Parked::from(sv.xh.take().expect("evict before restore: q‖k‖v‖o")),
-            ],
+            sv.fused.ytil.as_f32(gpu, &mut h_tilde),
+            &mut sv.yhat,
+            &mut sv.headnorm,
         );
-    }
-
-    /// Start the parked activations on their way back, without waiting. Called one
-    /// block ahead of this cell's backward so the upload overlaps compute.
-    pub fn prefetch_saved(&mut self, gpu: &Gpu) {
-        if let Some(park) = &mut self.park {
-            park.prefetch(gpu);
-        }
-    }
-
-    /// Put the parked activations back into the cache, in `evict_saved`'s order.
-    fn restore_saved(&mut self, gpu: &Gpu) {
-        let Some(park) = &mut self.park else { return };
-        // Backward pops from the end, so the cache being refilled is the last one —
-        // matching the park's own LIFO restore order.
-        let Some(sv) = self.saved.last_mut() else {
-            return;
-        };
-        let mut it = park.restore(gpu).into_iter();
-        let mut next = |what: &str| it.next().expect(what);
-        sv.yhat = Some(next("parked yhat").f32());
-        sv.xh = Some(next("parked q‖k‖v‖o").into());
+        drop(h_tilde);
+        // Narrow when `lin_out`'s GEMM reads bf16: it is the only reader.
+        let mut hconcat = ops::SlabAt::temp(gpu, &cache.temps, &[rows, dim], self.hconcat_narrow(gpu));
+        ops::ogate_fwd(gpu, &sv.xh, &sv.yhat, &mut hconcat.x, self.o_off());
+        out.reshape_to(&[rows, dim]);
+        self.lin_out.forward_slab_lhs(gpu, &hconcat.x, out);
+        out.reshape_to(&[batch, t, dim]);
     }
 
     /// Device bytes held, split `(params, activations)`. Diagnostic — see
     /// [`Hierarchical::retained_report`](super::hierarchical::Hierarchical::retained_report).
     ///
     /// Note the multiplier: this cell owns **three** [`Linear`]s, each with its own
-    /// saved input and bf16 GEMM staging, plus a head-wise [`RmsNorm`] holding an
-    /// `x̂` the width of the cell. `drop_saved_act` clears only `saved` — the
-    /// per-`Linear` retention survives it.
+    /// bf16 GEMM staging, plus a head-wise [`RmsNorm`].
     pub fn retained_bytes(&self) -> (usize, usize) {
         let (mut params, mut act) = (0, 0);
         for l in [&self.lin_qkvo, &self.lin_gates, &self.lin_out] {
@@ -496,7 +447,7 @@ impl MLstm {
         let (hn_p, hn_a) = self.headnorm.retained_bytes();
         params += hn_p;
         act += hn_a;
-        act += self.saved_bytes();
+        act += self.frames.device_bytes();
         (params, act)
     }
 
@@ -508,7 +459,6 @@ impl MLstm {
     /// [`reset_state`](Self::reset_state) — before the first chunk of a sweep.
     pub fn set_carry(&mut self, carry: bool) {
         self.carry = carry;
-        self.headnorm.set_carry(carry);
         if !carry {
             self.carry_state = None;
             self.carry_dstate = None;
@@ -523,7 +473,7 @@ impl MLstm {
     }
 
     /// Start the recurrence over at the next forward, keeping everything already
-    /// cached. See [`Cell::zero_state`].
+    /// cached.
     pub fn zero_state(&mut self, _gpu: &Gpu) {
         self.carry_state = None;
     }
@@ -531,18 +481,7 @@ impl MLstm {
     /// Drop the caches of an already-unwound sweep, keeping `C`/`n`/`m` — so the next
     /// forward continues this recurrence. See [`Cell::reset_caches`].
     pub fn reset_caches(&mut self, _gpu: &Gpu) {
-        // A sweep that ended early (a caller that forwarded chunks and never unwound
-        // them) would otherwise leave its host generations to accumulate across steps.
-        self.saved.clear();
-        self.discard_parked();
-    }
-
-    /// Drop host generations left over from a sweep whose backward never came, so
-    /// they do not accumulate across windows.
-    fn discard_parked(&mut self) {
-        if let Some(park) = &mut self.park {
-            park.discard_all();
-        }
+        self.frames.reset();
     }
 
     /// Drop the carried BPTT state, so the next backward starts with no incoming
@@ -551,35 +490,44 @@ impl MLstm {
         self.carry_dstate = None;
     }
 
+    /// Where documents start inside the next call. See [`Cell::set_resets`].
+    pub fn set_resets(&mut self, r: &Resets) {
+        self.resets.clone_from(&r.rows);
+    }
+
+    /// Overwrite the forget-gate logit of every reset row with [`DOC_RESET_FGATE`].
+    fn force_forget(&self, gpu: &Gpu, gates: &mut GTensor<f32>, batch: usize) {
+        if self.resets.is_empty() {
+            return;
+        }
+        assert_eq!(batch, 1, "MLstm: document resets on a batched call");
+        let h = self.heads;
+        for &r in &self.resets {
+            ops::fill_f32(gpu, gates, r * 2 * h + h, h, DOC_RESET_FGATE);
+        }
+    }
+
     /// Drop the forward caches, leaving the pool and the weight staging alone —
     /// for a caller that forwards repeatedly and never backwards.
     pub fn drop_saved(&mut self) {
-        self.saved.clear();
+        self.frames.reset();
     }
 
     /// Retained activation bytes split `(saved_cache, other)`.
     ///
-    /// `saved_cache` is what `drop_saved_act` releases. `other` is the pooled scratch
-    /// plus what the **three** projections and the head norm hold internally — their
-    /// saved inputs and bf16 GEMM staging — which no `drop_saved_act` reaches.
+    /// `saved_cache` is this cell's own frames. `other` is what the **three**
+    /// projections and the head norm hold internally — their bf16 GEMM staging — which
+    /// no `drop_saved_act` reaches.
     pub fn act_split(&self) -> (usize, usize) {
-        let saved = self.saved_bytes();
+        let saved = self.frames.device_bytes();
         let (_, all) = self.retained_bytes();
         (saved, all - saved)
     }
 
-    /// Device bytes held by the forward caches, summed over every chunk still awaiting
-    /// its backward.
-    fn saved_bytes(&self) -> usize {
-        self.saved.iter().map(SavedFused::retained_bytes).sum()
-    }
-
     /// Release everything a forward left behind that no backward will read: the
-    /// saved cache, and each projection's saved input and bf16 staging. The broader companion to the `Cell::drop_saved_act`, which only
-    /// clears `saved`.
+    /// frames, and each projection's saved input and bf16 staging.
     pub fn drop_all_act(&mut self, gpu: &Gpu) {
-        self.saved.clear();
-        self.discard_parked();
+        self.frames.release();
         for l in [&mut self.lin_qkvo, &mut self.lin_gates, &mut self.lin_out] {
             l.drop_saved_act(gpu);
         }
@@ -590,33 +538,8 @@ impl MLstm {
         // point where the whole stack is done.
     }
 
-    /// Park this cell's saved activations on the host between forward and backward.
-    ///
-    /// Opted into by the surrounding [`Block`](super::block::Block), and subject to the
-    /// same constraint: only for a stack whose whole forward precedes its backward.
-    /// See `Block::enable_offload`.
-    pub fn enable_offload(&mut self, gpu: &Gpu, in_flight: super::offload::SharedInFlight) {
-        self.park =
-            Some(super::offload::HostPark::new(gpu, in_flight).expect("offload: host park"));
-    }
-
-    /// Stop parking this cell's activations, discarding anything already parked.
-    /// See `Block::disable_offload`.
-    pub fn disable_offload(&mut self) {
-        self.discard_parked();
-        self.park = None;
-    }
-
-    /// Pinned host bytes this cell's park holds. Diagnostic.
-    pub fn parked_host_bytes(&self) -> usize {
-        self.park.as_ref().map_or(0, |p| p.host_bytes())
-    }
-
-    /// Backward over `[B, T, d]` → `dx` `[B, T, in]`. Accumulates all grads.
-    ///
-    /// Chunks are swept in reverse, carrying `dC`/`dn` (the grad wrt the state a
-    /// chunk hands to its successor) backwards the way forward carried `C`/`n`
-    /// forwards — BPTT over chunks, with the parallel form inside each.
+    /// Backward over `[B, T, d]` → `dx` `[B, T, in]`, reading the frame the matching
+    /// [`forward`](Self::forward) pushed. Accumulates all grads.
     pub fn backward(
         &mut self,
         gpu: &Gpu,
@@ -625,14 +548,10 @@ impl MLstm {
         dx: &mut GTensor<f32>,
         cache: &TrainingCache,
     ) {
-        // Bring the parked activations back into the cache first, so everything below
-        // reads them as if they had never left. No-op unless offload is enabled.
-        self.restore_saved(gpu);
-        // `take`, not `as_ref`: the cache holds a window's activations, and dropping
-        // them at the end of this call (rather than when the next forward overwrites
-        // the field) keeps them from staying resident across the optimizer step.
-        let sv = self.saved.pop().expect("MLstm::backward before forward");
-        self.backward_fused(gpu, x, dy, sv, dx, cache)
+        let mut f = self.frames.pop(gpu);
+        let mut sv = self.carve(gpu, &mut f, dy.shape[0], dy.shape[1]);
+        let xs = SlabBuf::F32(GTensor::view(gpu, &x.buf, 0, x.dims()));
+        self.backward_saved(gpu, &xs, dy, dx, &mut sv, cache)
     }
 
     /// Backward into a freshly allocated `dx` `[B, T, in]` — the by-value
@@ -649,19 +568,24 @@ impl MLstm {
         dx
     }
 
-    /// Backward of the fused path: two kernels for the whole chunkwise core, with
-    /// the same projection/head-norm/o-gate shell around it.
-    fn backward_fused(
+    /// Backward over `[B, T, d]` → `dx` `[B, T, in]`, reading what
+    /// [`forward_saved`](Self::forward_saved) wrote into `sv`. Accumulates all grads.
+    ///
+    /// Two kernels for the whole chunkwise core, with the projection/head-norm/o-gate
+    /// shell around it. Chunks are swept in reverse, carrying `dC`/`dn` (the grad wrt
+    /// the state a chunk hands to its successor) backwards the way forward carried
+    /// `C`/`n` forwards — BPTT over chunks, with the parallel form inside each.
+    pub fn backward_saved(
         &mut self,
         gpu: &Gpu,
-        x: &GTensor<f32>,
+        x: &SlabBuf,
         dy: &GTensor<f32>,
-        sv: SavedFused,
         dx: &mut GTensor<f32>,
+        sv: &mut MlstmSaved,
         cache: &TrainingCache,
     ) {
         let (d, h, dqk, dhv, inp) = (self.d, self.heads, self.dqk, self.dhv, self.input_size);
-        let (b, t) = (sv.b, sv.t);
+        let (b, t) = (dy.shape[0], dy.shape[1]);
         let n = b * t;
         assert!(
             n * inp <= dx.capacity(),
@@ -675,9 +599,14 @@ impl MLstm {
         // `dy` is `[B, T, d]` and `lin_out` wants `[N, d]` — the same elements, so a
         // view rather than a copy into scratch of its own.
         let dy_flat = GTensor::view(gpu, &dy.buf, 0, &[n, d]);
+        // `lin_out`'s input is rebuilt rather than saved: one elementwise pass over two
+        // tensors the frame holds anyway, against `[N, d]` more to move per chunk.
+        let mut hconcat = ops::SlabAt::temp(gpu, &cache.temps, &[n, d], self.hconcat_narrow(gpu));
+        ops::ogate_fwd(gpu, &sv.xh, &sv.yhat, &mut hconcat.x, self.o_off());
         let mut d_hconcat = cache.temps.get::<f32>(gpu, &[n, d]);
         self.lin_out
-            .backward_with_x(gpu, sv.hconcat(), &dy_flat, &mut d_hconcat, cache);
+            .backward_slab_x(gpu, &hconcat.x, &dy_flat, &mut d_hconcat, 0.0, cache);
+        drop(hconcat);
         // `dq‖dk‖dv‖do` is one buffer: `ogate_bwd` fills the `o` block here and
         // `mlstm_fused_bw` the other three below, between them writing every column,
         // so it comes in uninitialised and feeds `lin_qkvo`'s backward whole.
@@ -688,8 +617,8 @@ impl MLstm {
         ops::ogate_bwd(
             gpu,
             &d_hconcat,
-            sv.xh(),
-            sv.yhat(),
+            &sv.xh,
+            &sv.yhat,
             &mut dxh,
             &mut d_yhat,
             self.o_off(),
@@ -701,7 +630,7 @@ impl MLstm {
         // `yhat` is the head norm's own output, kept for `ogate_bwd` — which is also
         // what its backward rebuilds `x̂` from, so the norm stores no `[N, d]` of its own.
         self.headnorm
-            .backward(gpu, &d_yhat, sv.yhat(), &mut d_ytil, cache);
+            .backward_saved(gpu, &d_yhat, &sv.yhat, &sv.headnorm, None, &mut d_ytil, cache);
         drop(d_yhat);
 
         // `[N, 2·heads]` — a gate strip, not a rectangle, so it comes from the small
@@ -712,7 +641,7 @@ impl MLstm {
         let dstate = ops::mlstm_fused_bw(
             gpu,
             &sv.fused,
-            sv.xh(),
+            &sv.xh,
             &sv.gates,
             &mut dxh,
             &d_ytil,
@@ -735,6 +664,11 @@ impl MLstm {
         if self.carry {
             self.carry_dstate = Some(dstate);
         }
+        // A forced logit is a constant, not the projection's output: nothing flows back
+        // through it into `lin_gates`.
+        for &r in &self.resets {
+            ops::fill_f32(gpu, &mut dgates, r * 2 * h + h, h, 0.0);
+        }
 
         // No scatter and no split: the kernel wrote `dq`/`dk`/`dv` into the one
         // `[N, H*(2*dqk+dhv)]` buffer through the same strides the projection wrote
@@ -742,25 +676,20 @@ impl MLstm {
         // either — the factor lives in `lin_qkvo`'s k columns, so it is already in
         // their scale.
         //
-        // dx is the sum of the three projection backwards, accumulated into one
-        // buffer with one pooled scratch — not a fresh [N, in] per term. The
-        // accumulator is the caller's `dx` seen as `[N, in]`, so the sum lands where
-        // it is wanted instead of in scratch that then has to be copied out.
+        // dx is the sum of the two projection backwards: the gates' GEMM accumulates
+        // onto the one `lin_qkvo` wrote. The accumulator is the caller's `dx` seen as
+        // `[N, in]`, so the sum lands where it is wanted.
         //
-        // All three read the one `x` the caller kept from the forward, so they take
-        // `backward_with_x` rather than each consulting a private saved copy. It is
-        // narrowed once for all three, as in forward.
+        // Both read the one `x` the caller kept from the forward, at the width they
+        // read it in forward.
         let mut acc = GTensor::view(gpu, &dx.buf, 0, &[n, inp]);
-        let mut part = cache.temps.get::<f32>(gpu, &[n, inp]);
-        let xf = GTensor::view(gpu, &x.buf, 0, &[n, inp]);
-        let mut xf_b = cache.temps.get::<u16>(gpu, xf.dims());
-        xf_b.store(gpu, &xf);
+        let xv = x.view(gpu, &[n, inp]);
+        let xf = xv.at_width(gpu, self.lin_qkvo.is_bf16(), &cache.temps);
         self.lin_qkvo
-            .backward_staged_x(gpu, &xf, &xf_b, &dxh, &mut acc, cache);
+            .backward_slab_x(gpu, &xf.x, &dxh, &mut acc, 0.0, cache);
         self.lin_gates
-            .backward_staged_x(gpu, &xf, &xf_b, &dgates, &mut part, cache);
-        ops::add_assign(gpu, &mut acc, &part);
-        drop((acc, xf_b, part, dxh, dgates));
+            .backward_slab_x(gpu, &xf.x, &dgates, &mut acc, 1.0, cache);
+        drop((acc, xf, dxh, dgates));
         dx.reshape_to(&[b, t, inp]);
     }
 
@@ -801,27 +730,34 @@ impl MLstm {
 }
 
 impl Cell for MLstm {
-    fn forward(
-        &mut self,
-        gpu: &Gpu,
-        x: &GTensor<f32>,
-        out: &mut GTensor<f32>,
-        cache: &TrainingCache,
-    ) {
-        MLstm::forward(self, gpu, x, out, cache)
-    }
+    type Saved = MlstmSaved;
     /// The head norm keeps its own output (`yhat`, for the o-gate), so this cell has
     /// no use for the block's copy.
-    fn backward(
+    const NEEDS_Y: bool = false;
+    fn carve(&self, gpu: &Gpu, f: &mut Frame, b: usize, t: usize) -> MlstmSaved {
+        MLstm::carve(self, gpu, f, b, t)
+    }
+    fn forward_saved(
         &mut self,
         gpu: &Gpu,
-        x: &GTensor<f32>,
-        _y: &GTensor<f32>,
-        dy: &GTensor<f32>,
-        dx: &mut GTensor<f32>,
+        x: &SlabBuf,
+        out: &mut GTensor<f32>,
+        sv: &mut MlstmSaved,
         cache: &TrainingCache,
     ) {
-        MLstm::backward(self, gpu, x, dy, dx, cache)
+        MLstm::forward_saved(self, gpu, x, out, sv, cache)
+    }
+    fn backward_saved(
+        &mut self,
+        gpu: &Gpu,
+        x: &SlabBuf,
+        _y: Option<&GTensor<f32>>,
+        dy: &GTensor<f32>,
+        dx: &mut GTensor<f32>,
+        sv: &mut MlstmSaved,
+        cache: &TrainingCache,
+    ) {
+        MLstm::backward_saved(self, gpu, x, dy, dx, sv, cache)
     }
     fn zero_grad(&mut self, gpu: &Gpu) {
         MLstm::zero_grad(self, gpu)
@@ -833,25 +769,7 @@ impl Cell for MLstm {
         use super::block::phase::Bucket;
         (Bucket::MlstmCellFwd, Bucket::MlstmCellBwd)
     }
-    fn enable_offload(&mut self, gpu: &Gpu, in_flight: super::offload::SharedInFlight) {
-        MLstm::enable_offload(self, gpu, in_flight)
-    }
-    fn disable_offload(&mut self) {
-        MLstm::disable_offload(self)
-    }
-    fn parked_host_bytes(&self) -> usize {
-        MLstm::parked_host_bytes(self)
-    }
-    fn prefetch_act(&mut self, gpu: &Gpu) {
-        MLstm::prefetch_saved(self, gpu)
-    }
     fn trim_to(&mut self, _rows: usize) {}
-    fn drop_saved_act(&mut self) {
-        // The whole fused cache — the q‖k‖v slab, o, yhat and the `MlstmFused`
-        // internals. Safe to drop wholesale because the only caller re-forwards to
-        // rebuild it (see `Block::drop_saved_act`).
-        self.saved.clear();
-    }
     fn retained_bytes(&self) -> (usize, usize) {
         MLstm::retained_bytes(self)
     }
@@ -867,14 +785,14 @@ impl Cell for MLstm {
     fn reset_state(&mut self, gpu: &Gpu) {
         MLstm::reset_state(self, gpu)
     }
-    fn zero_state(&mut self, gpu: &Gpu) {
-        MLstm::zero_state(self, gpu)
-    }
     fn reset_caches(&mut self, gpu: &Gpu) {
         MLstm::reset_caches(self, gpu)
     }
     fn reset_bptt(&mut self, gpu: &Gpu) {
         MLstm::reset_bptt(self, gpu)
+    }
+    fn set_resets(&mut self, r: &Resets) {
+        MLstm::set_resets(self, r)
     }
     fn to_nn_block(
         &self,
@@ -1594,6 +1512,146 @@ mod tests {
                 e < 1e-2,
                 "chunked backward dx differs by {e} over {} chunks",
                 parts.len()
+            );
+        }
+    }
+
+    /// A reset row inside one call must split it into two independent sequences: the
+    /// outputs, the input gradient and the summed weight gradients equal those of the
+    /// two halves run on their own. The reset lands mid-chunk, with chunks on both
+    /// sides of it.
+    #[test]
+    fn document_reset_matches_separate_sequences() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        reset_matches_split(&gpu, 1.0);
+    }
+
+    /// The same where the document before the reset drives the stabilizer far above
+    /// the next row's input gate — static heads (`f̃` large, so `m` only ratchets up)
+    /// fed an input `ĩ` tens of units above the first row of the next document. The
+    /// forced logit must bury the old state whatever `m − ĩ` it left behind; at -25
+    /// this instance leaks half the output scale into the rows after the border.
+    #[test]
+    fn document_reset_survives_a_saturated_stabilizer() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        reset_matches_split(&gpu, 150.0);
+    }
+
+    fn reset_matches_split(gpu: &Gpu, prefix_gain: f32) {
+        use cudarc::driver::DevicePtr;
+        let tc = test_cache(gpu);
+        let (inp, d, heads, dqk, t, r) = (8usize, 16usize, 2usize, 8usize, 70usize, 29usize);
+        // Every tensor seeded, so the three cells below are one instance.
+        let make = || {
+            let mut c = CpuMLstm::new(inp, d, heads, dqk);
+            c.wi = Tensor::random_seeded(&[inp, heads], 0.3, 0xD1);
+            c.wf = Tensor::random_seeded(&[inp, heads], 0.3, 0xD2);
+            c.wq = Tensor::random_seeded(&[inp, d], 0.3, 0xD5);
+            c.wk = Tensor::random_seeded(&[inp, d], 0.3, 0xD6);
+            c.wv = Tensor::random_seeded(&[inp, d], 0.3, 0xD7);
+            c.wo = Tensor::random_seeded(&[inp, d], 0.3, 0xD8);
+            c.w_out = Tensor::random_seeded(&[d, d], 0.3, 0xD9);
+            c.bi = Tensor::random_seeded(&[heads], 0.1, 0xDA);
+            c.bf = Tensor::new(
+                &[heads],
+                vec![if prefix_gain > 1.0 { 8.0 } else { 3.0 }; heads],
+            );
+            c
+        };
+        let mut x = Tensor::random_seeded(&[1, t, inp], 0.5, 0xD3);
+        for v in &mut x.data[..r * inp] {
+            *v *= prefix_gain;
+        }
+        let dy = Tensor::random_seeded(&[1, t, d], 1.0, 0xD4);
+        let cut = |src: &Tensor, off: usize, len: usize, w: usize| {
+            Tensor::new(&[1, len, w], src.data[off * w..(off + len) * w].to_vec())
+        };
+        let gpu_run = |x: &Tensor, dy: &Tensor, resets: Option<Resets>| -> (Vec<f32>, Vec<f32>) {
+            let mut c = MLstm::from_cpu(gpu, &make());
+            c.set_chunk(8);
+            if let Some(r) = resets {
+                c.set_resets(&r);
+            }
+            let len = x.dims()[1];
+            let xd = GTensor::from_host(gpu, x);
+            let mut y = GTensor::uninit(gpu, &[1, len, d]);
+            c.forward(gpu, &xd, &mut y, &tc);
+            let dx = c.backward_alloc(gpu, &xd, &GTensor::from_host(gpu, dy), &tc);
+            (y.to_host(gpu).data.to_vec(), dx.to_host(gpu).data.to_vec())
+        };
+
+        let mask: Vec<i32> = (0..t).map(|i| i32::from(i == r)).collect();
+        let mask = gpu.stream.clone_htod(&mask).expect("mask");
+        let resets = Resets {
+            rows: vec![r],
+            mask: mask.device_ptr(&gpu.stream).0,
+        };
+        let (y_whole, dx_whole) = gpu_run(&x, &dy, Some(resets));
+        let mut halves = Vec::new();
+        let mut cpu = Vec::new();
+        for (off, len) in [(0, r), (r, t - r)] {
+            let (xs, dys) = (cut(&x, off, len, inp), cut(&dy, off, len, d));
+            halves.push(gpu_run(&xs, &dys, None));
+            let mut c = make();
+            let y = c.forward(&xs);
+            let dx = c.backward(&dys);
+            cpu.push((y.data.to_vec(), dx.data.to_vec()));
+        }
+
+        // Scale-aware worst error of rows `rows` of two `[t, w]` host tensors.
+        let err = |a: &[f32], b: &[f32], w: usize, rows: std::ops::Range<usize>| -> f32 {
+            let (a, b) = (
+                &a[rows.start * w..rows.end * w],
+                &b[rows.start * w..rows.end * w],
+            );
+            let scale = b.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-12);
+            a.iter()
+                .zip(b)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0f32, f32::max)
+                / scale
+        };
+        for (what, w, whole, half, reference) in [
+            (
+                "y",
+                d,
+                &y_whole,
+                [&halves[0].0, &halves[1].0],
+                [&cpu[0].0, &cpu[1].0],
+            ),
+            (
+                "dx",
+                inp,
+                &dx_whole,
+                [&halves[0].1, &halves[1].1],
+                [&cpu[0].1, &cpu[1].1],
+            ),
+        ] {
+            // The document before the border: its forward never sees what follows,
+            // and its backward receives nothing from across the border — so it matches
+            // the prefix run on its own up to the projections' GEMM blocking.
+            let e = err(whole, half[0], w, 0..r);
+            assert!(
+                e < 1e-5,
+                "{what}: prefix rows moved by {e} with the next document attached"
+            );
+            // The document after it, against the fp32 CPU cell run on it alone. The
+            // whole call blocks it differently from a call of its own, so it sits at
+            // the GPU's usual distance from fp32, not bit-equal to the GPU half — what
+            // the reset may not do is add to that distance.
+            let suffix = |v: &Vec<f32>| v[r * w..].to_vec();
+            let (e_whole, e_half) = (
+                err(&suffix(whole), reference[1], w, 0..t - r),
+                err(half[1], reference[1], w, 0..t - r),
+            );
+            assert!(
+                e_whole < (3.0 * e_half).max(5e-3),
+                "{what}: the document after the border is {e_whole} from fp32, \
+                 against {e_half} for the same document run on its own"
             );
         }
     }

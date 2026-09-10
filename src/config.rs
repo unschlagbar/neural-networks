@@ -95,7 +95,7 @@ pub const CARRY_WINDOW_STATE: bool = true;
 /// Backbone sweep chunk length in words (`0` = one whole-sequence sweep), which
 /// bounds resident activations at O(chunk) instead of O(words). Kept above the
 /// sLSTM's `FUSED_MIN_T` (32) so a chunk still runs time-fused.
-pub const BACKBONE_CHUNK: usize = 512;
+pub const BACKBONE_CHUNK: usize = 512 * 2;
 
 /// Largest encoder/decoder group in rows (`words × tmax`), `0` = uncapped.
 /// A group holds every word of one length and pooled buffers never shrink, so

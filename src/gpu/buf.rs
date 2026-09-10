@@ -49,7 +49,7 @@ const RETAIN_SLACK: usize = 4;
 
 /// Whether an existing `capacity` should be kept for a request of `want` elements.
 #[inline]
-fn fits(capacity: usize, want: usize) -> bool {
+pub(super) fn fits(capacity: usize, want: usize) -> bool {
     capacity >= want && capacity <= want.saturating_mul(RETAIN_SLACK)
 }
 
@@ -72,7 +72,7 @@ fn fits(capacity: usize, want: usize) -> bool {
 /// count to ~16 per octave — a constant, independent of how many distinct shapes the
 /// corpus produces.
 #[inline]
-fn size_class(n: usize) -> usize {
+pub(super) fn size_class(n: usize) -> usize {
     // Small allocations are left exact: the waste would be proportionally large and
     // there are few enough distinct small sizes for them not to be the problem.
     const MIN_CLASS: usize = 1024;

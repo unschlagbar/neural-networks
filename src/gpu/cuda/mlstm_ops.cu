@@ -163,6 +163,17 @@ extern "C" __global__ void ogate_fwd(const slab_t* o, const float* yhat, float* 
     hconcat[i] = g * yhat[i];
 }
 
+// `ogate_fwd` writing `hconcat` narrow: its only reader is the output projection's
+// bf16 GEMM, forward and backward.
+extern "C" __global__ void ogate_fwd_slab(const slab_t* o, const float* yhat, slab_t* hconcat,
+                                          int d, int stride, int off) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= d) return;
+    long long i = (long long)blockIdx.y * d + c;
+    float g = stable_sigmoid(slab_ld(o, (long long)blockIdx.y * stride + off + c));
+    slab_st(hconcat, i, g * yhat[i]);
+}
+
 // mLSTM chunking (inter-chunk state carry; see gpu/mlstm.rs)
 // A chunk is a contiguous T-range [c0, c0+L) of a [BH, T, W] head-major tensor.
 // Within a group g the range is contiguous (g*T*W + c0*W, length L*W), so both
@@ -494,16 +505,32 @@ extern "C" __global__ void revcumsum_dlogsig(const float* dfc, const float* f, f
 // SwiGLU backward: from d_mixed (grad wrt gate_act⊙value),
 //   d_value = d_mixed ⊙ gate_act
 //   d_gate  = d_mixed ⊙ value ⊙ SiLU'(gate_pre),  SiLU'(x) = σ(x)(1 + x(1-σ(x))).
-extern "C" __global__ void swiglu_backward(const float* d_mixed, const float* gate_act,
-                                           const float* value, const float* gate_pre,
-                                           float* d_gate, float* d_value, int n) {
+extern "C" __global__ void swiglu_backward(const float* d_mixed, const float* value,
+                                           const float* gate_pre, float* d_gate,
+                                           float* d_value, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float dm = d_mixed[i];
-    d_value[i] = dm * gate_act[i];
     float gp = gate_pre[i];
     float s = stable_sigmoid(gp);
+    // SiLU(gate_pre), exactly as `swiglu_forward` computed it.
+    d_value[i] = dm * (gp * s);
     float sp = s * (1.0f + gp * (1.0f - s));
     d_gate[i] = dm * value[i] * sp;
+}
+
+// `swiglu_backward` writing both deltas narrow: every reader (the projections' two
+// GEMMs and their bias sums) takes them at bf16.
+extern "C" __global__ void swiglu_backward_slab(const float* d_mixed, const float* value,
+                                                const float* gate_pre, slab_t* d_gate,
+                                                slab_t* d_value, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float dm = d_mixed[i];
+    float gp = gate_pre[i];
+    float s = stable_sigmoid(gp);
+    slab_st(d_value, i, dm * (gp * s));
+    float sp = s * (1.0f + gp * (1.0f - s));
+    slab_st(d_gate, i, dm * value[i] * sp);
 }
 

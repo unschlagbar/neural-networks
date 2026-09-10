@@ -6,9 +6,7 @@
 //! `determinism.rs` compares the whole model's LOSS, which is a forward quantity: a
 //! nondeterministic backward leaves it alone and only shows up a step later. This
 //! compares the gradients themselves, at the backbone's real shape and with the
-//! chunked state carry the backbone sweep uses. `OFFLOAD=1` parks the saved
-//! activations on the host between the forward and the backward, as the backbone
-//! does, so the transfer's stream ordering is on trial too.
+//! chunked state carry the backbone sweep uses.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -31,10 +29,6 @@ fn main() {
     let x = GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, d], 0.5, 0xA1));
     let g = GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, d], 1.0, 0xA2));
     let mut cell = MLstm::new_rand(&gpu, d, d, heads, dqk);
-    if std::env::var("OFFLOAD").is_ok() {
-        cell.enable_offload(&gpu, neural_networks::gpu::offload::InFlight::shared());
-        println!("(activation offload enabled)");
-    }
     // Positional labels for `grads()`, so a mismatch names something.
     const GRAD_NAMES: [&str; 16] = [
         "dWq", "dbq", "dWk", "dbk", "dWv", "dbv", "dWo", "dbo", "dWi", "dbi", "dWf", "dbf",

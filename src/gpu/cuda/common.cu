@@ -72,8 +72,11 @@ __device__ __forceinline__ float csm_ld(const float* p, long i) { return p[i]; }
 __device__ __forceinline__ float csm_ld(const slab_t* p, long i) { return slab_ld(p, i); }
 #endif
 
-template <typename MT>
-__device__ __forceinline__ void add_col_sum_impl(float* db, const float* dy, const MT* mul,
+// `DT` is `dy`'s storage width: a projection whose output delta is produced narrow
+// (the SwiGLU backward's) sums its bias gradient from the same bf16 values its GEMMs
+// read.
+template <typename DT, typename MT>
+__device__ __forceinline__ void add_col_sum_impl(float* db, const DT* dy, const MT* mul,
                                        int use_mul, const float* div, int use_div,
                                        int rows, int n) {
     extern __shared__ float shcs[];
@@ -83,7 +86,7 @@ __device__ __forceinline__ void add_col_sum_impl(float* db, const float* dy, con
     if (o < n) {
         for (int r = threadIdx.y; r < rows; r += blockDim.y) {
             long i = (long)r * n + o;
-            s += use_mul ? dy[i] * csm_ld(mul, i) : dy[i];
+            s += use_mul ? csm_ld(dy, i) * csm_ld(mul, i) : csm_ld(dy, i);
         }
     }
     shcs[tid] = s;
@@ -108,6 +111,12 @@ extern "C" __global__ void add_col_sum_slab(float* db, const float* dy, const sl
     add_col_sum_impl(db, dy, mul, use_mul, div, use_div, rows, n);
 }
 
+extern "C" __global__ void add_col_sum_dy_slab(float* db, const slab_t* dy, const float* mul,
+                                       int use_mul, const float* div, int use_div,
+                                       int rows, int n) {
+    add_col_sum_impl(db, dy, mul, use_mul, div, use_div, rows, n);
+}
+
 // `add_col_sum` with the row axis cut into `bands` of `band` rows, one band per
 // `blockIdx.y`, each writing its own `part[band, n]` row.
 //
@@ -116,13 +125,22 @@ extern "C" __global__ void add_col_sum_slab(float* db, const float* dy, const sl
 // at a tenth of the machine's bandwidth: the work is there, the parallelism is not.
 // Banding puts the row axis back into the grid.
 //
-// Still not an atomicAdd: `band` is a function of the shape alone, so which rows a
-// band holds, the tree inside it, and the order `col_sum_merge` folds the bands in
+// Still not an atomicAdd on the data: `band` is a function of the shape alone, so
+// which rows a band holds, the tree inside it, and the order the bands are folded in
 // are all fixed by the shape, and two runs of it agree bit for bit.
-template <typename MT>
-__device__ __forceinline__ void col_sum_part_impl(float* part, const float* dy, const MT* mul,
-                                        int use_mul, int rows, int n, int band) {
+//
+// The fold happens in the same launch: each block writes its band, then takes a
+// ticket for its column tile, and whichever block draws the last ticket folds all
+// bands of that tile in ascending order (the threadFenceReduction pattern). Which
+// block that is depends on scheduling; what it computes does not. The last block
+// also returns the ticket to 0, so `tickets` is all-zero between launches.
+template <typename DT, typename MT>
+__device__ __forceinline__ void col_sum_part_impl(float* db, float* part, const DT* dy,
+                                        const MT* mul, int use_mul, const float* div,
+                                        int use_div, unsigned* tickets, int rows, int n,
+                                        int band) {
     extern __shared__ float shcs[];
+    __shared__ bool last;
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;
     const int r0 = blockIdx.y * band;
@@ -131,7 +149,7 @@ __device__ __forceinline__ void col_sum_part_impl(float* part, const float* dy, 
     if (o < n) {
         for (int r = r0 + threadIdx.y; r < r1; r += blockDim.y) {
             long i = (long)r * n + o;
-            s += use_mul ? dy[i] * csm_ld(mul, i) : dy[i];
+            s += use_mul ? csm_ld(dy, i) * csm_ld(mul, i) : csm_ld(dy, i);
         }
     }
     shcs[tid] = s;
@@ -141,27 +159,39 @@ __device__ __forceinline__ void col_sum_part_impl(float* part, const float* dy, 
         __syncthreads();
     }
     if (threadIdx.y == 0 && o < n) part[(long)blockIdx.y * n + o] = shcs[tid];
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) last = atomicAdd(&tickets[blockIdx.x], 1u) == gridDim.y - 1;
+    __syncthreads();
+    if (!last) return;
+    if (threadIdx.y == 0 && o < n) {
+        float t = 0.0f;
+        // L2 loads: the other bands were written by other SMs, past this SM's L1.
+        for (int p = 0; p < (int)gridDim.y; ++p) t += __ldcg(&part[(long)p * n + o]);
+        db[o] += use_div ? t / div[o] : t;
+    }
+    if (tid == 0) tickets[blockIdx.x] = 0;
 }
 
-extern "C" __global__ void col_sum_part(float* part, const float* dy, const float* mul,
-                                        int use_mul, int rows, int n, int band) {
-    col_sum_part_impl(part, dy, mul, use_mul, rows, n, band);
+extern "C" __global__ void col_sum_part(float* db, float* part, const float* dy,
+                                        const float* mul, int use_mul, const float* div,
+                                        int use_div, unsigned* tickets, int rows, int n,
+                                        int band) {
+    col_sum_part_impl(db, part, dy, mul, use_mul, div, use_div, tickets, rows, n, band);
 }
 
-extern "C" __global__ void col_sum_part_slab(float* part, const float* dy, const slab_t* mul,
-                                        int use_mul, int rows, int n, int band) {
-    col_sum_part_impl(part, dy, mul, use_mul, rows, n, band);
+extern "C" __global__ void col_sum_part_slab(float* db, float* part, const float* dy,
+                                        const slab_t* mul, int use_mul, const float* div,
+                                        int use_div, unsigned* tickets, int rows, int n,
+                                        int band) {
+    col_sum_part_impl(db, part, dy, mul, use_mul, div, use_div, tickets, rows, n, band);
 }
 
-// db[o] += sum of the bands `col_sum_part` wrote, in ascending band order.
-// `div`/`use_div` are `add_col_sum`'s per-column divisor, applied once at the end.
-extern "C" __global__ void col_sum_merge(float* db, const float* part, const float* div,
-                                         int use_div, int bands, int n) {
-    const int o = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= n) return;
-    float s = 0.0f;
-    for (int p = 0; p < bands; ++p) s += part[(long)p * n + o];
-    db[o] += use_div ? s / div[o] : s;
+extern "C" __global__ void col_sum_part_dy_slab(float* db, float* part, const slab_t* dy,
+                                        const float* mul, int use_mul, const float* div,
+                                        int use_div, unsigned* tickets, int rows, int n,
+                                        int band) {
+    col_sum_part_impl(db, part, dy, mul, use_mul, div, use_div, tickets, rows, n, band);
 }
 
 // out[r, :] = table[ids[r], :]. One thread per output element.
@@ -268,8 +298,13 @@ __device__ __forceinline__ void rmsn_st(slab_t* p, long long i, float v) { slab_
 // consumer of a block's norm output is a GEMM that reads bf16 anyway: writing it
 // narrow here saves half the store, and saves the separate cast pass that would
 // otherwise read the fp32 result back out of HBM to produce the same bits.
+//
+// `x2`, when not null, is a residual branch: the norm runs over `z = x + x2`, and `z`
+// is written to `z_out` for the caller's next residual. Each thread writes only the
+// elements it reads, so `z_out` may alias `x`.
 template <typename OT>
-__device__ __forceinline__ void rms_norm_fwd_impl(const float* x, const float* gamma, OT* out,
+__device__ __forceinline__ void rms_norm_fwd_impl(const float* x, const float* x2,
+                                                float* z_out, const float* gamma, OT* out,
                                                 float* inv_rms,
                                                 int groups_per_row, int group, float eps,
                                                 int total_groups) {
@@ -284,29 +319,38 @@ __device__ __forceinline__ void rms_norm_fwd_impl(const float* x, const float* g
     float ss = 0.0f;
     for (int i = threadIdx.x; i < group; i += blockDim.x) {
         float v = x[off + i];
+        if (x2) {
+            v += x2[off + i];
+            z_out[off + i] = v;
+        }
         ss += v * v;
     }
     ss = rmsn_block_sum(ss, sh);
     float inv = rsqrtf(ss / (float)group + eps);
     if (threadIdx.x == 0) inv_rms[gi] = inv;
 
+    const float* z = x2 ? z_out : x;
     for (int i = threadIdx.x; i < group; i += blockDim.x) {
-        rmsn_st(out, off + i, gamma[g_off + i] * x[off + i] * inv);
+        rmsn_st(out, off + i, gamma[g_off + i] * z[off + i] * inv);
     }
 }
 
-extern "C" __global__ void rms_norm_forward(const float* x, const float* gamma, float* out,
+extern "C" __global__ void rms_norm_forward(const float* x, const float* x2, float* z_out,
+                                                const float* gamma, float* out,
                                                 float* inv_rms,
                                                 int groups_per_row, int group, float eps,
                                                 int total_groups) {
-    rms_norm_fwd_impl(x, gamma, out, inv_rms, groups_per_row, group, eps, total_groups);
+    rms_norm_fwd_impl(x, x2, z_out, gamma, out, inv_rms, groups_per_row, group, eps,
+                      total_groups);
 }
 
-extern "C" __global__ void rms_norm_forward_slab(const float* x, const float* gamma, slab_t* out,
+extern "C" __global__ void rms_norm_forward_slab(const float* x, const float* x2, float* z_out,
+                                                const float* gamma, slab_t* out,
                                                 float* inv_rms,
                                                 int groups_per_row, int group, float eps,
                                                 int total_groups) {
-    rms_norm_fwd_impl(x, gamma, out, inv_rms, groups_per_row, group, eps, total_groups);
+    rms_norm_fwd_impl(x, x2, z_out, gamma, out, inv_rms, groups_per_row, group, eps,
+                      total_groups);
 }
 
 // Backward twin — `dx` only. `dgamma` is a sum over ROWS of `dy ⊙ x̂`, which every
@@ -320,10 +364,12 @@ extern "C" __global__ void rms_norm_forward_slab(const float* x, const float* ga
 // `YT` is the forward output's storage width, which is whatever the forward wrote.
 // `dy` and `dx` stay fp32: `dx` continues into the residual chain, which is the one
 // place the model cannot afford a narrowed accumulation.
+// `resid`, when not null, is added to `dx`: the gradient of the residual branch that
+// bypasses this norm, so a block's pre-norm needs no separate add.
 template <typename YT>
 __device__ __forceinline__ void rms_norm_bwd_impl(const float* dy, const YT* y,
                                                  const float* inv_rms, const float* gamma,
-                                                 float* dx,
+                                                 const float* resid, float* dx,
                                                  int groups_per_row, int group,
                                                  int total_groups) {
     int gi = blockIdx.x;
@@ -343,24 +389,25 @@ __device__ __forceinline__ void rms_norm_bwd_impl(const float* dy, const YT* y,
 
     for (int i = threadIdx.x; i < group; i += blockDim.x) {
         float g = gamma[g_off + i];
-        dx[off + i] = inv * (g * dy[off + i] - (rmsn_ld(y, off + i) / g) * s_over_g);
+        float d = inv * (g * dy[off + i] - (rmsn_ld(y, off + i) / g) * s_over_g);
+        dx[off + i] = resid ? d + resid[off + i] : d;
     }
 }
 
 extern "C" __global__ void rms_norm_backward(const float* dy, const float* y,
                                                  const float* inv_rms, const float* gamma,
-                                                 float* dx,
+                                                 const float* resid, float* dx,
                                                  int groups_per_row, int group,
                                                  int total_groups) {
-    rms_norm_bwd_impl(dy, y, inv_rms, gamma, dx, groups_per_row, group, total_groups);
+    rms_norm_bwd_impl(dy, y, inv_rms, gamma, resid, dx, groups_per_row, group, total_groups);
 }
 
 extern "C" __global__ void rms_norm_backward_slab(const float* dy, const slab_t* y,
                                                  const float* inv_rms, const float* gamma,
-                                                 float* dx,
+                                                 const float* resid, float* dx,
                                                  int groups_per_row, int group,
                                                  int total_groups) {
-    rms_norm_bwd_impl(dy, y, inv_rms, gamma, dx, groups_per_row, group, total_groups);
+    rms_norm_bwd_impl(dy, y, inv_rms, gamma, resid, dx, groups_per_row, group, total_groups);
 }
 
 

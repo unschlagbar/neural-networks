@@ -16,29 +16,28 @@ extern "C" __global__ void add_assign(float* acc, const float* b, int n) {
     if (i < n) acc[i] += b[i];
 }
 
-// SwiGLU forward: gate_act = SiLU(gate_pre); mixed = gate_act ⊙ value.
-// SiLU(x) = x·σ(x). One thread per element of the [N, U] tensors.
+// SwiGLU forward: mixed = SiLU(gate_pre) ⊙ value, SiLU(x) = x·σ(x). One thread per
+// element of the [N, U] tensors. SiLU(gate_pre) is not stored: `swiglu_backward`
+// recomputes it from `gate_pre` with this same expression, so the bits agree.
 extern "C" __global__ void swiglu_forward(const float* gate_pre, const float* value,
-                                          float* gate_act, float* mixed, int n) {
+                                          float* mixed, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float gp = gate_pre[i];
     float ga = gp * stable_sigmoid(gp);
-    gate_act[i] = ga;
     mixed[i] = ga * value[i];
 }
 
 // `mixed` at the slab width. Its only readers are `lin_down`'s two GEMMs (forward
 // and the dW half of backward), which take a bf16 operand — so writing it narrow
 // here saves the cast each of them would otherwise do, and halves what the host
-// park moves for it. `gate_act` stays fp32: `swiglu_backward` computes on it.
+// offload moves for it.
 extern "C" __global__ void swiglu_forward_slab(const float* gate_pre, const float* value,
-                                               float* gate_act, slab_t* mixed, int n) {
+                                               slab_t* mixed, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float gp = gate_pre[i];
     float ga = gp * stable_sigmoid(gp);
-    gate_act[i] = ga;
     slab_st(mixed, i, ga * value[i]);
 }
 

@@ -8,7 +8,7 @@
 //! It exists to exercise what only real data produces. Packing fixes the word count,
 //! but the token span and the word-length histogram behind it still move window to
 //! window, so every layer's per-call buffers are refit — and sometimes reallocated —
-//! window after window, and the backbone's spans are cut wherever the documents in the
+//! window after window, and the backbone's cells restart wherever the documents in the
 //! window happen to start. A buffer that outlives a shape it was sized for surfaces
 //! asynchronously, and possibly much later, as a sticky
 //! CUBLAS_STATUS_EXECUTION_FAILED.
@@ -56,7 +56,16 @@ fn main() {
         w_token,
         cap: LOGIT_SOFTCAP,
     };
-    let mut model = Hierarchical::new(&gpu, cfg);
+    // `SOAK_MODEL=<path>` starts from a checkpoint (read, never written) instead of a
+    // fresh model; `SOAK_SKIP=<n>` starts at the file's n-th window, as a resume does.
+    let mut model = match std::env::var("SOAK_MODEL") {
+        Ok(p) => Hierarchical::load(&gpu, &p, w_token).expect("load SOAK_MODEL"),
+        Err(_) => Hierarchical::new(&gpu, cfg),
+    };
+    let mut skip: usize = std::env::var("SOAK_SKIP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let mut opt = AdamCfg::new(LR, neural_networks::optimizers::WEIGHT_DECAY);
 
     let mut data = ChunkedWordDataSet::open(
@@ -81,11 +90,22 @@ fn main() {
     let warmup = BATCH_SIZE;
     let (mut hot, mut hot_tokens) = (None, 0usize);
 
+    // Stateful exactly as the trainer runs it: a window continues the previous one's
+    // backbone state when the dataset says so.
+    let stateful = CARRY_WINDOW_STATE && std::env::var("SOAK_STATELESS").is_err();
+    model.set_stateful(stateful);
+
     'outer: while let Some(chunk) = data.next_chunk() {
-        for batch in chunk.iter() {
+        if skip >= chunk.len() {
+            skip -= chunk.len();
+            continue;
+        }
+        let mut ran_prev = false;
+        for batch in chunk.iter().skip(std::mem::take(&mut skip)) {
             let tokens: Vec<usize> = batch.tokens.iter().map(|&t| t as usize).collect();
             let words = &batch.words;
             if words.len() < 2 {
+                ran_prev = false;
                 continue;
             }
             let dw = words.len() - 1;
@@ -97,7 +117,9 @@ fn main() {
                 full += 1;
             }
 
+            model.set_continues(batch.continues && ran_prev);
             model.set_doc_starts(&batch.doc_starts);
+            ran_prev = true;
             loss_sum += model.forward_backward(&gpu, &tokens, words);
             seen += 1;
             if seen > warmup {

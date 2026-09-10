@@ -105,7 +105,7 @@ extern "C" __global__ void slstm_fused_time(
         slab_t* h_prev, float* c_state, float* n_state, float* m_state, float* h_state,
         float* hmir, float* wtail, state_t* c_entry, state_t* n_entry, slab_t* zt, slab_t* ot,
         state_t* i_prime, state_t* f_prime, state_t* c_out, state_t* n_out,
-        float* out, int T, int units_per_block, int carry) {
+        float* out, int T, int units_per_block, int carry, const int* __restrict__ reset) {
     extern __shared__ __align__(16) float smem[];
     cg::grid_group grid = cg::this_grid();
 
@@ -273,13 +273,20 @@ extern "C" __global__ void slstm_fused_time(
         // --- pointwise recurrence ---
         // Identical math to slstm_step_fused; see it for the stabilizer notes.
         if (owner) {
+            // A document starts at this row: the step runs exactly as a sequence's
+            // first, from zero state and with no recurrent half (the zero mirror of a
+            // fresh start reduces to +0 as well).
+            const bool rs = reset != nullptr && reset[t] != 0;
+            if (rs) {
+                c_reg = 0.0f; n_reg = 0.0f; m_reg = 0.0f; h_reg = 0.0f;
+            }
             // Gate pre-activation = input half + recurrent half (this block's gacc)
             // + bias. gacc is laid out [b][gate][unit].
             const float* ga = gacc + (long long)b_pw * ncol + jl_pw;
-            float z_pre = gz + ga[0] + bz;
-            float i_pre = gi + ga[nj] + bi;
-            float f_pre = gf + ga[2 * nj] + bf;
-            float o_pre = go4 + ga[3 * nj] + bo;
+            float z_pre = gz + (rs ? 0.0f : ga[0]) + bz;
+            float i_pre = gi + (rs ? 0.0f : ga[nj]) + bi;
+            float f_pre = gf + (rs ? 0.0f : ga[2 * nj]) + bf;
+            float o_pre = go4 + (rs ? 0.0f : ga[3 * nj]) + bo;
             g[go + 2 * FUSED_H] = f_pre; // biased forget pre-activation, for backward
 
             slab_st(h_prev, s, h_reg);
@@ -381,7 +388,8 @@ extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
         const slab_t* __restrict__ ot, const state_t* __restrict__ c_t,
         const state_t* __restrict__ n_t, const state_t* __restrict__ c_entry,
         const state_t* __restrict__ n_entry, const slab_t* __restrict__ zt,
-        const state_t* __restrict__ i_gate, const state_t* __restrict__ f_gate, int T) {
+        const state_t* __restrict__ i_gate, const state_t* __restrict__ f_gate, int T,
+        const int* __restrict__ reset) {
     cg::grid_group grid = cg::this_grid();
 
     // The block's whole dh vector: written by the contraction's lane 0, read by the
@@ -441,14 +449,18 @@ extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
         if (!owner) return;
         const long long s = ((long long)b_pw * T + t) * SLSTM_H + j_pw;
         const long long go = ((long long)b_pw * T + t) * BW_H4 + j_pw;
+        // A reset row's forward ran from zero state, so its predecessor is zero.
+        const bool rs = reset != nullptr && reset[t] != 0;
         f_dy = dy[s];
         f_fpre = g[go + 2 * SLSTM_H]; // biased forget pre-activation, from the forward
         f_o = slab_ld(ot, s);
         f_c = state_ld(c_t, s);
         f_n = state_ld(n_t, s);
-        f_cp = (t == 0) ? state_ld(c_entry, (long long)b_pw * SLSTM_H + j_pw)
+        f_cp = rs ? 0.0f
+             : (t == 0) ? state_ld(c_entry, (long long)b_pw * SLSTM_H + j_pw)
                         : state_ld(c_t, s - SLSTM_H);
-        f_np = (t == 0) ? state_ld(n_entry, (long long)b_pw * SLSTM_H + j_pw)
+        f_np = rs ? 0.0f
+             : (t == 0) ? state_ld(n_entry, (long long)b_pw * SLSTM_H + j_pw)
                         : state_ld(n_t, s - SLSTM_H);
         f_z = slab_ld(zt, s);
         f_i = state_ld(i_gate, s);
@@ -458,6 +470,9 @@ extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
     __syncthreads(); // dh seeded before the first timestep reads it
 
     for (int t = T - 1; t >= 0; --t) {
+        // Nothing crosses a reset row towards t - 1: its forward read no state and no
+        // recurrent h, so the carried gradients stop here.
+        const bool rs = reset != nullptr && reset[t] != 0;
         // --- pointwise: one thread per (batch row, owned unit) ---
         // Identical math to slstm_step_fused_bwd; see it for the derivation.
         if (owner) {
@@ -480,8 +495,8 @@ extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
             g[go + 3 * SLSTM_H] = d_o_pre;
 
             // Carry to step t-1: both paths are scaled by the forget gate.
-            dc_reg = d_c * f_f;
-            dn_reg = d_n * f_f;
+            dc_reg = rs ? 0.0f : d_c * f_f;
+            dn_reg = rs ? 0.0f : d_n * f_f;
         }
         if (t > 0) fetch(t - 1);
         grid.sync(); // this step's gate deltas visible in `g` across the grid
@@ -507,7 +522,7 @@ extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
             for (int off = 16; off > 0; off >>= 1) {
                 acc += __shfl_down_sync(0xffffffff, acc, off);
             }
-            if (lane == 0) dh_sh[b * SLSTM_NJ + u_w] = acc;
+            if (lane == 0) dh_sh[b * SLSTM_NJ + u_w] = rs ? 0.0f : acc;
         }
         __syncthreads(); // dh complete before the next timestep reads it
     }

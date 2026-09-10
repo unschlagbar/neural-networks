@@ -1,623 +1,554 @@
-//! Host-backed storage for activations that forward saves and backward reads.
+//! Storage for the activations a forward saves and its backward reads.
+//!
+//! Everything one block saves — its own FFN activations, its cell's cache, its norms'
+//! `inv_rms` — lives in one [`Frame`]: a byte range the layers carve typed views out of,
+//! in a fixed order that forward and backward both replay. So a block's saved state is
+//! one contiguous range, and moving it is one copy.
+//!
+//! A [`FrameStack`] hands the frames out, in one of two ways:
+//!
+//!   * **resident** ([`ResidentFrames`]) — one device buffer per stack depth, reused
+//!     across windows. The encoder, the decoder, eval and `GPU_NO_OFFLOAD`.
+//!   * **offloaded** ([`Offload`]) — the backbone. Every frame is copied to a pinned host
+//!     stack as its forward ends and comes back before its backward, through a fixed
+//!     ring of [`RING_SLOTS`] device slots. Nothing is allocated or freed per frame.
 //!
 //! Training is bounded by activation VRAM, and that bound is linear in the sequence
 //! length: step 0's saved tensors must survive until backward unwinds to `t = 0`, so
 //! no reordering of the forward loop frees them. Only moving them off the device — or
 //! recomputing them — changes the scaling.
 
-use cudarc::driver::{CudaEvent, CudaStream, PinnedHostSlice};
+use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, result};
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
+use super::buf::{fits, size_class};
+use super::ops::SlabBuf;
 use super::{GTensor, Gpu};
-use crate::gpu::ops::SlabBuf;
 
-/// Where one chunk of a tensor's timeline lives while it is off the device.
-struct HostChunk {
-    mem: PinnedHostSlice<f32>,
-    /// Elements actually used. The last chunk of a ragged `T` is shorter than the
-    /// allocation, and copying the full slice would move — and later restore —
-    /// garbage past the end of the timeline.
-    len: usize,
+/// Alignment of every region carved from a frame, in bytes — what `cuMemAlloc` itself
+/// guarantees, so a view is as aligned as an allocation would be.
+const ALIGN: usize = 256;
+
+pub fn align_up(n: usize) -> usize {
+    n.div_ceil(ALIGN) * ALIGN
 }
 
-/// A set of device tensors with a leading time axis, staged through host memory.
-pub struct OffloadRing {
-    /// The full `T` timeline, one entry per chunk, in host memory.
-    host: Vec<HostChunk>,
-    /// Double buffer: `K` timesteps of device staging, alternating so a copy can
-    /// drain from one half while compute fills the other.
-    dev: [GTensor<f32>; 2],
-    /// Copy stream, distinct from `gpu.stream` so transfers overlap compute.
+/// A byte range that one block's saved activations are carved out of.
+///
+/// Carving is sequential: each call takes the next aligned region. A layer carves in a
+/// single function that its forward and its backward both call, so the two see the same
+/// regions without either storing an offset. The views own nothing; the storage stays the
+/// [`FrameStack`]'s.
+pub struct Frame {
+    base: u64,
+    cap: usize,
+    used: usize,
+}
+
+impl Frame {
+    /// A frame with no memory behind it, for sizing a layout: carve it, then read
+    /// [`bytes`](Self::bytes). Its views must never reach a kernel.
+    pub fn measure() -> Self {
+        Self {
+            base: 0,
+            cap: usize::MAX,
+            used: 0,
+        }
+    }
+
+    fn at(base: u64, cap: usize) -> Self {
+        Self { base, cap, used: 0 }
+    }
+
+    /// A frame over the whole of `buf`, which must outlive every view carved from it.
+    pub fn over(gpu: &Gpu, buf: &CudaSlice<u8>) -> Self {
+        let (p, _g) = buf.device_ptr(&gpu.stream);
+        Self::at(p, buf.len())
+    }
+
+    /// Bytes carved so far; after a full carve, the frame's size.
+    pub fn bytes(&self) -> usize {
+        self.used
+    }
+
+    fn region(&mut self, bytes: usize) -> u64 {
+        let off = align_up(self.used);
+        assert!(
+            off + bytes <= self.cap,
+            "frame: carving {} B past a {} B frame",
+            off + bytes,
+            self.cap
+        );
+        self.used = off + bytes;
+        self.base + off as u64
+    }
+
+    pub fn f32(&mut self, gpu: &Gpu, dims: &[usize]) -> GTensor<f32> {
+        let n: usize = dims.iter().product();
+        GTensor::view_at(gpu, self.region(n * 4), dims)
+    }
+
+    pub fn bf16(&mut self, gpu: &Gpu, dims: &[usize]) -> GTensor<u16> {
+        let n: usize = dims.iter().product();
+        GTensor::view_at(gpu, self.region(n * 2), dims)
+    }
+
+    /// A slab at an explicit width — see [`SlabBuf::new_width`].
+    pub fn slab(&mut self, gpu: &Gpu, dims: &[usize], bf16: bool) -> SlabBuf {
+        if bf16 {
+            SlabBuf::Bf16(self.bf16(gpu, dims))
+        } else {
+            SlabBuf::F32(self.f32(gpu, dims))
+        }
+    }
+}
+
+/// Where a block's frames live. See the module docs.
+pub enum FrameStack {
+    Resident(ResidentFrames),
+    Offload(SharedOffload),
+}
+
+impl Default for FrameStack {
+    fn default() -> Self {
+        FrameStack::Resident(ResidentFrames::default())
+    }
+}
+
+impl FrameStack {
+    /// A frame of `bytes` for the forward about to run. `stacked` keeps the frames
+    /// already pushed (a chunked sweep, whose earlier chunks are still owed a backward);
+    /// otherwise a resident stack reuses its one frame.
+    pub fn push(&mut self, gpu: &Gpu, bytes: usize, stacked: bool) -> Frame {
+        match self {
+            FrameStack::Resident(r) => {
+                if !stacked {
+                    r.reset();
+                }
+                r.push(gpu, bytes)
+            }
+            FrameStack::Offload(o) => o.borrow_mut().push(gpu, bytes),
+        }
+    }
+
+    /// The forward that filled the last pushed frame has been issued.
+    pub fn pushed(&mut self, gpu: &Gpu) {
+        if let FrameStack::Offload(o) = self {
+            o.borrow_mut().pushed(gpu);
+        }
+    }
+
+    /// The last pushed frame, back on the device for its backward.
+    pub fn pop(&mut self, gpu: &Gpu) -> Frame {
+        match self {
+            FrameStack::Resident(r) => r.pop(gpu),
+            FrameStack::Offload(o) => o.borrow_mut().pop(gpu),
+        }
+    }
+
+    /// The backward that read the last popped frame has been issued.
+    pub fn popped(&mut self, gpu: &Gpu) {
+        if let FrameStack::Offload(o) = self {
+            o.borrow_mut().popped(gpu);
+        }
+    }
+
+    /// Forget every frame, keeping the memory. An offloaded stack is shared, so its
+    /// owner resets it once per sweep instead — see [`Offload::reset`].
+    pub fn reset(&mut self) {
+        if let FrameStack::Resident(r) = self {
+            r.reset();
+        }
+    }
+
+    /// Forget every frame and free a resident stack's memory.
+    pub fn release(&mut self) {
+        if let FrameStack::Resident(r) = self {
+            r.release();
+        }
+    }
+
+    /// Device bytes a resident stack holds. An offloaded one holds its ring, which is
+    /// the model's, not the block's.
+    pub fn device_bytes(&self) -> usize {
+        match self {
+            FrameStack::Resident(r) => r.device_bytes(),
+            FrameStack::Offload(_) => 0,
+        }
+    }
+
+    /// The most recently used frame of a resident stack, for diagnostics that read a
+    /// cache after the fact. `None` when offloaded.
+    pub fn recent(&self, gpu: &Gpu) -> Option<Frame> {
+        match self {
+            FrameStack::Resident(r) => r.recent(gpu),
+            FrameStack::Offload(_) => None,
+        }
+    }
+}
+
+/// Frames kept on the device: one buffer per stack depth, reused across windows.
+///
+/// A stack because a chunked sweep forwards every chunk before unwinding any, so chunk
+/// c's frame must survive chunk c+1's forward. Each depth reuses its buffer while it fits
+/// (see [`fits`]), so a steady window shape allocates nothing.
+#[derive(Default)]
+pub struct ResidentFrames {
+    bufs: Vec<CudaSlice<u8>>,
+    depth: usize,
+}
+
+impl ResidentFrames {
+    pub fn push(&mut self, gpu: &Gpu, bytes: usize) -> Frame {
+        let d = self.depth;
+        if d == self.bufs.len() || !fits(self.bufs[d].len(), bytes) {
+            // SAFETY: a frame's regions are written by the forward before the backward
+            // reads them.
+            let buf = unsafe { gpu.stream.alloc::<u8>(size_class(bytes).max(1)) }
+                .expect("frame alloc");
+            if d == self.bufs.len() {
+                self.bufs.push(buf);
+            } else {
+                self.bufs[d] = buf;
+            }
+        }
+        self.depth += 1;
+        Frame::over(gpu, &self.bufs[d])
+    }
+
+    pub fn pop(&mut self, gpu: &Gpu) -> Frame {
+        assert!(self.depth > 0, "frame stack: pop with nothing pushed");
+        self.depth -= 1;
+        // The address the matching push handed out: nothing reallocates this depth
+        // until it is pushed again.
+        Frame::over(gpu, &self.bufs[self.depth])
+    }
+
+    pub fn reset(&mut self) {
+        self.depth = 0;
+    }
+
+    pub fn release(&mut self) {
+        self.bufs.clear();
+        self.depth = 0;
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.bufs.iter().map(|b| b.len()).sum()
+    }
+
+    pub fn recent(&self, gpu: &Gpu) -> Option<Frame> {
+        let buf = self.bufs.get(self.depth.saturating_sub(1))?;
+        Some(Frame::over(gpu, buf))
+    }
+}
+
+/// Device slots in the offload ring.
+///
+/// Three because each direction wants a block of compute between a copy and the next
+/// write to its slot: forward writes frame j+3 into frame j's slot, so frame j's D2H has
+/// had frames j+1 and j+2 to hide behind; backward reads frame j while j-1 and j-2 are
+/// already on their way up.
+pub const RING_SLOTS: usize = 3;
+
+/// One device slot of the ring.
+struct Slot {
+    /// Held for ownership; every access goes through `addr`.
+    #[allow(dead_code)]
+    mem: CudaSlice<u8>,
+    addr: u64,
+    /// Index into the host stack of the frame this slot holds a valid copy of.
+    holds: Option<usize>,
+    /// The last transfer that touched this slot. Compute waits on it before writing the
+    /// slot (a D2H may still be reading it) or reading it (an H2D may still be filling
+    /// it).
+    done: Option<CudaEvent>,
+}
+
+/// Pinned host memory the offloaded frames live in, as one LIFO.
+struct HostStack {
+    mem: Option<PinnedHostSlice<u8>>,
+    ptr: *mut u8,
+    cap: usize,
+    /// `(offset, bytes)` of every frame pushed and not yet popped, bottom first.
+    frames: Vec<(usize, usize)>,
+}
+
+impl HostStack {
+    fn top(&self) -> usize {
+        self.frames.last().map_or(0, |&(o, b)| o + b)
+    }
+
+    fn slice(&mut self, i: usize) -> &mut [u8] {
+        let (off, bytes) = self.frames[i];
+        // SAFETY: `off + bytes <= cap` was checked on push, and the pinned allocation is
+        // alive for as long as `mem` is.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(off), bytes) }
+    }
+}
+
+/// The frames of a whole stack, staged through pinned host memory.
+///
+/// Shared by every block of the stack, because its frames form one LIFO: the backbone
+/// forwards chunk-major (chunk c through every block, then chunk c+1) and unwinds in
+/// exactly the reverse order, so the frame a backward wants is always the last one
+/// pushed. That is what lets one host stack hold them all, and lets [`pop`](Self::pop)
+/// prefetch the frames below it without being told which block runs next.
+///
+/// The ring is a write-through cache of the host stack: every frame is copied up when its
+/// forward ends, and a slot that still holds a frame when its backward comes serves it
+/// without a copy back — which is the case for the last frames of a sweep.
+pub struct Offload {
     xfer: Arc<CudaStream>,
-    /// Per-half "the copy out of this half has finished", so the next writer of that
-    /// half waits rather than overwriting a buffer still being read.
-    drained: [Option<CudaEvent>; 2],
-    /// Per-half "the copy into this half has finished", so a reader waits rather than
-    /// consuming a buffer the transfer has not filled yet.
-    filled: [Option<CudaEvent>; 2],
-    /// Timesteps per chunk (the last chunk may be shorter).
-    k: usize,
-    /// Elements per timestep — the product of the trailing (non-time) dims.
-    per_step: usize,
-    /// Total timesteps this ring was sized for.
-    t: usize,
+    slots: [Slot; RING_SLOTS],
+    slot_bytes: usize,
+    host: HostStack,
+    /// The slot of the frame between `push` and `pushed`, or `pop` and `popped`.
+    open: Option<usize>,
+    /// H2D copies issued, for the tests to observe which pops were served in place.
+    #[cfg(test)]
+    loads: usize,
 }
 
-impl OffloadRing {
-    /// A ring for a `[T, per_step]` timeline cut into chunks of `k` timesteps.
-    pub fn new(gpu: &Gpu, t: usize, per_step: usize, k: usize) -> Result<Self, String> {
-        assert!(k > 0, "OffloadRing: chunk length must be positive");
-        assert!(per_step > 0, "OffloadRing: per-step width must be positive");
+pub type SharedOffload = Rc<RefCell<Offload>>;
+
+impl Offload {
+    /// A ring of [`RING_SLOTS`] slots of `slot_bytes` each, and an empty host stack.
+    pub fn new(gpu: &Gpu, slot_bytes: usize) -> Self {
         let xfer = gpu
             .context
             .new_stream()
-            .map_err(|e| format!("offload: transfer stream creation failed: {e:?}"))?;
-
-        let mut host = Vec::with_capacity(t.div_ceil(k));
-        for c0 in (0..t).step_by(k) {
-            let len = k.min(t - c0) * per_step;
-            // SAFETY: freshly allocated pinned memory is uninitialised, and the
-            // contract is that a chunk is written (by `write`) before it is read (by
-            // `read`) — the ring never hands out a chunk it has not staged.
-            let mem = unsafe { gpu.context.alloc_pinned::<f32>(len) }
-                .map_err(|e| format!("offload: pinned host alloc of {len} floats failed: {e:?}"))?;
-            host.push(HostChunk { mem, len });
-        }
-
-        Ok(Self {
-            host,
-            dev: [
-                GTensor::uninit(gpu, &[k, per_step]),
-                GTensor::uninit(gpu, &[k, per_step]),
-            ],
+            .expect("offload: transfer stream creation failed");
+        let slots = Self::alloc_slots(gpu, slot_bytes);
+        Self {
             xfer,
-            drained: [None, None],
-            filled: [None, None],
-            k,
-            per_step,
-            t,
-        })
+            slots,
+            slot_bytes,
+            host: HostStack {
+                mem: None,
+                ptr: std::ptr::null_mut(),
+                cap: 0,
+                frames: Vec::new(),
+            },
+            open: None,
+            #[cfg(test)]
+            loads: 0,
+        }
     }
 
-    /// Number of chunks the timeline is cut into.
-    #[inline]
-    pub fn chunks(&self) -> usize {
-        self.host.len()
+    pub fn shared(gpu: &Gpu, slot_bytes: usize) -> SharedOffload {
+        Rc::new(RefCell::new(Self::new(gpu, slot_bytes)))
     }
 
-    /// Timesteps in chunk `i` — `k`, except for a ragged last chunk.
-    #[inline]
-    pub fn chunk_steps(&self, i: usize) -> usize {
-        self.host[i].len / self.per_step
+    fn alloc_slots(gpu: &Gpu, bytes: usize) -> [Slot; RING_SLOTS] {
+        let slots = std::array::from_fn(|_| {
+            // SAFETY: a slot is written (by a forward or an H2D) before it is read.
+            let mem = unsafe { gpu.stream.alloc::<u8>(bytes.max(1)) }.expect("offload slot");
+            let addr = mem.device_ptr(&gpu.stream).0;
+            Slot {
+                mem,
+                addr,
+                holds: None,
+                done: None,
+            }
+        });
+        // The allocation is stream-ordered on the compute stream, which the transfer
+        // stream knows nothing about; it must have happened before a copy touches it.
+        gpu.stream.synchronize().expect("offload: slot alloc");
+        slots
     }
 
-    /// Total device bytes this ring holds (the staging, not the timeline).
-    #[inline]
-    pub fn device_bytes(&self) -> usize {
-        2 * self.k * self.per_step * 4
+    /// Make room for a sweep of `total` frame bytes, none larger than `largest`. Call
+    /// with the stack empty, before the sweep's first push, so neither the ring nor the
+    /// host stack grows inside it.
+    pub fn reserve(&mut self, gpu: &Gpu, total: usize, largest: usize) {
+        assert!(
+            self.host.frames.is_empty(),
+            "offload: reserve with frames still pushed"
+        );
+        if largest > self.slot_bytes {
+            self.grow_slots(gpu, largest);
+        }
+        if total > self.host.cap {
+            // Headroom: windows vary by well under a percent, and page-locking ~10 GB
+            // again for every one that sets a new maximum costs seconds.
+            self.grow_host(gpu, total + total / 16);
+        }
     }
 
-    /// Total pinned host bytes (the timeline).
-    #[inline]
+    /// Forget every frame. For the start of a sweep, and for one abandoned before its
+    /// backward consumed the frames.
+    pub fn reset(&mut self) {
+        assert!(self.open.is_none(), "offload: reset inside a frame");
+        self.host.frames.clear();
+        for s in &mut self.slots {
+            s.holds = None;
+        }
+    }
+
     pub fn host_bytes(&self) -> usize {
-        self.t * self.per_step * 4
+        self.host.cap
     }
 
-    /// Device staging for chunk `i`, ready to be written by compute.
-    pub fn stage(&mut self, gpu: &Gpu, i: usize) -> &mut GTensor<f32> {
-        let half = i % 2;
-        if let Some(ev) = &self.drained[half] {
-            gpu.stream.wait(ev).expect("offload: wait for drain");
-        }
-        let steps = self.chunk_steps(i);
-        self.dev[half].shrink_to(&[steps, self.per_step]);
-        &mut self.dev[half]
+    pub fn device_bytes(&self) -> usize {
+        RING_SLOTS * self.slot_bytes
     }
 
-    /// Send chunk `i` to the host, having filled [`stage`](Self::stage) with it.
-    pub fn write(&mut self, gpu: &Gpu, i: usize) {
-        let half = i % 2;
-        let produced = gpu
-            .stream
-            .record_event(None)
-            .expect("offload: record produced");
-        self.xfer.wait(&produced).expect("offload: xfer waits");
-
-        let chunk = &mut self.host[i];
-        let src = self.dev[half].buf.slice(..chunk.len);
-        self.xfer
-            .memcpy_dtoh(&src, &mut chunk.mem)
-            .expect("offload: D2H");
-
-        self.drained[half] = Some(self.xfer.record_event(None).expect("offload: record drain"));
+    /// Frames pushed and not yet popped.
+    pub fn depth(&self) -> usize {
+        self.host.frames.len()
     }
 
-    /// Start chunk `i`'s host→device copy without waiting for it.
-    pub fn prefetch(&mut self, gpu: &Gpu, i: usize) {
-        let half = i % 2;
-        // The staging half may still be feeding a consumer on the compute stream, so
-        // the fill waits for compute before overwriting it.
-        let consumed = gpu
-            .stream
-            .record_event(None)
-            .expect("offload: record consumed");
-        self.xfer.wait(&consumed).expect("offload: xfer waits");
-
-        let chunk = &self.host[i];
-        let mut dst = self.dev[half].buf.slice_mut(..chunk.len);
-        self.xfer
-            .memcpy_htod(&chunk.mem, &mut dst)
-            .expect("offload: H2D");
-
-        self.filled[half] = Some(self.xfer.record_event(None).expect("offload: record fill"));
-    }
-
-    /// Chunk `i` back on the device, ready for compute to read.
-    pub fn read(&mut self, gpu: &Gpu, i: usize) -> &GTensor<f32> {
-        let half = i % 2;
-        if self.filled[half].is_none() {
-            self.prefetch(gpu, i);
-        }
-        let ev = self.filled[half].take().expect("just prefetched");
-        gpu.stream.wait(&ev).expect("offload: wait for fill");
-        let steps = self.chunk_steps(i);
-        self.dev[half].shrink_to(&[steps, self.per_step]);
-        &self.dev[half]
-    }
-
-    /// Block until every queued transfer has completed.
+    /// Block until every queued copy has landed. Teardown and tests.
     pub fn sync(&self) {
         self.xfer.synchronize().expect("offload: sync");
     }
-}
 
-/// A buffer a [`HostPark`] can move: an fp32 tensor or a bf16 slab.
-pub enum Parked {
-    F32(GTensor<f32>),
-    Bf16(GTensor<u16>),
-}
+    fn grow_slots(&mut self, gpu: &Gpu, bytes: usize) {
+        gpu.stream.synchronize().expect("offload: sync");
+        self.sync();
+        self.slots = Self::alloc_slots(gpu, bytes);
+        self.slot_bytes = bytes;
+    }
 
-impl Parked {
-    fn dims(&self) -> &[usize] {
-        match self {
-            Parked::F32(t) => t.dims(),
-            Parked::Bf16(t) => t.dims(),
+    fn grow_host(&mut self, gpu: &Gpu, bytes: usize) {
+        // Copies still in flight read or write the old allocation.
+        self.sync();
+        let top = self.host.top();
+        if top == 0 {
+            // Nothing to carry over, so the old allocation goes first: holding both
+            // pins twice the stack at once, ~20 GB at the backbone's size.
+            self.host.mem = None;
+            self.host.ptr = std::ptr::null_mut();
+            self.host.cap = 0;
         }
-    }
-
-    /// Size in `u16` units — the pinned slots' element type, so fp32 counts double.
-    fn u16_len(&self) -> usize {
-        self.bytes() / 2
-    }
-
-    pub fn bytes(&self) -> usize {
-        match self {
-            Parked::F32(t) => t.len() * 4,
-            Parked::Bf16(t) => t.len() * 2,
+        // SAFETY: the bytes below `top` are copied over; everything above is written by
+        // a D2H before an H2D reads it.
+        let mut mem = unsafe { gpu.context.alloc_pinned::<u8>(bytes) }
+            .expect("offload: pinned host alloc");
+        let ptr = mem.as_mut_ptr().expect("offload: pinned ptr");
+        if top > 0 {
+            // SAFETY: both ranges are live pinned allocations of at least `top` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(self.host.ptr, ptr, top) };
         }
+        self.host.mem = Some(mem);
+        self.host.ptr = ptr;
+        self.host.cap = bytes;
     }
 
-    fn is_bf16(&self) -> bool {
-        matches!(self, Parked::Bf16(_))
+    /// The slot to overwrite: one that holds nothing, else the one whose frame is
+    /// furthest from being needed. `keep` holds the slots that must not be touched.
+    fn victim(&self, keep: impl Fn(usize, &Slot) -> bool) -> Option<usize> {
+        let free = (0..RING_SLOTS).filter(|&i| !keep(i, &self.slots[i]));
+        free.min_by_key(|&i| self.slots[i].holds.map_or((0, 0), |h| (1, h)))
     }
 
-    /// Copy this buffer's bytes into a pinned `u16` host slot, on `xfer`.
-    fn copy_to_host(&self, xfer: &Arc<CudaStream>, dst: &mut PinnedHostSlice<u16>) {
-        // The slot is reused by capacity and may be longer than this buffer, so both
-        // sides are cut to `u16_len()` — the copy must not be sized by the slot.
-        let n16 = self.u16_len();
-        let dst = &mut dst.as_mut_slice().expect("offload: pinned slot view")[..n16];
-        match self {
-            Parked::Bf16(t) => {
-                let n = t.len();
-                xfer.memcpy_dtoh(&t.buf.slice(..n), dst)
-            }
-            Parked::F32(t) => {
-                let n = t.len();
-                let src = t.buf.slice(..n);
-                // SAFETY: `f32` and `u16` are both plain data with no invalid bit
-                // patterns, and n f32 cover exactly 2n u16 with identical alignment
-                // requirements met (f32 is 4-aligned, hence 2-aligned).
-                let view = unsafe { src.transmute::<u16>(n * 2) }.expect("offload: f32->u16 view");
-                xfer.memcpy_dtoh(&view, dst)
-            }
+    fn push(&mut self, gpu: &Gpu, bytes: usize) -> Frame {
+        assert!(self.open.is_none(), "offload: push inside a frame");
+        if bytes > self.slot_bytes {
+            self.grow_slots(gpu, bytes);
         }
-        .expect("offload: D2H");
-    }
-
-    /// Fill this buffer from a pinned `u16` host slot, on `xfer`. Inverse of
-    /// [`copy_to_host`](Self::copy_to_host).
-    fn fill_from_host(&mut self, xfer: &Arc<CudaStream>, src: &PinnedHostSlice<u16>) {
-        // Cut to this buffer's length, not the slot's — see `copy_to_host`.
-        let n16 = self.u16_len();
-        let src = &src.as_slice().expect("offload: pinned slot view")[..n16];
-        match self {
-            Parked::Bf16(t) => {
-                let n = t.len();
-                xfer.memcpy_htod(src, &mut t.buf.slice_mut(..n))
-            }
-            Parked::F32(t) => {
-                let n = t.len();
-                let mut dst = t.buf.slice_mut(..n);
-                // SAFETY: as in `copy_to_host` — same bytes, same element count.
-                let mut view =
-                    unsafe { dst.transmute_mut::<u16>(n * 2) }.expect("offload: f32->u16 view");
-                xfer.memcpy_htod(src, &mut view)
+        let j = self.host.frames.len();
+        let off = align_up(self.host.top());
+        if off + bytes > self.host.cap {
+            self.grow_host(gpu, (off + bytes).max(2 * self.host.cap));
+        }
+        self.host.frames.push((off, bytes));
+        // Whatever a slot held at or above `j` belonged to frames already popped.
+        for s in &mut self.slots {
+            if s.holds.is_some_and(|h| h >= j) {
+                s.holds = None;
             }
         }
-        .expect("offload: H2D");
+        let s = self.victim(|_, _| false).expect("offload: no slot");
+        let slot = &mut self.slots[s];
+        if let Some(ev) = &slot.done {
+            gpu.stream.wait(ev).expect("offload: wait for slot");
+        }
+        slot.holds = None;
+        self.open = Some(s);
+        Frame::at(slot.addr, self.slot_bytes)
     }
 
-    /// Download to the host as fp32, widening a bf16 slab.
-    pub fn to_host(&self, gpu: &Gpu) -> crate::tensor::Tensor {
-        match self {
-            Parked::F32(t) => t.to_host(gpu),
-            Parked::Bf16(t) => {
-                let mut wide = GTensor::uninit(gpu, t.dims());
-                t.load(gpu, &mut wide);
-                wide.to_host(gpu)
+    fn pushed(&mut self, gpu: &Gpu) {
+        let s = self.open.take().expect("offload: pushed without push");
+        let j = self.host.frames.len() - 1;
+        let produced = gpu.stream.record_event(None).expect("offload: record");
+        self.xfer.wait(&produced).expect("offload: xfer waits");
+        let addr = self.slots[s].addr;
+        let dst = self.host.slice(j);
+        self.xfer.context().bind_to_thread().expect("offload: bind");
+        // SAFETY: `dst` is pinned and outlives the copy (the host stack only reallocates
+        // after syncing this stream); the slot holds `dst.len()` bytes of frame `j`.
+        unsafe { result::memcpy_dtoh_async(dst, addr, self.xfer.cu_stream()) }
+            .expect("offload: D2H");
+        let slot = &mut self.slots[s];
+        slot.done = Some(self.xfer.record_event(None).expect("offload: record"));
+        slot.holds = Some(j);
+    }
+
+    /// Issue frame `i`'s H2D into slot `s`, once compute is done with what it held.
+    fn load(&mut self, gpu: &Gpu, i: usize, s: usize) {
+        let consumed = gpu.stream.record_event(None).expect("offload: record");
+        self.xfer.wait(&consumed).expect("offload: xfer waits");
+        let addr = self.slots[s].addr;
+        let src = self.host.slice(i);
+        self.xfer.context().bind_to_thread().expect("offload: bind");
+        // SAFETY: as in `pushed`, and the D2H that filled `src` is earlier on this stream.
+        unsafe { result::memcpy_htod_async(addr, src, self.xfer.cu_stream()) }
+            .expect("offload: H2D");
+        let slot = &mut self.slots[s];
+        slot.done = Some(self.xfer.record_event(None).expect("offload: record"));
+        slot.holds = Some(i);
+        #[cfg(test)]
+        {
+            self.loads += 1;
+        }
+    }
+
+    fn pop(&mut self, gpu: &Gpu) -> Frame {
+        assert!(self.open.is_none(), "offload: pop inside a frame");
+        let j = self
+            .host
+            .frames
+            .len()
+            .checked_sub(1)
+            .expect("offload: pop with nothing pushed");
+        let held = (0..RING_SLOTS).find(|&i| self.slots[i].holds == Some(j));
+        let s = match held {
+            Some(s) => s,
+            None => {
+                let s = self.victim(|_, _| false).expect("offload: no slot");
+                self.load(gpu, j, s);
+                s
             }
+        };
+        if let Some(ev) = &self.slots[s].done {
+            gpu.stream.wait(ev).expect("offload: wait for fill");
         }
-    }
-
-    /// Unwrap an fp32 tensor, panicking if this is a bf16 slab.
-    pub fn f32(self) -> GTensor<f32> {
-        match self {
-            Parked::F32(t) => t,
-            Parked::Bf16(_) => panic!("offload: expected an fp32 tensor, got a bf16 slab"),
-        }
-    }
-
-    /// Unwrap a bf16 slab, panicking if this is an fp32 tensor.
-    pub fn bf16(self) -> GTensor<u16> {
-        match self {
-            Parked::Bf16(t) => t,
-            Parked::F32(_) => panic!("offload: expected a bf16 slab, got an fp32 tensor"),
-        }
-    }
-}
-
-impl From<GTensor<f32>> for Parked {
-    fn from(t: GTensor<f32>) -> Self {
-        Parked::F32(t)
-    }
-}
-
-/// A slab is the same fp32-or-bf16 pair, chosen by `Kernels::slab_bf16` rather than
-/// per value — so it parks directly, at whatever width it was built with.
-impl From<SlabBuf> for Parked {
-    fn from(s: SlabBuf) -> Self {
-        match s {
-            SlabBuf::F32(t) => Parked::F32(t),
-            SlabBuf::Bf16(t) => Parked::Bf16(t),
-        }
-    }
-}
-
-impl From<Parked> for SlabBuf {
-    fn from(p: Parked) -> Self {
-        match p {
-            Parked::F32(t) => SlabBuf::F32(t),
-            Parked::Bf16(t) => SlabBuf::Bf16(t),
-        }
-    }
-}
-
-impl From<GTensor<u16>> for Parked {
-    fn from(t: GTensor<u16>) -> Self {
-        Parked::Bf16(t)
-    }
-}
-
-/// Shape and kind of one parked buffer, enough to rebuild it on restore.
-struct ParkedShape {
-    dims: Vec<usize>,
-    bf16: bool,
-}
-
-/// Host parking space for one layer's saved activations.
-pub struct HostPark {
-    /// One generation per parked chunk, in eviction order; within a generation, one
-    /// pinned slot per parked buffer.
-    gens: Vec<ParkedGen>,
-    /// How many of `gens` currently hold live data, i.e. how many restores are owed.
-    live: usize,
-    xfer: Arc<CudaStream>,
-    /// Device tensors handed over by [`evict`](Self::evict), held until their D2H copy
-    /// completes.
-    in_flight: SharedInFlight,
-    /// Uploads started by [`prefetch`](Self::prefetch) but not yet consumed, with the
-    /// event that says they have landed. Belongs to the generation that
-    /// [`restore`](Self::restore) will take next — the last one evicted.
-    prefetched: Option<(Vec<Parked>, CudaEvent)>,
-    /// Pinned slots not currently held by a generation, reusable by capacity.
-    spare: Vec<PinnedHostSlice<u16>>,
-    /// Most slots this park has ever needed LIVE at once — generations still owed a
-    /// restore. The retention bound follows this, so a park keeps exactly the slots its
-    /// own sweep shape turns over and no more.
-    ///
-    /// Must not count [`spare`](Self::spare): that pool is what the bound limits, so
-    /// including it makes the bound grow with the thing it is bounding and stop binding
-    /// at all.
-    peak_slots: usize,
-    /// Page-locking calls this park has made, for the reuse test to observe.
-    #[cfg(test)]
-    allocs: usize,
-}
-
-/// Headroom above a park's observed peak demand, in slots.
-const SPARE_SLACK: usize = 8;
-
-/// One eviction's pinned slots and the shapes needed to rebuild its tensors.
-struct ParkedGen {
-    slots: Vec<PinnedHostSlice<u16>>,
-    shapes: Vec<ParkedShape>,
-}
-
-/// The one block's worth of evicted buffers that may be awaiting a copy at any time.
-pub type SharedInFlight = Rc<RefCell<InFlight>>;
-
-/// One block's worth of evicted buffers, waiting for their copy to land.
-#[derive(Default)]
-pub struct InFlight {
-    /// Evictions awaiting their copy, oldest first.
-    pending: Vec<(Vec<Parked>, CudaEvent)>,
-}
-
-/// How many evictions may be awaiting their copy at once. See [`InFlight::pending`].
-const IN_FLIGHT_DEPTH: usize = 2;
-
-impl InFlight {
-    /// A fresh shared slot. One per model, cloned into each block's park.
-    pub fn shared() -> SharedInFlight {
-        Default::default()
-    }
-
-    /// Free the oldest eviction's buffers once its copy has landed.
-    pub fn release(&mut self) {
-        while self.pending.len() >= IN_FLIGHT_DEPTH {
-            let (_, ev) = self.pending.remove(0);
-            ev.synchronize().expect("offload: await park");
-        }
-    }
-
-    /// Block the host until every queued copy has landed, then free. Teardown/tests.
-    pub fn release_blocking(&mut self) {
-        for (_, ev) in &self.pending {
-            ev.synchronize().expect("offload: await park");
-        }
-        self.pending.clear();
-    }
-
-    /// Queue an eviction's buffers behind the event that says its copy has landed.
-    fn push(&mut self, bufs: Vec<Parked>, done: CudaEvent) {
-        self.pending.push((bufs, done));
-    }
-
-    /// Device bytes currently held awaiting a copy.
-    pub fn bytes(&self) -> usize {
-        self.pending
-            .iter()
-            .flat_map(|(bufs, _)| bufs)
-            .map(Parked::bytes)
-            .sum()
-    }
-}
-
-impl HostPark {
-    /// An empty park, sharing `in_flight` with every other park in the model.
-    pub fn new(gpu: &Gpu, in_flight: SharedInFlight) -> Result<Self, String> {
-        Ok(Self {
-            gens: Vec::new(),
-            live: 0,
-            xfer: gpu
-                .context
-                .new_stream()
-                .expect("offload: transfer stream creation failed"),
-            in_flight,
-            prefetched: None,
-            spare: Vec::new(),
-            peak_slots: 0,
-            #[cfg(test)]
-            allocs: 0,
-        })
-    }
-
-    /// Bytes currently parked on the host, over every generation.
-    pub fn host_bytes(&self) -> usize {
-        // Every slot the park holds, not just the live ones: the spare pool is pinned
-        // host memory too, and a diagnostic that cannot see it cannot see it grow.
-        self.gens
-            .iter()
-            .flat_map(|g| g.slots.iter())
-            .chain(self.spare.iter())
-            .map(|s| s.num_bytes())
-            .sum()
-    }
-
-    /// Whether anything is parked (i.e. a [`restore`](Self::restore) is owed).
-    pub fn is_parked(&self) -> bool {
-        self.gens[..self.live].iter().any(|g| !g.slots.is_empty())
-    }
-
-    /// Copy `bufs` to pinned host memory.
-    fn recycle(&mut self, slots: Vec<PinnedHostSlice<u16>>) {
-        let spare_max = self.peak_slots + SPARE_SLACK;
-        for s in slots {
-            if self.spare.len() < spare_max {
-                self.spare.push(s);
+        self.open = Some(s);
+        // The frames below are the next backwards to run; start them on their way up
+        // while this one is read.
+        for i in (j.saturating_sub(RING_SLOTS - 1)..j).rev() {
+            if self.slots.iter().any(|sl| sl.holds == Some(i)) {
                 continue;
             }
-            let smallest = self
-                .spare
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, x)| x.len())
-                .map(|(i, _)| i);
-            if let Some(i) = smallest
-                && self.spare[i].len() < s.len()
-            {
-                self.spare[i] = s;
+            let keep = |k: usize, sl: &Slot| k == s || sl.holds.is_some_and(|h| h >= i && h <= j);
+            match self.victim(keep) {
+                Some(v) => self.load(gpu, i, v),
+                None => break,
             }
         }
+        let slot = &self.slots[s];
+        Frame::at(slot.addr, self.slot_bytes)
     }
 
-    pub fn evict(&mut self, gpu: &Gpu, bufs: Vec<Parked>) {
-        self.in_flight.borrow_mut().release();
-
-        let produced = gpu
-            .stream
-            .record_event(None)
-            .expect("offload: record produced");
-        self.xfer.wait(&produced).expect("offload: xfer waits");
-
-        // Append a generation rather than overwriting the last: a chunked sweep evicts
-        // once per chunk and every one of them is owed a restore.
-        let depth = self.live;
-
-        let live_slots: usize = self.gens[..depth]
-            .iter()
-            .map(|g| g.slots.len())
-            .sum::<usize>()
-            + bufs.len();
-        self.peak_slots = self.peak_slots.max(live_slots);
-
-        if self.gens.len() > depth {
-            let displaced: Vec<_> = self.gens.drain(depth..).flat_map(|g| g.slots).collect();
-            self.recycle(displaced);
-        }
-
-        let mut slots = Vec::with_capacity(bufs.len());
-        let mut shapes = Vec::with_capacity(bufs.len());
-        for b in &bufs {
-            let need = b.u16_len();
-
-            let hit = self
-                .spare
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.len() >= need)
-                .min_by_key(|(_, s)| s.len())
-                .map(|(i, _)| i)
-                .map(|i| self.spare.swap_remove(i));
-            let mem = match hit {
-                Some(m) => m,
-                None => {
-                    #[cfg(test)]
-                    {
-                        self.allocs += 1;
-                    }
-                    // SAFETY: uninitialised pinned memory, fully written by the copy
-                    // below before any read (`restore` is the only reader).
-                    unsafe { gpu.context.alloc_pinned::<u16>(need) }
-                        .expect("offload: pinned host alloc")
-                }
-            };
-            slots.push(mem);
-            shapes.push(ParkedShape {
-                dims: b.dims().to_vec(),
-                bf16: b.is_bf16(),
-            });
-        }
-        self.gens.push(ParkedGen { slots, shapes });
-
-        self.live = depth + 1;
-        let cur = &mut self.gens[depth];
-        for (slot, b) in cur.slots.iter_mut().zip(&bufs) {
-            b.copy_to_host(&self.xfer, slot);
-        }
-        // Hand the sources, and the event that says their copy has landed, to the
-        // caller's slot. The next block's evict waits on it and frees them.
-        //
-        // `restore` needs no event of its own: it runs a whole forward pass after this
-        // eviction, and `InFlight::release` has synchronized on the copy long before
-        // then — the host data is complete by construction.
-        let done = self.xfer.record_event(None).expect("offload: record park");
-        self.in_flight.borrow_mut().push(bufs, done);
-    }
-
-    /// Free the previous eviction's buffers, ordered on the compute stream.
-    pub fn release_previous(&self) {
-        self.in_flight.borrow_mut().release();
-    }
-
-    /// Block the host until any in-flight eviction has landed. Teardown and tests.
-    pub fn sync_parked(&self) {
-        self.in_flight.borrow_mut().release_blocking();
-    }
-
-    /// Drop every live generation without restoring it, for a sweep abandoned before
-    /// its backward consumed the chunks.
-    pub fn discard_all(&mut self) {
-        if self.live == 0 && self.prefetched.is_none() {
-            return;
-        }
-        self.sync_parked();
-        self.prefetched = None;
-        let dropped: Vec<_> = self.gens.drain(..self.live).flat_map(|g| g.slots).collect();
-        self.recycle(dropped);
-        self.live = 0;
-    }
-
-    /// Start this park's uploads without waiting for them.
-    pub fn prefetch(&mut self, gpu: &Gpu) {
-        if self.prefetched.is_some() || self.live == 0 {
-            return;
-        }
-        self.prefetched = Some(self.issue_uploads(gpu));
-    }
-
-    /// The prefetched tensors, waiting for their uploads if they have not landed.
-    pub fn take_prefetched(&mut self, gpu: &Gpu) -> Vec<Parked> {
-        let (out, filled) = match self.prefetched.take() {
-            Some(p) => p,
-            None => self.issue_uploads(gpu),
-        };
-        gpu.stream.wait(&filled).expect("offload: wait for fill");
-        out
-    }
-
-    /// Allocate the destinations and queue their H2D copies, returning them with the
-    /// event that says the copies have landed. Shared by prefetch and restore.
-    /// Reads the newest live generation — backward unwinds chunks right to left, so the
-    /// last chunk evicted is the first one restored. Popping is `restore`'s job: a
-    /// prefetch runs a block ahead of the take and must leave the generation in place.
-    fn issue_uploads(&mut self, gpu: &Gpu) -> (Vec<Parked>, CudaEvent) {
-        let cur = &self.gens[self.live - 1];
-        let mut out: Vec<Parked> = cur
-            .shapes
-            .iter()
-            .map(|s| {
-                if s.bf16 {
-                    Parked::Bf16(GTensor::uninit(gpu, &s.dims))
-                } else {
-                    Parked::F32(GTensor::uninit(gpu, &s.dims))
-                }
-            })
-            .collect();
-        // The allocations above are *stream-ordered* on the compute stream
-        // (`cuMemAllocAsync`), and with `disable_event_tracking` the transfer stream
-        // knows nothing about that ordering. Without this event the H2D below can
-        // write into memory whose allocation has not yet been reached on the compute
-        // stream — an illegal access that only shows up asynchronously.
-        let allocated = gpu
-            .stream
-            .record_event(None)
-            .expect("offload: record allocated");
-        self.xfer.wait(&allocated).expect("offload: xfer waits");
-
-        for (slot, t) in self.gens[self.live - 1].slots.iter().zip(&mut out) {
-            t.fill_from_host(&self.xfer, slot);
-        }
-        let filled = self.xfer.record_event(None).expect("offload: record fill");
-        (out, filled)
-    }
-
-    /// Bring the parked buffers back, in the order they were evicted.
-    pub fn restore(&mut self, gpu: &Gpu) -> Vec<Parked> {
-        let out = self.take_prefetched(gpu);
-        self.live -= 1;
-        out
+    fn popped(&mut self, _gpu: &Gpu) {
+        let s = self.open.take().expect("offload: popped without pop");
+        // A backward may write into its frame (the sLSTM reuses `g` for its deltas), so
+        // what the slot holds is no longer the frame.
+        self.slots[s].holds = None;
+        self.host.frames.pop();
     }
 }
 
@@ -626,409 +557,151 @@ mod tests {
     use super::*;
     use crate::tensor::Tensor;
 
-    /// A full write-then-read round trip must return every chunk unchanged, including
-    /// a **ragged last chunk** (`t` deliberately not a multiple of `k`).
-    ///
-    /// This is the property every offload consumer rests on: what backward reads is
-    /// exactly what forward wrote.
-    #[test]
-    fn ring_roundtrip_preserves_values() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        let (t, per_step, k) = (14usize, 8usize, 4usize); // 14 = 3·4 + 2 (ragged)
-        let mut ring = OffloadRing::new(&gpu, t, per_step, k).expect("ring");
-        assert_eq!(ring.chunks(), 4);
-        assert_eq!(ring.chunk_steps(3), 2, "last chunk should be ragged");
-
-        // Distinct value per element, so a swapped or truncated chunk cannot pass.
-        let full = Tensor::new(
-            &[t, per_step],
-            (0..t * per_step).map(|i| i as f32 * 0.5).collect(),
-        );
-        let src = GTensor::from_host(&gpu, &full);
-
-        for i in 0..ring.chunks() {
-            let steps = ring.chunk_steps(i);
-            let off = i * k * per_step;
-            let stage = ring.stage(&gpu, i);
-            gpu.stream
-                .memcpy_dtod(
-                    &src.buf.slice(off..off + steps * per_step),
-                    &mut stage.buf.slice_mut(..steps * per_step),
-                )
-                .expect("fill stage");
-            ring.write(&gpu, i);
-        }
-
-        // Read back in reverse, the order backward uses.
-        for i in (0..ring.chunks()).rev() {
-            let steps = ring.chunk_steps(i);
-            let got = ring.read(&gpu, i).to_host(&gpu);
-            let off = i * k * per_step;
-            assert_eq!(
-                &got.data[..steps * per_step],
-                &full.data[off..off + steps * per_step],
-                "chunk {i} came back changed"
-            );
+    /// Push `n` frames through `stack`, frame `i` filled with the value `i` at `lens[i]`
+    /// floats.
+    fn push_tagged(gpu: &Gpu, stack: &mut FrameStack, lens: &[usize]) {
+        for (i, &len) in lens.iter().enumerate() {
+            let mut f = stack.push(gpu, len * 4, true);
+            let mut v = f.f32(gpu, &[len]);
+            let tag = GTensor::from_host(gpu, &Tensor::new(&[len], vec![i as f32; len]));
+            v.copy_from(gpu, &tag);
+            stack.pushed(gpu);
         }
     }
 
-    /// The hand-placed events must hold up when the compute stream is genuinely busy.
-    ///
-    /// With `disable_event_tracking` on, nothing but those events orders the transfer
-    /// stream against compute — so this writes each chunk from a kernel, keeps the
-    /// compute stream loaded, and checks the values survive. A missing event shows up
-    /// here as a stale or torn chunk rather than as an error.
-    #[test]
-    fn ring_roundtrip_survives_contention() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        let (t, per_step, k) = (32usize, 1024usize, 8usize);
-        let mut ring = OffloadRing::new(&gpu, t, per_step, k).expect("ring");
-
-        // Something slow enough on the compute stream that the transfers must really
-        // overlap it rather than trivially finishing first.
-        let busy = GTensor::zeros(&gpu, &[512, 512]);
-        let mut sink = GTensor::uninit(&gpu, &[512, 512]);
-
-        for i in 0..ring.chunks() {
-            let steps = ring.chunk_steps(i);
-            {
-                let stage = ring.stage(&gpu, i);
-                // Tag every element of the chunk with its chunk index.
-                let tag = Tensor::new(&[steps, per_step], vec![i as f32; steps * per_step]);
-                let host = GTensor::from_host(&gpu, &tag);
-                stage.copy_from(&gpu, &host);
-            }
-            ring.write(&gpu, i);
-            // Load the compute stream so the copy above has something to hide behind.
-            super::super::ops::matmul_nn_into(&gpu, &busy, &busy, &mut sink, 0.0);
-        }
-
-        for i in (0..ring.chunks()).rev() {
-            let steps = ring.chunk_steps(i);
-            super::super::ops::matmul_nn_into(&gpu, &busy, &busy, &mut sink, 0.0);
-            let got = ring.read(&gpu, i).to_host(&gpu);
+    /// Pop every frame, checking each comes back as it was pushed.
+    fn pop_checked(gpu: &Gpu, stack: &mut FrameStack, lens: &[usize]) {
+        for (i, &len) in lens.iter().enumerate().rev() {
+            let mut f = stack.pop(gpu);
+            let got = f.f32(gpu, &[len]).to_host(gpu);
             assert!(
-                got.data[..steps * per_step].iter().all(|&v| v == i as f32),
-                "chunk {i} did not come back uniformly tagged — cross-stream ordering is wrong"
+                got.data.iter().all(|&v| v == i as f32),
+                "frame {i} came back changed"
             );
-        }
-        ring.sync();
-    }
-
-    /// Evict-then-restore must return every buffer unchanged, at its own shape.
-    ///
-    /// The block-major consumer parks a set of differently-shaped activations at once,
-    /// so the ordering and the per-buffer shapes both have to survive the round trip.
-    #[test]
-    fn park_roundtrip_preserves_values_and_shapes() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        let mut park = HostPark::new(&gpu, InFlight::shared()).expect("park");
-        assert!(!park.is_parked());
-
-        // Deliberately mismatched shapes and widths, as a block's Act really is.
-        let hosts = [
-            Tensor::new(&[7, 5], (0..35).map(|i| i as f32 * 0.25).collect()),
-            Tensor::new(&[3, 11], (0..33).map(|i| -(i as f32)).collect()),
-            Tensor::new(&[64], (0..64).map(|i| i as f32 * 1e-3).collect()),
-        ];
-        let devs: Vec<GTensor<f32>> = hosts.iter().map(|t| GTensor::from_host(&gpu, t)).collect();
-
-        // `evict` takes ownership: the park holds the device tensors until its copy
-        // lands, then frees them. `sync_parked` forces that here.
-        park.evict(&gpu, devs.into_iter().map(Parked::from).collect());
-        park.sync_parked();
-        assert!(park.is_parked());
-        assert_eq!(park.host_bytes(), (35 + 33 + 64) * 4);
-
-        let back = park.restore(&gpu);
-        assert_eq!(back.len(), hosts.len());
-        for (got, want) in back.iter().zip(&hosts) {
-            assert_eq!(got.dims(), want.dims(), "parked shape changed");
-            assert_eq!(&got.to_host(&gpu).data, &want.data, "parked data changed");
+            stack.popped(gpu);
         }
     }
 
-    /// A bf16 slab must come back as bf16, bit-for-bit, and must cost half an fp32
-    /// tensor of the same shape on the host.
-    ///
-    /// The park moves bytes; it must never change a value's width. Widening on the way
-    /// out would double both the transfer and the restored footprint, and the
-    /// precision split is decided at each value's production point (`gpu::bf16`), not
-    /// here — see the module docs.
+    /// Regions are aligned and sequential, and a measuring frame sizes a layout exactly
+    /// as a real carve lays it out.
     #[test]
-    fn park_preserves_bf16_width() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        // Values exactly representable in bf16, so the comparison is exact and the
-        // test says something about the transfer rather than about rounding.
-        let src = Tensor::new(
-            &[8, 16],
-            (0..128).map(|i| (i as f32 - 64.0) * 0.5).collect(),
-        );
-        let mut slab = GTensor::uninit(&gpu, &[8, 16]);
-        slab.store(&gpu, &GTensor::from_host(&gpu, &src));
-        let slab = Parked::Bf16(slab);
-        let before = slab.to_host(&gpu).data;
-
-        let mut park = HostPark::new(&gpu, InFlight::shared()).expect("park");
-        park.evict(&gpu, vec![slab]);
-        park.sync_parked();
-
-        // Half the bytes an fp32 [8,16] would take — the width really was preserved.
-        assert_eq!(park.host_bytes(), 8 * 16 * 2);
-
-        let back = park.restore(&gpu);
-        assert!(
-            matches!(back[0], Parked::Bf16(_)),
-            "a bf16 slab came back as something else"
-        );
-        assert_eq!(
-            back[0].to_host(&gpu).data,
-            before,
-            "bf16 round trip changed bits"
-        );
-    }
-
-    /// A prefetched restore must return exactly what an un-prefetched one does.
-    ///
-    /// Prefetch is what hides the upload behind a block of compute, so it runs on every
-    /// backbone block in training — but it changes *when* the copy is issued, and a
-    /// mistake there yields stale data rather than an error.
-    #[test]
-    fn prefetched_restore_matches_direct_restore() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        let want = [Tensor::random(&[9, 7], 1.0), Tensor::random(&[4, 16], 1.0)];
-
-        let mut direct = HostPark::new(&gpu, InFlight::shared()).expect("park");
-        let mut early = HostPark::new(&gpu, InFlight::shared()).expect("park");
-        for park in [&mut direct, &mut early] {
-            park.evict(
-                &gpu,
-                want.iter()
-                    .map(|t| Parked::from(GTensor::from_host(&gpu, t)))
-                    .collect(),
-            );
-            park.sync_parked();
-        }
-
-        // The prefetching park starts its uploads well before it consumes them, with
-        // unrelated compute in between — the training-path shape.
-        early.prefetch(&gpu);
-        let busy = GTensor::zeros(&gpu, &[256, 256]);
-        let mut sink = GTensor::uninit(&gpu, &[256, 256]);
-        super::super::ops::matmul_nn_into(&gpu, &busy, &busy, &mut sink, 0.0);
-        // A second prefetch before consuming must be a harmless no-op.
-        early.prefetch(&gpu);
-
-        let prefetched = early.restore(&gpu);
-        let plain = direct.restore(&gpu);
-        assert_eq!(prefetched.len(), want.len());
-        for ((got, base), w) in prefetched.iter().zip(&plain).zip(&want) {
-            assert_eq!(got.dims(), w.dims(), "prefetched restore changed the shape");
-            assert_eq!(
-                got.to_host(&gpu).data,
-                w.data,
-                "prefetched restore differs from the evicted source"
-            );
-            assert_eq!(
-                base.to_host(&gpu).data,
-                w.data,
-                "direct restore differs from the evicted source"
-            );
-        }
-    }
-
-    /// The spare pool must stay bounded when the shapes keep changing.
-    ///
-    /// This is the other half of `park_reuses_pinned_slots_across_steps`, and the half
-    /// that was missing: every test here checked that re-evicting does not page-lock,
-    /// none checked that the pool ever gives a slot back. It did not. The retention
-    /// bound was `peak_slots + SPARE_SLACK` where `peak_slots` was a high-water mark of
-    /// everything the park owned *including the spare pool* — so `spare.len() <
-    /// peak_slots + SLACK` held by construction, the reclaim never dropped a slot, and
-    /// every capacity miss pinned one more host buffer for the life of the process.
-    ///
-    /// Real windows never repeat a shape, so a training run missed constantly: ~4 GB of
-    /// pinned host memory per window, and the OOM killer within a couple of minutes.
-    #[test]
-    fn park_pool_stays_bounded_as_shapes_change() {
+    fn carve_is_aligned_and_measurable() {
         let Some(gpu) = crate::gpu::test_gpu() else {
             return;
         };
-        let mut park = HostPark::new(&gpu, InFlight::shared()).expect("park");
-        // Ever-larger shapes, which is what defeats best-fit reuse: each one misses and
-        // allocates, so nothing here is reused and only the bound can stop the growth.
-        for i in 0..40 {
-            if i > 0 {
-                let _ = park.restore(&gpu);
-            }
-            let t = Tensor::random(&[16 + i, 32], 1.0);
-            park.evict(&gpu, vec![GTensor::from_host(&gpu, &t).into()]);
-            park.sync_parked();
-        }
-        // One live generation of one slot, so the pool may hold SPARE_SLACK more.
-        let held = park.gens.iter().map(|g| g.slots.len()).sum::<usize>() + park.spare.len();
-        assert!(
-            held <= 1 + SPARE_SLACK + 1,
-            "spare pool grew to {held} slots over 40 shapes; the retention bound never bound"
-        );
-        // And the bytes with it: 40 growing shapes summed would be ~10x the largest.
-        let largest = (16 + 39) * 32 * 4;
-        assert!(
-            park.host_bytes() <= largest * (1 + SPARE_SLACK + 1),
-            "park holds {} pinned bytes, largest slot is {largest}",
-            park.host_bytes()
-        );
+        let carve = |f: &mut Frame| {
+            let a = f.f32(&gpu, &[3]);
+            let b = f.bf16(&gpu, &[5, 7]);
+            let c = f.slab(&gpu, &[2, 2], false);
+            (a, b, c)
+        };
+        let mut m = Frame::measure();
+        carve(&mut m);
+        assert_eq!(m.bytes(), 2 * ALIGN + 16);
+
+        let mut r = ResidentFrames::default();
+        let mut f = r.push(&gpu, m.bytes());
+        let (a, b, _) = carve(&mut f);
+        let addr = |p: u64| p % ALIGN as u64;
+        assert_eq!(addr(a.buf.device_ptr(&gpu.stream).0), 0);
+        assert_eq!(addr(b.buf.device_ptr(&gpu.stream).0), 0);
+        assert_eq!(f.bytes(), m.bytes());
     }
 
-    /// Re-evicting the same shapes must not re-allocate pinned memory: page-locking is
-    /// expensive, and a training loop parks the same shapes every window.
+    /// A resident stack returns every frame intact, and a steady shape reuses the same
+    /// device addresses window after window.
     #[test]
-    fn park_reuses_pinned_slots_across_steps() {
-        let Some(gpu) = super::super::test_gpu() else {
+    fn resident_frames_roundtrip_and_reuse() {
+        let Some(gpu) = crate::gpu::test_gpu() else {
             return;
         };
-        let mut park = HostPark::new(&gpu, InFlight::shared()).expect("park");
-        let src = Tensor::random(&[16, 32], 1.0);
-
-        park.evict(&gpu, vec![GTensor::from_host(&gpu, &src).into()]);
-        park.sync_parked();
-
-        // Each step evicts and restores once, as a real sweep does — the restore is
-        // what returns the generation to the spare pool for the next step to reuse.
-        let settled = park.allocs;
-        for _ in 0..4 {
-            let _ = park.restore(&gpu);
-            park.evict(&gpu, vec![GTensor::from_host(&gpu, &src).into()]);
-            park.sync_parked();
-        }
-        assert_eq!(
-            park.allocs, settled,
-            "re-evicting the same shape re-allocated pinned memory"
-        );
-
-        // The shapes a real sweep alternates between at one depth: one park serves both
-        // the cell and the FFN (different buffer counts), and a balanced `chunk_spans`
-        // makes the last chunk one row short. A smaller shape must reuse the slot it
-        // already has rather than page-locking a fresh one.
-        let short = Tensor::random(&[15, 32], 1.0);
-        let pair = Tensor::random(&[16, 32], 1.0);
-        let settled = park.allocs;
-        for _ in 0..4 {
-            let _ = park.restore(&gpu);
-            park.evict(&gpu, vec![GTensor::from_host(&gpu, &short).into()]);
-            park.sync_parked();
-            let _ = park.restore(&gpu);
-            park.evict(
-                &gpu,
-                vec![
-                    GTensor::from_host(&gpu, &pair).into(),
-                    GTensor::from_host(&gpu, &short).into(),
-                ],
-            );
-            park.sync_parked();
-        }
-        // The two-buffer eviction needs one slot more than the pool held, so one
-        // allocation is legitimate; what must not happen is one per eviction.
-        let grew = park.allocs - settled;
-        assert!(
-            grew <= 1,
-            "alternating shapes page-locked {grew} times, expected at most 1"
-        );
-
-        // A larger shape legitimately reallocates: no spare is big enough. `host_bytes`
-        // counts the spare pool too, so the check is on the GROWTH — the smaller slots
-        // from above are still held, and are supposed to be.
-        let _ = park.restore(&gpu);
-        let (before, allocs) = (park.host_bytes(), park.allocs);
-        let b = Tensor::random(&[16, 64], 1.0);
-        park.evict(&gpu, vec![GTensor::from_host(&gpu, &b).into()]);
-        park.sync_parked();
-        assert_eq!(
-            park.allocs,
-            allocs + 1,
-            "a larger shape must page-lock a new slot"
-        );
-        assert_eq!(
-            park.host_bytes() - before,
-            16 * 64 * 4,
-            "and only that slot"
-        );
-    }
-
-    /// A chunked sweep holds one generation per chunk, so a park's peak slot demand
-    /// scales with the number of chunks — not with `IN_FLIGHT_DEPTH`. Retention must
-    /// follow that demand, and the restored data must survive the reuse.
-    ///
-    /// With a fixed cap below the peak, every step displaced more slots than it could
-    /// retain and page-locked them again (measured: 256 allocations per step, ~225 ms
-    /// of `cuMemHostAlloc` on the critical path).
-    #[test]
-    fn park_reuses_slots_across_a_chunked_sweep() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        let mut park = HostPark::new(&gpu, InFlight::shared()).expect("park");
-        // Enough chunks that the live generations alone exceed any small fixed cap.
-        let chunks = 12;
-        let bufs_per_evict = 6;
-        let src: Vec<Tensor> = (0..chunks)
-            .map(|c| Tensor::random(&[8 + c % 3, 32], 1.0))
-            .collect();
-
-        let mut settled = 0;
-        for step in 0..4 {
-            // Forward: evict every chunk, all staying live at increasing depth.
-            for s in &src {
-                let bufs = (0..bufs_per_evict)
-                    .map(|_| GTensor::from_host(&gpu, s).into())
-                    .collect();
-                park.evict(&gpu, bufs);
-            }
-            // Backward: unwind right to left, checking each chunk comes back intact.
-            for s in src.iter().rev() {
-                for got in park.restore(&gpu) {
-                    assert_eq!(
-                        got.to_host(&gpu).data,
-                        s.data,
-                        "a reused pinned slot returned the wrong data"
-                    );
-                }
-            }
-            park.sync_parked();
-            // The first sweep legitimately page-locks its working set; later sweeps
-            // turn over the same shapes and must allocate nothing.
-            if step == 0 {
-                settled = park.allocs;
+        let lens = [64, 65, 64, 30];
+        let mut stack = FrameStack::default();
+        let mut first = Vec::new();
+        for window in 0..3 {
+            push_tagged(&gpu, &mut stack, &lens);
+            let FrameStack::Resident(r) = &stack else {
+                unreachable!()
+            };
+            let addrs: Vec<u64> = r.bufs.iter().map(|b| b.device_ptr(&gpu.stream).0).collect();
+            if window == 0 {
+                first = addrs;
             } else {
-                assert_eq!(
-                    park.allocs, settled,
-                    "sweep {step} re-page-locked slots the pool should have retained"
-                );
+                assert_eq!(addrs, first, "window {window} reallocated a frame");
             }
+            pop_checked(&gpu, &mut stack, &lens);
         }
     }
 
-    /// Device staging must stay at `2·k` timesteps no matter how long the timeline is
-    /// — the property the whole plan exists for.
+    /// Frames pushed through the ring come back exactly, ragged sizes included, with
+    /// the compute stream kept busy so the hand-placed events are what orders the copies.
     #[test]
-    fn device_footprint_is_independent_of_sequence_length() {
-        let Some(gpu) = super::super::test_gpu() else {
+    fn offload_roundtrip_survives_contention() {
+        let Some(gpu) = crate::gpu::test_gpu() else {
             return;
         };
-        let (per_step, k) = (256usize, 8usize);
-        let short = OffloadRing::new(&gpu, 64, per_step, k).expect("ring");
-        let long = OffloadRing::new(&gpu, 4096, per_step, k).expect("ring");
-        assert_eq!(short.device_bytes(), long.device_bytes());
-        assert_eq!(long.host_bytes(), 64 * short.host_bytes());
+        let lens: Vec<usize> = (0..11).map(|i| 4096 + 37 * i).collect();
+        let off = Offload::shared(&gpu, lens.iter().max().unwrap() * 4);
+        let mut stack = FrameStack::Offload(off.clone());
+        let busy = GTensor::zeros(&gpu, &[512, 512]);
+        let mut sink = GTensor::uninit(&gpu, &[512, 512]);
+        for _ in 0..2 {
+            for (i, &len) in lens.iter().enumerate() {
+                let mut f = stack.push(&gpu, len * 4, true);
+                let mut v = f.f32(&gpu, &[len]);
+                super::super::ops::matmul_nn_into(&gpu, &busy, &busy, &mut sink, 0.0);
+                let tag = GTensor::from_host(&gpu, &Tensor::new(&[len], vec![i as f32; len]));
+                v.copy_from(&gpu, &tag);
+                stack.pushed(&gpu);
+            }
+            for (i, &len) in lens.iter().enumerate().rev() {
+                super::super::ops::matmul_nn_into(&gpu, &busy, &busy, &mut sink, 0.0);
+                let mut f = stack.pop(&gpu);
+                let got = f.f32(&gpu, &[len]).to_host(&gpu);
+                assert!(
+                    got.data.iter().all(|&v| v == i as f32),
+                    "frame {i} came back changed — cross-stream ordering is wrong"
+                );
+                stack.popped(&gpu);
+            }
+            assert_eq!(off.borrow().depth(), 0);
+        }
+        off.borrow().sync();
+    }
+
+    /// The last frames of a sweep are still in the ring when backward starts, so they
+    /// come back without a copy; every earlier one takes exactly one H2D.
+    #[test]
+    fn turnaround_frames_skip_the_upload() {
+        let Some(gpu) = crate::gpu::test_gpu() else {
+            return;
+        };
+        let lens = [256; 8];
+        let off = Offload::shared(&gpu, 256 * 4);
+        let mut stack = FrameStack::Offload(off.clone());
+        push_tagged(&gpu, &mut stack, &lens);
+        pop_checked(&gpu, &mut stack, &lens);
+        assert_eq!(off.borrow().loads, lens.len() - RING_SLOTS);
+    }
+
+    /// `reserve` sizes both sides once; a sweep inside the reservation grows neither.
+    #[test]
+    fn reserved_sweep_does_not_grow() {
+        let Some(gpu) = crate::gpu::test_gpu() else {
+            return;
+        };
+        let lens = [100, 300, 200, 300];
+        let total: usize = lens.iter().map(|&l| align_up(l * 4)).sum();
+        let off = Offload::shared(&gpu, 16);
+        off.borrow_mut().reserve(&gpu, total, 300 * 4);
+        let (host, dev) = (off.borrow().host_bytes(), off.borrow().device_bytes());
+        let mut stack = FrameStack::Offload(off.clone());
+        for _ in 0..3 {
+            off.borrow_mut().reset();
+            push_tagged(&gpu, &mut stack, &lens);
+            pop_checked(&gpu, &mut stack, &lens);
+        }
+        assert_eq!(off.borrow().host_bytes(), host, "host stack grew");
+        assert_eq!(off.borrow().device_bytes(), dev, "ring grew");
     }
 }

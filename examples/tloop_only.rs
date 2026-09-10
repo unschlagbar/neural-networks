@@ -89,6 +89,7 @@ fn main() {
                 out,
                 t,
                 false,
+                0,
                 &cache.temps,
             )
         };
@@ -100,7 +101,7 @@ fn main() {
         for _ in 0..5 {
             fwd(&mut g, &mut slabs, &mut out);
             ops::slstm_fused_time_bwd(
-                &gpu, &whr, &dy, &mut g, &mut dh, &mut dc, &mut dn, &slabs, t,
+                &gpu, &whr, &dy, &mut g, &mut dh, &mut dc, &mut dn, &slabs, t, 0,
             );
         }
         gpu.stream.synchronize().ok();
@@ -120,7 +121,7 @@ fn main() {
             for _ in 0..iters {
                 fwd(&mut g, &mut slabs, &mut out);
                 ops::slstm_fused_time_bwd(
-                    &gpu, &whr, &dy, &mut g, &mut dh, &mut dc, &mut dn, &slabs, t,
+                    &gpu, &whr, &dy, &mut g, &mut dh, &mut dc, &mut dn, &slabs, t, 0,
                 );
             }
             gpu.stream.synchronize().ok();

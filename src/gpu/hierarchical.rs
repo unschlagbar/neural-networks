@@ -88,10 +88,13 @@ fn stage_cfg(cfg: &AdamCfg, lr_scale: f32, weight_decay: f32) -> AdamCfg {
     }
 }
 
-use super::block::Block;
+use super::block::{Block, Resets};
+use super::offload::{Offload, RING_SLOTS, SharedOffload, align_up};
 use super::temp;
 use super::word_groups::{DecoderGroups, EncoderGroups, GroupIds, max_group_rows};
-use super::{GTensor, Gpu, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm};
+use super::{
+    Buf, GTensor, Gpu, linear::Linear, mlstm::MLstm, ops, rms_norm::RmsNorm, slstm::SLstm,
+};
 use crate::config::{
     BACKBONE_WEIGHT_DECAY, DECODER_LR_SCALE, DECODER_WEIGHT_DECAY, ENCODER_LR_SCALE,
     ENCODER_WEIGHT_DECAY, GROUP_MAX_ROWS, WORDS_PER_SEQ,
@@ -218,35 +221,18 @@ fn chunk_spans(n: usize, chunk: usize) -> Vec<(usize, usize)> {
     out
 }
 
-/// One span of the backbone sweep: `len` word steps starting at word `c0`.
+/// One span of the backbone sweep: `len` word steps starting at word `c0`, cut at a
+/// `BACKBONE_CHUNK` border that the recurrence carries straight across.
 ///
-/// A span is either a `BACKBONE_CHUNK` cut — the recurrence carries straight across
-/// it — or a document border, where `reset` says the state starts from zero. Both are
-/// the same loop, so a packed window and a single-document one run the same code.
-#[derive(Clone, Copy, Debug)]
+/// Document borders do not cut spans: the cells restart at them in place (see
+/// [`Resets`]), so every window of the same length sweeps the same spans however its
+/// documents fall.
+#[derive(Clone, Debug)]
 struct BbSpan {
     c0: usize,
     len: usize,
-    reset: bool,
-}
-
-/// Concatenate row-blocks back into one `[rows, width]` tensor, in order.
-fn concat_rows(gpu: &Gpu, parts: &[GTensor<f32>], rows: usize, width: usize) -> GTensor<f32> {
-    let mut out = GTensor::uninit(gpu, &[rows, width]);
-    let mut off = 0;
-    for p in parts {
-        let n = p.len();
-        gpu.stream
-            .memcpy_dtod(&p.buf.slice(..n), &mut out.buf.slice_mut(off..off + n))
-            .expect("concat_rows");
-        off += n;
-    }
-    debug_assert_eq!(
-        off,
-        rows * width,
-        "concat_rows: parts do not tile the output"
-    );
-    out
+    /// Rows, local to the span, where a packed document begins.
+    resets: Vec<usize>,
 }
 
 /// Upload slots of an encoder group, in the order [`Hierarchical::encoder_forward`]
@@ -397,17 +383,42 @@ impl PhaseTimer {
     }
 }
 
+/// The backbone sweep's own buffers, owned by the model so a window allocates none of
+/// them: each is reused while it fits (see [`Buf`]).
+#[derive(Default)]
+struct BackboneBufs {
+    /// `[dw, WH]` — `bb_front`'s output, the first block's input.
+    bb_in: Buf,
+    /// `[dw, WH]` — the last block's output, written one chunk's rows at a time.
+    /// `bb_back`'s input, which its backward reads again for `dW`.
+    bb_out: Buf,
+    /// `[dw, HC]` — the context handed to the decoder.
+    o: Buf,
+    /// `[1, len, WH]` — the pair the blocks between the first and the last alternate
+    /// between, in both directions.
+    hb: [Buf; 2],
+    /// `[dw, WH]` — the gradient at the last block's output.
+    d_bb_out: Buf,
+    /// `[dw, WH]` — the gradient at the first block's input.
+    d_bb_in: Buf,
+    /// `[dw, HC]` — the gradient at the word embeddings, for the encoder backward.
+    d_embeds: Buf,
+}
+
 /// The backbone forward's outputs, handed to the decoder and then to the backward.
 struct BackboneFwd {
-    /// `[dw, HC]` context, one row per word — the decoder's slot-0 injection.
-    o: GTensor<f32>,
     /// Chunk spans over the word axis; a single full-length span when unchunked.
     spans: Vec<BbSpan>,
-    /// Each chunk's input to `bb_back`, kept because `forward_shared` saves nothing
-    /// and the backward needs every chunk's `X` for `dW = XᵀdY`.
-    back_in: Vec<GTensor<f32>>,
     /// Rows of the largest chunk — what the backbone's pool has to hold.
     rows_max: usize,
+    bufs: BackboneBufs,
+}
+
+impl BackboneFwd {
+    /// `[dw, HC]` context, one row per word — the decoder's slot-0 injection.
+    fn o(&self) -> &GTensor<f32> {
+        self.bufs.o.expect("backbone forward wrote o")
+    }
 }
 
 pub struct Hierarchical {
@@ -501,6 +512,16 @@ pub struct Hierarchical {
     /// Where the documents inside the next window start, as word indices. Set per
     /// window by [`set_doc_starts`](Self::set_doc_starts) and consumed by it.
     doc_starts: Vec<usize>,
+
+    /// The backbone's frames between forward and backward, shared by every backbone
+    /// block: `None` with offload off. See [`enable_backbone_offload`](Self::enable_backbone_offload).
+    offload: Option<SharedOffload>,
+    /// The backbone sweep's own buffers. Taken for the duration of a window.
+    bb_bufs: BackboneBufs,
+    /// `i32[WORDS_PER_SEQ]`, 1 at every word where a document starts inside the
+    /// current window, and its device address — what a span's [`Resets`] point into.
+    /// Built at the first window with a border.
+    reset_mask: Option<(CudaSlice<i32>, u64)>,
 }
 
 /// Bit-exact checksum of a device tensor, printed when `GPU_HASH` is set.
@@ -642,6 +663,9 @@ impl Hierarchical {
             stateful: false,
             continues: false,
             doc_starts: Vec::new(),
+            offload: None,
+            bb_bufs: BackboneBufs::default(),
+            reset_mask: None,
         };
         model.enable_backbone_offload(gpu);
         model
@@ -679,31 +703,50 @@ impl Hierarchical {
         self.arenas = Some(arenas);
     }
 
-    /// Park the backbone blocks' saved activations on the host (unless
-    /// `GPU_NO_OFFLOAD=1`).
+    /// Keep the backbone blocks' frames in pinned host memory between forward and
+    /// backward (unless `GPU_NO_OFFLOAD=1`), through one [`Offload`] every backbone block
+    /// shares.
     ///
     /// **Backbone only.** It is the one stack that runs its whole forward before any
-    /// of its backward, which is what gives each block's device→host copy a full block
-    /// of compute to hide behind and what makes releasing the source buffers one block
-    /// later safe. The encoder re-forwards per group instead of saving, and the
-    /// decoder runs forward-then-backward within each length group — only two blocks
-    /// apart, so parking there frees buffers that are still being read (observed as
-    /// `CUDA_ERROR_ILLEGAL_ADDRESS`). See `Block::enable_offload`.
+    /// of its backward, which is what gives each frame's device→host copy the blocks
+    /// after it to hide behind, and what makes its frames one LIFO. The encoder
+    /// re-forwards per group instead of saving, and the decoder runs
+    /// forward-then-backward within each length group.
+    ///
+    /// The ring's slots are sized here, for the largest frame a backbone chunk makes.
     fn enable_backbone_offload(&mut self, gpu: &Gpu) {
         if !self.flags.offload {
             return;
         }
-        // One shared slot across the backbone: block i+1's eviction releases block i's
-        // buffers, bounding in-flight device memory at a single block's worth.
-        let in_flight = crate::gpu::offload::InFlight::shared();
+        let rows = self.bb_rows_max();
+        let slot = self
+            .bb_blocks
+            .iter()
+            .map(|b| b.frame_bytes(gpu, 1, rows))
+            .max()
+            .unwrap_or(0);
+        let off = Offload::shared(gpu, slot);
         for blk in self.bb_blocks.iter_mut() {
-            blk.enable_offload(gpu, in_flight.clone());
+            blk.set_offload(Some(off.clone()));
         }
         if self.flags.mem {
             println!(
-                "  offload: parking activations for {} backbone blocks",
-                self.bb_blocks.len()
+                "  offload: {} backbone blocks, ring {} x {:.1} MB",
+                self.bb_blocks.len(),
+                RING_SLOTS,
+                slot as f64 / 1e6
             );
+        }
+        self.offload = Some(off);
+    }
+
+    /// Rows of the longest span the backbone sweeps: one chunk, or the whole window
+    /// when unchunked.
+    fn bb_rows_max(&self) -> usize {
+        match self.bb_chunk {
+            Some(c) => c.clamp(1, WORDS_PER_SEQ),
+            None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(WORDS_PER_SEQ).max(1),
+            None => WORDS_PER_SEQ,
         }
     }
 
@@ -800,16 +843,17 @@ impl Hierarchical {
             self.enable_backbone_offload(gpu);
         } else {
             for blk in self.bb_blocks.iter_mut() {
-                blk.disable_offload();
+                blk.set_offload(None);
             }
+            self.offload = None;
         }
     }
 
-    /// Pinned host bytes the backbone's activation parks hold. Diagnostic: a forward
-    /// whose backward never came shows up here as growth window after window, and it
-    /// is host memory, so it OOMs the process rather than the device.
+    /// Pinned host bytes the backbone's offload stack holds. Diagnostic: it is sized
+    /// per window by the sweep's own frames, so it must stay flat across windows of
+    /// the same shape.
     pub fn parked_host_bytes(&self) -> usize {
-        self.bb_blocks.iter().map(|b| b.parked_host_bytes()).sum()
+        self.offload.as_ref().map_or(0, |o| o.borrow().host_bytes())
     }
 
     /// Forward-only evaluation of one window: the same encode → backbone → decode
@@ -917,12 +961,17 @@ impl Hierarchical {
 
         let bb_rows_max = bb.rows_max;
         let (loss, d_o, dec_rows_max) =
-            self.decode_groups(gpu, tokens, words, word_loss, &bb.o, &mut sc, &cache, grad);
+            self.decode_groups(gpu, tokens, words, word_loss, bb.o(), &mut sc, &cache, grad);
 
-        if let Some(d_o) = d_o {
-            let d_word_embeds = self.backbone_backward(gpu, bb, &d_o, dw, &cache);
-            self.encoder_backward(gpu, &d_word_embeds, &mut sc, &cache);
-        }
+        self.bb_bufs = match d_o {
+            Some(d_o) => {
+                let bufs = self.backbone_backward(gpu, bb, &sc.word_embeds, &d_o, dw, &cache);
+                let d_embeds = bufs.d_embeds.expect("backbone backward wrote d_embeds");
+                self.encoder_backward(gpu, d_embeds, &mut sc, &cache);
+                bufs
+            }
+            None => bb.bufs,
+        };
 
         self.scratch = Some(sc);
         if self.flags.mem {
@@ -973,11 +1022,7 @@ impl Hierarchical {
     fn temp_slot_elems(&self) -> usize {
         let (hc, wh) = (self.cfg.hc, self.cfg.wh);
         let enc_rows = max_group_rows(self.group_cap());
-        let bb_rows = match self.bb_chunk {
-            Some(c) => c.clamp(1, WORDS_PER_SEQ),
-            None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(WORDS_PER_SEQ).max(1),
-            None => WORDS_PER_SEQ,
-        };
+        let bb_rows = self.bb_rows_max();
         // The encoder and decoder fix `heads` at 16 (see `WordEncoder::new`); only the
         // backbone takes its head split from the config.
         let enc_heads = 16.min(hc);
@@ -1005,11 +1050,7 @@ impl Hierarchical {
         let l = crate::config::MLSTM_CHUNK.min(ops::FUSED_MAX_L);
         let enc_rows = max_group_rows(self.group_cap());
         let enc_tmax = crate::config::MAX_WORD_BYTES + 1;
-        let bb_rows = match self.bb_chunk {
-            Some(c) => c.clamp(1, WORDS_PER_SEQ),
-            None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(WORDS_PER_SEQ).max(1),
-            None => WORDS_PER_SEQ,
-        };
+        let bb_rows = self.bb_rows_max();
         let (hc, wh) = (self.cfg.hc, self.cfg.wh);
         let eh = 16.min(hc);
         // Sweep every `tmax` a group can have rather than assuming the longest. A group
@@ -1037,11 +1078,7 @@ impl Hierarchical {
     /// [`temp::widest_small`].
     fn temp_small_elems(&self) -> usize {
         let enc_rows = max_group_rows(self.group_cap());
-        let bb_rows = match self.bb_chunk {
-            Some(c) => c.clamp(1, WORDS_PER_SEQ),
-            None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(WORDS_PER_SEQ).max(1),
-            None => WORDS_PER_SEQ,
-        };
+        let bb_rows = self.bb_rows_max();
         temp::widest_small(enc_rows, 16).max(temp::widest_small(bb_rows, self.cfg.heads))
     }
 
@@ -1151,43 +1188,83 @@ impl Hierarchical {
         enc_rows
     }
 
-    /// The word axis split into the spans the backbone sweeps.
+    /// The word axis split into the spans the backbone sweeps, each carrying the
+    /// document starts that fall inside it. `chunk_spans(dw, dw)` is the unchunked
+    /// sweep, so both modes run the same code.
     ///
-    /// Cut first at the document borders `doc_starts` names — the recurrence must not
-    /// run across one — then each of those segments into `BACKBONE_CHUNK`-sized pieces.
-    /// `resume` is whether the state carried in from the previous window survives into
-    /// span 0. `chunk_spans(dw, dw)` is the unchunked sweep, so both modes run the same
-    /// code.
-    fn backbone_spans(&self, dw: usize, doc_starts: &[usize], resume: bool) -> Vec<BbSpan> {
+    /// A start at word 0 is not a reset row: it is the sweep's own fresh start, which
+    /// `backbone_forward` gives it by not resuming the previous window's state.
+    fn backbone_spans(&self, dw: usize, doc_starts: &[usize]) -> Vec<BbSpan> {
         let chunk = match self.bb_chunk {
             Some(c) => c.min(dw).max(1),
             None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(dw),
             None => dw,
         };
-        // Segment borders: every document start with a backbone step of its own, plus
-        // the two ends. A start at word 0 is span 0's own reset, not a cut.
-        let mut cuts = vec![0];
-        cuts.extend(doc_starts.iter().copied().filter(|&d| d > 0 && d < dw));
-        cuts.push(dw);
+        let mut starts: Vec<usize> = doc_starts
+            .iter()
+            .copied()
+            .filter(|&d| d > 0 && d < dw)
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        chunk_spans(dw, chunk)
+            .into_iter()
+            .map(|(c0, len)| BbSpan {
+                c0,
+                len,
+                resets: starts
+                    .iter()
+                    .filter(|&&d| (c0..c0 + len).contains(&d))
+                    .map(|&d| d - c0)
+                    .collect(),
+            })
+            .collect()
+    }
 
-        let mut out = Vec::new();
-        for seg in cuts.windows(2) {
-            let (s0, s1) = (seg[0], seg[1]);
-            let first = out.len();
-            out.extend(
-                chunk_spans(s1 - s0, chunk.min(s1 - s0).max(1))
-                    .into_iter()
-                    .map(|(c0, len)| BbSpan {
-                        c0: s0 + c0,
-                        len,
-                        reset: false,
-                    }),
-            );
-            // Only the segment's first span resets; the chunks inside it carry.
-            out[first].reset = true;
+    /// Mark this window's reset rows in the device mask, allocating it at the first
+    /// window that has any. A no-op for a window without a border inside it.
+    fn upload_resets(&mut self, gpu: &Gpu, spans: &[BbSpan]) {
+        if spans.iter().all(|s| s.resets.is_empty()) {
+            return;
         }
-        out[0].reset = !resume;
-        out
+        let (mask, base) = self.reset_mask.get_or_insert_with(|| {
+            use cudarc::driver::DevicePtr;
+            let m = gpu
+                .stream
+                .alloc_zeros::<i32>(WORDS_PER_SEQ)
+                .expect("reset mask");
+            let addr = m.device_ptr(&gpu.stream).0;
+            (m, addr)
+        });
+        gpu.stream.memset_zeros(mask).expect("reset mask");
+        for s in spans {
+            for &r in &s.resets {
+                let at = s.c0 + r;
+                assert!(at < WORDS_PER_SEQ, "reset row {at} past the mask");
+                // SAFETY: `at` is inside the mask's `WORDS_PER_SEQ` words.
+                unsafe { ops::memset_d32(gpu, *base + (at * size_of::<i32>()) as u64, 1, 1) };
+            }
+        }
+    }
+
+    /// `span`'s document starts, for its blocks' next call.
+    fn span_resets(&self, span: &BbSpan) -> Resets {
+        let mask = match (&self.reset_mask, span.resets.is_empty()) {
+            (Some((_, base)), false) => base + (span.c0 * size_of::<i32>()) as u64,
+            _ => 0,
+        };
+        Resets {
+            rows: span.resets.clone(),
+            mask,
+        }
+    }
+
+    /// Hand every backbone block `span`'s document starts.
+    fn set_span_resets(&mut self, span: &BbSpan) {
+        let r = self.span_resets(span);
+        for blk in self.bb_blocks.iter_mut() {
+            blk.set_resets(&r);
+        }
     }
 
     /// PHASE 2 — autoregress the backbone over the word embeddings.
@@ -1201,7 +1278,8 @@ impl Hierarchical {
     /// state carried from chunk c-1, so the arithmetic is identical to the unchunked
     /// sweep (pinned by `chunked_carry_matches_unchunked` and
     /// `mlstm_chunked_carry_matches_whole`) while only the chunks in flight are
-    /// resident.
+    /// resident. It is also what makes every block's frames one LIFO across the stack
+    /// — see [`Offload`](super::offload::Offload).
     fn backbone_forward(
         &mut self,
         gpu: &Gpu,
@@ -1211,12 +1289,18 @@ impl Hierarchical {
         cache: &TrainingCache,
     ) -> BackboneFwd {
         let (hc, wh) = (self.cfg.hc, self.cfg.wh);
-        let bb_in = self.bb_front.forward_alloc(gpu, word_embeds); // [dw, WH]
+        let mut bufs = mem::take(&mut self.bb_bufs);
+        let bb_in = bufs.bb_in.get(gpu, &[dw, wh]);
+        // `word_embeds` stays put until the encoder backward, so `bb_front` reads it
+        // back from there rather than saving a copy.
+        self.bb_front.forward_shared(gpu, word_embeds, bb_in);
         // A window that starts a document starts the recurrence too, single-chunk ones
         // included: without the reset it would resume the previous window's state.
         let resume = self.stateful && mem::take(&mut self.continues) && !doc_starts.contains(&0);
-        let spans = self.backbone_spans(dw, doc_starts, resume);
+        let spans = self.backbone_spans(dw, doc_starts);
         let rows_max = spans.iter().map(|s| s.len).max().unwrap_or(0);
+        self.reserve_offload(gpu, &spans);
+        self.upload_resets(gpu, &spans);
 
         // Under `stateful` the state has to be captured on every window, single-chunk
         // ones included, because the next window may be the one that continues it.
@@ -1231,49 +1315,65 @@ impl Hierarchical {
                 blk.reset_state(gpu);
             }
         }
-        // `bb_back`'s input per chunk. `Linear::forward` saves its input for `dW` and a
-        // later chunk's forward overwrites it, so each chunk's is kept here and handed
-        // back through `backward_with_x` — otherwise `dW` accumulates from the last
-        // chunk only, a silent wrong gradient rather than a crash.
-        let mut back_in: Vec<GTensor<f32>> = Vec::with_capacity(spans.len());
-        // The chunks tile the output rows, so each writes its own slice of the window
-        // tensor and there is nothing left to concatenate afterwards.
-        let o = GTensor::uninit(gpu, &[dw, hc]);
-        debug_assert!(!self.bb_blocks.is_empty(), "backbone with no blocks");
-        for &BbSpan { c0, len, reset } in &spans {
-            // A document border inside the window: the recurrence starts over, but the
-            // caches of the spans to its left are still waiting for their backward, so
-            // only the state is zeroed.
-            if reset && c0 != 0 {
-                for blk in self.bb_blocks.iter_mut() {
-                    blk.zero_state(gpu);
+        // The chunks tile the rows of both window tensors: the first block reads its
+        // chunk's rows of `bb_in`, the last writes its chunk's rows of `bb_out`, and only
+        // the pair the blocks in between alternate between is chunk-sized.
+        let bb_out = bufs.bb_out.get(gpu, &[dw, wh]);
+        let [hb_a, hb_b] = &mut bufs.hb;
+        let last = self.bb_blocks.len() - 1;
+        for span in &spans {
+            let (c0, len) = (span.c0, span.len);
+            self.set_span_resets(span);
+            let src = GTensor::view(gpu, &bb_in.buf, c0 * wh, &[1, len, wh]);
+            let mut dst = GTensor::view(gpu, &bb_out.buf, c0 * wh, &[1, len, wh]);
+            let (mut cur, mut nxt) = (hb_a.get(gpu, &[1, len, wh]), hb_b.get(gpu, &[1, len, wh]));
+            for (i, blk) in self.bb_blocks.iter_mut().enumerate() {
+                let x = if i == 0 { &src } else { &*cur };
+                if i == last {
+                    blk.forward(gpu, x, &mut dst, cache);
+                } else {
+                    blk.forward(gpu, x, nxt, cache);
+                    mem::swap(&mut cur, &mut nxt);
                 }
             }
-            // A block never writes its input, so the first one reads this chunk's rows
-            // out of the window tensor directly; only the two buffers the rest
-            // alternate between are the chunk's own.
-            let src = GTensor::view(gpu, &bb_in.buf, c0 * wh, &[1, len, wh]);
-            let mut hb = GTensor::uninit(gpu, &[1, len, wh]);
-            let mut hb_next = GTensor::uninit(gpu, &[1, len, wh]);
-            for (i, blk) in self.bb_blocks.iter_mut().enumerate() {
-                let x = if i == 0 { &src } else { &hb };
-                blk.forward(gpu, x, &mut hb_next, cache);
-                mem::swap(&mut hb, &mut hb_next);
-            }
-            let flat = hb.reshaped(&[len, wh]);
-            let mut y = GTensor::view(gpu, &o.buf, c0 * hc, &[len, hc]);
-            self.bb_back.forward_shared(gpu, &flat, &mut y);
-            back_in.push(flat);
         }
+        // `bb_back` is position-wise, so it runs once over the whole window rather than
+        // once per chunk, and its backward reads `bb_out` back for `dW`.
+        let o = bufs.o.get(gpu, &[dw, hc]);
+        self.bb_back.forward_shared(gpu, bb_out, o);
         self.timer.mark(gpu, "backbone fwd");
-        hash_dbg(gpu, "bb_in", &bb_in);
-        hash_dbg(gpu, "o", &o);
+        hash_dbg(gpu, "bb_in", bufs.bb_in.expect("bb_in"));
+        hash_dbg(gpu, "o", bufs.o.expect("o"));
         BackboneFwd {
-            o,
             spans,
-            back_in,
             rows_max,
+            bufs,
         }
+    }
+
+    /// Clear the shared offload stack and size it for this window's sweep: one frame per
+    /// block per span. After this neither the ring nor the host stack grows inside the
+    /// sweep. A no-op with offload off.
+    fn reserve_offload(&self, gpu: &Gpu, spans: &[BbSpan]) {
+        let Some(off) = &self.offload else { return };
+        let mut lens: Vec<usize> = spans.iter().map(|s| s.len).collect();
+        lens.sort_unstable();
+        lens.dedup();
+        // `(len, bytes of every block's frame at len, the largest of them)`.
+        let per_len: Vec<(usize, usize, usize)> = lens
+            .iter()
+            .map(|&len| {
+                let sizes = self.bb_blocks.iter().map(|b| b.frame_bytes(gpu, 1, len));
+                let (sum, max) = sizes.fold((0, 0), |(s, m), b| (s + align_up(b), m.max(b)));
+                (len, sum, max)
+            })
+            .collect();
+        let at = |len: usize| per_len.iter().find(|p| p.0 == len).expect("span length");
+        let total = spans.iter().map(|s| at(s.len).1).sum();
+        let largest = per_len.iter().map(|p| p.2).max().unwrap_or(0);
+        let mut off = off.borrow_mut();
+        off.reset();
+        off.reserve(gpu, total, largest);
     }
 
     /// PHASE 3 — decode every word, forward and (when `grad`) straight back again,
@@ -1517,8 +1617,8 @@ impl Hierarchical {
         );
     }
 
-    /// PHASE 4 — unwind the backbone, returning the word-embedding gradient for the
-    /// encoder backward.
+    /// PHASE 4 — unwind the backbone, returning its buffers with the word-embedding
+    /// gradient in `d_embeds`, for the encoder backward.
     ///
     /// Chunks unwind right to left, the mirror of the forward's left-to-right, so the
     /// BPTT state each cell carries flows backwards across the same borders the forward
@@ -1529,125 +1629,75 @@ impl Hierarchical {
         &mut self,
         gpu: &Gpu,
         bb: BackboneFwd,
+        word_embeds: &GTensor<f32>,
         d_o: &GTensor<f32>,
         dw: usize,
         cache: &TrainingCache,
-    ) -> GTensor<f32> {
-        let wh = self.cfg.wh;
-        let BackboneFwd { spans, back_in, .. } = bb;
-        let chunked = spans.len() > 1;
+    ) -> BackboneBufs {
+        let (hc, wh) = (self.cfg.hc, self.cfg.wh);
+        let BackboneFwd {
+            spans, mut bufs, ..
+        } = bb;
+        let d_bb_out = bufs.d_bb_out.get(gpu, &[dw, wh]);
+        self.bb_back
+            .backward_with_x(gpu, bufs.bb_out.expect("bb_out"), d_o, d_bb_out, 0.0, cache);
 
-        // The last block's activations are wanted first, and nothing inside the loop
-        // precedes them — so their upload is issued here, ahead of `bb_back`'s
-        // backward, and overlaps it.
-        if let Some(last) = self.bb_blocks.last_mut() {
-            last.prefetch_act(gpu);
-        }
-        let d_bb_out = self.bb_back_backward(gpu, &back_in, &spans, d_o, dw, cache);
-
-        let mut d_parts: Vec<Option<GTensor<f32>>> = (0..spans.len()).map(|_| None).collect();
-        for (ci, &BbSpan { c0, len, .. }) in spans.iter().enumerate().rev() {
-            // The last block is wanted first in every chunk, not just the first one:
-            // the prefetch above covers only the leftmost pass, so without this each
-            // later chunk opens with an unhidden upload. Issued before the slicing and
-            // the BPTT reset below, which is the compute it hides behind.
-            if chunked && let Some(last) = self.bb_blocks.last_mut() {
-                last.prefetch_act(gpu);
-            }
-
+        let d_bb_in = bufs.d_bb_in.get(gpu, &[dw, wh]);
+        for (ci, span) in spans.iter().enumerate().rev() {
+            let (c0, len) = (span.c0, span.len);
             // The rightmost chunk starts with no gradient coming from its right — under
             // `stateful` an unchunked window too, since it carries and so would take the
-            // gradient the previous window's leftmost chunk left behind. So does the
-            // chunk left of a document border: the forward did not cross it either.
-            if spans.get(ci + 1).is_none_or(|next| next.reset) {
+            // gradient the previous window's leftmost chunk left behind. A document
+            // border stops the gradient inside the cells, at its reset row.
+            if ci + 1 == spans.len() {
                 for blk in self.bb_blocks.iter_mut() {
                     blk.reset_bptt(gpu);
                 }
             }
+            self.set_span_resets(span);
             // A block never writes its `dy`, so this chunk's rows are read straight out
-            // of the whole-window gradient.
+            // of the whole-window gradient, and the first block writes its `dx` straight
+            // into the whole-window result.
             let d_hb = GTensor::view(gpu, &d_bb_out.buf, c0 * wh, &[1, len, wh]);
-            d_parts[ci] = Some(self.bb_blocks_backward(gpu, &d_hb, len, cache));
+            let mut dst = GTensor::view(gpu, &d_bb_in.buf, c0 * wh, &[1, len, wh]);
+            self.bb_blocks_backward(gpu, &d_hb, &mut dst, &mut bufs.hb, cache);
         }
-        let mut d_parts: Vec<GTensor<f32>> = d_parts
-            .into_iter()
-            .map(|p| p.expect("every chunk unwound"))
-            .collect();
-        let d_hb_all = if d_parts.len() == 1 {
-            d_parts.pop().expect("one chunk")
-        } else {
-            concat_rows(gpu, &d_parts, dw, wh)
-        };
-        let d_word_embeds = self.bb_front.backward_alloc(gpu, &d_hb_all, cache); // [dw, HC]
+        let d_embeds = bufs.d_embeds.get(gpu, &[dw, hc]);
+        self.bb_front
+            .backward_with_x(gpu, word_embeds, d_bb_in, d_embeds, 0.0, cache);
         self.timer.mark(gpu, "backbone bwd");
-        d_word_embeds
+        bufs
     }
 
-    /// `bb_back`'s backward over all chunks, returning the `[dw, WH]` gradient at the
-    /// last block's output.
+    /// One chunk's `[1, len, WH]` gradient `d_out` down through the backbone blocks, into
+    /// `dst`. `hb` is the pair the blocks in between alternate between.
     ///
-    /// `bb_back` ran `forward_shared` per chunk, so it saved nothing — its input comes
-    /// back through `back_in`. Feeding the chunks' inputs in the same order makes
-    /// `dW = XᵀdY` accumulate over all of them (beta = 1), which is what makes the
-    /// chunked gradient equal the whole-window one.
-    fn bb_back_backward(
-        &mut self,
-        gpu: &Gpu,
-        back_in: &[GTensor<f32>],
-        spans: &[BbSpan],
-        d_o: &GTensor<f32>,
-        dw: usize,
-        cache: &TrainingCache,
-    ) -> GTensor<f32> {
-        if back_in.len() == 1 {
-            return self
-                .bb_back
-                .backward_alloc_with_x(gpu, &back_in[0], d_o, cache);
-        }
-        let (hc, wh) = (self.cfg.hc, self.cfg.wh);
-        // The chunks tile both sides: each reads its rows of `d_o` and writes its rows
-        // of the result, so neither end needs a copy.
-        let out = GTensor::uninit(gpu, &[dw, wh]);
-        for (i, &BbSpan { c0, len, .. }) in spans.iter().enumerate() {
-            let d_o_c = GTensor::view(gpu, &d_o.buf, c0 * hc, &[len, hc]);
-            let mut dx = GTensor::view(gpu, &out.buf, c0 * wh, &[len, wh]);
-            self.bb_back
-                .backward_with_x(gpu, &back_in[i], &d_o_c, &mut dx, cache);
-        }
-        out
-    }
-
-    /// One chunk's `[1, len, WH]` gradient down through the backbone blocks.
-    ///
-    /// With offload on, each block's saved activations have to come back from the host
-    /// first — so block i-1's upload is started *before* block i's backward runs, giving
-    /// it a whole block of compute to hide behind. Issuing the copy and waiting for it
-    /// in the same breath exposes the whole transfer (measured: +37 ms).
+    /// With offload on, each block's frame comes back from the host first; the shared
+    /// [`Offload`](super::offload::Offload) starts the frames below it on their way up
+    /// as soon as one is popped, so the copies hide behind the blocks above.
     fn bb_blocks_backward(
         &mut self,
         gpu: &Gpu,
         d_out: &GTensor<f32>,
-        len: usize,
+        dst: &mut GTensor<f32>,
+        hb: &mut [Buf; 2],
         cache: &TrainingCache,
-    ) -> GTensor<f32> {
-        let wh = self.cfg.wh;
-        let mut d_hb = GTensor::uninit(gpu, &[1, len, wh]);
-        let mut d_hb_next = GTensor::uninit(gpu, &[1, len, wh]);
+    ) {
+        let dims = d_out.dims();
+        let [hb_a, hb_b] = hb;
+        let (mut cur, mut nxt) = (hb_a.get(gpu, dims), hb_b.get(gpu, dims));
         let last = self.bb_blocks.len() - 1;
         for i in (0..self.bb_blocks.len()).rev() {
             // The topmost block reads the caller's gradient; below it, what the block
             // above wrote.
-            let dy = if i == last { d_out } else { &d_hb };
-            if i > 0 {
-                let (head, tail) = self.bb_blocks.split_at_mut(i);
-                head[i - 1].prefetch_act(gpu);
-                tail[0].backward(gpu, dy, &mut d_hb_next, cache);
+            let dy = if i == last { d_out } else { &*cur };
+            if i == 0 {
+                self.bb_blocks[0].backward(gpu, dy, dst, cache);
             } else {
-                self.bb_blocks[0].backward(gpu, dy, &mut d_hb_next, cache);
+                self.bb_blocks[i].backward(gpu, dy, nxt, cache);
+                mem::swap(&mut cur, &mut nxt);
             }
-            mem::swap(&mut d_hb, &mut d_hb_next);
         }
-        d_hb.reshaped(&[len, wh])
     }
 
     /// PHASE 5 — unwind the encoder, one group at a time, re-forwarding each.
@@ -1955,6 +2005,10 @@ impl Hierarchical {
             l.drop_saved_act(gpu);
         }
         self.dec_norm.drop_saved_act();
+        self.bb_bufs = BackboneBufs::default();
+        if let Some(off) = &self.offload {
+            off.borrow_mut().reset();
+        }
     }
 
     /// Release the retained activations of one stage only, for the memory audit.
@@ -2370,13 +2424,13 @@ mod tests {
         assert_eq!(scaled.t, base.t);
     }
 
-    /// A forward-only window must not leave anything parked on the host.
+    /// A forward-only window must not leave anything on the host stack.
     ///
-    /// Offload evicts a block's activations to pinned host memory in the forward and
-    /// the backward reads them back. A forward with no backward therefore parks a
-    /// generation nothing ever collects, and since this is *host* memory it OOMs the
-    /// process, not the device — the pool and `mem_get_info` both stay flat while RSS
-    /// climbs. Windows vary in shape, so the check is across two different ones.
+    /// Offload copies a block's frame to pinned host memory in the forward and the
+    /// backward pops it back. A forward with no backward therefore pushes frames
+    /// nothing pops, and since this is *host* memory it OOMs the process, not the
+    /// device — the pool and `mem_get_info` both stay flat while RSS climbs. Windows
+    /// vary in shape, so the check is across two different ones.
     #[test]
     fn eval_loss_parks_nothing_on_the_host() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -2387,7 +2441,6 @@ mod tests {
             hc: 16,
             wh: 24,
             enc_blocks: 1,
-            // Both cell kinds: the backbone alternates them and each parks its own.
             bb_blocks: 2,
             dec_blocks: 1,
             heads: 2,
@@ -2420,8 +2473,8 @@ mod tests {
         let (t2, w2) = window(9);
         let _ = model.eval_loss(&gpu, &t1, &w1);
         let _ = model.eval_loss(&gpu, &t2, &w2);
-        // The pinned slots are recycled rather than freed, so the steady state is a
-        // constant, not zero: what a leak looks like is growth.
+        // The host stack is kept rather than freed, so the steady state is a constant,
+        // not zero: what a leak looks like is growth.
         let steady = model.parked_host_bytes();
         for _ in 0..3 {
             let _ = model.eval_loss(&gpu, &t1, &w1);
@@ -2905,10 +2958,11 @@ mod tests {
     /// holding that document alone does.
     ///
     /// That is the whole claim packing rests on: concatenating documents changes which
-    /// window a word lands in and nothing else. It holds because `doc_starts` cuts the
-    /// backbone sweep at the border and zeroes the recurrent state there, and because
-    /// the one prediction that would reach across — the second document's first word,
-    /// whose only context is the first document's last step — carries no loss.
+    /// window a word lands in and nothing else. It holds because every backbone cell
+    /// restarts its recurrence at the border row `doc_starts` names, and because the
+    /// one prediction that would reach across — the second document's first word,
+    /// whose only context is the first document's last step — carries no loss. The
+    /// gradients are compared too: nothing may cross the border backwards either.
     ///
     /// The control runs the same packed window with the border undeclared, which is
     /// the bug this pins: the second document then autoregresses out of the first.
@@ -2921,9 +2975,9 @@ mod tests {
         packed_vs_own_window(usize::MAX);
     }
 
-    /// The same with the backbone chunked inside each document, the shape the real
-    /// config runs: a border reset then lands among chunk borders that must keep
-    /// carrying.
+    /// The same with the backbone chunked, the shape the real config runs: the border
+    /// then falls inside a chunk, among chunk borders that must keep carrying, and
+    /// the chunks are short enough that the sLSTM takes its per-step loop.
     #[test]
     fn packed_document_decodes_like_its_own_window_chunked() {
         packed_vs_own_window(8);
@@ -2938,7 +2992,8 @@ mod tests {
             hc: 16,
             wh: 24,
             enc_blocks: 1,
-            bb_blocks: 3,
+            // Five, so block 4 is an sLSTM: both cells restart at the border.
+            bb_blocks: 5,
             dec_blocks: 1,
             heads: 2,
             dqk: 8,
@@ -2977,18 +3032,21 @@ mod tests {
         // The second document alone: word `a` is its encode-only prefix, so its scored
         // targets are words `a+1 ..`. Masking the packed window to the same targets
         // makes both losses a mean over exactly those rows.
-        let own = fresh().forward_backward(&gpu, &tokens[a * 2..], &second);
+        let mut own_model = fresh();
+        let own = own_model.forward_backward(&gpu, &tokens[a * 2..], &second);
+        let own_grads = own_model.grad_values(&gpu);
         let mask: Vec<bool> = (0..words.len() - 1).map(|w| w >= a).collect();
 
-        let run = |declare: bool| -> f32 {
+        let run = |declare: bool| -> (f32, Vec<(String, Vec<f32>)>) {
             let mut model = fresh();
             if declare {
                 model.set_doc_starts(&[0, a]);
             }
-            model.forward_backward_masked(&gpu, &tokens, &words, &mask)
+            let loss = model.forward_backward_masked(&gpu, &tokens, &words, &mask);
+            (loss, model.grad_values(&gpu))
         };
-        let packed = run(true);
-        let unbroken = run(false);
+        let (packed, packed_grads) = run(true);
+        let (unbroken, _) = run(false);
 
         // Over the whole window this time, with no mask of our own: `doc_starts` alone
         // must already drop the `<END>` at word `a-1` and the second document's first
@@ -3026,17 +3084,37 @@ mod tests {
             "spelling the border mask out changed the loss ({spelled} vs {derived}) — \
              `doc_starts` does not mask everything at the border"
         );
+        // The first document scores nothing, so every gradient the packed window
+        // accumulates must come from the second one alone — anything that crossed the
+        // border backwards shows up here, where the loss cannot see it. Scale-aware,
+        // for the reason `chunked_vs_unchunked` gives.
+        for ((name, got), (_, want)) in packed_grads.iter().zip(&own_grads) {
+            let scale = got
+                .iter()
+                .chain(want)
+                .fold(0.0f32, |m, v| m.max(v.abs()))
+                .max(1e-12);
+            let worst = got
+                .iter()
+                .zip(want)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0f32, f32::max)
+                / scale;
+            assert!(
+                worst < 2e-2 * slab,
+                "{name}: packed gradient differs from the own window's by {worst} of {scale}"
+            );
+        }
     }
 
     /// A backbone sweep of three or more chunks must give the same gradients as one.
     ///
     /// Distinct from `backbone_chunked_matches_unchunked`, which runs chunks shorter
     /// than `FUSED_MIN_T` and so never exercises the time-fused loops. Here every chunk
-    /// takes them *and* there are three, which is what it takes to run a chunk after
-    /// `chunk_saved` has swapped the live buffers out from under the cell — a stale
-    /// slab there gives NaN gradients from an out-of-bounds read rather than a
-    /// wrong-but-finite number. Two chunks cannot catch it: the first still sees its
-    /// own buffers.
+    /// takes them *and* there are three, so a chunk runs with two frames stacked below
+    /// its own — a stale slab there gives NaN gradients from an out-of-bounds read
+    /// rather than a wrong-but-finite number. Two chunks cannot catch it: the first
+    /// still sees its own buffers.
     #[test]
     fn backbone_three_chunks_match_unchunked() {
         let Some(gpu) = super::super::test_gpu() else {

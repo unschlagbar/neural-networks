@@ -45,7 +45,7 @@ pub use bf16::Slab;
 pub use buf::{Buf, SlabSlot};
 pub use gtensor::GTensor;
 use kernels::Kernels;
-pub use offload::OffloadRing;
+pub use offload::{Frame, FrameStack};
 pub use temp::{Temp, TempCache};
 
 use iron_oxide::collections::Matrix;
@@ -126,6 +126,10 @@ pub struct Gpu {
     /// cannot place one block deadlocks rather than running slowly — see
     /// `ops::fused_fwd_threads_for`.
     pub regs_per_sm: usize,
+    /// One counter per column tile for the banded `col_sum_part`, whose last block
+    /// per tile folds the bands. All-zero between launches; shared by clones, which
+    /// is sound because they share `stream` too.
+    pub col_sum_tickets: Arc<cudarc::driver::CudaSlice<u32>>,
 }
 
 impl Gpu {
@@ -186,6 +190,9 @@ impl Gpu {
         let regs_per_sm = context
             .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR)
             .map_err(|e| format!("querying register file size failed: {e:?}"))? as usize;
+        let col_sum_tickets = stream
+            .alloc_zeros::<u32>(ops::COL_SUM_TICKETS)
+            .map_err(|e| format!("allocating col_sum tickets failed: {e:?}"))?;
         Ok(Self {
             context,
             stream,
@@ -195,6 +202,7 @@ impl Gpu {
             max_shared_optin,
             sm_count,
             regs_per_sm,
+            col_sum_tickets: Arc::new(col_sum_tickets),
         })
     }
 }

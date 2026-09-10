@@ -9,7 +9,7 @@
 
 use super::arena::{self, ParamKind, ParamSlot, TrainingCache};
 use super::ops::{self, GpuRmsForward};
-use super::{GTensor, Gpu};
+use super::{Frame, GTensor, Gpu};
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
 
@@ -25,20 +25,14 @@ pub struct RmsNorm {
     /// Normalization group width: `== size` for plain RMSNorm, `== dhv` for the
     /// head-wise variant (`F/group` independent groups per row, one γ slice each).
     group: usize,
-    /// Saved `inv_rms`, one per normalization group, reused across calls.
+    /// Saved `inv_rms` of a standalone [`forward`](Self::forward), reused across calls.
     ///
     /// The only thing the forward keeps. `x̂` is NOT stored: backward is handed the
     /// forward output and rebuilds `x̂ = y/γ`, which is what Apex's `memory_efficient`
     /// path does and Liger's equivalent from the input side. Storing it costs `[N, F]`
-    /// against this `[N]` — at the backbone's shape three norms per block over a chunked
-    /// sweep came to 1.15 GB of device memory that nothing else could use.
+    /// against this `[N]`. A norm inside a block saves into the block's frame instead —
+    /// see [`carve`](Self::carve).
     fwd: Option<GpuRmsForward>,
-    /// Earlier chunks' `inv_rms`, oldest first. The single `fwd` slot holds one chunk's,
-    /// so without this chunk c+1's forward overwrites what chunk c's backward reads.
-    /// Empty unless [`set_carry`](Self::set_carry) is on.
-    chunk_saved: Vec<GpuRmsForward>,
-    /// Whether this norm is inside a chunked sweep. See [`set_carry`](Self::set_carry).
-    carry: bool,
 }
 
 impl RmsNorm {
@@ -65,8 +59,6 @@ impl RmsNorm {
             size,
             group,
             fwd: None,
-            chunk_saved: Vec::new(),
-            carry: false,
         }
     }
 
@@ -75,61 +67,73 @@ impl RmsNorm {
         Self::from_parts(gpu, &Tensor::new(&[size], vec![1.0; size]))
     }
 
-    /// `y = γ ⊙ (x / rms(x))`, row-wise, into the caller's `out` `[B, F]`. Saves
-    /// `inv_rms` for backward, and nothing else.
+    /// This norm's saved `inv_rms` for `rows` rows, carved from `f`.
+    pub fn carve(&self, gpu: &Gpu, f: &mut Frame, rows: usize) -> GpuRmsForward {
+        GpuRmsForward {
+            inv_rms: f.f32(gpu, &[rows * (self.size / self.group)]),
+        }
+    }
+
+    /// `y = γ ⊙ (x / rms(x))`, row-wise, into the caller's `out` `[B, F]`, saving
+    /// `inv_rms` into `saved` and nothing else.
     ///
     /// `out` may alias `x` (the kernel reads each row before writing it), which
     /// is what lets a caller normalize a buffer in place.
-    pub fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>) {
-        self.fit_saved(gpu, x);
-        let Self {
-            gamma, group, fwd, ..
-        } = self;
-        let saved = fwd.as_mut().expect("fit_saved filled it");
-        ops::rms_norm_forward_into(gpu, x, gamma, *group, EPS, out, saved);
+    pub fn forward_saved(
+        &self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        out: &mut GTensor<f32>,
+        saved: &mut GpuRmsForward,
+    ) {
+        assert_eq!(x.as_2d().1, self.size, "RmsNorm::forward — width mismatch");
+        ops::rms_norm_forward_into(gpu, x, &self.gamma, self.group, EPS, out, saved);
     }
 
-    /// [`forward`](Self::forward) writing a slab, for a caller whose only readers of
-    /// `y` take it narrow — the block's two pre-norms, whose output goes straight into
-    /// a GEMM. `x` stays fp32: it is the residual stream.
+    /// [`forward_saved`](Self::forward_saved) writing a slab, for a caller whose only
+    /// readers of `y` take it narrow — the block's two pre-norms, whose output goes
+    /// straight into a GEMM. `x` stays fp32: it is the residual stream.
     ///
-    /// Pair it with [`backward_slab`](Self::backward_slab); mixing the two widths
-    /// across a forward/backward pair reads the wrong bits.
-    pub fn forward_slab(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut ops::SlabBuf) {
-        self.fit_saved(gpu, x);
-        let Self {
-            gamma, group, fwd, ..
-        } = self;
-        let saved = fwd.as_mut().expect("fit_saved filled it");
-        ops::rms_norm_forward_into_slab(gpu, x, gamma, *group, EPS, out, saved);
+    /// Pair it with [`backward_slab_saved`](Self::backward_slab_saved); mixing the two
+    /// widths across a forward/backward pair reads the wrong bits.
+    ///
+    /// With `add = Some((x2, z))` the norm's input is the residual sum `z = x + x2`,
+    /// which is written to `z` in the same pass.
+    pub fn forward_slab_saved(
+        &self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        add: Option<(&GTensor<f32>, &mut GTensor<f32>)>,
+        out: &mut ops::SlabBuf,
+        saved: &mut GpuRmsForward,
+    ) {
+        assert_eq!(x.as_2d().1, self.size, "RmsNorm::forward — width mismatch");
+        ops::rms_norm_forward_into_slab(gpu, x, add, &self.gamma, self.group, EPS, out, saved);
     }
 
-    /// Present `inv_rms` at the shape this call needs, setting the previous chunk's
-    /// aside first when the sweep is chunked.
-    fn fit_saved(&mut self, gpu: &Gpu, x: &GTensor<f32>) {
-        // Position-wise: any rank is accepted and folded to `[N, F]` over the last
-        // axis, so a caller holding `[B, T, H]` need not reshape.
-        let (b, f) = x.as_2d();
-        assert_eq!(f, self.size, "RmsNorm::forward — width mismatch");
-        let total_groups = b * (f / self.group);
-        // Chunked sweep: the previous chunk's `inv_rms` is still owed a backward, so set
-        // it aside rather than letting the refit below reuse its buffer.
-        if self.carry
-            && let Some(prev) = self.fwd.take()
-        {
-            self.chunk_saved.push(prev);
-        }
+    /// [`forward_saved`](Self::forward_saved) into this norm's own slot, for a norm
+    /// used on its own.
+    pub fn forward(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut GTensor<f32>) {
+        let mut saved = self.take_slot(gpu, x);
+        self.forward_saved(gpu, x, out, &mut saved);
+        self.fwd = Some(saved);
+    }
 
-        match &self.fwd {
-            Some(s) if s.inv_rms.len() == total_groups => {}
-            _ => {
-                self.fwd = Some(GpuRmsForward {
-                    inv_rms: gpu
-                        .stream
-                        .alloc_zeros::<f32>(total_groups)
-                        .expect("alloc inv_rms"),
-                })
-            }
+    /// [`forward_slab_saved`](Self::forward_slab_saved) into this norm's own slot.
+    pub fn forward_slab(&mut self, gpu: &Gpu, x: &GTensor<f32>, out: &mut ops::SlabBuf) {
+        let mut saved = self.take_slot(gpu, x);
+        self.forward_slab_saved(gpu, x, None, out, &mut saved);
+        self.fwd = Some(saved);
+    }
+
+    /// The own slot at `x`'s row count, reusing its buffer when it already fits.
+    fn take_slot(&mut self, gpu: &Gpu, x: &GTensor<f32>) -> GpuRmsForward {
+        let groups = x.as_2d().0 * (self.size / self.group);
+        match self.fwd.take() {
+            Some(s) if s.inv_rms.len() == groups => s,
+            _ => GpuRmsForward {
+                inv_rms: GTensor::uninit(gpu, &[groups]),
+            },
         }
     }
 
@@ -154,7 +158,8 @@ impl RmsNorm {
         dx
     }
 
-    /// Given `dY` `[B, F]`, accumulate `dγ` and write `dX` `[B, F]` into `dx`.
+    /// Given `dY` `[B, F]`, accumulate `dγ` and write `dX` `[B, F]` into `dx`, reading
+    /// the `inv_rms` a standalone [`forward`](Self::forward) saved.
     ///
     /// `y` is this norm's own forward OUTPUT, which backward divides by γ to recover
     /// `x̂`. Keeping the caller's `y` alive is the whole reason the forward can get away
@@ -167,12 +172,13 @@ impl RmsNorm {
         dx: &mut GTensor<f32>,
         cache: &TrainingCache,
     ) {
-        self.backward_wos(gpu, dy, ops::WideOrSlab::F32(y), dx, cache);
+        let saved = self.fwd.take().expect("RmsNorm::backward before forward");
+        self.backward_saved(gpu, dy, y, &saved, None, dx, cache);
+        self.fwd = Some(saved);
     }
 
-    /// [`backward`](Self::backward) where `y` is the slab this norm's
-    /// [`forward_slab`](Self::forward_slab) wrote. Both readers of `y` — the kernel
-    /// and the `dγ` reduction — take it at that width.
+    /// [`backward`](Self::backward) where `y` is the slab
+    /// [`forward_slab`](Self::forward_slab) wrote.
     pub fn backward_slab(
         &mut self,
         gpu: &Gpu,
@@ -181,36 +187,69 @@ impl RmsNorm {
         dx: &mut GTensor<f32>,
         cache: &TrainingCache,
     ) {
-        self.backward_wos(gpu, dy, ops::WideOrSlab::Slab(y), dx, cache);
+        let saved = self.fwd.take().expect("RmsNorm::backward before forward");
+        self.backward_slab_saved(gpu, dy, y, &saved, None, dx, cache);
+        self.fwd = Some(saved);
     }
 
+    /// [`backward`](Self::backward) reading the `inv_rms` a
+    /// [`forward_saved`](Self::forward_saved) wrote. `resid`, when given, is added to
+    /// `dx` — the gradient of a residual branch that bypasses the norm.
+    pub fn backward_saved(
+        &mut self,
+        gpu: &Gpu,
+        dy: &GTensor<f32>,
+        y: &GTensor<f32>,
+        saved: &GpuRmsForward,
+        resid: Option<&GTensor<f32>>,
+        dx: &mut GTensor<f32>,
+        cache: &TrainingCache,
+    ) {
+        self.backward_wos(gpu, dy, ops::WideOrSlab::F32(y), saved, resid, dx, cache);
+    }
+
+    /// [`backward_saved`](Self::backward_saved) where `y` is the slab
+    /// [`forward_slab_saved`](Self::forward_slab_saved) wrote. Both readers of `y` — the
+    /// kernel and the `dγ` reduction — take it at that width.
+    pub fn backward_slab_saved(
+        &mut self,
+        gpu: &Gpu,
+        dy: &GTensor<f32>,
+        y: &ops::SlabBuf,
+        saved: &GpuRmsForward,
+        resid: Option<&GTensor<f32>>,
+        dx: &mut GTensor<f32>,
+        cache: &TrainingCache,
+    ) {
+        self.backward_wos(gpu, dy, ops::WideOrSlab::Slab(y), saved, resid, dx, cache);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn backward_wos(
         &mut self,
         gpu: &Gpu,
         dy: &GTensor<f32>,
         y: ops::WideOrSlab<'_>,
+        saved: &GpuRmsForward,
+        resid: Option<&GTensor<f32>>,
         dx: &mut GTensor<f32>,
         cache: &TrainingCache,
     ) {
         let (_, f) = dy.as_2d();
         assert_eq!(f, self.size, "RmsNorm::backward — width mismatch");
         assert_eq!(y.as_2d(), dy.as_2d(), "RmsNorm::backward — y shape");
-        let fwd = self.fwd.as_ref().expect("RmsNorm::backward before forward");
         ops::rms_norm_backward_into(
             gpu,
             dy,
-            fwd,
+            saved,
             y,
             &self.gamma,
             &mut self.dgamma,
             self.group,
+            resid,
             dx,
             &cache.temps,
         );
-        // Chunks unwind right to left, so hand the slot to the chunk on the left.
-        if let Some(prev) = self.chunk_saved.pop() {
-            self.fwd = Some(prev);
-        }
     }
 
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
@@ -247,20 +286,9 @@ impl RmsNorm {
         (params, act)
     }
 
-    /// Keep one saved `inv_rms` per chunk, for a sweep whose chunks all forward
-    /// before any of them unwinds. Off means the single slot is reused per call, which
-    /// is what every unchunked caller wants.
-    pub fn set_carry(&mut self, carry: bool) {
-        self.carry = carry;
-        if !carry {
-            self.chunk_saved.clear();
-        }
-    }
-
-    /// Release the saved `x̂` / `inv_rms`. The next forward reallocates them.
+    /// Release the own slot's `inv_rms`. The next forward reallocates it.
     pub fn drop_saved_act(&mut self) {
         self.fwd = None;
-        self.chunk_saved.clear();
     }
 
     /// AdamW step (norm scale is never decayed). Clears the grad.
@@ -307,9 +335,12 @@ mod tests {
 
             let mut narrow = RmsNorm::from_parts_grouped(&gpu, &g, group);
             let mut y_n = ops::SlabBuf::new(&gpu, &[rows, size]);
-            narrow.forward_slab(&gpu, &x, &mut y_n);
+            let mut saved = ops::GpuRmsForward {
+                inv_rms: GTensor::uninit(&gpu, &[rows * (size / group)]),
+            };
+            narrow.forward_slab_saved(&gpu, &x, None, &mut y_n, &mut saved);
             let mut dx_n = GTensor::uninit(&gpu, &[rows, size]);
-            narrow.backward_slab(&gpu, &dy, &y_n, &mut dx_n, &tc);
+            narrow.backward_slab_saved(&gpu, &dy, &y_n, &saved, None, &mut dx_n, &tc);
 
             // bf16 keeps 8 mantissa bits, so a single rounding is ~4e-3 relative. The
             // fp32 build makes the two paths the same kernel, hence the tighter bound.

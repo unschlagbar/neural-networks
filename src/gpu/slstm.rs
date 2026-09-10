@@ -59,10 +59,11 @@
 //! fused `[·, 4H]`, with the input rows above the recurrent rows in `[rows, H]`.
 
 use super::arena::{self, ParamKind, ParamSlot};
-use super::block::phase;
-use super::ops::{self, SlabBuf, SlstmSlabs};
+use super::block::{Resets, phase};
+use super::offload::{Frame, ResidentFrames};
+use super::ops::{self, GpuRmsForward, SlabBuf, SlstmSlabs};
 use super::rms_norm::RmsNorm;
-use super::{GTensor, Gpu};
+use super::{Buf, GTensor, Gpu};
 use crate::gpu::arena::TrainingCache;
 use crate::nn2::optim::AdamCfg;
 use crate::tensor::Tensor;
@@ -218,44 +219,15 @@ pub struct SLstm {
     dc_bptt: GTensor<f32>,
     dn_bptt: GTensor<f32>,
 
-    // Handed from forward to backward: the gate buffer [B, T, 4H], the saved
-    // [B, T, H] slabs, and the flattened input [B·T, in] (needed for dWx).
-    //
-    // These are *reused* across calls rather than reallocated, and `out` / `dy_buf`
-    // exist for the same reason: a stack runs the same handful of shapes over and
-    // over (one rectangle per length bucket, one chunk length on the backbone), so
-    // `take_uninit` turns what would be an allocate/free pair per call per buffer
-    // into a pointer move.
-    g: Option<GTensor<f32>>,
-    slabs: Option<SlstmSlabs>,
-    /// The forward's input at the width the GEMMs consume it: `[B·T, in]`.
-    ///
-    /// Not a copy of `x` — a *narrowing* of it. `x` itself cannot be held (the caller
-    /// returns its buffer to the pool the moment forward returns, and `dWx = xᵀ·dg`
-    /// needs it again in backward), and both GEMMs that read it want bf16 anyway. So
-    /// the one cast the forward GEMM was doing per call is hoisted here and the
-    /// backward GEMM reuses its result — one narrowing instead of a copy plus two.
-    x_saved: Option<SlabBuf>,
-    out_buf: Option<GTensor<f32>>,
-    /// Forward caches of earlier chunks of a chunked sweep, oldest first.
-    ///
-    /// The buffers above are reused call to call, which is exactly what a chunked
-    /// sweep cannot have: chunk c+1's forward would overwrite what chunk c's backward
-    /// reads. So each chunk's `(g, slabs, x_saved)` is moved aside here when the next
-    /// chunk's forward takes fresh buffers, and backward pops them right to left.
-    /// Only what backward *reads* moves; `out_buf`/`dy_buf` are written through.
-    ///
-    /// Empty on the unchunked path, where the reuse above is untouched.
-    chunk_saved: Vec<SlstmChunk>,
-    /// Host staging for the chunk caches above, when the surrounding block opted in.
-    ///
-    /// Only the *set-aside* chunks ride: the live `g`/`slabs`/`x_saved` slots are
-    /// about to be written again, so parking them would buy nothing.
-    park: Option<super::offload::HostPark>,
-    /// Where the post-cell norm's backward lands, so the loop reads a buffer this
-    /// cell owns and reuses instead of allocating one per call.
-    dy_buf: Option<GTensor<f32>>,
-    batch: usize,
+    /// The loop's output before the post-cell norm, and where that norm's backward
+    /// lands — scratch this cell reuses call to call.
+    out_buf: Buf,
+    dy_buf: Buf,
+    /// Frames of a cell used on its own. Inside a [`Block`](super::block::Block) the
+    /// block's frame holds this cell's cache and this stays empty.
+    frames: ResidentFrames,
+    /// `(B, T)` of the last forward, for [`state_extremes`](Self::state_extremes).
+    last_shape: (usize, usize),
     /// bf16 staging for the **whole-sequence** GEMMs (`x·Wx` forward; `dg·Wxᵀ`,
     /// `xᵀ·dg` and `h_prevᵀ·dg` backward). Those run once per call over `[N, ·]`,
     /// exactly like a `Linear`'s, and were the last fp32 SIMT matmuls left on the
@@ -275,130 +247,18 @@ pub struct SLstm {
     /// Whether the whole-sequence GEMMs take the bf16 path. Pinned at construction so
     /// forward and backward cannot disagree.
     bf16: bool,
+    /// Rows of the next call where a document starts: the step there runs exactly as a
+    /// sequence's first. See [`set_resets`](Self::set_resets).
+    resets: Resets,
 }
 
-/// One chunk's forward cache, set aside so a later chunk's forward can take fresh
-/// buffers without destroying it. See [`SLstm::chunk_saved`].
-///
-/// `Resident` holds the device buffers directly. `Parked` means the same set has been
-/// handed to the [`HostPark`](super::offload::HostPark) and lives in host memory; the
-/// park's generation stack is popped in the same right-to-left order backward unwinds
-/// the chunks, so the two stay in step without storing an index here.
-enum SlstmChunk {
-    Resident {
-        g: GTensor<f32>,
-        slabs: SlstmSlabs,
-        x_saved: SlabBuf,
-    },
-    Parked,
-}
-
-/// The eleven buffers of one chunk cache, in the fixed order `evict`/`restore` share.
-///
-/// Written out rather than derived so the two directions cannot drift: a mismatch here
-/// is a silent shape/width swap, not a compile error.
-fn park_order(g: GTensor<f32>, slabs: SlstmSlabs, x_saved: SlabBuf) -> Vec<super::offload::Parked> {
-    use super::offload::Parked;
-    vec![
-        Parked::from(g),
-        Parked::from(x_saved),
-        Parked::from(slabs.c_entry),
-        Parked::from(slabs.n_entry),
-        Parked::from(slabs.i_prime),
-        Parked::from(slabs.f_prime),
-        Parked::from(slabs.c),
-        Parked::from(slabs.n),
-        Parked::from(slabs.zt),
-        Parked::from(slabs.ot),
-        Parked::from(slabs.h_prev),
-    ]
-}
-
-/// Rebuild a chunk cache from `park_order`'s output, in the same order.
-fn park_unorder(p: Vec<super::offload::Parked>) -> (GTensor<f32>, SlstmSlabs, SlabBuf) {
-    use super::offload::Parked;
-    assert_eq!(p.len(), 11, "slstm park: restored buffer count");
-    let mut it = p.into_iter();
-    // The stabilizer group is fp32 by construction (`gpu::bf16`), so a bf16 buffer
-    // arriving here is a park/restore order mismatch, not a precision choice.
-    fn wide(it: &mut std::vec::IntoIter<super::offload::Parked>, what: &str) -> GTensor<f32> {
-        match it.next().expect("slstm park: short restore") {
-            Parked::F32(t) => t,
-            Parked::Bf16(_) => panic!("slstm park: {what} came back bf16"),
-        }
-    }
-    let g = wide(&mut it, "g");
-    let slab = |it: &mut std::vec::IntoIter<super::offload::Parked>| {
-        SlabBuf::from(it.next().expect("slstm park: short restore"))
-    };
-    let x_saved = slab(&mut it);
-    let (c_entry, n_entry) = (slab(&mut it), slab(&mut it));
-    let (i_prime, f_prime) = (slab(&mut it), slab(&mut it));
-    let (c, n) = (slab(&mut it), slab(&mut it));
-    let slabs = SlstmSlabs {
-        c_entry,
-        n_entry,
-        i_prime,
-        f_prime,
-        c,
-        n,
-        zt: slab(&mut it),
-        ot: slab(&mut it),
-        h_prev: slab(&mut it),
-    };
-    (g, slabs, x_saved)
-}
-
-/// Keep `slot`'s buffer when it already has the wanted shape, else allocate a
-/// fresh (uninitialised) one — so a stack that repeats a handful of shapes keeps
-/// the allocator off the hot path.
-fn take_uninit(gpu: &Gpu, slot: Option<GTensor<f32>>, dims: &[usize]) -> GTensor<f32> {
-    match slot {
-        Some(t) if t.dims() == dims => t,
-        _ => GTensor::uninit(gpu, dims),
-    }
-}
-
-/// [`take_uninit`] for the narrowed input: keep `slot` when it is wide enough, else
-/// allocate at the width the GEMMs will read it at. `bf16` is the cell's GEMM path,
-/// not the slab flag — this buffer feeds cuBLAS, not the fused kernels.
-fn fit_saved(gpu: &Gpu, slot: Option<SlabBuf>, bf16: bool, dims: &[usize]) -> SlabBuf {
-    let n: usize = dims.iter().product();
-    match slot {
-        Some(mut s) if matches!(s, SlabBuf::Bf16(_)) == bf16 && s.capacity() >= n => {
-            s.shrink_to(dims);
-            s
-        }
-        _ if bf16 => SlabBuf::Bf16(super::GTensor::uninit(gpu, dims)),
-        _ => SlabBuf::F32(GTensor::uninit(gpu, dims)),
-    }
-}
-
-/// [`take_uninit`] for the whole saved set. fp32 for the stabilizer-carrying slabs,
-/// kernel-matched width for the plain activations — see `SlstmSlabs` and `gpu::bf16`.
-fn fit_slabs(gpu: &Gpu, slot: Option<SlstmSlabs>, dims: &[usize]) -> SlstmSlabs {
-    if let Some(s) = slot
-        && s.c.dims() == dims
-    {
-        return s;
-    }
-    let slab = || SlabBuf::new(gpu, dims);
-    // The stabilizer group follows `state_bf16`, a different switch from the plain
-    // slabs' `slab_bf16` — see `SlstmSlabs` and `gpu::bf16`.
-    let st = || SlabBuf::new_width(gpu, dims, gpu.kernels.state_bf16);
-    // `c_entry`/`n_entry` hold one timestep, not the sweep: [B, H], not [B, T, H].
-    let entry = || SlabBuf::new_width(gpu, &[dims[0], dims[2]], gpu.kernels.state_bf16);
-    SlstmSlabs {
-        c_entry: entry(),
-        n_entry: entry(),
-        i_prime: st(),
-        f_prime: st(),
-        c: st(),
-        n: st(),
-        zt: slab(),
-        ot: slab(),
-        h_prev: slab(),
-    }
+/// What a forward saves for its backward, carved from a frame — see [`SLstm::carve`].
+pub struct SlstmSaved {
+    /// The gate buffer `[B, T, 4H]`: pre-activations in forward, and the gate deltas
+    /// backward writes over them.
+    g: GTensor<f32>,
+    slabs: SlstmSlabs,
+    post: GpuRmsForward,
 }
 
 /// Reuse `t`'s device buffer when the shape matches, zeroing it in place; else
@@ -505,18 +365,15 @@ impl SLstm {
             dh_bptt: GTensor::zeros(gpu, &[0, 0]),
             dc_bptt: GTensor::zeros(gpu, &[0, 0]),
             dn_bptt: GTensor::zeros(gpu, &[0, 0]),
-            g: None,
-            slabs: None,
-            x_saved: None,
-            out_buf: None,
-            dy_buf: None,
-            chunk_saved: Vec::new(),
-            park: None,
-            batch: 0,
+            out_buf: Buf::new(),
+            dy_buf: Buf::new(),
+            frames: ResidentFrames::default(),
+            last_shape: (0, 0),
             gemm_x: ops::GemmBf16::new(),
             gemm_dx: ops::GemmBf16::new(),
             gemm_h: ops::GemmBf16::new(),
             bf16: ops::gemm_bf16_enabled(gpu),
+            resets: Resets::default(),
         }
     }
 
@@ -669,38 +526,32 @@ impl SLstm {
         &self.post_norm.gamma
     }
 
-    /// Move the live forward cache into [`chunk_saved`](Self::chunk_saved), so the
-    /// call about to run can take fresh buffers without destroying it.
-    ///
-    /// A chunked sweep forwards every chunk before unwinding any, so the previous
-    /// chunk's `(g, slabs, x_saved)` is still owed a backward. Unchunked there is
-    /// nothing to preserve and this is never called.
-    fn set_aside_chunk(&mut self, gpu: &Gpu) {
-        let (Some(g), Some(slabs), Some(x_saved)) =
-            (self.g.take(), self.slabs.take(), self.x_saved.take())
-        else {
-            return; // first chunk of the sweep: nothing forwarded yet
-        };
-        // With offload on, the cache goes to the host instead of staying resident. The
-        // device tensors are handed to the park, which holds them until its D2H has
-        // landed — the next chunk's eviction releases them, so the copy overlaps that
-        // chunk's compute.
-        match &mut self.park {
-            Some(park) => {
-                park.evict(gpu, park_order(g, slabs, x_saved));
-                self.chunk_saved.push(SlstmChunk::Parked);
-            }
-            None => self
-                .chunk_saved
-                .push(SlstmChunk::Resident { g, slabs, x_saved }),
+    /// This cell's saved tensors for a `[B, T, ·]` call, carved from `f` in the one order
+    /// its forward and backward share. fp32 for the stabilizer-carrying slabs,
+    /// kernel-matched width for the plain activations — see `SlstmSlabs` and `gpu::bf16`.
+    pub fn carve(&self, gpu: &Gpu, f: &mut Frame, b: usize, t: usize) -> SlstmSaved {
+        let (h, n) = (self.hidden, b * t);
+        let (st, sl) = (gpu.kernels.state_bf16, gpu.kernels.slab_bf16);
+        SlstmSaved {
+            g: f.f32(gpu, &[b, t, 4 * h]),
+            slabs: SlstmSlabs {
+                // `c_entry`/`n_entry` hold one timestep, not the sweep.
+                c_entry: f.slab(gpu, &[b, h], st),
+                n_entry: f.slab(gpu, &[b, h], st),
+                i_prime: f.slab(gpu, &[b, t, h], st),
+                f_prime: f.slab(gpu, &[b, t, h], st),
+                c: f.slab(gpu, &[b, t, h], st),
+                n: f.slab(gpu, &[b, t, h], st),
+                zt: f.slab(gpu, &[b, t, h], sl),
+                ot: f.slab(gpu, &[b, t, h], sl),
+                h_prev: f.slab(gpu, &[b, t, h], sl),
+            },
+            post: self.post_norm.carve(gpu, f, n),
         }
     }
 
-    /// Forward over a whole `[B, T, in]` sequence into `y` `[B, T, H]`.
-    ///
-    /// The recurrence starts from zero unless [`set_carry`](Self::set_carry) says this
-    /// call continues the previous one's sequence, and the whole state stays
-    /// device-resident across the T-loop either way.
+    /// Forward over a whole `[B, T, in]` sequence into `y` `[B, T, H]`, saving into a
+    /// frame of this cell's own. See [`forward_saved`](Self::forward_saved).
     pub fn forward(
         &mut self,
         gpu: &Gpu,
@@ -708,14 +559,46 @@ impl SLstm {
         y: &mut GTensor<f32>,
         cache: &TrainingCache,
     ) {
-        // Release the previous eviction before allocating anything here: freeing
-        // returns memory to the CUDA allocator, which must not hand it back while a
-        // copy is still reading it. See `InFlight::release`.
-        if let Some(park) = &self.park {
-            park.release_previous();
+        let (b, t) = (x.shape[0], x.shape[1]);
+        let mut m = Frame::measure();
+        self.carve(gpu, &mut m, b, t);
+        self.carve_x(gpu, &mut m, b, t);
+        if !self.carry {
+            self.frames.reset();
         }
-        assert_eq!(x.rank, 3, "SLstm::forward expects [B, T, in]");
-        let (b, t, inp) = (x.shape[0], x.shape[1], x.shape[2]);
+        let mut f = self.frames.push(gpu, m.bytes());
+        let mut sv = self.carve(gpu, &mut f, b, t);
+        let mut xs = self.carve_x(gpu, &mut f, b, t);
+        xs.store(gpu, x);
+        self.forward_saved(gpu, &xs, y, &mut sv, cache);
+    }
+
+    /// The input a standalone [`forward`](Self::forward) keeps for its backward, carved
+    /// after the cell's own tensors, at the width the GEMMs read it. In a
+    /// [`Block`](super::block::Block) the block's `norm1_out` plays this part.
+    fn carve_x(&self, gpu: &Gpu, f: &mut Frame, b: usize, t: usize) -> SlabBuf {
+        f.slab(gpu, &[b, t, self.input], self.bf16)
+    }
+
+    /// Forward over a whole `[B, T, in]` sequence into `y` `[B, T, H]`, saving into `sv`.
+    ///
+    /// The recurrence starts from zero unless [`set_carry`](Self::set_carry) says this
+    /// call continues the previous one's sequence, and the whole state stays
+    /// device-resident across the T-loop either way.
+    ///
+    /// `x` must stay alive and unchanged until this call's backward, which takes it
+    /// back for `dWx = xᵀ·dg`; the cell keeps no copy.
+    pub fn forward_saved(
+        &mut self,
+        gpu: &Gpu,
+        x: &SlabBuf,
+        y: &mut GTensor<f32>,
+        sv: &mut SlstmSaved,
+        cache: &TrainingCache,
+    ) {
+        let xd = x.dims();
+        assert_eq!(xd.len(), 3, "SLstm::forward expects [B, T, in]");
+        let (b, t, inp) = (xd[0], xd[1], xd[2]);
         assert_eq!(inp, self.input, "SLstm::forward — input width mismatch");
         assert_eq!(
             y.dims(),
@@ -725,7 +608,7 @@ impl SLstm {
         let h = self.hidden;
         let h4 = 4 * h;
         let n = b * t;
-        self.batch = b;
+        self.last_shape = (b, t);
 
         // `wx`/`whr`/`bcat` are the parameters themselves — already in the layout the
         // GEMMs below want, so there is nothing to pack here.
@@ -750,39 +633,28 @@ impl SLstm {
             fit_uninit(gpu, s, &[b, h]);
         }
 
-        if carry {
-            self.set_aside_chunk(gpu);
-        }
-
-        // Narrow `x` into the cell's own `[N, in]` buffer. This is the only place the
-        // input is read at full width: the forward GEMM below and backward's
-        // `dWx = xᵀ·dg` both consume the narrowed copy, and `x` itself is gone by then
-        // (the caller returns its buffer to the pool the moment this returns).
-        //
-        // `store` takes the leading `N·in` elements, which is what `x` holds — a
-        // pooled buffer may be *larger* than [B, T, in] (`Buf`/`Pool` reuse by
-        // capacity), and copying its whole allocation would move capacity, not content.
-        let mut x_flat = fit_saved(gpu, self.x_saved.take(), self.bf16, &[n, inp]);
-        phase::timed(gpu, phase::Bucket::SlstmCopyFwd, || x_flat.store(gpu, x));
+        let SlstmSaved { g, slabs, post } = sv;
 
         // The input half of every gate pre-activation, for all timesteps at once —
         // it has no recurrent dependency, so it is one GEMM outside the loop.
         //
         // One buffer, two views: the GEMM wants [N, 4H], the time loop wants
-        // [B, T, 4H]. `reshaped` is metadata-only, so the allocation is untouched.
-        let mut g = take_uninit(gpu, self.g.take(), &[b, t, h4]).reshaped(&[n, h4]);
+        // [B, T, 4H]. The reshape is metadata-only.
+        g.reshape_to(&[n, h4]);
         let (gemm_x, wx_w) = (&mut self.gemm_x, &self.wx);
-        phase::timed(gpu, phase::Bucket::SlstmGemmFwd, || match &x_flat {
-            SlabBuf::Bf16(xb) => gemm_x.run_staged_lhs(gpu, ops::MmForm::Nn, xb, wx_w, &mut g, 0.0),
-            SlabBuf::F32(xf) => ops::matmul_nn_into(gpu, xf, wx_w, &mut g, 0.0),
+        let xv = x.view(gpu, &[n, inp]);
+        let xs = xv.at_width(gpu, self.bf16, &cache.temps);
+        phase::timed(gpu, phase::Bucket::SlstmGemmFwd, || match &xs.x {
+            SlabBuf::Bf16(xb) => gemm_x.run_staged_lhs(gpu, ops::MmForm::Nn, xb, wx_w, g, 0.0),
+            SlabBuf::F32(xf) => ops::matmul_nn_into(gpu, xf, wx_w, g, 0.0),
         });
-        let mut g = g.reshaped(&[b, t, h4]);
+        drop(xs);
+        g.reshape_to(&[b, t, h4]);
 
-        let mut slabs = fit_slabs(gpu, self.slabs.take(), &[b, t, h]);
-        let mut out = take_uninit(gpu, self.out_buf.take(), &[b, t, h]);
-
+        let mut out_buf = std::mem::take(&mut self.out_buf);
+        let out = out_buf.get(gpu, &[b, t, h]);
         phase::timed(gpu, phase::Bucket::SlstmLoopFwd, || {
-            self.fwd_loop(gpu, &mut g, &mut slabs, &mut out, t, carry, cache);
+            self.fwd_loop(gpu, g, slabs, out, t, carry, cache);
         });
 
         // The loop writes `out`, and the result reaches the caller's buffer through
@@ -793,12 +665,9 @@ impl SLstm {
         // stay [B, T, H]. `y` was asserted that shape on entry, so the write covers
         // exactly the caller's buffer.
         phase::timed(gpu, phase::Bucket::SlstmCopyFwd, || {
-            self.post_norm.forward(gpu, &out, y);
+            self.post_norm.forward_saved(gpu, out, y, post);
         });
-        self.g = Some(g);
-        self.slabs = Some(slabs);
-        self.x_saved = Some(x_flat);
-        self.out_buf = Some(out);
+        self.out_buf = out_buf;
     }
 
     /// The forward time loop: one cooperative launch when T is long enough, else
@@ -838,12 +707,16 @@ impl SLstm {
                 out,
                 t,
                 carry,
+                self.resets.mask,
                 &cache.temps,
             )
         {
             return;
         }
-        if self.batches_at(gpu, b)
+        // The batched kernels take no resets; only the backbone has any, and it runs at
+        // B = 1.
+        if self.resets.is_empty()
+            && self.batches_at(gpu, b)
             && ops::slstm_batched_fwd(
                 gpu,
                 &self.whr,
@@ -889,6 +762,7 @@ impl SLstm {
             let (h_narrow, h_state) = (&mut self.h_narrow, &self.h_state);
             h_narrow.store(gpu, h_state);
         }
+        let mut resets = self.resets.rows.iter().copied().peekable();
         for step in 0..t {
             // Recurrent half of the gates (one dense GEMM into the contiguous
             // scratch), then the elementwise recurrence: two launches per timestep.
@@ -898,7 +772,9 @@ impl SLstm {
             // At a sequence start it is skipped outright: `h_{-1}` is zero, so the
             // product is, and the kernel substitutes that. At the encoder's shape that
             // is a `[512,256]x[256,1024]` GEMM saved out of every group's T of them.
-            let first = step == 0 && !carry;
+            // A document start inside the call is a sequence start too.
+            let reset = resets.next_if_eq(&step).is_some();
+            let first = (step == 0 && !carry) || reset;
             if !first {
                 let Self {
                     gemm_h,
@@ -959,11 +835,8 @@ impl SLstm {
         dx
     }
 
-    /// Backward over the whole sequence. `dy` is `[B, T, H]`, `dx` is the
-    /// caller's `[B, T, in]` output. Accumulates weight/bias grads.
-    /// `y` is this cell's forward output — the post-cell norm's output, which that
-    /// norm's backward divides by γ to recover `x̂`. The caller keeps it; the norm
-    /// itself stores only `inv_rms`.
+    /// Backward over the whole sequence, reading the frame the matching
+    /// [`forward`](Self::forward) pushed. See [`backward_saved`](Self::backward_saved).
     pub fn backward(
         &mut self,
         gpu: &Gpu,
@@ -972,20 +845,40 @@ impl SLstm {
         dx: &mut GTensor<f32>,
         cache: &TrainingCache,
     ) {
+        let mut f = self.frames.pop(gpu);
+        let (b, t) = (dy.shape[0], dy.shape[1]);
+        let mut sv = self.carve(gpu, &mut f, b, t);
+        let xs = self.carve_x(gpu, &mut f, b, t);
+        self.backward_saved(gpu, &xs, y, dy, dx, &mut sv, cache);
+    }
+
+    /// Backward over the whole sequence. `dy` is `[B, T, H]`, `dx` is the caller's
+    /// `[B, T, in]` output. Accumulates weight/bias grads.
+    ///
+    /// `y` is this cell's forward output — the post-cell norm's output, which that
+    /// norm's backward divides by γ to recover `x̂`. The caller keeps it; the norm
+    /// itself saves only `inv_rms`. `sv` is what the forward saved; its gate buffer is
+    /// overwritten with the gate deltas.
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_saved(
+        &mut self,
+        gpu: &Gpu,
+        x: &SlabBuf,
+        y: &GTensor<f32>,
+        dy: &GTensor<f32>,
+        dx: &mut GTensor<f32>,
+        sv: &mut SlstmSaved,
+        cache: &TrainingCache,
+    ) {
         assert_eq!(dy.rank, 3, "SLstm::backward expects [B, T, H]");
         let (b, t, h) = (dy.shape[0], dy.shape[1], dy.shape[2]);
-        assert_eq!(b, self.batch, "SLstm::backward — batch mismatch");
         assert_eq!(h, self.hidden, "SLstm::backward — hidden mismatch");
         assert_eq!(dx.dims(), [b, t, self.input], "SLstm::backward — dx shape");
+        assert_eq!(x.dims(), [b, t, self.input], "SLstm::backward — x shape");
         let inp = self.input;
         let h4 = 4 * h;
         let n = b * t;
-
-        // Taken, not borrowed: these are rebuilt by every forward, so releasing them
-        // here frees the device memory across the optimizer step.
-        let mut g = self.g.take().expect("forward before backward");
-        let mut slabs = self.slabs.take().expect("forward before backward");
-        let x_flat = self.x_saved.take().expect("forward before backward");
+        let SlstmSaved { g, slabs, post } = sv;
 
         // BPTT channels start at zero — unless this call continues the backward of a
         // sequence whose later chunk ran first (see `set_carry`), where they start at
@@ -1003,21 +896,24 @@ impl SLstm {
         //
         // It lands in `dy_buf`, the buffer this cell reuses call to call, so undoing
         // the norm doubles as the staging the loop would otherwise need.
-        let mut dy_buf = take_uninit(gpu, self.dy_buf.take(), &[b, t, h]);
+        let mut dy_buf = std::mem::take(&mut self.dy_buf);
+        let d_out = dy_buf.get(gpu, &[b, t, h]);
         phase::timed(gpu, phase::Bucket::SlstmCopyBwd, || {
-            self.post_norm.backward(gpu, dy, y, &mut dy_buf, cache);
+            self.post_norm
+                .backward_saved(gpu, dy, y, post, None, d_out, cache);
         });
 
         // The only thing the loop must carry is BPTT: the gate deltas go straight
         // back into `g`, and everything derived from them waits until the loop ends.
         phase::timed(gpu, phase::Bucket::SlstmLoopBwd, || {
-            self.bwd_loop(gpu, &dy_buf, &mut g, &slabs, t, cache);
+            self.bwd_loop(gpu, d_out, g, slabs, t, cache);
         });
-        self.dy_buf = Some(dy_buf);
+        self.dy_buf = dy_buf;
 
         // `g` now holds the gate deltas for the whole sequence: dx, dWx, dWh and the
         // bias grads are three GEMMs and one reduction over it.
-        let dg = g.reshaped(&[n, h4]);
+        g.reshape_to(&[n, h4]);
+        let dg = &*g;
         dx.reshape_to(&[n, inp]);
         // `dx = dg·Wxᵀ`, `dWx = x_flatᵀ·dg` and `dWh = h_prevᵀ·dg` all read `dg`, so
         // where the operands are narrow all three go through one call that casts it
@@ -1029,10 +925,12 @@ impl SLstm {
         let dwx = &mut self.dwx;
         let dwhr = &mut self.dwhr;
         let gemm_dx = &mut self.gemm_dx;
+        let xv = x.view(gpu, &[n, inp]);
+        let xs = xv.at_width(gpu, self.bf16, &cache.temps);
         phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || {
-            match (&x_flat, &slabs.h_prev) {
+            match (&xs.x, &slabs.h_prev) {
                 (SlabBuf::Bf16(xb), SlabBuf::Bf16(hb)) => {
-                    gemm_dx.run_slstm_backward(gpu, xb, hb, &dg, wx, dwx, dwhr, dx)
+                    gemm_dx.run_slstm_backward(gpu, xb, hb, dg, wx, dwx, dwhr, dx)
                 }
                 // Either the GEMMs or the kernels were built fp32, so `dWh` goes to
                 // cuBLAS wide — widening a narrow `h_prev` into a borrowed slot first.
@@ -1041,26 +939,25 @@ impl SLstm {
                 (x, hp) => {
                     match x {
                         SlabBuf::Bf16(xb) => {
-                            gemm_dx.run_backward_staged_x(gpu, xb, &dg, wx, dwx, dx)
+                            gemm_dx.run_backward_staged_x(gpu, xb, dg, wx, dwx, dx, 0.0)
                         }
                         SlabBuf::F32(xf) => {
-                            ops::matmul_nt_into(gpu, &dg, wx, dx, 0.0);
-                            ops::matmul_tn_into(gpu, xf, &dg, dwx, 1.0);
+                            ops::matmul_nt_into(gpu, dg, wx, dx, 0.0);
+                            ops::matmul_tn_into(gpu, xf, dg, dwx, 1.0);
                         }
                     }
                     let mut scratch = cache.temps.get::<f32>(gpu, &[n, h]);
                     let hf = hp.as_f32(gpu, &mut scratch);
-                    ops::matmul_tn_into(gpu, hf, &dg, dwhr, 1.0);
+                    ops::matmul_tn_into(gpu, hf, dg, dwhr, 1.0);
                 }
             }
         });
-        slabs.h_prev.shrink_to(&[b, t, h]);
 
         // The bias gradient is the column sum of the gate deltas, accumulating straight
         // into the fused `dbcat`. Nothing to scatter afterwards.
         let dbcat = &mut self.dbcat;
         phase::timed(gpu, phase::Bucket::SlstmGemmBwd, || {
-            ops::add_col_sum(gpu, dbcat, &dg, &cache.temps);
+            ops::add_col_sum(gpu, dbcat, dg, &cache.temps);
         });
 
         // FlashRNN keeps `dR`/`db` at bf16 (`Ctype = CUDA_R_16BF`, `beta = 1`), so every
@@ -1076,37 +973,6 @@ impl SLstm {
                 ops::quantize_bf16_(gpu, t);
             }
         }
-
-        // Give the buffers back at their original shapes so the next forward reuses
-        // the same allocations.
-        self.g = Some(dg.reshaped(&[b, t, h4]));
-        self.slabs = Some(slabs);
-        self.x_saved = Some(x_flat);
-
-        // Chunked sweep: this chunk is done, so the chunk to its left — the next one
-        // to unwind — takes the live slots. Its buffers are the ones its own forward
-        // wrote, so backward reads exactly what that chunk produced. Dropping what was
-        // just handed back releases this chunk's activations now rather than at the
-        // next forward, which is what keeps only the chunks still owed a backward
-        // resident.
-        match self.chunk_saved.pop() {
-            Some(SlstmChunk::Resident { g, slabs, x_saved }) => {
-                self.g = Some(g);
-                self.slabs = Some(slabs);
-                self.x_saved = Some(x_saved);
-            }
-            // The park's generations pop in the same right-to-left order, so this
-            // restores the chunk to the left — exactly the one that unwinds next.
-            Some(SlstmChunk::Parked) => {
-                let park = self.park.as_mut().expect("parked chunk without a park");
-                let (g, slabs, x_saved) = park_unorder(park.restore(gpu));
-                self.g = Some(g);
-                self.slabs = Some(slabs);
-                self.x_saved = Some(x_saved);
-            }
-            None => {}
-        }
-
         dx.reshape_to(&[b, t, inp]);
     }
 
@@ -1134,11 +1000,13 @@ impl SLstm {
                 &mut self.dn_bptt,
                 slabs,
                 t,
+                self.resets.mask,
             )
         {
             return;
         }
-        if self.batches_at(gpu, b)
+        if self.resets.is_empty()
+            && self.batches_at(gpu, b)
             && ops::slstm_batched_bwd(
                 gpu,
                 &self.whr,
@@ -1170,7 +1038,9 @@ impl SLstm {
         // fused one has been *tried* — it can decline at launch, not just at geometry.
         let (b, h) = (self.dc_bptt.rows(), self.dc_bptt.cols());
         self.dgh.fit(gpu, &[b, 4 * h]);
+        let mut resets = self.resets.rows.iter().rev().copied().peekable();
         for step in (0..t).rev() {
+            let reset = resets.next_if_eq(&step).is_some();
             ops::slstm_step_fused_bwd(
                 gpu,
                 dy,
@@ -1181,7 +1051,13 @@ impl SLstm {
                 &mut self.dc_bptt,
                 &mut self.dn_bptt,
                 step,
+                reset,
             );
+            // A reset step read no `h_{t-1}`, so nothing reaches it through `Wh`.
+            if reset {
+                self.dh_bptt.zero_(gpu);
+                continue;
+            }
             // dh_{t-1} = dgates_t · Whᵀ — the one gradient BPTT cannot defer. The
             // weight comes from the same cache the forward's `h·Wh` fills: it is the
             // same `whr`, narrowed once per optimizer step rather than once per GEMM.
@@ -1252,13 +1128,21 @@ impl SLstm {
         self.param_slots().into_iter().map(|s| &*s.grad).collect()
     }
 
-    /// Forward-cache extremes of the last sweep: `(min |n|, max |c|, max |c/n|)`.
+    /// Forward-cache extremes of the last standalone sweep: `(min |n|, max |c|,
+    /// max |c/n|)`. See [`extremes_of`](Self::extremes_of).
+    pub fn state_extremes(&self, gpu: &Gpu) -> Option<(f32, f32, f32)> {
+        let mut f = self.frames.recent(gpu)?;
+        let (b, t) = self.last_shape;
+        Some(Self::extremes_of(gpu, &self.carve(gpu, &mut f, b, t)))
+    }
+
+    /// `(min |n|, max |c|, max |c/n|)` over a saved sweep.
     ///
     /// The backward divides by `n` and by `n²`, so a normalizer that collapses is the
     /// difference between a finite gradient and a NaN. Diagnostic — downloads the
     /// whole `[B, T, H]` slabs, so it belongs in a probe.
-    pub fn state_extremes(&self, gpu: &Gpu) -> Option<(f32, f32, f32)> {
-        let slabs = self.slabs.as_ref()?;
+    pub fn extremes_of(gpu: &Gpu, sv: &SlstmSaved) -> (f32, f32, f32) {
+        let slabs = &sv.slabs;
         // Widened into scratch: under `SLSTM_BF16_STATE` these are the narrow copies,
         // and the extremes we are after are precisely what narrowing might move.
         let mut scratch = GTensor::uninit(gpu, slabs.n.dims());
@@ -1272,25 +1156,7 @@ impl SLstm {
             .zip(&n)
             .map(|(a, b)| (a / b).abs())
             .fold(0.0, f32::max);
-        Some((min_n, max_c, max_ratio))
-    }
-
-    /// Release the forward cache — the `[B, T, ·]` slabs and the saved input — without
-    /// reading it.
-    ///
-    /// For a stack that re-forwards rather than unwinding; see
-    /// `Block::drop_saved_act`. These are the cell's largest buffers, and in the
-    /// encoder every group but the last leaves them holding activations no backward
-    /// will ever read.
-    pub fn drop_saved_act(&mut self) {
-        self.slabs = None;
-        self.x_saved = None;
-        self.chunk_saved.clear();
-        self.discard_parked();
-        // The GEMM staging deliberately stays: `drop_saved_act` runs between the chunks
-        // of a sweep, and dropping the cached bf16 `Wx` there costs a re-narrow per
-        // chunk. It is bounded by the window, not the corpus, and `clear` on the layer
-        // is what releases it.
+        (min_n, max_c, max_ratio)
     }
 
     /// Continue the previous call's recurrence rather than starting from zero.
@@ -1344,7 +1210,6 @@ impl SLstm {
 
     pub fn set_carry(&mut self, carry: bool) {
         self.carry = carry;
-        self.post_norm.set_carry(carry);
     }
 
     /// Zero the carried **forward** state, so the next `forward` starts the recurrence
@@ -1360,7 +1225,7 @@ impl SLstm {
     }
 
     /// Start the recurrence over at the next forward, keeping everything already
-    /// cached. See [`Cell::zero_state`].
+    /// cached.
     pub fn zero_state(&mut self, gpu: &Gpu) {
         for s in [
             &mut self.h_state,
@@ -1377,49 +1242,7 @@ impl SLstm {
     /// Drop the caches of an already-unwound sweep, keeping `h`/`c`/`n`/`m` — so the
     /// next forward continues this recurrence. See [`Cell::reset_caches`].
     pub fn reset_caches(&mut self, _gpu: &Gpu) {
-        // A sweep that ended early (a caller that forwarded chunks and never unwound
-        // them) would otherwise leave its caches to accumulate across steps.
-        self.chunk_saved.clear();
-        self.discard_parked();
-    }
-
-    /// Drop any host generations left over from a sweep that was abandoned before its
-    /// backward consumed them, so they do not accumulate across steps.
-    fn discard_parked(&mut self) {
-        if let Some(park) = &mut self.park {
-            park.discard_all();
-        }
-    }
-
-    /// Park this cell's set-aside chunk caches on the host between forward and
-    /// backward.
-    ///
-    /// Opted into by the surrounding [`Block`](super::block::Block), and subject to the
-    /// same constraint: only for a stack whose whole forward precedes its backward.
-    /// See `Block::enable_offload`.
-    pub fn enable_offload(&mut self, gpu: &Gpu, in_flight: super::offload::SharedInFlight) {
-        self.park =
-            Some(super::offload::HostPark::new(gpu, in_flight).expect("offload: host park"));
-    }
-
-    /// Stop parking this cell's chunk caches, discarding anything already parked.
-    /// See `Block::disable_offload`.
-    pub fn disable_offload(&mut self) {
-        self.discard_parked();
-        self.park = None;
-    }
-
-    /// Pinned host bytes this cell's park holds. Diagnostic.
-    pub fn parked_host_bytes(&self) -> usize {
-        self.park.as_ref().map_or(0, |p| p.host_bytes())
-    }
-
-    /// Start the parked chunk on its way back, without waiting. Called one block ahead
-    /// of this cell's backward so the upload overlaps compute.
-    pub fn prefetch_saved(&mut self, gpu: &Gpu) {
-        if let Some(park) = &mut self.park {
-            park.prefetch(gpu);
-        }
+        self.frames.reset();
     }
 
     /// Zero the carried **BPTT** channels, so the next `backward` starts with no
@@ -1432,53 +1255,31 @@ impl SLstm {
         }
     }
 
+    /// Where documents start inside the next call. See [`Cell::set_resets`](super::block::Cell::set_resets).
+    pub fn set_resets(&mut self, r: &Resets) {
+        self.resets.clone_from(r);
+    }
+
     /// Retained activation bytes split `(saved_cache, other)`.
     ///
-    /// `saved_cache` is the `[B, T, ·]` slabs and saved input that
-    /// [`drop_saved_act`](Self::drop_saved_act) releases. `other` is everything it
-    /// keeps: the gate buffer, the stable `out`/`dy` buffers, the widening scratch,
-    /// the per-batch state and BPTT channels, and the post-norm's saved `x̂`.
+    /// `saved_cache` is this cell's own frames. `other` is everything it keeps: the
+    /// stable `out`/`dy` buffers, the per-batch state and BPTT channels and the GEMM
+    /// staging.
     pub fn act_split(&self) -> (usize, usize) {
-        let saved = self.slabs.as_ref().map_or(0, |s| s.retained_bytes())
-            + self.x_saved.as_ref().map_or(0, |t| t.retained_bytes())
-            + self
-                .chunk_saved
-                .iter()
-                .map(|c| match c {
-                    SlstmChunk::Resident { g, slabs, x_saved } => {
-                        slabs.retained_bytes() + x_saved.retained_bytes() + g.capacity() * 4
-                    }
-                    // On the host, so it holds no device bytes — which is the point.
-                    SlstmChunk::Parked => 0,
-                })
-                .sum::<usize>();
+        let saved = self.frames.device_bytes();
         let (_, all) = self.retained_bytes();
         (saved, all - saved)
     }
 
-    /// Release every activation this cell holds — the saved slabs and input, the
-    /// gate/output/dy buffers and the widening scratch.
+    /// Release this cell's frames and its post-norm's slot.
     ///
-    /// Broader than [`drop_saved_act`](Self::drop_saved_act), which keeps the reused
-    /// buffers on purpose. For a window boundary, not the hot path.
+    /// `out_buf` and `dy_buf` are deliberately KEPT: the encoder and decoder run one
+    /// rectangle per length bucket and the buckets repeat window after window, so
+    /// dropping them per group would mean a fresh allocation for every group of every
+    /// window. At CHAR_HIDDEN=256 they are single-digit MB.
     pub fn drop_all_act(&mut self) {
-        // The big per-`[B, T, ·]` buffers: these are what scale with the rectangle and
-        // what a group boundary needs back.
-        self.slabs = None;
-        self.x_saved = None;
-        self.chunk_saved.clear();
-        self.discard_parked();
+        self.frames.release();
         self.post_norm.drop_saved_act();
-
-        // `g`, `out_buf` and `dy_buf` are deliberately KEPT: the
-        // encoder and decoder run one rectangle per length bucket and the buckets
-        // repeat window after window, so dropping them per group would mean a fresh
-        // allocation for every group of every window.
-        //
-        // Keeping them costs the `[B, T, 4H]` gate buffer and two `[B, T, H]` staging
-        // buffers at the LARGEST bucket's shape, which at the encoder/decoder's
-        // CHAR_HIDDEN=256 is single-digit MB — against the ~1.2 GB that releasing the
-        // slabs and saved input recovers.
     }
 
     /// Device bytes held, split `(params, activations)`. Diagnostic — see
@@ -1507,12 +1308,9 @@ impl SLstm {
         .iter()
         .map(|t| t.capacity() * 4)
         .sum();
-        let opt: usize = [&self.g, &self.out_buf, &self.dy_buf]
-            .iter()
-            .filter_map(|s| s.as_ref())
-            .map(|t| t.capacity() * 4)
-            .sum::<usize>()
-            + self.x_saved.as_ref().map_or(0, |t| t.retained_bytes());
+        let opt = self.out_buf.retained_bytes()
+            + self.dy_buf.retained_bytes()
+            + self.frames.device_bytes();
         let live: usize = [
             &self.h_state,
             &self.c_state,
@@ -1528,12 +1326,11 @@ impl SLstm {
         .sum::<usize>()
             + self.h_narrow.retained_bytes()
             + self.dgh.retained_bytes();
-        let slabs = self.slabs.as_ref().map_or(0, |s| s.retained_bytes());
         let staging = self.gemm_x.retained_bytes()
             + self.gemm_dx.retained_bytes()
             + self.gemm_h.retained_bytes();
         let (pn_p, _) = self.post_norm.retained_bytes();
-        (params + pn_p, opt + live + slabs + staging)
+        (params + pn_p, opt + live + staging)
     }
 
     pub fn zero_grad(&mut self, gpu: &Gpu) {
@@ -2334,6 +2131,77 @@ mod tests {
     /// tests compare the GPU to `nn2`, which inference never runs, so this is the
     /// pair that has to agree. State is reset per word in the encoder/decoder, so
     /// the sequence start (`n_prev == 0`) is exercised on every call.
+    /// A reset row inside one call must split it into two independent sequences: the
+    /// outputs, the input gradient and the summed weight gradients of the whole call
+    /// equal those of the two halves run on their own, each from zero state — on the
+    /// time-fused loops and on the per-step one.
+    #[test]
+    fn document_reset_matches_separate_sequences() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        for fused in [true, false] {
+            reset_matches_split(&gpu, fused);
+        }
+    }
+
+    fn reset_matches_split(gpu: &Gpu, fused: bool) {
+        use cudarc::driver::DevicePtr;
+        let tc = test_cache(gpu);
+        // Both halves long enough for the fused loops, so each path is compared with
+        // itself.
+        let (b, inp, h, t, r) = (1, 8, 12, 80, 37);
+        let cpu = CpuSLstm::new(inp, h);
+        let x = Tensor::random(&[b, t, inp], 0.5);
+        let dy = Tensor::random(&[b, t, h], 1.0);
+        let cut = |src: &Tensor, f: usize, off: usize, len: usize| {
+            GTensor::from_host(
+                gpu,
+                &Tensor::new(&[b, len, f], src.data[off * f..(off + len) * f].to_vec()),
+            )
+        };
+        let cell = || {
+            let mut c = from_cpu(gpu, &cpu);
+            c.force_fused_time = Some(fused);
+            c
+        };
+
+        let mask: Vec<i32> = (0..t).map(|i| i32::from(i == r)).collect();
+        let mask = gpu.stream.clone_htod(&mask).expect("mask");
+        let mut whole = cell();
+        whole.set_resets(&Resets {
+            rows: vec![r],
+            mask: mask.device_ptr(&gpu.stream).0,
+        });
+        let yw = whole.forward_alloc(gpu, &GTensor::from_host(gpu, &x), &tc);
+        let dxw = whole
+            .backward_alloc(gpu, &yw, &GTensor::from_host(gpu, &dy), &tc)
+            .to_host(gpu);
+
+        let halves = [(0, r), (r, t - r)].map(|(off, len)| {
+            let mut c = cell();
+            let y = c.forward_alloc(gpu, &cut(&x, inp, off, len), &tc);
+            let dx = c.backward_alloc(gpu, &y, &cut(&dy, h, off, len), &tc);
+            (
+                c,
+                y.to_host(gpu).data.to_vec(),
+                dx.to_host(gpu).data.to_vec(),
+            )
+        });
+        let [(c0, y0, dx0), (c1, y1, dx1)] = &halves;
+        assert_close(&yw.to_host(gpu).data, &[y0.as_slice(), y1].concat(), 1e-5);
+        assert_close(&dxw.data, &[dx0.as_slice(), dx1].concat(), 1e-4);
+        let add = |p: Vec<f32>, q: Vec<f32>| -> Vec<f32> {
+            p.iter().zip(&q).map(|(a, b)| a + b).collect()
+        };
+        for gi in 0..4 {
+            let dw = add(c0.gate_dw(gpu, gi), c1.gate_dw(gpu, gi));
+            let db = add(c0.gate_db(gpu, gi), c1.gate_db(gpu, gi));
+            assert_close(&whole.gate_dw(gpu, gi), &dw, 1e-3);
+            assert_close(&whole.gate_db(gpu, gi), &db, 1e-3);
+        }
+    }
+
     #[test]
     fn gpu_matches_nn_slstm_inference_cell() {
         let Some(gpu) = super::super::test_gpu() else {

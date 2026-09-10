@@ -189,12 +189,13 @@ extern "C" __global__ void slstm_step_fused(
 //   d_c_recur    [B, H]      both cell grad carried backward across steps
 //   d_n_recur    [B, H]      both normalizer grad carried backward across steps
 //   t, T, H, BH              in   current step, sequence length, width, B*H
+//   reset                    in   step t starts a document (its forward ran as `first`)
 extern "C" __global__ void slstm_step_fused_bwd(
         const float* d_out, float* gates, slab_t* d_gates_flat, const float* d_h_recur,
         const slab_t* o_act, const state_t* c_t, const state_t* n_t,
         const state_t* c_entry, const state_t* n_entry, const slab_t* z_act,
         const state_t* i_gate, const state_t* f_gate,
-        float* d_c_recur, float* d_n_recur, int t, int T, int H, int BH) {
+        float* d_c_recur, float* d_n_recur, int t, int T, int H, int BH, int reset) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= BH) return;
     int b = k / H, j = k % H;
@@ -218,8 +219,10 @@ extern "C" __global__ void slstm_step_fused_bwd(
     // Grads w.r.t. the stabilized gate values i', f', before their exp/sigmoid.
     // c_{t-1}, n_{t-1}: the same history one timestep back, except at the sweep's
     // first step, whose predecessor is the carried-in state.
-    float c_pr = (t == 0) ? state_ld(c_entry, k) : state_ld(c_t, s - H);
-    float n_pr = (t == 0) ? state_ld(n_entry, k) : state_ld(n_t, s - H);
+    // A `reset` row (a document start) ran from zero state, so its predecessor is zero
+    // and nothing is carried past it.
+    float c_pr = reset ? 0.0f : (t == 0) ? state_ld(c_entry, k) : state_ld(c_t, s - H);
+    float n_pr = reset ? 0.0f : (t == 0) ? state_ld(n_entry, k) : state_ld(n_t, s - H);
     float d_f_gate = d_c * c_pr + d_n * n_pr;
     float d_i_gate = d_c * z + d_n;
     float d_z_act = d_c * i;
@@ -236,6 +239,6 @@ extern "C" __global__ void slstm_step_fused_bwd(
     gates[gate_off + 3 * H] = d_o_pre;  slab_st(d_gates_flat, flat_off + 3 * H, d_o_pre);
 
     // Carry to step t−1: both paths are scaled by the forget gate.
-    d_c_recur[k] = d_c * f;
-    d_n_recur[k] = d_n * f;
+    d_c_recur[k] = reset ? 0.0f : d_c * f;
+    d_n_recur[k] = reset ? 0.0f : d_n * f;
 }

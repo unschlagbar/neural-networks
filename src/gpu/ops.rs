@@ -635,6 +635,7 @@ impl GemmBf16 {
 
     /// [`run_backward`](Self::run_backward) where `x` is already narrowed into a
     /// bf16 by the caller — only `dy` is cast here.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_backward_staged_x(
         &mut self,
         gpu: &Gpu,
@@ -643,6 +644,7 @@ impl GemmBf16 {
         w: &GTensor<f32>,
         dw: &mut GTensor<f32>,
         dx: &mut GTensor<f32>,
+        dx_beta: f32,
     ) {
         let n = dy.len();
         match &mut self.rhs {
@@ -671,7 +673,36 @@ impl GemmBf16 {
         } else {
             self.lhs.as_ref().expect("staged")
         };
-        matmul_bf16_into(gpu, MmForm::Nt, dy_b, w_b, dx, 0.0);
+        matmul_bf16_into(gpu, MmForm::Nt, dy_b, w_b, dx, dx_beta);
+    }
+
+    /// [`run_backward_staged_x`](Self::run_backward_staged_x) where `dy` arrives
+    /// narrowed as well, so nothing is cast here but (once per step) the weight.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_backward_narrow(
+        &mut self,
+        gpu: &Gpu,
+        x: &super::GTensor<u16>,
+        dy: &super::GTensor<u16>,
+        w: &GTensor<f32>,
+        dw: &mut GTensor<f32>,
+        dx: &mut GTensor<f32>,
+        dx_beta: f32,
+    ) {
+        matmul_bf16_into(gpu, MmForm::Tn, x, dy, dw, 1.0);
+        let w_b = if wcache_enabled() {
+            self.stage_w(gpu, w)
+        } else {
+            let n = w.len();
+            match &mut self.lhs {
+                Some(t) if t.capacity() >= n => t.shrink_to(w.dims()),
+                _ => self.lhs = Some(super::GTensor::uninit(gpu, w.dims())),
+            }
+            let t = self.lhs.as_mut().expect("just filled");
+            t.store(gpu, w);
+            &*t
+        };
+        matmul_bf16_into(gpu, MmForm::Nt, dy, w_b, dx, dx_beta);
     }
 
     /// The sLSTM cell's THREE post-loop GEMMs, all driven from one narrowed copy of
@@ -698,7 +729,7 @@ impl GemmBf16 {
         dwhr: &mut GTensor<f32>,
         dx: &mut GTensor<f32>,
     ) {
-        self.run_backward_staged_x(gpu, x, dg, wx, dwx, dx);
+        self.run_backward_staged_x(gpu, x, dg, wx, dwx, dx, 0.0);
         // That left the narrowed gate deltas in the staging slot — the weight goes to
         // `w` or `lhs`, never `rhs` — so the recurrent grad reads the same copy.
         let dg_b = self.rhs.as_ref().expect("staged by run_backward_staged_x");
@@ -711,6 +742,8 @@ impl GemmBf16 {
     /// Running them as separate `run`/`run_wb` calls narrows `dy` twice — the same
     /// values, through two different slots. The cast is launch-bound at these shapes
     /// (two thirds of them are under 1.5 µs), so the duplicate is nearly all overhead.
+    /// `dx_beta = 1` accumulates into `dx` instead of overwriting it.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_backward(
         &mut self,
         gpu: &Gpu,
@@ -719,6 +752,7 @@ impl GemmBf16 {
         w: &GTensor<f32>,
         dw: &mut GTensor<f32>,
         dx: &mut GTensor<f32>,
+        dx_beta: f32,
     ) {
         // `dy` is the shared operand: right for `Tn`, left for `Nt`. It lives in `rhs`
         // so `lhs` stays free for `x`.
@@ -760,7 +794,7 @@ impl GemmBf16 {
         } else {
             self.lhs.as_ref().expect("staged")
         };
-        matmul_bf16_into(gpu, MmForm::Nt, dy_b, w_b, dx, 0.0);
+        matmul_bf16_into(gpu, MmForm::Nt, dy_b, w_b, dx, dx_beta);
     }
 }
 
@@ -1074,7 +1108,17 @@ pub fn add_col_sum(
     dy: &GTensor<f32>,
     cache: &super::temp::TempCache,
 ) {
-    col_sum_into(gpu, db, dy, None, None, cache);
+    col_sum_into(gpu, db, WideOrSlab::F32(dy), None, None, cache);
+}
+
+/// [`add_col_sum`] over a `dy` stored at either width.
+pub fn add_col_sum_slab(
+    gpu: &Gpu,
+    db: &mut GTensor<f32>,
+    dy: &SlabBuf,
+    cache: &super::temp::TempCache,
+) {
+    col_sum_into(gpu, db, WideOrSlab::Slab(dy), None, None, cache);
 }
 
 /// [`add_col_sum`] over the elementwise product `dy ⊙ mul` — RMSNorm's `dgamma`,
@@ -1087,7 +1131,7 @@ pub fn add_col_sum_mul(
     cache: &super::temp::TempCache,
 ) {
     assert_eq!(dy.len(), mul.len(), "add_col_sum_mul: operand sizes");
-    col_sum_into(gpu, db, dy, Some(WideOrSlab::F32(mul)), None, cache);
+    col_sum_into(gpu, db, WideOrSlab::F32(dy), Some(WideOrSlab::F32(mul)), None, cache);
 }
 
 /// [`add_col_sum_mul`] with each column divided by `div[o]` after the reduction.
@@ -1110,21 +1154,9 @@ pub fn add_col_sum_mul_div(
         "add_col_sum_mul_div: operand shapes"
     );
     assert_eq!(db.len(), div.len(), "add_col_sum_mul_div: divisor width");
-    col_sum_into(gpu, db, dy, Some(mul), Some(div), cache);
+    col_sum_into(gpu, db, WideOrSlab::F32(dy), Some(mul), Some(div), cache);
 }
 
-/// `db[o] += Σ_r dy[r, o]` (times `mul[r, o]` if given), **deterministically**.
-///
-/// A block owns a column tile and a **band** of its rows, folding the band through
-/// `threadIdx.y` and a fixed-order tree; `col_sum_merge` then folds the bands in
-/// ascending order. Both splits are functions of the shape, never of scheduling —
-/// float addition does not associate, so an `atomicAdd` across blocks would make the
-/// last bits of every bias gradient depend on the order the blocks happened to run
-/// in, and one optimizer step later that is a different model.
-///
-/// A single band (the whole row axis in one block) leaves the grid at `ceil(n / 32)`,
-/// which at these layer widths is 8–24 blocks and reads at a tenth of the machine's
-/// bandwidth. [`col_sum_bands`] decides when the second launch is worth paying for.
 /// An operand that may be stored fp32 or narrow, borrowed for one launch.
 ///
 /// RMSNorm's output is read by three different kernels (its own backward, the `dγ`
@@ -1158,6 +1190,15 @@ impl<'a> WideOrSlab<'a> {
             _ => wide,
         }
     }
+
+    /// Device address, for a kernel parameter whose width the kernel name decides.
+    fn addr(&self, gpu: &Gpu) -> u64 {
+        match self {
+            WideOrSlab::F32(t) => addr_or_null(gpu, Some(*t)),
+            WideOrSlab::Slab(SlabBuf::F32(t)) => addr_or_null(gpu, Some(t)),
+            WideOrSlab::Slab(SlabBuf::Bf16(t)) => addr_or_null(gpu, Some(t)),
+        }
+    }
 }
 
 /// Push a [`WideOrSlab`] as the next kernel argument.
@@ -1171,10 +1212,22 @@ macro_rules! push_wos {
     };
 }
 
+/// `db[o] += Σ_r dy[r, o]` (times `mul[r, o]` if given), **deterministically**.
+///
+/// A block owns a column tile and a **band** of its rows, folding the band through
+/// `threadIdx.y` and a fixed-order tree; the last block of each tile then folds the
+/// bands in ascending order. Both splits are functions of the shape, never of
+/// scheduling — float addition does not associate, so an `atomicAdd` across blocks
+/// would make the last bits of every bias gradient depend on the order the blocks
+/// happened to run in, and one optimizer step later that is a different model.
+///
+/// A single band (the whole row axis in one block) leaves the grid at `ceil(n / 32)`,
+/// which at these layer widths is 8–24 blocks and reads at a tenth of the machine's
+/// bandwidth. [`col_sum_bands`] decides when banding is worth its scratch round trip.
 fn col_sum_into(
     gpu: &Gpu,
     db: &mut GTensor<f32>,
-    dy: &GTensor<f32>,
+    dy: WideOrSlab<'_>,
     mul: Option<WideOrSlab<'_>>,
     div: Option<&GTensor<f32>>,
     cache: &super::temp::TempCache,
@@ -1194,38 +1247,58 @@ fn col_sum_into(
         block_dim: (bx as u32, by as u32, 1),
         shared_mem_bytes: (bx * by * std::mem::size_of::<f32>()) as u32,
     };
-    // No second operand: hand the kernel `dy` again rather than a null it would have
-    // to test per element. The divisor stands in the same way — `dy` is at least `n`
-    // wide, so the unused read stays in bounds.
-    let use_mul = mul.is_some() as i32;
-    let mul = mul.unwrap_or(WideOrSlab::F32(dy));
-    let use_div = div.is_some() as i32;
-    let div = div.unwrap_or(dy);
+    // The kernel reads `mul` and `div` only under their flags, so an absent one is null.
+    let names = match (dy, mul) {
+        (WideOrSlab::Slab(SlabBuf::Bf16(_)), None) => ("add_col_sum_dy_slab", "col_sum_part_dy_slab"),
+        (WideOrSlab::Slab(SlabBuf::Bf16(_)), Some(_)) => {
+            panic!("col_sum: a narrow dy takes no second operand")
+        }
+        (_, Some(m)) => (
+            m.pick("add_col_sum", "add_col_sum_slab"),
+            m.pick("col_sum_part", "col_sum_part_slab"),
+        ),
+        (_, None) => ("add_col_sum", "col_sum_part"),
+    };
+    let ops = ColSumOps {
+        dy: dy.addr(gpu),
+        mul: mul.map_or(0, |m| m.addr(gpu)),
+        use_mul: mul.is_some() as i32,
+        div: addr_or_null(gpu, div),
+        use_div: div.is_some() as i32,
+    };
 
     let bands = col_sum_bands(gpu, rows, by, cfg.grid_dim.0 as usize);
     if bands > 1 {
-        col_sum_banded(
-            gpu, db, dy, mul, use_mul, div, use_div, rows, n, bx, by, cfg, bands, cache,
-        );
+        col_sum_banded(gpu, db, names.1, &ops, rows, n, bx, by, cfg, bands, cache);
         return;
     }
-    let f = gpu.kernels.get(mul.pick("add_col_sum", "add_col_sum_slab"));
+    let f = gpu.kernels.get(names.0);
     let mut lb = gpu.stream.launch_builder(&f);
-    lb.arg(&mut db.buf).arg(&dy.buf);
-    push_wos!(lb, mul);
-    lb.arg(&use_mul)
-        .arg(&div.buf)
-        .arg(&use_div)
+    lb.arg(&mut db.buf)
+        .arg(&ops.dy)
+        .arg(&ops.mul)
+        .arg(&ops.use_mul)
+        .arg(&ops.div)
+        .arg(&ops.use_div)
         .arg(&rows_i)
         .arg(&n_i);
     unsafe { lb.launch(cfg) }.expect("add_col_sum");
 }
 
+/// The operands of one `col_sum` launch, as device addresses (null when absent).
+struct ColSumOps {
+    dy: u64,
+    mul: u64,
+    use_mul: i32,
+    div: u64,
+    use_div: i32,
+}
+
 /// How many row bands to cut the reduction into — see `col_sum_part`.
 ///
 /// One block per column tile leaves the grid at `ceil(n / 32)`, which at these layer
-/// widths is a handful of blocks on an 84-SM part. Bands trade a second (tiny) launch
-/// for a grid that fills the machine, so the split is worth it only once there are
+/// widths is a handful of blocks on an 84-SM part. Bands trade a scratch round trip
+/// and a ticket for a grid that fills the machine, so the split is worth it only once there are
 /// enough rows to go round: each band still wants a few rows per `threadIdx.y`, or the
 /// bands are pure overhead.
 ///
@@ -1243,15 +1316,17 @@ fn col_sum_bands(gpu: &Gpu, rows: usize, by: usize, grid_x: usize) -> usize {
     want.min(afford).max(1)
 }
 
+/// Column tiles one banded `col_sum` launch may have: the length of
+/// [`Gpu::col_sum_tickets`](super::Gpu::col_sum_tickets). 32 columns per tile.
+pub const COL_SUM_TICKETS: usize = 4096;
+
 /// [`col_sum_into`] over `bands` row bands: a partial per band, then a fold.
+#[allow(clippy::too_many_arguments)]
 fn col_sum_banded(
     gpu: &Gpu,
     db: &mut GTensor<f32>,
-    dy: &GTensor<f32>,
-    mul: WideOrSlab<'_>,
-    use_mul: i32,
-    div: &GTensor<f32>,
-    use_div: i32,
+    name: &'static str,
+    ops: &ColSumOps,
     rows: usize,
     n: usize,
     bx: usize,
@@ -1262,42 +1337,30 @@ fn col_sum_banded(
 ) {
     let (rows_i, n_i) = (rows as i32, n as i32);
     let band_i = rows.div_ceil(bands) as i32;
-    let bands_i = bands as i32;
-    {
-        let mut part = cache.get::<f32>(gpu, &[bands, n]);
-        let part = &mut *part;
-        let f = gpu
-            .kernels
-            .get(mul.pick("col_sum_part", "col_sum_part_slab"));
-        let mut lb = gpu.stream.launch_builder(&f);
-        lb.arg(&mut part.buf).arg(&dy.buf);
-        push_wos!(lb, mul);
-        lb.arg(&use_mul).arg(&rows_i).arg(&n_i).arg(&band_i);
-        let part_cfg = LaunchConfig {
-            grid_dim: (cfg.grid_dim.0, bands as u32, 1),
-            block_dim: (bx as u32, by as u32, 1),
-            shared_mem_bytes: cfg.shared_mem_bytes,
-        };
-        unsafe { lb.launch(part_cfg) }.expect("col_sum_part");
-
-        let f = gpu.kernels.get("col_sum_merge");
-        let mut lb = gpu.stream.launch_builder(&f);
-        lb.arg(&mut db.buf)
-            .arg(&part.buf)
-            .arg(&div.buf)
-            .arg(&use_div)
-            .arg(&bands_i)
-            .arg(&n_i);
-        let threads = n.clamp(32, 256).next_power_of_two().min(1024);
-        unsafe {
-            lb.launch(LaunchConfig {
-                grid_dim: (n.div_ceil(threads) as u32, 1, 1),
-                block_dim: (threads as u32, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .expect("col_sum_merge");
-    }
+    assert!(
+        cfg.grid_dim.0 as usize <= COL_SUM_TICKETS,
+        "col_sum: {n} columns exceed the ticket buffer"
+    );
+    let mut part = cache.get::<f32>(gpu, &[bands, n]);
+    let f = gpu.kernels.get(name);
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&mut db.buf)
+        .arg(&mut part.buf)
+        .arg(&ops.dy)
+        .arg(&ops.mul)
+        .arg(&ops.use_mul)
+        .arg(&ops.div)
+        .arg(&ops.use_div)
+        .arg(&*gpu.col_sum_tickets)
+        .arg(&rows_i)
+        .arg(&n_i)
+        .arg(&band_i);
+    let part_cfg = LaunchConfig {
+        grid_dim: (cfg.grid_dim.0, bands as u32, 1),
+        block_dim: (bx as u32, by as u32, 1),
+        shared_mem_bytes: cfg.shared_mem_bytes,
+    };
+    unsafe { lb.launch(part_cfg) }.expect("col_sum_part");
 }
 
 /// Gather rows of `table` (`[vocab, dim]`) by `ids` into a `[ids.len(), dim]`
@@ -1433,7 +1496,8 @@ pub fn embedding_scatter_add_u32(
 /// the input and rebuilds `x̂ = x·inv_rms` from the other side). `x̂` is `[N, F]`, so
 /// storing it costs the full activation width for a value two flops recover.
 pub struct GpuRmsForward {
-    pub inv_rms: CudaSlice<f32>,
+    /// `[B * F/group]`, one per normalization group.
+    pub inv_rms: GTensor<f32>,
 }
 
 /// Grouped RMSNorm forward (plain: `group == F`; head-wise: `group == dhv`).
@@ -1449,10 +1513,7 @@ pub fn rms_norm_forward(
     let total_groups = b * (f / group);
     let mut out = GTensor::uninit(gpu, &[b, f]);
     let mut saved = GpuRmsForward {
-        inv_rms: gpu
-            .stream
-            .alloc_zeros::<f32>(total_groups)
-            .expect("alloc inv_rms"),
+        inv_rms: GTensor::uninit(gpu, &[total_groups]),
     };
     rms_norm_forward_into(gpu, x, gamma, group, eps, &mut out, &mut saved);
     (out, saved)
@@ -1509,7 +1570,7 @@ pub fn rms_norm_forward_into(
 ) {
     // No reshape: `out` may legitimately be `[B, T, H]` and the caller's next op
     // depends on its rank. `as_2d` in the launcher folds it for the shape check only.
-    rms_fwd_launch(gpu, x, gamma, group, eps, RmsOut::F32(out), saved);
+    rms_fwd_launch(gpu, x, None, gamma, group, eps, RmsOut::F32(out), saved);
 }
 
 /// [`rms_norm_forward_into`] writing a slab.
@@ -1519,18 +1580,27 @@ pub fn rms_norm_forward_into(
 /// that reads bf16 anyway, so writing narrow here both halves the store and removes
 /// the cast pass that would otherwise read the fp32 result straight back out of HBM
 /// to produce the very same bits.
+///
+/// With `add = Some((x2, z))` the norm runs over `z = x + x2` and writes `z` too —
+/// the residual sum in front of a pre-norm, without its own pass.
 pub fn rms_norm_forward_into_slab(
     gpu: &Gpu,
     x: &GTensor<f32>,
+    add: Option<(&GTensor<f32>, &mut GTensor<f32>)>,
     gamma: &GTensor<f32>,
     group: usize,
     eps: f32,
     out: &mut SlabBuf,
     saved: &mut GpuRmsForward,
 ) {
-    let (b, f) = x.as_2d();
-    out.fit(gpu, &[b, f]);
-    rms_fwd_launch(gpu, x, gamma, group, eps, RmsOut::Slab(out), saved);
+    out.fit(gpu, x.dims());
+    rms_fwd_launch(gpu, x, add, gamma, group, eps, RmsOut::Slab(out), saved);
+}
+
+/// Device address of `t`, or null, for a kernel's optional operand.
+fn addr_or_null<T>(gpu: &Gpu, t: Option<&GTensor<T>>) -> u64 {
+    use cudarc::driver::DevicePtr;
+    t.map_or(0, |t| t.buf.device_ptr(&gpu.stream).0)
 }
 
 /// The forward's output, at either width. Mutable, so it cannot reuse [`WideOrSlab`].
@@ -1542,6 +1612,7 @@ enum RmsOut<'a> {
 fn rms_fwd_launch(
     gpu: &Gpu,
     x: &GTensor<f32>,
+    add: Option<(&GTensor<f32>, &mut GTensor<f32>)>,
     gamma: &GTensor<f32>,
     group: usize,
     eps: f32,
@@ -1551,6 +1622,14 @@ fn rms_fwd_launch(
     // Position-wise over the last axis, so a `[B, T, H]` caller is served as-is —
     // see `GTensor::as_2d`.
     let (b, f) = x.as_2d();
+    let (x2, z) = match add {
+        Some((x2, z)) => {
+            assert_eq!(x2.as_2d(), (b, f), "rms_norm_forward: residual shape");
+            assert_eq!(z.as_2d(), (b, f), "rms_norm_forward: sum shape");
+            (addr_or_null(gpu, Some(x2)), addr_or_null(gpu, Some(&*z)))
+        }
+        None => (0, 0),
+    };
     let groups_per_row = f / group;
     let total_groups = b * groups_per_row;
     assert_eq!(
@@ -1566,7 +1645,7 @@ fn rms_fwd_launch(
     };
     let func = gpu.kernels.get(name);
     let mut lb = gpu.stream.launch_builder(&func);
-    lb.arg(&x.buf).arg(&gamma.buf);
+    lb.arg(&x.buf).arg(&x2).arg(&z).arg(&gamma.buf);
     match out {
         RmsOut::F32(t) => {
             assert_eq!(t.as_2d(), (b, f), "rms_norm_forward: out shape");
@@ -1581,7 +1660,7 @@ fn rms_fwd_launch(
             lb.arg(&mut t.buf)
         }
     };
-    lb.arg(&mut saved.inv_rms)
+    lb.arg(&mut saved.inv_rms.buf)
         .arg(&gpr_i)
         .arg(&group_i)
         .arg(&eps)
@@ -1609,6 +1688,7 @@ pub fn rms_norm_backward(
         gamma,
         dgamma,
         group,
+        None,
         &mut dx,
         cache,
     );
@@ -1617,7 +1697,7 @@ pub fn rms_norm_backward(
 
 /// Grouped RMSNorm backward into a caller-owned `dx` — the no-allocation form of
 /// [`rms_norm_backward`]. `dgamma` is accumulated into (not overwritten); `dx` is
-/// written in full.
+/// written in full, as the norm's input gradient plus `resid` when given.
 #[allow(clippy::too_many_arguments)]
 pub fn rms_norm_backward_into(
     gpu: &Gpu,
@@ -1627,6 +1707,7 @@ pub fn rms_norm_backward_into(
     gamma: &GTensor<f32>,
     dgamma: &mut GTensor<f32>,
     group: usize,
+    resid: Option<&GTensor<f32>>,
     dx: &mut GTensor<f32>,
     cache: &super::temp::TempCache,
 ) {
@@ -1635,6 +1716,10 @@ pub fn rms_norm_backward_into(
     let total_groups = b * groups_per_row;
     assert_eq!(dx.as_2d(), (b, f), "rms_norm_backward: dx shape");
     assert_eq!(y.as_2d(), (b, f), "rms_norm_backward: y shape");
+    if let Some(r) = resid {
+        assert_eq!(r.as_2d(), (b, f), "rms_norm_backward: residual shape");
+    }
+    let resid = addr_or_null(gpu, resid);
     let (gpr_i, group_i, tg_i) = (groups_per_row as i32, group as i32, total_groups as i32);
     let cfg = rms_norm_cfg(total_groups, group);
     // `dy` and `dx` stay fp32 either way: `dx` continues into the residual chain.
@@ -1644,8 +1729,9 @@ pub fn rms_norm_backward_into(
     let mut lb = gpu.stream.launch_builder(&func);
     lb.arg(&dy.buf);
     push_wos!(lb, y);
-    lb.arg(&fwd.inv_rms)
+    lb.arg(&fwd.inv_rms.buf)
         .arg(&gamma.buf)
+        .arg(&resid)
         .arg(&mut dx.buf)
         .arg(&gpr_i)
         .arg(&group_i)
@@ -2088,6 +2174,35 @@ pub enum SlabBuf {
     Bf16(super::GTensor<u16>),
 }
 
+/// A slab view over a borrowed `temps` slot: from [`SlabBuf::at_width`] (the
+/// converted copy, when one was needed) or [`SlabAt::temp`] (uninitialized).
+pub struct SlabAt<'c> {
+    pub x: SlabBuf,
+    _narrow: Option<super::temp::Temp<'c, u16>>,
+    _wide: Option<super::temp::Temp<'c, f32>>,
+}
+
+impl<'c> SlabAt<'c> {
+    /// An uninitialized `dims` slab at the chosen width, borrowed from `temps`.
+    pub fn temp(gpu: &Gpu, temps: &'c super::temp::TempCache, dims: &[usize], bf16: bool) -> Self {
+        if bf16 {
+            let t = temps.get::<u16>(gpu, dims);
+            SlabAt {
+                x: SlabBuf::Bf16(super::GTensor::view(gpu, &t.buf, 0, dims)),
+                _narrow: Some(t),
+                _wide: None,
+            }
+        } else {
+            let t = temps.get::<f32>(gpu, dims);
+            SlabAt {
+                x: SlabBuf::F32(GTensor::view(gpu, &t.buf, 0, dims)),
+                _narrow: None,
+                _wide: Some(t),
+            }
+        }
+    }
+}
+
 impl SlabBuf {
     /// An uninitialized slab at an explicitly chosen width.
     ///
@@ -2183,6 +2298,52 @@ impl SlabBuf {
             self.shrink_to(dims);
         } else {
             *self = SlabBuf::new(gpu, dims);
+        }
+    }
+
+    /// This slab as a GEMM with `bf16` operands reads it: a view of itself when the
+    /// width already matches, otherwise converted into a borrowed `temps` slot. The
+    /// result must not outlive `self`.
+    pub fn at_width<'c>(
+        &self,
+        gpu: &Gpu,
+        bf16: bool,
+        temps: &'c super::temp::TempCache,
+    ) -> SlabAt<'c> {
+        let dims = self.dims().to_vec();
+        match (self, bf16) {
+            (SlabBuf::F32(t), true) => {
+                let mut nb = temps.get::<u16>(gpu, &dims);
+                nb.store(gpu, t);
+                SlabAt {
+                    x: SlabBuf::Bf16(super::GTensor::view(gpu, &nb.buf, 0, &dims)),
+                    _narrow: Some(nb),
+                    _wide: None,
+                }
+            }
+            (SlabBuf::Bf16(_), false) => {
+                let mut wide = temps.get::<f32>(gpu, &dims);
+                self.as_f32(gpu, &mut wide);
+                SlabAt {
+                    x: SlabBuf::F32(GTensor::view(gpu, &wide.buf, 0, &dims)),
+                    _narrow: None,
+                    _wide: Some(wide),
+                }
+            }
+            _ => SlabAt {
+                x: self.view(gpu, &dims),
+                _narrow: None,
+                _wide: None,
+            },
+        }
+    }
+
+    /// A non-owning view of this slab's leading elements at `dims`, at its width. The
+    /// view must not outlive `self`.
+    pub fn view(&self, gpu: &Gpu, dims: &[usize]) -> SlabBuf {
+        match self {
+            SlabBuf::F32(t) => SlabBuf::F32(GTensor::view(gpu, &t.buf, 0, dims)),
+            SlabBuf::Bf16(t) => SlabBuf::Bf16(super::GTensor::view(gpu, &t.buf, 0, dims)),
         }
     }
 
@@ -2577,6 +2738,7 @@ pub fn slstm_fused_time_bwd(
     dn_recur: &mut GTensor<f32>,
     slabs: &SlstmSlabs,
     t: usize,
+    reset: u64,
 ) -> bool {
     if !gpu.kernels.has_coop {
         return false;
@@ -2625,7 +2787,7 @@ pub fn slstm_fused_time_bwd(
     push_slab_ref!(lb, slabs.zt);
     push_slab_ref!(lb, slabs.i_prime);
     push_slab_ref!(lb, slabs.f_prime);
-    lb.arg(&t_i);
+    lb.arg(&t_i).arg(&reset);
     // SAFETY: the geometry above guarantees a co-resident grid.
     match unsafe { lb.launch_cooperative(cfg) } {
         Ok(_) => true,
@@ -3009,6 +3171,7 @@ pub fn slstm_fused_time(
     out: &mut GTensor<f32>,
     t: usize,
     carry: bool,
+    reset: u64,
     cache: &super::temp::TempCache,
 ) -> bool {
     if !gpu.kernels.has_coop {
@@ -3081,7 +3244,11 @@ pub fn slstm_fused_time(
             push_slab!(lb, slabs.f_prime);
             push_slab!(lb, slabs.c);
             push_slab!(lb, slabs.n);
-            lb.arg(&mut out.buf).arg(&t_i).arg(&upb_i).arg(&carry_i);
+            lb.arg(&mut out.buf)
+                .arg(&t_i)
+                .arg(&upb_i)
+                .arg(&carry_i)
+                .arg(&reset);
             // SAFETY: the geometry above guarantees the grid is co-resident (a cooperative
             // launch deadlocks otherwise) and that every block's shared slice fits.
             match unsafe { lb.launch_cooperative(cfg) } {
@@ -3295,11 +3462,13 @@ pub fn slstm_step_fused_bwd(
     d_c_recur: &mut GTensor<f32>,
     d_n_recur: &mut GTensor<f32>,
     t: usize,
+    reset: bool,
 ) {
     let (b, h) = (d_c_recur.rows(), d_c_recur.cols());
     let bh = b * h;
     let big_t = d_out.shape[1];
     let (t_i, bigt_i, h_i, bh_i) = (t as i32, big_t as i32, h as i32, bh as i32);
+    let reset_i = i32::from(reset);
     let f = gpu.kernels.get("slstm_step_fused_bwd");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&d_out.buf).arg(&mut gates.buf);
@@ -3318,8 +3487,38 @@ pub fn slstm_step_fused_bwd(
         .arg(&t_i)
         .arg(&bigt_i)
         .arg(&h_i)
-        .arg(&bh_i);
+        .arg(&bh_i)
+        .arg(&reset_i);
     unsafe { lb.launch(elem_cfg(gpu, bh as u32)) }.expect("slstm_step_fused_bwd");
+}
+
+/// Set `n` elements of `t`, starting at element `at`, to `value`: one stream-ordered
+/// 32-bit memset, no kernel.
+pub fn fill_f32(gpu: &Gpu, t: &mut GTensor<f32>, at: usize, n: usize, value: f32) {
+    use cudarc::driver::DevicePtrMut;
+    assert!(
+        at + n <= t.capacity(),
+        "fill_f32: {at}+{n} past {}",
+        t.capacity()
+    );
+    let (p, _rec) = t.buf.device_ptr_mut(&gpu.stream);
+    // SAFETY: the range was checked against the allocation above.
+    unsafe { memset_d32(gpu, p + (at * size_of::<f32>()) as u64, n, value.to_bits()) };
+}
+
+/// Set `n` 32-bit words at device address `addr` to `bits`, ordered on the compute
+/// stream.
+///
+/// # Safety
+/// `addr .. addr + 4n` must lie inside one live device allocation.
+pub unsafe fn memset_d32(gpu: &Gpu, addr: u64, n: usize, bits: u32) {
+    // SAFETY: the caller vouches for the range.
+    let r = unsafe { cudarc::driver::sys::cuMemsetD32Async(addr, bits, n, gpu.stream.cu_stream()) };
+    assert_eq!(
+        r,
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "memset_d32: {r:?}"
+    );
 }
 
 // Residual block / SwiGLU kernels (see gpu/block.rs).
@@ -3364,41 +3563,32 @@ pub fn add_into(gpu: &Gpu, a: &GTensor<f32>, b: &GTensor<f32>, out: &mut GTensor
     unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("add");
 }
 
-/// SwiGLU forward: returns `(gate_act = SiLU(gate_pre), mixed = gate_act ⊙ value)`.
-pub fn swiglu_forward(
-    gpu: &Gpu,
-    gate_pre: &GTensor<f32>,
-    value: &GTensor<f32>,
-) -> (GTensor<f32>, GTensor<f32>) {
-    let mut gate_act = GTensor::uninit(gpu, gate_pre.dims());
+/// SwiGLU forward: returns `mixed = SiLU(gate_pre) ⊙ value`.
+pub fn swiglu_forward(gpu: &Gpu, gate_pre: &GTensor<f32>, value: &GTensor<f32>) -> GTensor<f32> {
     let mut mixed = GTensor::uninit(gpu, gate_pre.dims());
-    swiglu_forward_into(gpu, gate_pre, value, &mut gate_act, &mut mixed);
-    (gate_act, mixed)
+    swiglu_forward_into(gpu, gate_pre, value, &mut mixed);
+    mixed
 }
 
-/// SwiGLU forward into caller-owned buffers — the no-allocation form of
-/// [`swiglu_forward`]. Both outputs are written in full.
+/// SwiGLU forward into a caller-owned `mixed` — the no-allocation form of
+/// [`swiglu_forward`].
+///
+/// `SiLU(gate_pre)` is not an output: the backward recomputes it from `gate_pre`, so a
+/// block saves `gate_pre` and `value` and nothing in between.
 pub fn swiglu_forward_into(
     gpu: &Gpu,
     gate_pre: &GTensor<f32>,
     value: &GTensor<f32>,
-    gate_act: &mut GTensor<f32>,
     mixed: &mut GTensor<f32>,
 ) {
     let n = gate_pre.len();
     assert_eq!(n, value.len(), "swiglu_forward: length mismatch");
-    assert_eq!(
-        n,
-        gate_act.len(),
-        "swiglu_forward: gate_act length mismatch"
-    );
     assert_eq!(n, mixed.len(), "swiglu_forward: mixed length mismatch");
     let n_i = n as i32;
     let f = gpu.kernels.get("swiglu_forward");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&gate_pre.buf)
         .arg(&value.buf)
-        .arg(&mut gate_act.buf)
         .arg(&mut mixed.buf)
         .arg(&n_i);
     unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("swiglu_forward");
@@ -3408,69 +3598,52 @@ pub fn swiglu_forward_into(
 ///
 /// `mixed`'s only readers are `lin_down`'s forward and backward GEMMs, both of which
 /// want it narrow; producing it narrow here removes their casts and halves what an
-/// offloaded block sends to the host for it. `gate_act` stays fp32 — `swiglu_backward`
-/// reads it arithmetically.
+/// offloaded block sends to the host for it.
 pub fn swiglu_forward_slab(
     gpu: &Gpu,
     gate_pre: &GTensor<f32>,
     value: &GTensor<f32>,
-    gate_act: &mut GTensor<f32>,
     mixed: &mut SlabBuf,
 ) {
     let SlabBuf::Bf16(m) = mixed else {
-        let SlabBuf::F32(m) = mixed else { unreachable!() };
-        swiglu_forward_into(gpu, gate_pre, value, gate_act, m);
+        let SlabBuf::F32(m) = mixed else {
+            unreachable!()
+        };
+        swiglu_forward_into(gpu, gate_pre, value, m);
         return;
     };
     let n = gate_pre.len();
     assert_eq!(n, value.len(), "swiglu_forward_slab: length mismatch");
-    assert_eq!(
-        n,
-        gate_act.len(),
-        "swiglu_forward_slab: gate_act length mismatch"
-    );
     assert_eq!(n, m.len(), "swiglu_forward_slab: mixed length mismatch");
     let n_i = n as i32;
     let f = gpu.kernels.get("swiglu_forward_slab");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&gate_pre.buf)
         .arg(&value.buf)
-        .arg(&mut gate_act.buf)
         .arg(&mut m.buf)
         .arg(&n_i);
     unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("swiglu_forward_slab");
 }
 
-/// SwiGLU backward: from `d_mixed` and the saved `gate_act`/`value`/`gate_pre`,
-/// returns `(d_gate, d_value)`.
+/// SwiGLU backward: from `d_mixed` and the saved `value`/`gate_pre`, returns
+/// `(d_gate, d_value)`.
 pub fn swiglu_backward(
     gpu: &Gpu,
     d_mixed: &GTensor<f32>,
-    gate_act: &GTensor<f32>,
     value: &GTensor<f32>,
     gate_pre: &GTensor<f32>,
 ) -> (GTensor<f32>, GTensor<f32>) {
     let mut d_gate = GTensor::uninit(gpu, d_mixed.dims());
     let mut d_value = GTensor::uninit(gpu, d_mixed.dims());
-    swiglu_backward_into(
-        gpu,
-        d_mixed,
-        gate_act,
-        value,
-        gate_pre,
-        &mut d_gate,
-        &mut d_value,
-    );
+    swiglu_backward_into(gpu, d_mixed, value, gate_pre, &mut d_gate, &mut d_value);
     (d_gate, d_value)
 }
 
 /// SwiGLU backward into caller-owned buffers — the no-allocation form of
 /// [`swiglu_backward`].
-#[allow(clippy::too_many_arguments)]
 pub fn swiglu_backward_into(
     gpu: &Gpu,
     d_mixed: &GTensor<f32>,
-    gate_act: &GTensor<f32>,
     value: &GTensor<f32>,
     gate_pre: &GTensor<f32>,
     d_gate: &mut GTensor<f32>,
@@ -3483,13 +3656,45 @@ pub fn swiglu_backward_into(
     let f = gpu.kernels.get("swiglu_backward");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&d_mixed.buf)
-        .arg(&gate_act.buf)
         .arg(&value.buf)
         .arg(&gate_pre.buf)
         .arg(&mut d_gate.buf)
         .arg(&mut d_value.buf)
         .arg(&n_i);
     unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("swiglu_backward");
+}
+
+/// [`swiglu_backward_into`] writing both deltas as slabs — narrow when they are bf16,
+/// for projections whose GEMMs and bias sums then read them without a cast.
+pub fn swiglu_backward_into_slab(
+    gpu: &Gpu,
+    d_mixed: &GTensor<f32>,
+    value: &GTensor<f32>,
+    gate_pre: &GTensor<f32>,
+    d_gate: &mut SlabBuf,
+    d_value: &mut SlabBuf,
+) {
+    let (d_gate, d_value) = match (d_gate, d_value) {
+        (SlabBuf::F32(g), SlabBuf::F32(v)) => {
+            return swiglu_backward_into(gpu, d_mixed, value, gate_pre, g, v);
+        }
+        (SlabBuf::Bf16(g), SlabBuf::Bf16(v)) => (g, v),
+        _ => panic!("swiglu_backward: d_gate and d_value at different widths"),
+    };
+    assert!(gpu.kernels.slab_bf16, "swiglu_backward: bf16 deltas need bf16 slab kernels");
+    let n = d_mixed.len();
+    assert_eq!(n, d_gate.len(), "swiglu_backward: d_gate length mismatch");
+    assert_eq!(n, d_value.len(), "swiglu_backward: d_value length mismatch");
+    let n_i = n as i32;
+    let f = gpu.kernels.get("swiglu_backward_slab");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&d_mixed.buf)
+        .arg(&value.buf)
+        .arg(&gate_pre.buf)
+        .arg(&mut d_gate.buf)
+        .arg(&mut d_value.buf)
+        .arg(&n_i);
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("swiglu_backward_slab");
 }
 
 // mLSTM parallel/chunkwise core (see gpu/mlstm.rs).
@@ -4270,22 +4475,32 @@ pub fn ogate_fwd(
     gpu: &Gpu,
     xh: &SlabBuf,
     yhat: &GTensor<f32>,
-    hconcat: &mut GTensor<f32>,
+    hconcat: &mut SlabBuf,
     o_off: usize,
 ) {
     assert_eq!(
         yhat.len(),
-        hconcat.len(),
+        hconcat.dims().iter().product::<usize>(),
         "ogate_fwd: output length mismatch"
     );
     let (rows, d, stride) = (yhat.rows(), yhat.cols(), xh.dims()[1]);
     let (d_i, stride_i, off_i) = (d as i32, stride as i32, o_off as i32);
-    let f = gpu.kernels.get("ogate_fwd");
+    let narrow = matches!(hconcat, SlabBuf::Bf16(_));
+    assert!(
+        !narrow || gpu.kernels.slab_bf16,
+        "ogate_fwd: a bf16 output needs bf16 slab kernels"
+    );
+    let f = gpu
+        .kernels
+        .get(if narrow { "ogate_fwd_slab" } else { "ogate_fwd" });
     let mut lb = gpu.stream.launch_builder(&f);
     push_slab_ref!(lb, *xh);
-    lb.arg(&yhat.buf)
-        .arg(&mut hconcat.buf)
-        .arg(&d_i)
+    lb.arg(&yhat.buf);
+    match hconcat {
+        SlabBuf::F32(t) => lb.arg(&mut t.buf),
+        SlabBuf::Bf16(t) => lb.arg(&mut t.buf),
+    };
+    lb.arg(&d_i)
         .arg(&stride_i)
         .arg(&off_i);
     unsafe { lb.launch(ogate_cfg(rows, d)) }.expect("ogate_fwd");
@@ -4526,24 +4741,76 @@ pub struct MlstmFused {
     msv: GTensor<f32>,  // [BH, T]      per-row stabilizer
     psiv: GTensor<f32>, // [BH, T]
     qnv: GTensor<f32>,  // [BH, T]
+    /// The allocation the views above live in, when this cache owns one — see
+    /// [`alloc`](Self::alloc). `None` for a cache carved from a block's frame.
+    _own: Option<CudaSlice<u8>>,
 }
 
 impl MlstmFused {
+    /// Every tensor a fused forward over `st` saves, carved from `f` in one fixed order —
+    /// the layout [`mlstm_fused_fw_into`] writes and [`mlstm_fused_bw`] reads.
+    pub fn carve(gpu: &Gpu, f: &mut super::Frame, st: MlstmShape, l: usize) -> Self {
+        let (bh, t, dqk, dhv) = (st.bh(), st.t, st.dqk, st.dhv);
+        let l = l.min(t);
+        let nc = t.div_ceil(l);
+        MlstmFused {
+            l,
+            nc,
+            ytil: f.slab(gpu, &[st.batch * t, st.heads * dhv], gpu.kernels.slab_bf16),
+            cst: f.f32(gpu, &[bh, nc + 1, dhv, dqk]),
+            nst: f.f32(gpu, &[bh, nc + 1, dqk]),
+            mst: f.f32(gpu, &[bh, nc + 1]),
+            fcb: f.f32(gpu, &[bh, nc, l]),
+            gvec: f.f32(gpu, &[bh, nc]),
+            msv: f.f32(gpu, &[bh, t]),
+            psiv: f.f32(gpu, &[bh, t]),
+            qnv: f.f32(gpu, &[bh, t]),
+            _own: None,
+        }
+    }
+
+    /// [`carve`](Self::carve) into an allocation of its own, for a caller with no frame.
+    pub fn alloc(gpu: &Gpu, st: MlstmShape, l: usize) -> Self {
+        let mut m = super::Frame::measure();
+        Self::carve(gpu, &mut m, st, l);
+        // SAFETY: the forward writes every region before the backward reads it.
+        let own = unsafe { gpu.stream.alloc::<u8>(m.bytes().max(1)) }.expect("fused cache");
+        let mut f = super::Frame::over(gpu, &own);
+        let mut out = Self::carve(gpu, &mut f, st, l);
+        out._own = Some(own);
+        out
+    }
+
     /// The state leaving the last chunk — index `NC` of each array, which the kernel
     /// publishes as the final state. Feed to the next chunk's `carry_in`.
     pub fn final_state(&self, gpu: &Gpu, bh: usize, dhv: usize, dqk: usize) -> MlstmState {
+        let mut out = None;
+        self.final_state_into(gpu, bh, dhv, dqk, &mut out);
+        out.expect("just written")
+    }
+
+    /// [`final_state`](Self::final_state) into `into`, reusing its buffers when they
+    /// already have the size — the carried state is the same size chunk after chunk.
+    pub fn final_state_into(
+        &self,
+        gpu: &Gpu,
+        bh: usize,
+        dhv: usize,
+        dqk: usize,
+        into: &mut Option<MlstmState>,
+    ) {
         let slots = self.nc + 1;
         // Slot NC of each bh — one launch, not a `bh`-long loop of tiny copies.
-        let grab = |src: &GTensor<f32>, stride: usize| {
-            let mut out = GTensor::uninit(gpu, &[bh * stride]);
-            state_slot_copy(gpu, src, &mut out, bh, slots, self.nc, stride, true);
-            out
+        let prev = into.take();
+        let (c, n, m) = match prev {
+            Some(MlstmState { c, n, m }) => (Some(c), Some(n), Some(m)),
+            None => (None, None, None),
         };
-        MlstmState {
-            c: grab(&self.cst, dhv * dqk),
-            n: grab(&self.nst, dqk),
-            m: grab(&self.mst, 1),
-        }
+        *into = Some(MlstmState {
+            c: read_state_slot_n(gpu, &self.cst, bh, slots, self.nc, dhv * dqk, c),
+            n: read_state_slot_n(gpu, &self.nst, bh, slots, self.nc, dqk, n),
+            m: read_state_slot_n(gpu, &self.mst, bh, slots, self.nc, 1, m),
+        });
     }
 
     /// Device bytes this fused cache holds. Diagnostic.
@@ -4948,56 +5215,75 @@ impl MlstmShape {
 
 pub fn mlstm_fused_fw(
     gpu: &Gpu,
+    xh: &SlabBuf,
+    gates: &GTensor<f32>,
+    l: usize,
+    carry_in: Option<&MlstmState>,
+    st: MlstmShape,
+) -> MlstmFused {
+    let mut out = MlstmFused::alloc(gpu, st, l);
+    let mut avec = GTensor::uninit(gpu, &[st.bh(), out.nc, out.l]);
+    mlstm_fused_fw_into(gpu, xh, gates, carry_in, st, &mut out, &mut avec);
+    out
+}
+
+/// [`mlstm_fused_fw`] into a cache the caller carved (see [`MlstmFused::carve`]), with
+/// its `[BH, NC, L]` scratch `avec` lent too — nothing is allocated.
+pub fn mlstm_fused_fw_into(
+    gpu: &Gpu,
     // q ‖ k ‖ v, `[B*T, H*(2*dqk + dhv)]`, bf16 storage (reference: matQ/matK/matV at
     // DTYPE, concatenated as its fused `qkv_opreact`). k carries the 1/√dqk already.
     xh: &SlabBuf,
     // ĩ ‖ f̃, `[B*T, 2*H]`, fp32: gate logits (the reference pins vecI/vecB to fp32
     // too) from one `ifgate_preact` projection.
     gates: &GTensor<f32>,
-    l: usize,
     // State this call continues from, or `None` to start the recurrence at zero.
     carry_in: Option<&MlstmState>,
     st: MlstmShape,
-) -> MlstmFused {
+    out: &mut MlstmFused,
+    avec: &mut GTensor<f32>,
+) {
     let (bh, t, dqk, dhv) = (st.batch * st.heads, st.t, st.dqk, st.dhv);
-    let l = l.min(t);
+    let (l, nc) = (out.l, out.nc);
     assert!(
         mlstm_fused_supported(l, dqk, dhv),
         "fused mLSTM: unsupported shape"
     );
-    let nc = t.div_ceil(l);
+    assert_eq!(nc, t.div_ceil(l), "fused mLSTM: cache carved for another T");
+    assert_eq!(avec.len(), bh * nc * l, "fused mLSTM: avec shape");
     let h_i = st.heads as i32;
     let (t_i, l_i, nc_i, dqk_i, dhv_i) = (t as i32, l as i32, nc as i32, dqk as i32, dhv as i32);
-
-    let mut fcb = GTensor::uninit(gpu, &[bh, nc, l]);
-    let mut cst = GTensor::uninit(gpu, &[bh, nc + 1, dhv, dqk]);
-    let mut nst = GTensor::uninit(gpu, &[bh, nc + 1, dqk]);
-    let mut mst = GTensor::uninit(gpu, &[bh, nc + 1]);
+    let MlstmFused {
+        ytil,
+        cst,
+        nst,
+        mst,
+        fcb,
+        gvec,
+        msv,
+        psiv,
+        qnv,
+        ..
+    } = out;
     // Carrying: stage the incoming state into slot 0 of each array, which is where
     // `mlstm_state_scan` (and `mlstm_fw_gates`, for `m`) picks it up under `CARRY`.
     // Copying rather than aliasing keeps the "state entering chunk k lives at index k"
     // invariant intact for backward.
     if let Some(st) = carry_in {
-        seed_state_slot0(gpu, &st.c, &mut cst, bh, nc + 1, dhv * dqk);
-        seed_state_slot0(gpu, &st.n, &mut nst, bh, nc + 1, dqk);
-        seed_state_slot0(gpu, &st.m, &mut mst, bh, nc + 1, 1);
+        seed_state_slot0(gpu, &st.c, cst, bh, nc + 1, dhv * dqk);
+        seed_state_slot0(gpu, &st.n, nst, bh, nc + 1, dqk);
+        seed_state_slot0(gpu, &st.m, mst, bh, nc + 1, 1);
     }
     let carry_i = carry_in.is_some() as i32;
     // ytil is the kernel's output h (reference stores matHout at DTYPE); the
     // stabilizer/normalizer triple stays fp32, as does the chunk state. Written
     // position-major like q/k/v, so it reaches the head norm without a scatter.
-    let mut ytil = SlabBuf::new(gpu, &[st.batch * t, st.heads * dhv]);
-    let mut msv = GTensor::uninit(gpu, &[bh, t]);
-    let mut psiv = GTensor::uninit(gpu, &[bh, t]);
-    let mut qnv = GTensor::uninit(gpu, &[bh, t]);
 
     // Gates: `fcb` plus the per-chunk `a`/`g` and the stabilizer scan. One block per
     // (b, h) — the scan over chunks is serial, and it is the only thing left in the
     // forward that is. `avec` is consumed by the next launch and by nothing else;
     // `gvec` is the decay both scan directions need, so it joins the saved cache
     // rather than being recomputed from `fcb`/`mst`/`msv` in backward.
-    let mut avec = GTensor::<f32>::uninit(gpu, &[bh, nc, l]);
-    let mut gvec = GTensor::uninit(gpu, &[bh, nc]);
     let f = gpu.kernels.get("mlstm_fw_gates");
     let mut lb = gpu.stream.launch_builder(&f);
     lb.arg(&gates.buf)
@@ -5058,7 +5344,7 @@ pub fn mlstm_fused_fw(
     // both slots — and the encoder and decoder are always in that case, so the launch
     // is skipped rather than run as an expensive copy.
     if nc > 1 || carry_in.is_some() {
-        state_scan(gpu, &mut cst, &mut nst, &gvec, bh, nc, dqk, dhv, false);
+        state_scan(gpu, cst, nst, gvec, bh, nc, dqk, dhv, false);
     }
 
     let par_threads = parallel_threads(fw_parallel_warps(l, dhv));
@@ -5083,7 +5369,7 @@ pub fn mlstm_fused_fw(
         .arg(&cst.buf)
         .arg(&nst.buf)
         .arg(&mst.buf);
-    push_slab!(lb, ytil);
+    push_slab!(lb, *ytil);
     lb.arg(&mut msv.buf)
         .arg(&mut psiv.buf)
         .arg(&mut qnv.buf)
@@ -5096,20 +5382,6 @@ pub fn mlstm_fused_fw(
         .arg(&h_i);
     unsafe { lb.launch(fused_cfg((nc as u32, bh as u32, 1), par_threads, smem)) }
         .expect("mlstm_fw_parallel");
-
-    MlstmFused {
-        l,
-        nc,
-        ytil,
-        cst,
-        nst,
-        mst,
-        fcb,
-        gvec,
-        msv,
-        psiv,
-        qnv,
-    }
 }
 
 /// Chunkwise backward: `mlstm_bw_dqn` → `mlstm_bw_dC` → `mlstm_state_scan` (REV) →

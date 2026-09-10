@@ -1,8 +1,8 @@
 //! Step time against backbone chunk length, at the real model shape.
 //!
 //! Chunking the backbone bounds its activation memory but adds per-chunk work — the
-//! state carries, the slice/concat at the chunk borders, and (under offload) one park
-//! generation per chunk. This is the A/B that says what that costs.
+//! state carries, the chunk-sized launches, and (under offload) one frame per block per
+//! chunk. This is the A/B that says what that costs.
 //!
 //! `cargo run --release --features cuda --example chunk_ab -- [words]`
 
