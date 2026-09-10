@@ -1355,6 +1355,13 @@ impl SLstm {
     /// chunked forward runs left-to-right and resets here, while its backward runs
     /// right-to-left and resets at the *last* chunk.
     pub fn reset_state(&mut self, gpu: &Gpu) {
+        self.zero_state(gpu);
+        self.reset_caches(gpu);
+    }
+
+    /// Start the recurrence over at the next forward, keeping everything already
+    /// cached. See [`Cell::zero_state`].
+    pub fn zero_state(&mut self, gpu: &Gpu) {
         for s in [
             &mut self.h_state,
             &mut self.c_state,
@@ -1365,6 +1372,11 @@ impl SLstm {
                 s.zero_(gpu);
             }
         }
+    }
+
+    /// Drop the caches of an already-unwound sweep, keeping `h`/`c`/`n`/`m` — so the
+    /// next forward continues this recurrence. See [`Cell::reset_caches`].
+    pub fn reset_caches(&mut self, _gpu: &Gpu) {
         // A sweep that ended early (a caller that forwarded chunks and never unwound
         // them) would otherwise leave its caches to accumulate across steps.
         self.chunk_saved.clear();

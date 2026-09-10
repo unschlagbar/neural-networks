@@ -214,7 +214,7 @@ impl Buf {
 /// built for it, fp32 otherwise.
 ///
 /// Same contract as `Buf` (persist across calls, reuse by capacity, allocate at a size
-/// class), for a value whose every reader takes it narrow. `zn` in a `Block` is the
+/// class), for a value whose every reader takes it narrow. `norm2_out` in a `Block` is the
 /// case that motivated it: its norm writes it, two GEMMs and that norm's own backward
 /// read it, and all four are happy with bf16 — so materializing it fp32 only to narrow
 /// it again was a full extra pass over the tensor per reader.

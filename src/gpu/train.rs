@@ -17,9 +17,10 @@ use rand::seq::SliceRandom;
 
 use crate::batches::ChunkedWordDataSet;
 use crate::config::{
-    BATCH_SIZE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, LOG_EVERY, LOGIT_SOFTCAP, LR, MAX_WINDOW_TOKENS,
-    MIN_WORDS_PER_SEQ, SFT_BATCH_SIZE, SFT_DATA, SFT_EPOCHS, SFT_LR, SFT_MAX_TOKENS,
-    SFT_WARMUP_WINDOWS, TRAIN_DATA, VAL_DATA, WORD_BLOCKS, WORD_HIDDEN, WORDS_PER_SEQ,
+    BATCH_SIZE, CARRY_WINDOW_STATE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, LOG_EVERY, LOGIT_SOFTCAP, LR,
+    MAX_WINDOW_TOKENS, MIN_WORDS_PER_SEQ, SFT_BATCH_SIZE, SFT_DATA, SFT_EPOCHS, SFT_LR,
+    SFT_MAX_TOKENS, SFT_WARMUP_WINDOWS, TRAIN_DATA, VAL_DATA, WORD_BLOCKS, WORD_HIDDEN,
+    WORDS_PER_SEQ,
 };
 use crate::gpu::Gpu;
 use crate::gpu::hierarchical::{Hierarchical, ModelCfg};
@@ -114,6 +115,11 @@ pub fn train_hierarchical_gpu(model_path: &str) {
     state.set_defer_log_flush(true);
 
     let mut opt = AdamCfg::new(LR, crate::optimizers::WEIGHT_DECAY);
+    let mut capture = crate::gpu::profile::Capture::from_env();
+
+    // The loop below walks a file's windows in corpus order, which is what makes a
+    // window's `continues` flag mean anything.
+    model.set_stateful(CARRY_WINDOW_STATE);
 
     // Where the last run stopped, from the sidecar next to the checkpoint. The
     // step count cannot answer this: it spans every corpus the weights have seen.
@@ -190,6 +196,11 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                     skip -= chunk.len();
                     continue;
                 }
+                // Whether the window just trained is the one a `continues` flag refers
+                // to. False at the start of a chunk and after any window the loop
+                // skipped, so a resume never inherits state from a document it did not
+                // run — and false with `CARRY_WINDOW_STATE` off, where nothing carries.
+                let mut ran_prev = false;
                 for batch in chunk.iter().skip(skip) {
                     // Counts every window the iterator yields, including the ones
                     // skipped below — `done` must stay aligned with the position
@@ -200,9 +211,16 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                     let tokens: Vec<usize> = batch.tokens.iter().map(|&t| t as usize).collect();
                     let words = &batch.words;
                     if words.len() < 2 {
+                        ran_prev = false;
                         continue; // no decoded word in this window
                     }
+                    model.set_continues(batch.continues && ran_prev);
+                    model.set_doc_starts(&batch.doc_starts);
+                    ran_prev = true;
 
+                    if let Some(c) = capture.as_mut() {
+                        c.before_window(&gpu);
+                    }
                     let loss = model.forward_backward(&gpu, &tokens, words);
                     model.seen.add_pretrain(tokens.len(), words.len());
                     tokens_since_print += tokens.len();
@@ -221,6 +239,9 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                         model.step(&gpu, &opt);
                     }
                     model.step_count = state.step;
+                    if let Some(c) = capture.as_mut() {
+                        c.after_window(&gpu);
+                    }
 
                     if state.print() {
                         let word_loss = state.metric_mean("word_loss");
@@ -364,6 +385,7 @@ pub fn validate_hierarchical_gpu(model_path: &str) {
             if words.len() < 2 {
                 continue; // no decoded word in this window
             }
+            model.set_doc_starts(&batch.doc_starts);
             c_total += model.eval_loss(&gpu, &tokens, words);
             w_total += model.last_word_loss();
             windows += 1;

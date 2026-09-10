@@ -232,6 +232,38 @@ impl Linear {
         }
     }
 
+    /// [`forward_shared_resid`](Self::forward_shared_resid) with a slab `x` — the
+    /// residual form of [`forward_slab_lhs`](Self::forward_slab_lhs), for the block's
+    /// down-projection, whose input is written narrow by the SwiGLU.
+    pub fn forward_slab_lhs_resid(
+        &mut self,
+        gpu: &Gpu,
+        x: &ops::SlabBuf,
+        resid: &GTensor<f32>,
+        y: &mut GTensor<f32>,
+    ) {
+        match x {
+            ops::SlabBuf::F32(t) => self.forward_shared_resid(gpu, t, resid, y),
+            ops::SlabBuf::Bf16(b) => {
+                assert!(
+                    self.bf16,
+                    "Linear::forward_slab_lhs_resid — layer is fp32-pinned"
+                );
+                assert_eq!(
+                    y.dims(),
+                    [b.dims()[0], self.output],
+                    "Linear::forward_slab_lhs_resid — output shape"
+                );
+                if !self.x.is_empty() {
+                    self.x = GTensor::uninit(gpu, &[0, self.input]);
+                }
+                ops::broadcast_row_resid(gpu, y, resid, &self.b);
+                self.gemm
+                    .run_staged_lhs(gpu, ops::MmForm::Nn, b, &self.w, y, 1.0);
+            }
+        }
+    }
+
     /// The GEMM half of forward, without the input-saving policy. Shared by
     /// [`forward`](Self::forward) and [`forward_shared`](Self::forward_shared) so the
     /// two cannot drift apart.

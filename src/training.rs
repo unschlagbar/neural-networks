@@ -530,7 +530,7 @@ pub fn probe_hierarchical(model_path: &str) {
     // were actively pulled down by training or by input drive.
     let bias = model.backbone_forget_bias();
     let mut samples: Vec<Vec<Vec<f32>>> = Vec::new();
-    for crate::batches::WordBatch { tokens, words } in chunk.iter().take(n) {
+    for crate::batches::WordBatch { tokens, words, .. } in chunk.iter().take(n) {
         model.reset();
         model.forward_over(tokens, &words);
         let per_window = model.backbone_forget_samples();

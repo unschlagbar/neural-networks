@@ -2091,7 +2091,7 @@ pub enum SlabBuf {
 impl SlabBuf {
     /// An uninitialized slab at an explicitly chosen width.
     ///
-    /// For a value whose readers are not the fused kernels: `zn` is normalized by the
+    /// For a value whose readers are not the fused kernels: `norm2_out` is normalized by the
     /// RMSNorm kernels (which take either width) and read by GEMMs (which take bf16
     /// only under `gemm_bf16_enabled`), so it must narrow only when *both* switches
     /// are on. [`new`](Self::new) asks the kernels alone, which is right for a slab the
@@ -3402,6 +3402,43 @@ pub fn swiglu_forward_into(
         .arg(&mut mixed.buf)
         .arg(&n_i);
     unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("swiglu_forward");
+}
+
+/// [`swiglu_forward_into`] writing `mixed` at the slab width.
+///
+/// `mixed`'s only readers are `lin_down`'s forward and backward GEMMs, both of which
+/// want it narrow; producing it narrow here removes their casts and halves what an
+/// offloaded block sends to the host for it. `gate_act` stays fp32 — `swiglu_backward`
+/// reads it arithmetically.
+pub fn swiglu_forward_slab(
+    gpu: &Gpu,
+    gate_pre: &GTensor<f32>,
+    value: &GTensor<f32>,
+    gate_act: &mut GTensor<f32>,
+    mixed: &mut SlabBuf,
+) {
+    let SlabBuf::Bf16(m) = mixed else {
+        let SlabBuf::F32(m) = mixed else { unreachable!() };
+        swiglu_forward_into(gpu, gate_pre, value, gate_act, m);
+        return;
+    };
+    let n = gate_pre.len();
+    assert_eq!(n, value.len(), "swiglu_forward_slab: length mismatch");
+    assert_eq!(
+        n,
+        gate_act.len(),
+        "swiglu_forward_slab: gate_act length mismatch"
+    );
+    assert_eq!(n, m.len(), "swiglu_forward_slab: mixed length mismatch");
+    let n_i = n as i32;
+    let f = gpu.kernels.get("swiglu_forward_slab");
+    let mut lb = gpu.stream.launch_builder(&f);
+    lb.arg(&gate_pre.buf)
+        .arg(&value.buf)
+        .arg(&mut gate_act.buf)
+        .arg(&mut m.buf)
+        .arg(&n_i);
+    unsafe { lb.launch(elem_cfg(gpu, n as u32)) }.expect("swiglu_forward_slab");
 }
 
 /// SwiGLU backward: from `d_mixed` and the saved `gate_act`/`value`/`gate_pre`,

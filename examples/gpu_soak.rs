@@ -5,11 +5,12 @@
 //!
 //!   cargo run --release --features cuda --example gpu_soak -- <corpus> [windows]
 //!
-//! It exists to exercise what only real data produces: the window's word count `dw`
-//! varies (windows never cross document borders, so every short document yields a
-//! short window), so every layer's per-call buffers are refit — and sometimes
-//! reallocated — window after window. A buffer that outlives a shape it was sized for
-//! surfaces asynchronously, and possibly much later, as a sticky
+//! It exists to exercise what only real data produces. Packing fixes the word count,
+//! but the token span and the word-length histogram behind it still move window to
+//! window, so every layer's per-call buffers are refit — and sometimes reallocated —
+//! window after window, and the backbone's spans are cut wherever the documents in the
+//! window happen to start. A buffer that outlives a shape it was sized for surfaces
+//! asynchronously, and possibly much later, as a sticky
 //! CUBLAS_STATUS_EXECUTION_FAILED.
 //!
 //! Prints the distribution of window shapes it actually exercised, so a clean run
@@ -47,9 +48,9 @@ fn main() {
         vocab,
         hc: CHAR_HIDDEN,
         wh: WORD_HIDDEN,
-        enc_blocks: 2,
+        enc_blocks: 4,
         bb_blocks: WORD_BLOCKS,
-        dec_blocks: 2,
+        dec_blocks: 4,
         heads,
         dqk: WORD_HIDDEN / heads,
         w_token,
@@ -75,6 +76,10 @@ fn main() {
     // per-step loop.
     let (mut tiny, mut short, mut full) = (0usize, 0usize, 0usize);
     let mut loss_sum = 0.0;
+    // Throughput is measured after one full batch: the first windows pay for every
+    // pool and arena the run will ever allocate.
+    let warmup = BATCH_SIZE;
+    let (mut hot, mut hot_tokens) = (None, 0usize);
 
     'outer: while let Some(chunk) = data.next_chunk() {
         for batch in chunk.iter() {
@@ -92,8 +97,13 @@ fn main() {
                 full += 1;
             }
 
+            model.set_doc_starts(&batch.doc_starts);
             loss_sum += model.forward_backward(&gpu, &tokens, words);
             seen += 1;
+            if seen > warmup {
+                hot.get_or_insert_with(Instant::now);
+                hot_tokens += tokens.len();
+            }
             if seen % BATCH_SIZE == 0 {
                 opt.t += 1;
                 model.step(&gpu, &opt);
@@ -112,10 +122,16 @@ fn main() {
         }
     }
 
+    let hot_secs = hot.map_or(0.0, |t| t.elapsed().as_secs_f64());
+    let hot_windows = seen.saturating_sub(warmup);
     println!(
         "\nOK — {seen} windows, no device fault.\n\
          shapes exercised: dw<32 (eager path) {tiny}, 32..full {short}, full {full}\n\
-         {:.3} s/window",
+         {:.3} s/window over all {seen}\n\
+         after warmup: {:.3} s/window, {:.0} tokens/s ({hot_windows} windows, \
+         {hot_tokens} tokens)",
         t0.elapsed().as_secs_f64() / seen.max(1) as f64,
+        hot_secs / hot_windows.max(1) as f64,
+        hot_tokens as f64 / hot_secs.max(1e-9),
     );
 }

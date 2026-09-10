@@ -28,6 +28,20 @@ extern "C" __global__ void swiglu_forward(const float* gate_pre, const float* va
     mixed[i] = ga * value[i];
 }
 
+// `mixed` at the slab width. Its only readers are `lin_down`'s two GEMMs (forward
+// and the dW half of backward), which take a bf16 operand — so writing it narrow
+// here saves the cast each of them would otherwise do, and halves what the host
+// park moves for it. `gate_act` stays fp32: `swiglu_backward` computes on it.
+extern "C" __global__ void swiglu_forward_slab(const float* gate_pre, const float* value,
+                                               float* gate_act, slab_t* mixed, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float gp = gate_pre[i];
+    float ga = gp * stable_sigmoid(gp);
+    gate_act[i] = ga;
+    slab_st(mixed, i, ga * value[i]);
+}
+
 // mLSTM projections (nn2/mlstm.rs `project`)
 // In-place multiply by a scalar (the k-projection's 1/√dqk scale).
 extern "C" __global__ void scale_inplace(float* x, float s, int n) {

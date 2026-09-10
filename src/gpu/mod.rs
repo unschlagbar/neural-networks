@@ -33,6 +33,7 @@ pub mod mlstm;
 pub mod nn_convert;
 pub mod offload;
 pub mod ops;
+pub mod profile;
 pub mod rms_norm;
 pub mod slstm;
 pub mod temp;

@@ -4,17 +4,9 @@
 //!   z = x + cell(pre_norm1(x))
 //!   y = z + lin_down( SiLU(lin_gate·pre_norm2(z)) ⊙ (lin_value·pre_norm2(z)) )
 //!
-//! The cell's output goes into the residual already normalized: each cell owns the
-//! post-norm that suits it — sLSTM a plain row-wise RMSNorm, mLSTM its head-wise
-//! `headnorm` — and the block neither holds one nor knows which shape applies.
-//!
-//! The norms and the SwiGLU MLP are position-wise and run on the flattened
-//! `[N, H]` view (`N = B·T`); only the recurrent `cell` sees the `[B, T, H]`
-//! sequence. Since a `GTensor<f32>` is contiguous row-major, the `[B,T,H] ↔ [N,H]`
-//! reshapes are metadata-only (`GTensor::reshaped`), no copy. The block composes
-//! the already-parity-tested `gpu::Linear` / `gpu::RmsNorm` sub-layers plus three
-//! small elementwise kernels (`add`, `swiglu_forward`, `swiglu_backward`) around
-//! a generic GPU `Cell`.
+//! The cell owns its own post-norm, so its output enters the residual normalized.
+//! Everything but the cell is position-wise and runs on an `[N, H]` view of the
+//! `[B, T, H]` sequence (`N = B·T`), which is metadata-only — the storage is shared.
 
 use super::{
     Buf, GTensor, Gpu, SlabSlot,
@@ -26,21 +18,15 @@ use super::{
     slstm::SLstm,
 };
 use crate::{
-    gpu::arena::TrainingCache,
+    gpu::{arena::TrainingCache, offload::HostPark},
     nn::{linear::LinearLayer, rms_norm::RMSNorm, slstm_block::SLSTMBlock},
     nn_layer::NnLayer,
-    nn2::optim::AdamCfg,
+    nn2::{self, optim::AdamCfg},
     tensor::Tensor,
 };
 
-/// Per-phase timing, off unless `GPU_PHASE=1`.
-///
-/// A block is a cell (the recurrence) wrapped in norms, residuals and a SwiGLU MLP,
-/// and the whole point of a breakdown is to say which of those the time is in. The
-/// GPU is asynchronous, so a phase can only be timed by synchronizing around it —
-/// which perturbs the schedule and is exactly why this is opt-in rather than always
-/// compiled in. Numbers taken with it on are for *attribution*, not for the headline
-/// step time; take that from a run with it off.
+/// Per-phase timing, off unless `GPU_PHASE=1`. It synchronizes around each phase, so
+/// its numbers are for attribution only — never read a step time off a run with it on.
 pub mod phase {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -55,24 +41,18 @@ pub mod phase {
         MlstmCellBwd = 3,
         FfnFwd = 4,
         FfnBwd = 5,
-        /// Norms, residual adds and the block-level buffer copies — everything in a
-        /// block that is neither the cell nor the MLP.
-        GlueFwd = 6,
-        GlueBwd = 7,
-        /// sLSTM sub-phases, so the 70%-of-a-step cell can be broken down further.
-        /// `Copy` is the device-to-device staging of `x`/`dy`/`out` into the buffers
-        /// the cell owns; `Gemm` is the whole-sequence input projection plus
-        /// backward's dx/dW/db GEMMs; `Loop` is the serial T-loop itself.
-        SlstmCopyFwd = 8,
-        SlstmGemmFwd = 9,
-        SlstmLoopFwd = 10,
-        SlstmCopyBwd = 11,
-        SlstmGemmBwd = 12,
-        SlstmLoopBwd = 13,
+        /// sLSTM sub-phases: `Copy` stages `x`/`dy`/`out` into the cell's buffers,
+        /// `Gemm` is every whole-sequence matmul, `Loop` the serial T-loop.
+        SlstmCopyFwd = 6,
+        SlstmGemmFwd = 7,
+        SlstmLoopFwd = 8,
+        SlstmCopyBwd = 9,
+        SlstmGemmBwd = 10,
+        SlstmLoopBwd = 11,
     }
 
     impl Bucket {
-        pub const COUNT: usize = 14;
+        pub const COUNT: usize = 12;
         pub const ALL: [(Bucket, &'static str); Self::COUNT] = [
             (Bucket::SlstmCellFwd, "sLSTM cell"),
             (Bucket::SlstmCellBwd, "sLSTM cell"),
@@ -80,8 +60,6 @@ pub mod phase {
             (Bucket::MlstmCellBwd, "mLSTM cell"),
             (Bucket::FfnFwd, "SwiGLU FFN"),
             (Bucket::FfnBwd, "SwiGLU FFN"),
-            (Bucket::GlueFwd, "norms/residual/copies"),
-            (Bucket::GlueBwd, "norms/residual/copies"),
             (Bucket::SlstmCopyFwd, "sLSTM copies"),
             (Bucket::SlstmGemmFwd, "sLSTM gemm"),
             (Bucket::SlstmLoopFwd, "sLSTM T-loop"),
@@ -143,11 +121,8 @@ pub trait Cell {
         out: &mut GTensor<f32>,
         cache: &TrainingCache,
     );
-    /// `x` is this cell's forward input, handed back so a cell whose projections need
-    /// it for their `dW` keeps no copy of its own; a cell that saves its own (narrowed,
-    /// say) ignores it. `y` is this cell's own forward output — which, because a cell
-    /// ends in a post-norm, is that norm's output and so what its backward rebuilds
-    /// `x̂` from. A cell that keeps its post-norm's output internally ignores it.
+    /// `x` is the forward input and `y` the cell's own output, handed back so a cell
+    /// that needs them for `dW` or `x̂` keeps no copy. A cell that saves its own ignores.
     fn backward(
         &mut self,
         gpu: &Gpu,
@@ -181,12 +156,8 @@ pub trait Cell {
     /// Which phase buckets this cell's forward/backward count toward, so a mixed
     /// stack can be attributed per cell kind. See [`phase`].
     fn phase_buckets(&self) -> (phase::Bucket, phase::Bucket);
-    /// Park this cell's saved activations on the host between forward and backward.
-    ///
-    /// Default: do nothing, for a cell with no large per-`N` cache to move. The
-    /// surrounding [`Block`] calls this from its own `enable_offload`, so a cell opts
-    /// in wherever the block does — subject to the same whole-forward-then-backward
-    /// constraint.
+    /// Park this cell's saved activations on the host, from [`Block::enable_offload`]
+    /// and under its constraint. Default: do nothing.
     fn enable_offload(&mut self, _gpu: &Gpu, _in_flight: offload::SharedInFlight) {}
     /// Stop parking this cell's activations, discarding anything already parked.
     /// Default: do nothing, for a cell that never parked.
@@ -205,22 +176,26 @@ pub trait Cell {
     /// Drop pooled scratch far larger than a `rows`-row window needs.
     /// See [`Block::trim_to`].
     fn trim_to(&mut self, _rows: usize) {}
-    /// Continue the previous call's recurrence instead of starting from zero.
-    ///
-    /// For a chunked sweep, where one sequence is split across several calls and the
-    /// state has to cross the chunk borders. Default: ignore it — a cell with no
-    /// cross-call state has nothing to carry.
+    /// Continue the previous call's recurrence instead of starting from zero, for a
+    /// sweep chunked across calls. Default: ignore — no cross-call state to carry.
     fn set_carry(&mut self, _carry: bool) {}
     /// Zero the carried forward state (before the first chunk of a sweep).
     fn reset_state(&mut self, _gpu: &Gpu) {}
+    /// Zero the carried forward state and nothing else — [`reset_state`](Self::reset_state)
+    /// without dropping the caches, for a border *inside* a sweep whose earlier chunks
+    /// still have their backward ahead of them. Default: no state to zero.
+    fn zero_state(&mut self, _gpu: &Gpu) {}
+    /// Drop the caches an unwound sweep left behind while keeping the carried forward
+    /// state — [`reset_state`](Self::reset_state) minus the zeroing, for a sweep that
+    /// continues the previous one. Default: nothing cached, nothing carried.
+    fn reset_caches(&mut self, _gpu: &Gpu) {}
     /// Zero the carried BPTT state (before the last chunk's backward — backward
     /// unwinds chunks right to left).
     fn reset_bptt(&mut self, _gpu: &Gpu) {}
     /// Device bytes this cell holds, split `(params, activations)`. Diagnostic.
     fn retained_bytes(&self) -> (usize, usize);
-    /// Retained activation bytes split `(saved_cache, other)` — "other" being the
-    /// cell's own stable buffers plus whatever its internal projections and norms
-    /// hold, i.e. the part `drop_saved_act` does **not** reach. Diagnostic.
+    /// Retained activation bytes split `(saved_cache, other)`, "other" being the part
+    /// `drop_saved_act` does **not** reach. Diagnostic.
     fn act_split(&self) -> (usize, usize);
     /// Release every activation this cell holds, including the ones its
     /// `drop_saved_act` leaves behind (a cell's projections and norms keep their own).
@@ -305,6 +280,12 @@ impl Cell for SLstm {
     fn reset_state(&mut self, gpu: &Gpu) {
         SLstm::reset_state(self, gpu)
     }
+    fn zero_state(&mut self, gpu: &Gpu) {
+        SLstm::zero_state(self, gpu)
+    }
+    fn reset_caches(&mut self, gpu: &Gpu) {
+        SLstm::reset_caches(self, gpu)
+    }
     fn reset_bptt(&mut self, gpu: &Gpu) {
         SLstm::reset_bptt(self, gpu)
     }
@@ -336,9 +317,8 @@ impl Cell for SLstm {
     }
 }
 
-/// Type-erased `Block`, so a model can hold a heterogeneous stack (alternating
-/// sLSTM / mLSTM blocks) as `Vec<Box<dyn BlockLike>>`. `Block<C>` is generic over
-/// its cell, so the concrete types differ; this is the common interface.
+/// Type-erased `Block`: `Block<C>` is generic over its cell, so an alternating
+/// sLSTM/mLSTM stack needs this to be one `Vec`.
 pub trait BlockLike {
     fn forward(
         &mut self,
@@ -354,10 +334,14 @@ pub trait BlockLike {
         dx: &mut GTensor<f32>,
         cache: &TrainingCache,
     );
-    /// Forward into a freshly allocated `[B, T, H]`. Blocks are H-in == H-out, so
-    /// the shape follows the input. For benchmarks and one-shot call sites; a
+    /// Forward into a fresh `[B, T, H]` (H in == H out). For one-shot call sites; a
     /// training loop passes its own buffer to [`forward`](Self::forward).
-    fn forward_alloc(&mut self, gpu: &Gpu, x: &GTensor<f32>, cache: &TrainingCache) -> GTensor<f32> {
+    fn forward_alloc(
+        &mut self,
+        gpu: &Gpu,
+        x: &GTensor<f32>,
+        cache: &TrainingCache,
+    ) -> GTensor<f32> {
         let mut y = GTensor::uninit(gpu, x.dims());
         self.forward(gpu, x, &mut y, cache);
         y
@@ -391,9 +375,8 @@ pub trait BlockLike {
     }
     /// The cell's forward-cache extremes. See [`Cell::state_extremes`].
     fn state_extremes(&self, gpu: &Gpu) -> Option<(f32, f32, f32)>;
-    /// Park this block's FFN activations on the host between forward and backward.
-    /// See [`Block::enable_offload`] — only valid for a whole-forward-then-backward
-    /// stack, i.e. the backbone.
+    /// Park this block's FFN activations on the host. See [`Block::enable_offload`]
+    /// for the constraint on which stacks may.
     fn enable_offload(&mut self, gpu: &Gpu, in_flight: offload::SharedInFlight);
     /// Stop parking this block's activations and discard anything already parked.
     /// See [`Block::disable_offload`].
@@ -401,9 +384,8 @@ pub trait BlockLike {
     /// Pinned host bytes this block's parks hold, its cell's included.
     /// See [`Block::parked_host_bytes`].
     fn parked_host_bytes(&self) -> usize;
-    /// Start this block's parked activations on their way back to the device, without
-    /// waiting. Call one block ahead of its backward so the upload overlaps compute;
-    /// no-op when this block is not offloaded. See [`Block::prefetch_act`].
+    /// Start the parked activations back to the device without waiting, one block ahead
+    /// of the backward that reads them. See [`Block::prefetch_act`].
     fn prefetch_act(&mut self, gpu: &Gpu);
     /// Release the saved forward activations without reading them, for a stack that
     /// re-forwards rather than unwinding. See [`Block::drop_saved_act`].
@@ -424,6 +406,11 @@ pub trait BlockLike {
     fn set_carry(&mut self, carry: bool);
     /// Zero the carried forward state (before a sweep's first chunk).
     fn reset_state(&mut self, gpu: &Gpu);
+    /// Zero the carried forward state while keeping every cache. See [`Cell::zero_state`].
+    fn zero_state(&mut self, gpu: &Gpu);
+    /// Drop the block's caches but keep the carried forward state, for a sweep that
+    /// continues the previous one. See [`Cell::reset_caches`].
+    fn reset_caches(&mut self, gpu: &Gpu);
     /// Zero the carried BPTT state (before a sweep's last chunk backward).
     fn reset_bptt(&mut self, gpu: &Gpu);
     /// The cell's `(saved_cache, other)` activation split. See [`Cell::act_split`].
@@ -499,10 +486,15 @@ impl<C: Cell> BlockLike for Block<C> {
     fn reset_state(&mut self, gpu: &Gpu) {
         // A sweep that forwarded chunks and never unwound them would otherwise leave
         // its FFN caches to accumulate across steps.
-        self.act.chunk_saved.clear();
-        self.seq.clear();
-        self.fwd_chunks = 0;
+        self.drop_chunk_caches();
         self.cell.reset_state(gpu)
+    }
+    fn zero_state(&mut self, gpu: &Gpu) {
+        self.cell.zero_state(gpu)
+    }
+    fn reset_caches(&mut self, gpu: &Gpu) {
+        self.drop_chunk_caches();
+        self.cell.reset_caches(gpu)
     }
     fn reset_bptt(&mut self, gpu: &Gpu) {
         self.cell.reset_bptt(gpu)
@@ -527,186 +519,129 @@ pub struct Block<C: Cell> {
 
     /// This block's activations, owned across calls.
     act: Act,
-    /// `(B, T)` of each forward still owed a backward, oldest first. A chunked sweep's
-    /// last chunk is shorter than the rest, so backward cannot assume one shape — it
-    /// pops the shape belonging to the chunk it is unwinding.
+    /// `(B, T)` of each forward still owed a backward, oldest first — a chunked sweep's
+    /// last chunk is short, so backward pops the shape rather than assuming one.
     seq: Vec<(usize, usize)>,
     /// Whether this block is part of a chunked sweep, i.e. whether its forward caches
     /// must survive the next chunk's forward. Set alongside the cell's own carry.
     carry: bool,
-    /// Chunks forwarded in the current sweep and not yet unwound. Drives the stash:
-    /// the first chunk has nothing to preserve, every later one does. Counted rather
-    /// than inferred from the `Buf` slots, which `BlockSaved::put_back` refills.
+    /// Chunks forwarded and not yet unwound: the first has nothing to stash, later ones
+    /// do. Counted, not inferred from the slots, which `put_back` refills.
     fwd_chunks: usize,
 }
 
-/// A block's activations.
+/// The activations a block's forward must keep until its backward, one buffer each.
 ///
-/// Only three values have to survive the forward: the SwiGLU operands its
-/// backward differentiates. Those get a permanent [`Buf`] each. Everything else
-/// — the residual chain, the norm outputs, every `d_*` — is a temporary consumed
-/// within the same call, and comes from the shared slots in
-/// [`temp`](super::temp) instead.
+/// Named after the forward, which computes them in this order:
 ///
-/// That split is what keeps the memory honest. Giving all 23 intermediates a
-/// permanent buffer pins every one of them at once: measured at the backbone's
-/// shape (16 blocks, N=2048, H=1024) that is 4–6 GB of retained activations, and
-/// it pushed an 11 GB step to an out-of-memory abort. Borrowing the temporaries
-/// keeps only as many buffers as are simultaneously live — a handful — while
-/// still allocating nothing once the shapes are steady.
+/// ```text
+///   norm1_out = pre_norm1(x)               the cell's input
+///   cell_out  = cell(norm1_out)            already post-normed, by the cell
+///   z         = x + cell_out               residual 1  (not kept)
+///   norm2_out = pre_norm2(z)               both FFN projections' input
+///   gate_pre  = lin_gate(norm2_out)        value = lin_value(norm2_out)
+///   gate_act  = SiLU(gate_pre)
+///   mixed     = gate_act ⊙ value           lin_down's input
+///   out       = z + lin_down(mixed)        residual 2
+/// ```
+///
+/// Everything else (`z`, every `d_*`) comes from [`temp`](super::temp) instead: owning
+/// all 23 intermediates cost 4-6 GB at the backbone's shape and OOM'd an 11 GB step.
 #[derive(Default)]
 struct Act {
-    // The two norm outputs on the residual path. Each is what its norm's backward
-    // rebuilds `x̂` from (see `RmsNorm::backward`), which is why neither norm stores an
-    // `[N, H]` of its own — these ARE that tensor, and they are parkable besides.
-    xn1: Buf,      // [N, H] pre_norm1(x) — also the cell's input
-    cell_out: Buf, // [N, H] the cell's output, i.e. its post-norm's output
-    // The SwiGLU operands, read by backward, so they outlive the forward.
-    gate_pre: Buf, // [N, U] pre-activation for SiLU'
-    gate_act: Buf, // [N, U] SiLU(gate_pre)
-    value: Buf,    // [N, U]
-    // The FFN projections' saved inputs, held here rather than inside the three
-    // `Linear`s (which would keep `zn` twice — see `forward`). Backward hands these
-    // back through `Linear::backward_with_x`. `zn` doubles as pre_norm2's `y`.
-    /// `[N, H]` pre_norm2(z), at the slab width. Every reader of it takes it narrow —
-    /// the two projections' GEMMs, their backwards, and pre_norm2's own backward (which
-    /// rebuilds `x̂ = y/γ` from it) — so materializing it fp32 meant a `cast_f32_to_bf16`
-    /// pass per reader over a tensor the norm could have produced narrow in the first
-    /// place. Measured as 1.18-1.26x on norm-plus-cast (`examples/rms_bench.rs`); the
-    /// norm kernel alone is a wash, it is the deleted cast that pays.
-    zn: SlabSlot,
-    mixed: Buf, // [N, U] SwiGLU output — input to lin_down
-    /// Host parking for the seven buffers above, when offload is enabled.
-    ///
-    /// The backbone sweeps block by block, so a block's activations sit unread from
-    /// its own forward until backward unwinds back to it — 15 blocks of compute at
-    /// the backbone's depth. Parking them on the host over that gap trades ~1.2 ms of
-    /// (overlapped) PCIe for ~46 MB of device memory per block.
-    park: Option<super::offload::HostPark>,
-    /// The parked tensors between `restore` and their consumption in backward. Only
-    /// non-empty inside `backward`.
-    restored: Vec<offload::Parked>,
-    /// Earlier chunks' activations, oldest first, when the sweep is chunked.
-    ///
-    /// The seven `Buf` slots above hold one chunk's worth, so without this chunk c+1's
-    /// forward overwrites what chunk c's backward reads. Each chunk's set moves here
-    /// as the next one's forward starts, and backward pops them right to left. Empty
-    /// on the unchunked path, and on the offload path (where the park holds a
-    /// generation per chunk instead).
-    chunk_saved: Vec<BlockSaved>,
+    norm1_out: Buf, // [N, H] pre_norm1's output
+    cell_out: Buf,  // [N, H] the cell's output
+
+    gate_pre: Buf,       // [N, U] lin_gate's output
+    value: Buf,          // [N, U] lin_value's output
+    gate_act: Buf,       // [N, U] SiLU(gate_pre)
+    norm2_out: SlabSlot, // [N, H] pre_norm2's output, kept once for both projections
+    mixed: SlabSlot,     // [N, U] the SwiGLU's output, lin_down's input
+    // Host storage for the buffers above. Used only with offload on; empty otherwise.
+    park: Option<HostPark>, // the host copy: ~1.2 ms of PCIe per ~46 MB
+    restored: Vec<offload::Parked>, // what `park` gave back; only set inside backward
+    chunk_saved: Vec<BlockSaved>, // earlier chunks' sets, oldest first
 }
 
 impl Act {
-    /// A block's activation set, with no offload.
-    ///
-    /// One place decides, so every way of building a `Block` — fresh, from a CPU
-    /// layer, from a checkpoint — gets the same behaviour.
-    /// A block's activation set with no offload — the default.
-    ///
-    /// Offload is opt-in per block via [`Block::enable_offload`], not a property of
-    /// construction: only the backbone qualifies. See that method for why.
+    /// A block's activation set, with no offload — that is opt-in per block via
+    /// [`Block::enable_offload`]. One place decides, so every constructor agrees.
     fn new(gpu: &Gpu) -> Self {
-        // `zn` narrows only when BOTH switches allow it. `slab_bf16` (GPU_NO_BF16) is
-        // what the RMSNorm kernels were built for; `gemm_bf16_enabled` is what the two
-        // projections that read it accept. They are separate flags and either one off
-        // means this value has an fp32 reader, so it stays fp32.
+        // Both switches must allow it: either one off means these values have an fp32
+        // reader (the norm kernels, or the GEMMs), so they stay fp32.
+        let narrow = gpu.kernels.slab_bf16 && ops::gemm_bf16_enabled(gpu);
         Self {
-            zn: SlabSlot::new(gpu.kernels.slab_bf16 && ops::gemm_bf16_enabled(gpu)),
+            norm2_out: SlabSlot::new(narrow),
+            mixed: SlabSlot::new(narrow),
             ..Default::default()
         }
     }
 }
 
-/// The seven activations a block's backward reads, moved out of the block for the
-/// duration of the call.
-///
-/// They come from one of two places — the owned [`Buf`] slots, or the tensors
-/// [`HostPark`](offload::HostPark) just restored — and backward should not care which.
-/// Moving them out (rather than borrowing) is what lets the `Linear`s and the pool be
-/// borrowed mutably at the same time.
+/// The saved activations, moved out of [`Act`] for the duration of one backward —
+/// from the owned slots or from the park, which backward does not distinguish.
 struct BlockSaved {
-    xn1: GTensor<f32>,
+    norm1_out: GTensor<f32>,
     cell_out: GTensor<f32>,
     gate_pre: GTensor<f32>,
     gate_act: GTensor<f32>,
     value: GTensor<f32>,
-    zn: ops::SlabBuf,
-    mixed: GTensor<f32>,
+    norm2_out: ops::SlabBuf,
+    mixed: ops::SlabBuf,
     /// Whether these came from the owned `Buf`s and must go back into them.
     owned: bool,
 }
 
 impl<C: Cell> Block<C> {
-    /// Park this block's FFN activations on the host between forward and backward,
-    /// sharing `in_flight` with the other blocks of the same sweep.
+    /// Park this block's FFN activations on the host between forward and backward.
     ///
-    /// **Only legal for a stack whose forward completes before its backward begins** —
-    /// the backbone, which runs all 16 blocks forward and only then unwinds. Two
-    /// properties depend on that gap:
-    ///
-    ///   * the D2H copy has a whole block of compute to finish in, so releasing the
-    ///     source buffers at the *next* block's eviction does not stall; and
-    ///   * a block's own restore happens long after its eviction landed.
-    ///
-    /// The decoder violates both: `Hierarchical::forward_backward` runs it forward and
-    /// straight back again per length group, so with only two blocks a shared slot
-    /// would release buffers still being read — which showed up as
-    /// `CUDA_ERROR_ILLEGAL_ADDRESS`, not as a wrong number. The encoder likewise
-    /// re-forwards per group rather than saving. Hence opt-in, per stack, rather than
-    /// a property of every `Block`.
+    /// **Only legal where the whole stack forwards before any of it unwinds** — the
+    /// gap is what each copy lands in. The decoder, going forward and straight back,
+    /// freed buffers still being read: `CUDA_ERROR_ILLEGAL_ADDRESS`.
     pub fn enable_offload(&mut self, gpu: &Gpu, in_flight: offload::SharedInFlight) {
         assert!(
             self.act.restored.is_empty(),
             "enable_offload between forward and backward"
         );
-        // The cell gets its own park — its saved set is separate from the FFN's, and
-        // in the mLSTM's case comparable in size — but shares the in-flight slot, so
-        // the whole block still has only one eviction outstanding at a time.
+        // The cell parks separately but shares the in-flight slot, so the block still
+        // has one eviction outstanding at a time.
         self.cell.enable_offload(gpu, in_flight.clone());
         self.act.park = Some(offload::HostPark::new(gpu, in_flight).expect("offload: host park"));
     }
 
-    /// Release the saved FFN activations without reading them.
-    ///
-    /// For a stack that **re-forwards instead of unwinding** — the encoder, which runs
-    /// its forward once per length group and then, in backward, re-runs each group's
-    /// forward to rebuild that group's cache (activation checkpointing; see
-    /// `Hierarchical::forward_backward`). Every group but the last therefore leaves
-    /// buffers nothing will ever read, and because [`Buf`] reuses by capacity they
-    /// settle at the largest group's size and stay resident for the whole step.
-    ///
-    /// Release saved scratch far larger than a `rows`-row window needs.
-    ///
-    /// Call at a window boundary. Window sizes vary across a corpus and [`Buf`]
-    /// reuses by capacity, so without this every buffer ratchets to the
-    /// largest window ever seen: measured on the real `hg` path at
-    /// `WORDS_PER_SEQ = 2048`, device memory climbed monotonically window over window
-    /// — 10.4 GB, 13.4, 15.9, 16.6 — until it aborted. Nothing about the *steady*
-    /// footprint was the problem.
+    /// Drop pooled scratch far larger than a `rows`-row window needs. Call at a window
+    /// boundary: [`Buf`] reuses by capacity, so otherwise every buffer ratchets to the
+    /// largest window ever seen (10.4, 13.4, 15.9, 16.6 GB, then abort).
     pub fn trim_to(&mut self, rows: usize) {
         self.cell.trim_to(rows);
     }
 
-    /// Modest in absolute terms — the encoder runs at `CHAR_HIDDEN`, an order of
-    /// magnitude narrower than the backbone — but these activations are garbage by
-    /// construction, and nothing should hold garbage across a step.
+    /// Drop what a chunked sweep accumulates outside the cell, so an abandoned sweep
+    /// does not leave it to grow across windows.
+    fn drop_chunk_caches(&mut self) {
+        self.act.chunk_saved.clear();
+        self.seq.clear();
+        self.fwd_chunks = 0;
+    }
+
+    /// Release the saved activations unread, for a stack that re-forwards instead of
+    /// unwinding: the encoder rebuilds each group's cache in backward.
     pub fn drop_saved_act(&mut self) {
         let a = &mut self.act;
         for b in [
-            &mut a.xn1,
+            &mut a.norm1_out,
             &mut a.cell_out,
             &mut a.gate_pre,
             &mut a.gate_act,
             &mut a.value,
-            &mut a.mixed,
         ] {
             b.clear();
         }
-        a.zn.clear();
+        a.norm2_out.clear();
+        a.mixed.clear();
         a.restored.clear();
-        // These caches are being abandoned, not consumed, so the bookkeeping that
-        // tracks what is owed a backward goes with them — otherwise a stack that
-        // re-forwards per group (the encoder) accumulates shapes it will never pop.
+        // Abandoned, not consumed, so what tracks the debt goes too — otherwise the
+        // encoder accumulates shapes nothing will ever pop.
         a.chunk_saved.clear();
         self.seq.clear();
         self.fwd_chunks = 0;
@@ -728,30 +663,26 @@ impl<C: Cell> Block<C> {
             act += a;
         }
         let a = &self.act;
-        act += a.xn1.retained_bytes()
+        act += a.norm1_out.retained_bytes()
             + a.cell_out.retained_bytes()
             + a.gate_pre.retained_bytes()
             + a.gate_act.retained_bytes()
             + a.value.retained_bytes()
-            + a.zn.retained_bytes()
+            + a.norm2_out.retained_bytes()
             + a.mixed.retained_bytes();
         (params, act)
     }
 
-    /// Retained activation bytes broken out by owner, for the memory audit:
-    /// `(ffn_bufs, norms, projections, cell)`.
-    ///
-    /// The split matters because only the first is reachable from
-    /// [`drop_saved_act`](Self::drop_saved_act) + [`trim_to`](Self::trim_to); the last
-    /// three are held inside the sub-layers and survive both.
+    /// Retained activation bytes by owner: `(ffn_bufs, norms, projections, cell)`.
+    /// Only the first is reachable from `drop_saved_act` + `trim_to`.
     pub fn act_breakdown(&self) -> [usize; 4] {
         let a = &self.act;
-        let saved = a.xn1.retained_bytes()
+        let saved = a.norm1_out.retained_bytes()
             + a.cell_out.retained_bytes()
             + a.gate_pre.retained_bytes()
             + a.gate_act.retained_bytes()
             + a.value.retained_bytes()
-            + a.zn.retained_bytes()
+            + a.norm2_out.retained_bytes()
             + a.mixed.retained_bytes();
         let norms: usize = [&self.pre_norm1, &self.pre_norm2]
             .iter()
@@ -764,19 +695,11 @@ impl<C: Cell> Block<C> {
         [saved, norms, proj, self.cell.retained_bytes().1]
     }
 
-    /// Release every activation this block holds, everywhere — the FFN buffers and
-    /// pool, the cell's caches, and the saved inputs and narrowed activations inside
-    /// the norms and projections. The projections' cached bf16 *weights* stay: they
-    /// are parameter-sized, so they are not what a rectangle grows.
-    ///
-    /// [`drop_saved_act`](Self::drop_saved_act) deliberately keeps the last group; this
-    /// does not. For a window boundary, not the hot path.
+    /// Release every activation
     pub fn drop_all_act(&mut self, gpu: &Gpu) {
         self.drop_saved_act();
-        // The pool is NOT emptied here — see `MLstm::drop_all_act`. It is this block's
-        // scratch working set, re-taken in full on the next call, and dropping it at a
-        // group boundary puts the allocator back on the hot path. `trim_to` at the
-        // window boundary is what sizes it.
+        // The pool is NOT emptied (see `MLstm::drop_all_act`): dropping scratch per
+        // group puts the allocator on the hot path. `trim_to` sizes it per window.
         self.pre_norm1.drop_saved_act();
         self.pre_norm2.drop_saved_act();
         for l in [&mut self.lin_gate, &mut self.lin_value, &mut self.lin_down] {
@@ -786,27 +709,22 @@ impl<C: Cell> Block<C> {
         self.cell.drop_all_act(gpu);
     }
 
-    /// Pinned host bytes held by this block's park and its cell's — the parked
-    /// generations plus the recycled spare slots. Diagnostic: a forward whose backward
-    /// never came shows up here as growth window after window.
+    /// Pinned host bytes held by this block's park and its cell's. Diagnostic: a
+    /// forward whose backward never came shows up as growth window after window.
     pub fn parked_host_bytes(&self) -> usize {
         self.act.park.as_ref().map_or(0, |p| p.host_bytes()) + self.cell.parked_host_bytes()
     }
 
-    /// Drop host generations left over from a forward whose backward never came, so
-    /// they do not accumulate across windows. No-op unless offload is on and a sweep
-    /// was abandoned.
+    /// Drop host generations left by a forward whose backward never came, so they do
+    /// not accumulate across windows.
     fn discard_parked(&mut self) {
         if let Some(park) = &mut self.act.park {
             park.discard_all();
         }
     }
 
-    /// Turn offload back off, discarding whatever is parked.
-    ///
-    /// Used by a forward-only pass — parking buys nothing when no backward will read
-    /// it back — and by the parity test, which runs both paths in one process (the
-    /// `GPU_NO_OFFLOAD` env gate resolves once and cannot be flipped).
+    /// Turn offload back off, discarding whatever is parked. For a forward-only pass,
+    /// and for the parity test, which runs both paths in one process.
     pub fn disable_offload(&mut self) {
         assert!(
             self.act.restored.is_empty(),
@@ -822,15 +740,29 @@ impl BlockSaved {
     /// Move the saved activations out of wherever forward left them.
     fn take(act: &mut Act) -> Self {
         if act.restored.is_empty() {
-            let take = |b: &mut Buf, what: &str| b.take().expect(what);
             Self {
-                xn1: take(&mut act.xn1, "forward before backward: xn1"),
-                cell_out: take(&mut act.cell_out, "forward before backward: cell_out"),
-                gate_pre: take(&mut act.gate_pre, "forward before backward: gate_pre"),
-                gate_act: take(&mut act.gate_act, "forward before backward: gate_act"),
-                value: take(&mut act.value, "forward before backward: value"),
-                zn: act.zn.take().expect("forward before backward: zn"),
-                mixed: take(&mut act.mixed, "forward before backward: mixed"),
+                norm1_out: act
+                    .norm1_out
+                    .take()
+                    .expect("forward before backward: norm1_out"),
+                cell_out: act
+                    .cell_out
+                    .take()
+                    .expect("forward before backward: cell_out"),
+                gate_pre: act
+                    .gate_pre
+                    .take()
+                    .expect("forward before backward: gate_pre"),
+                gate_act: act
+                    .gate_act
+                    .take()
+                    .expect("forward before backward: gate_act"),
+                value: act.value.take().expect("forward before backward: value"),
+                norm2_out: act
+                    .norm2_out
+                    .take()
+                    .expect("forward before backward: norm2_out"),
+                mixed: act.mixed.take().expect("forward before backward: mixed"),
                 owned: true,
             }
         } else {
@@ -839,38 +771,35 @@ impl BlockSaved {
                 7,
                 "Block::backward — restored buffer count"
             );
-            // All but `zn` are fp32, so each comes back as `Parked::F32`; `f32()`
-            // panics if the park ever hands one back at the wrong width. `zn` rides at
-            // the slab width and converts back to whichever it was written at.
+            // `f32()` panics if the park hands one back at the wrong width; `norm2_out` and
+            // `mixed` convert back to whichever width they were written at.
             let mut it = act.restored.drain(..);
             let mut next = |what: &str| it.next().expect(what);
             Self {
-                xn1: next("restored xn1").f32(),
+                norm1_out: next("restored norm1_out").f32(),
                 cell_out: next("restored cell_out").f32(),
                 gate_pre: next("restored gate_pre").f32(),
                 gate_act: next("restored gate_act").f32(),
                 value: next("restored value").f32(),
-                zn: next("restored zn").into(),
-                mixed: next("restored mixed").f32(),
+                norm2_out: next("restored norm2_out").into(),
+                mixed: next("restored mixed").into(),
                 owned: false,
             }
         }
     }
 
-    /// Return the buffers to their owned slots, so the next forward reuses the same
-    /// allocations. On the offload path there is nothing to return — the tensors were
-    /// allocated by `restore` and are dropped here, which is what frees the device
-    /// memory again.
+    /// Back to the owned slots for the next forward to reuse. Under offload there is
+    /// nothing to return, and dropping them here frees the device memory.
     fn put_back(self, act: &mut Act) {
         if !self.owned {
             return;
         }
-        act.xn1.put(self.xn1);
+        act.norm1_out.put(self.norm1_out);
         act.cell_out.put(self.cell_out);
         act.gate_pre.put(self.gate_pre);
         act.gate_act.put(self.gate_act);
         act.value.put(self.value);
-        act.zn.put(self.zn);
+        act.norm2_out.put(self.norm2_out);
         act.mixed.put(self.mixed);
     }
 }
@@ -899,13 +828,9 @@ impl<C: Cell> Block<C> {
         }
     }
 
-    /// Assemble around a cell, taking the surrounding norms/projections from a
-    /// CPU block (the cell is uploaded by the caller). Shared by the `from_cpu`
-    /// constructors below.
-    fn from_cpu_parts<D>(gpu: &Gpu, cpu: &crate::nn2::Block<D>, cell: C) -> Self
-    where
-        D: crate::nn2::block::Cell,
-    {
+    /// Assemble around a cell, with the surrounding norms/projections from a CPU block
+    /// (the caller uploads the cell). Shared by the `from_cpu` constructors.
+    fn from_cpu_parts<D: nn2::block::Cell>(gpu: &Gpu, cpu: &nn2::Block<D>, cell: C) -> Self {
         Self {
             hidden: cpu.hidden,
             up: cpu.up,
@@ -922,10 +847,8 @@ impl<C: Cell> Block<C> {
         }
     }
 
-    /// Forward over `[B, T, H]` → `out` `[B, T, H]`.
-    /// `input` and `out` must not alias: the input is read straight from the caller's buffer
-    /// rather than copied, so writing the output over it would corrupt the residual.
-    /// Every caller ping-pongs a pair, which satisfies this.
+    /// Forward over `[B, T, H]` → `out` `[B, T, H]`. They must not alias: `input` is
+    /// read from the caller's buffer, so writing `out` over it corrupts the residual.
     pub fn forward(
         &mut self,
         gpu: &Gpu,
@@ -937,39 +860,17 @@ impl<C: Cell> Block<C> {
         let (b, t, h) = (input.shape[0], input.shape[1], input.shape[2]);
         assert_eq!(h, self.hidden, "Block::forward — hidden mismatch");
         assert_eq!(out.dims(), input.dims(), "Block::forward — output shape");
+
         let (n, u) = (b * t, self.up);
         self.seq.push((b, t));
-        // Whole-block span; `glue` is this minus the cell and FFN spans, i.e. the
-        // norms, residual adds and buffer copies that are neither.
-        let blk_t0 = phase::enabled().then(|| {
-            gpu.stream.synchronize().expect("sync");
-            (
-                std::time::Instant::now(),
-                phase::get(self.cell.phase_buckets().0),
-                phase::get(phase::Bucket::FfnFwd),
-            )
-        });
-        // Release the previous block's evicted buffers BEFORE allocating this block's.
-        //
-        // The order matters and is not obvious: eviction leaves the source tensors
-        // alive until their D2H lands, and freeing them returns that memory to the
-        // CUDA allocator. If this block allocated first, the allocator could hand back
-        // memory a live DMA was still reading — an illegal access that only appears
-        // asynchronously (it vanishes under CUDA_LAUNCH_BLOCKING=1, which is how it
-        // was diagnosed). Releasing first means any memory the allocator reuses here
-        // is already drained.
-        //
-        // The release is an event on the compute stream, not a host wait: the free is
-        // itself stream-ordered, so ordering the stream suffices and the transfer
-        // still overlaps this block's compute.
+        // Release BEFORE allocating: the other order can hand this block memory a live
+        // D2H is still reading. It is a stream event, not a host wait, so nothing stalls.
         if let Some(park) = &self.act.park {
             park.release_previous();
         }
         let a = &mut self.act;
-        // Chunked sweep without offload: the previous chunk's FFN activations are still
-        // owed a backward, so move them aside before the `Buf` slots below overwrite
-        // them. With offload on, the park already holds a generation per chunk and the
-        // slots are empty here.
+        // Chunked, no offload: the previous chunk is still owed a backward, so move it
+        // aside before the slots below overwrite it. Under offload the park has it.
         if self.carry && a.park.is_none() && self.fwd_chunks > 0 {
             let prev = BlockSaved::take(a);
             a.chunk_saved.push(prev);
@@ -978,55 +879,50 @@ impl<C: Cell> Block<C> {
             self.fwd_chunks += 1;
         }
 
-        // The input seen as [N, H]: it feeds both the norm path and the residual, and
-        // neither writes to it. A view rather than a pooled copy — the storage stays
-        // the caller's, so this must not outlive `input` and must not go back to the pool.
+        // The input as [N, H]. A view, not a pooled copy: the storage stays the
+        // caller's, so it must not outlive `input` nor go back to the pool.
         let x_flat = GTensor::view(gpu, &input.buf, 0, &[n, h]);
 
-        // Residual 1: z = input + cell(pre_norm1(input)). The cell's output is already
-        // normalized — each kind does it its own way, inside itself.
-        //
-        // Both intermediates go to owned slots rather than the pool: each is the OUTPUT
-        // of a norm whose backward needs it (pre_norm1's own, and the post-norm inside
-        // the cell), which is what lets those two norms save only `inv_rms`.
-        let Act { xn1, cell_out, .. } = a;
-        let xn1 = xn1.get(gpu, &[b, t, h]);
-        self.pre_norm1.forward(gpu, &x_flat, xn1);
+        // Residual 1: z = input + cell(pre_norm1(input)). Both intermediates are owned,
+        // not pooled: each is a norm's output, which is all that norm's backward saves.
+        let Act {
+            norm1_out,
+            cell_out,
+            ..
+        } = a;
+        let norm1_out = norm1_out.get(gpu, &[b, t, h]);
+        self.pre_norm1.forward(gpu, &x_flat, norm1_out);
         let cell_out = cell_out.get(gpu, &[b, t, h]);
         let (cf, _cb) = self.cell.phase_buckets();
-        phase::timed(gpu, cf, || self.cell.forward(gpu, xn1, cell_out, cache));
+        phase::timed(gpu, cf, || {
+            self.cell.forward(gpu, norm1_out, cell_out, cache)
+        });
 
         // Downstream is position-wise [N, H].
         cell_out.reshape_to(&[n, h]);
         let mut z = cache.temps.get::<f32>(gpu, &[n, h]);
         ops::add_into(gpu, &x_flat, a.cell_out.expect("cell wrote it"), &mut z);
 
-        // Residual 2: out = z + SwiGLU(pre_norm2(z)). The three SwiGLU operands are
-        // the only values backward needs, so they alone go to permanent buffers.
-        //
-        // `zn` and `mixed` are owned here rather than pooled, because backward reads
-        // them as the saved inputs of the three projections. Keeping them once in the
-        // block beats `Linear::forward` saving its own copy: `lin_gate` and
-        // `lin_value` share `zn`, so that path would hold it twice (4 MB per block at
-        // the backbone's shape, 64 MB across 16 blocks) for one tensor.
-        self.pre_norm2.forward_slab(gpu, &z, a.zn.get(gpu, &[n, h]));
-        // The saved buffers are disjoint `Buf` slots, but each `get`/`expect` borrows
-        // `a` as a whole — so take the handles apart once, up front.
+        // Residual 2: out = z + SwiGLU(pre_norm2(z)). `norm2_out` is kept once here because
+        // `lin_gate` and `lin_value` share it — a copy each is 64 MB over the backbone.
+        self.pre_norm2
+            .forward_slab(gpu, &z, a.norm2_out.get(gpu, &[n, h]));
+        // The slots are disjoint but each `get` borrows `a` whole, so split them once.
         let Act {
-            zn,
+            norm2_out,
             gate_pre,
             gate_act,
             value,
             mixed,
             ..
         } = a;
-        let zn = zn.expect("normalized");
+        let norm2_out = norm2_out.expect("normalized");
         phase::timed(gpu, phase::Bucket::FfnFwd, || {
             self.lin_gate
-                .forward_slab_lhs(gpu, zn, gate_pre.get(gpu, &[n, u]));
+                .forward_slab_lhs(gpu, norm2_out, gate_pre.get(gpu, &[n, u]));
             self.lin_value
-                .forward_slab_lhs(gpu, zn, value.get(gpu, &[n, u]));
-            ops::swiglu_forward_into(
+                .forward_slab_lhs(gpu, norm2_out, value.get(gpu, &[n, u]));
+            ops::swiglu_forward_slab(
                 gpu,
                 gate_pre.expect("projected"),
                 value.expect("projected"),
@@ -1034,89 +930,61 @@ impl<C: Cell> Block<C> {
                 mixed.get(gpu, &[n, u]),
             );
             // `out = z + down(mixed)`: the residual rides in `lin_down`'s bias seed, so
-            // there is no separate add and no `down` buffer to hold its output.
+            // there is no separate add and no buffer for `down`'s output.
             out.reshape_to(&[n, h]);
             self.lin_down
-                .forward_shared_resid(gpu, mixed.expect("mixed"), &z, out);
+                .forward_slab_lhs_resid(gpu, mixed.expect("mixed"), &z, out);
         });
         out.reshape_to(&[b, t, h]);
         drop(z);
-        // With offload on, this block's saved activations go to the host now and the
-        // device buffers are released. Backward restores them (see `restore_act`).
+        // Under offload the saved activations go to the host here; backward restores.
         self.evict_act(gpu);
-        if let Some((t0, cell0, ffn0)) = blk_t0 {
-            gpu.stream.synchronize().expect("sync");
-            let total = t0.elapsed().as_nanos() as u64;
-            let inner = (phase::get(self.cell.phase_buckets().0) - cell0)
-                + (phase::get(phase::Bucket::FfnFwd) - ffn0);
-            phase::add(phase::Bucket::GlueFwd, total.saturating_sub(inner));
-        }
     }
 
-    /// Send this block's saved FFN activations to host memory. No-op unless offload is
-    /// enabled.
-    ///
-    /// Called at the end of forward. The five buffers are dead to the device until
-    /// backward reaches this block, which in the backbone's block-major sweep is a
-    /// whole forward-and-partial-backward away.
-    ///
-    /// The device tensors are not freed here — they are handed to the shared in-flight
-    /// slot, and the *next* block's eviction releases them once the copy has landed.
-    /// See [`InFlight`](super::offload::InFlight) for why the reclaim has to be one
-    /// block behind rather than immediate.
+    /// Send the saved FFN activations to the host, at the end of forward. They are not
+    /// freed here but drained by the *next* eviction — see `offload::InFlight`.
     fn evict_act(&mut self, gpu: &Gpu) {
         let Act {
             park,
-            xn1,
+            norm1_out,
             cell_out,
             gate_pre,
             gate_act,
             value,
-            zn,
+            norm2_out,
             mixed,
             ..
         } = &mut self.act;
         let Some(park) = park else { return };
-        // Hand the device tensors to the park rather than copying and freeing them
-        // here. It holds them until its D2H has landed, so the copy overlaps the next
-        // block's compute instead of blocking on this one — waiting here costs the
-        // entire transfer time (measured: +24% on a step, the un-overlapped total).
+        // Hand the tensors over rather than freeing them: the park holds them until
+        // its D2H lands. Waiting here instead costs +24% on a step.
         let take = |b: &mut Buf, what: &str| offload::Parked::from(b.take().expect(what));
         park.evict(
             gpu,
             vec![
-                take(xn1, "forward filled xn1"),
+                take(norm1_out, "forward filled norm1_out"),
                 take(cell_out, "forward filled cell_out"),
                 take(gate_pre, "forward filled gate_pre"),
                 take(gate_act, "forward filled gate_act"),
                 take(value, "forward filled value"),
-                offload::Parked::from(zn.take().expect("forward filled zn")),
-                take(mixed, "forward filled mixed"),
+                offload::Parked::from(norm2_out.take().expect("forward filled norm2_out")),
+                offload::Parked::from(mixed.take().expect("forward filled mixed")),
             ],
         );
     }
 
-    /// Start this block's parked activations on their way back to the device.
-    ///
-    /// The caller runs this one block ahead of the block whose backward it belongs to,
-    /// so the upload overlaps that block's compute. Without it, `restore_act` issues
-    /// the copy and immediately waits — the transfer is fully exposed, which measured
-    /// as +37 ms of "block glue" against ~32 ms of raw transfer, i.e. no overlap.
+    /// Start the parked activations back to the device, one block ahead of the backward
+    /// that reads them. Without it `restore_act` issues the copy and waits: +37 ms.
     pub fn prefetch_act(&mut self, gpu: &Gpu) {
-        // Backward reads the FFN's activations first and the cell's after, so they are
-        // issued in that order — the transfer stream serves them FIFO.
+        // The transfer stream is FIFO, so issue in the order backward reads them.
         if let Some(park) = &mut self.act.park {
             park.prefetch(gpu);
         }
         self.cell.prefetch_act(gpu);
     }
 
-    /// Bring the parked activations back, in the order `evict_act` sent them.
-    ///
-    /// Returns them rather than refilling the `Buf`s: they are consumed once, within
-    /// this backward, and putting them back in the owned slots would keep the device
-    /// memory alive until the next forward overwrote it — exactly what parking exists
-    /// to avoid.
+    /// Bring the parked activations back, in the order `evict_act` sent them. Returned
+    /// rather than put back in the slots, which would keep the device memory alive.
     fn restore_act(&mut self, gpu: &Gpu) {
         let Act { park, restored, .. } = &mut self.act;
         let Some(park) = park else { return };
@@ -1136,30 +1004,17 @@ impl<C: Cell> Block<C> {
         let (h, u) = (self.hidden, self.up);
         let n = b * t;
         assert_eq!(dx.dims(), [b, t, h], "Block::backward — dx shape");
-        let blk_t0 = phase::enabled().then(|| {
-            gpu.stream.synchronize().expect("sync");
-            (
-                std::time::Instant::now(),
-                phase::get(self.cell.phase_buckets().1),
-                phase::get(phase::Bucket::FfnBwd),
-            )
-        });
-        // With offload on, this block's activations come back from the host now, into
-        // `self.restored`. The H2D copies are issued on the transfer stream and waited
-        // for on the compute stream, so they overlap whatever the previous block's
-        // backward is still finishing.
+        // Under offload the activations come back into `self.restored`, H2D on the
+        // transfer stream, so the copy overlaps the previous block's backward.
         self.restore_act(gpu);
-        // Take the saved set out of `self` entirely for the duration of this call, so
-        // the `Linear`s and the pool below can be borrowed mutably alongside it. The
-        // buffers are returned to their slots at the end (`BlockSaved::put_back`), which
-        // for the offload path means simply dropping them.
+        // Out of `self` for the whole call, so the `Linear`s and the pool stay mutably
+        // borrowable; `put_back` at the end returns them (or, under offload, drops them).
         let saved = BlockSaved::take(&mut self.act);
         self.fwd_chunks = self.fwd_chunks.saturating_sub(1);
         let a = &mut self.act;
 
-        // Owned [N, H]: read by lin_down.backward and again by the d_z residual.
-        // Read-only view of the incoming delta as [N, H], the counterpart of `x_flat`
-        // in the forward: nothing writes to it, so it needs no pooled copy.
+        // The incoming delta as [N, H], the counterpart of `x_flat`: read by
+        // lin_down's backward and again by the d_z residual, never written.
         let dy_flat = GTensor::view(gpu, &dy.buf, 0, &[n, h]);
 
         // Residual 2.
@@ -1169,7 +1024,7 @@ impl<C: Cell> Block<C> {
             std::time::Instant::now()
         });
         self.lin_down
-            .backward_with_x(gpu, &saved.mixed, &dy_flat, &mut d_mixed, cache);
+            .backward_slab_x(gpu, &saved.mixed, &dy_flat, &mut d_mixed, cache);
         let mut d_gate = cache.temps.get::<f32>(gpu, &[n, u]);
         let mut d_value = cache.temps.get::<f32>(gpu, &[n, u]);
         ops::swiglu_backward_into(
@@ -1182,76 +1037,63 @@ impl<C: Cell> Block<C> {
             &mut d_value,
         );
         drop(d_mixed);
-        // Both projections read the one saved `zn`, which the forward already wrote at
-        // the width their GEMMs want — so neither narrows anything here.
-        let mut d_zn_g = cache.temps.get::<f32>(gpu, &[n, h]);
-        let mut d_zn_v = cache.temps.get::<f32>(gpu, &[n, h]);
+        // Forward wrote `norm2_out` at the width both GEMMs want, so neither narrows here.
+        let mut d_norm2_out_g = cache.temps.get::<f32>(gpu, &[n, h]);
+        let mut d_norm2_out_v = cache.temps.get::<f32>(gpu, &[n, h]);
         self.lin_gate
-            .backward_slab_x(gpu, &saved.zn, &d_gate, &mut d_zn_g, cache);
+            .backward_slab_x(gpu, &saved.norm2_out, &d_gate, &mut d_norm2_out_g, cache);
         self.lin_value
-            .backward_slab_x(gpu, &saved.zn, &d_value, &mut d_zn_v, cache);
-        let mut d_zn = cache.temps.get::<f32>(gpu, &[n, h]);
-        ops::add_into(gpu, &d_zn_g, &d_zn_v, &mut d_zn);
+            .backward_slab_x(gpu, &saved.norm2_out, &d_value, &mut d_norm2_out_v, cache);
+        let mut d_norm2_out = cache.temps.get::<f32>(gpu, &[n, h]);
+        ops::add_into(gpu, &d_norm2_out_g, &d_norm2_out_v, &mut d_norm2_out);
         if let Some(t0) = ffn_t0 {
             gpu.stream.synchronize().expect("sync");
             phase::add(phase::Bucket::FfnBwd, t0.elapsed().as_nanos() as u64);
         }
-        drop((d_gate, d_value, d_zn_g, d_zn_v));
+        drop((d_gate, d_value, d_norm2_out_g, d_norm2_out_v));
 
-        // z feeds pre_norm2 (the MLP path) and the y = z + down residual, so the
-        // norm's dx and the incoming dy sum into d_z. `d_z_mlp` is separate because
-        // `add_into`'s destination must not be one of its operands.
+        // z feeds pre_norm2 and the y = z + down residual, so the norm's dx and the
+        // incoming dy sum into d_z. `add_into`'s destination may not be an operand.
         let mut d_z_mlp = cache.temps.get::<f32>(gpu, &[n, h]);
-        // `zn` is pre_norm2's own output — see `RmsNorm::backward`.
-        self.pre_norm2.backward_slab(gpu, &d_zn, &saved.zn, &mut d_z_mlp, cache);
+        // `norm2_out` is pre_norm2's own output — see `RmsNorm::backward`.
+        self.pre_norm2
+            .backward_slab(gpu, &d_norm2_out, &saved.norm2_out, &mut d_z_mlp, cache);
         let mut d_z = cache.temps.get::<f32>(gpu, &[n, h]);
         ops::add_into(gpu, &d_z_mlp, &dy_flat, &mut d_z);
-        drop((d_zn, d_z_mlp));
+        drop((d_norm2_out, d_z_mlp));
 
-        // Residual 1. Both cells read their `dy` and never write it, so d_z goes in
-        // as a `[B, T, H]` view — the dx residual below still needs it as `[N, H]`.
+        // Residual 1. Neither cell writes its `dy`, so d_z goes in as a `[B, T, H]`
+        // view — the dx residual below still needs it as `[N, H]`.
         let d_cell_out = GTensor::view(gpu, &d_z.buf, 0, &[b, t, h]);
         let mut d_cell_in = cache.temps.get::<f32>(gpu, &[b, t, h]);
         let (_cf, cb) = self.cell.phase_buckets();
         phase::timed(gpu, cb, || {
-            self.cell
-                .backward(
-                    gpu,
-                    &saved.xn1,
-                    &saved.cell_out,
-                    &d_cell_out,
-                    &mut d_cell_in,
-                    cache,
-                )
+            self.cell.backward(
+                gpu,
+                &saved.norm1_out,
+                &saved.cell_out,
+                &d_cell_out,
+                &mut d_cell_in,
+                cache,
+            )
         });
         drop(d_cell_out);
         d_cell_in.reshape_to(&[n, h]);
-        let mut d_xn1 = cache.temps.get::<f32>(gpu, &[n, h]);
+        let mut d_norm1_out = cache.temps.get::<f32>(gpu, &[n, h]);
         self.pre_norm1
-            .backward(gpu, &d_cell_in, &saved.xn1, &mut d_xn1, cache);
+            .backward(gpu, &d_cell_in, &saved.norm1_out, &mut d_norm1_out, cache);
         // x feeds pre_norm1 (cell path) and the z = x + cn residual.
         dx.reshape_to(&[n, h]);
-        ops::add_into(gpu, &d_xn1, &d_z, dx);
+        ops::add_into(gpu, &d_norm1_out, &d_z, dx);
         dx.reshape_to(&[b, t, h]);
-        drop((d_cell_in, d_xn1, d_z));
-        // Give the saved buffers back to their owned slots so the next forward reuses
-        // the allocations. On the offload path this drops them instead, which is what
-        // releases the restored device memory again.
+        drop((d_cell_in, d_norm1_out, d_z));
+        // Back to the owned slots for the next forward; under offload this drops them,
+        // which is what releases the restored device memory.
         saved.put_back(a);
-        // Chunked sweep: the slots now hold the chunk just unwound, which nothing will
-        // read again. Replace them with the chunk to its left — the next to unwind —
-        // so `BlockSaved::take` finds that chunk's own activations. The allocations the
-        // line above returned are dropped here, releasing them a chunk earlier than
-        // the next forward would.
+        // Chunked: replace the chunk just unwound with the one to its left, so the next
+        // `take` finds it — and release the one above a chunk earlier.
         if let Some(prev) = a.chunk_saved.pop() {
             prev.put_back(a);
-        }
-        if let Some((t0, cell0, ffn0)) = blk_t0 {
-            gpu.stream.synchronize().expect("sync");
-            let total = t0.elapsed().as_nanos() as u64;
-            let inner = (phase::get(self.cell.phase_buckets().1) - cell0)
-                + (phase::get(phase::Bucket::FfnBwd) - ffn0);
-            phase::add(phase::Bucket::GlueBwd, total.saturating_sub(inner));
         }
     }
 
@@ -1267,9 +1109,8 @@ impl<C: Cell> Block<C> {
         v
     }
 
-    /// Export the block into the matching CPU `nn` block for a `HIER` checkpoint.
-    /// Downloads every surrounding norm/projection, then lets the cell assemble
-    /// the concrete `SLSTMBlock` / `MLSTMBlock`.
+    /// Export into the matching CPU `nn` block for a `HIER` checkpoint: downloads the
+    /// norms/projections, then lets the cell assemble the concrete block.
     pub fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn crate::nn_layer::NnLayer> {
         use super::{dt_matrix, dt_vec};
         let (h, u) = (self.hidden, self.up);
@@ -1381,19 +1222,9 @@ mod tests {
     use crate::nn2::optim::AdamCfg;
     use crate::tensor::Tensor;
 
-    /// Compare with an absolute floor plus a term scaled by the tensor's magnitude.
-    ///
-    /// The scale term is `rel * max|want|`, **not** `rel * |want[i]|`. bf16 slab
-    /// storage perturbs each saved `zt`/`ot` by ~2^-8 of *its own* magnitude, but
-    /// `dx[i]` is a sum over many such terms, so what lands on any one element is an
-    /// absolute error set by the size of the whole tensor. An individual `dx[i]` that
-    /// comes out small does so by cancellation between larger terms — its error does
-    /// not shrink with it, and measured runs show ~0.006-0.027 absolute spread
-    /// roughly evenly whether the element is 0.09 or 4.6.
-    ///
-    /// A per-element relative bound therefore fails on exactly the elements where the
-    /// physics says it should: the near-zero ones. On the fp32 path `rel` is 0 and
-    /// this reduces to the original absolute check.
+    /// Absolute floor plus `rel * max|want|` — scaled by the whole tensor, **not** per
+    /// element: `dx[i]` sums many bf16-perturbed terms, so a small element (one made
+    /// small by cancellation) carries the same absolute error as a large one.
     fn assert_close_rel(got: &[f32], want: &[f32], abs: f32, rel: f32, what: &str) {
         assert_eq!(got.len(), want.len(), "{what}: length mismatch");
         let scale = want.iter().fold(0.0, |m: f32, w| m.max(w.abs()));
@@ -1411,21 +1242,8 @@ mod tests {
         assert_close_rel(got, want, tol, 0.0, what);
     }
 
-    /// Relative tolerance term for GPU-vs-CPU comparisons: bf16's half-ulp bound
-    /// when the sLSTM's saved slabs are stored narrow, zero on the fp32 path.
-    ///
-    /// The CPU reference is all-fp32, so with bf16 slabs the gap is one quantization
-    /// of `zt`/`ot` propagated through the block — bounded in relative terms, which
-    /// is why it belongs here rather than in the absolute tolerance. The dangerous
-    /// failure mode (error *growing* with sequence length) is pinned separately by
-    /// `gpu::slstm::tests::bf16_slab_error_does_not_compound_with_t`.
-    /// Relative term for a parameter compared AFTER an Adam step.
-    ///
-    /// Larger than [`rel`] on purpose. Adam's `lr·ĝ/(√v̂+ε)` is scale-invariant in
-    /// the gradient, so a weight whose gradient is near zero has its bf16-sized
-    /// difference divided by an equally small √v̂ — a ~1e-7 wobble lands as ~1e-4 on
-    /// the weight. Reusing the activation tolerance here leaves a bound that passes
-    /// in isolation and fails on roughly one full-suite run in five.
+    /// Tolerance for a parameter compared AFTER an Adam step, wider than [`rel`]: the
+    /// update divides by √v̂, so on a near-zero gradient a 1e-7 wobble lands as 1e-4.
     fn step_rel(gpu: &Gpu) -> f32 {
         if ops::gemm_bf16_enabled(gpu) || gpu.kernels.slab_bf16 {
             5e-2
@@ -1434,18 +1252,10 @@ mod tests {
         }
     }
 
+    /// Tolerance against the all-fp32 CPU reference, 0 on the fp32 path. Three bf16
+    /// sources chain here, so it is a small multiple of one quantization: the worst
+    /// element over ten runs was 0.0110. Growth with T is pinned in `gpu::slstm`.
     fn rel(gpu: &Gpu) -> f32 {
-        // Three independent bf16 sources, not one: the saved slabs, the projections'
-        // GEMM operands, and the sLSTM's own whole-sequence GEMMs (`x·Wx`, `dg·Wxᵀ`,
-        // `xᵀ·dg`, also `ops::GemmBf16`). A block chains several matmuls, each
-        // contributing ~2^-8 relative on its own operands, so the budget against an
-        // all-fp32 CPU reference is a small multiple of the single-quantization bound
-        // rather than exactly it.
-        //
-        // 1e-2 was calibrated before the sLSTM GEMMs joined and sat right on the
-        // measured maximum, so it failed roughly one run in three. Ten runs of the
-        // worst element: `y` peaks at 0.0094, `dx` at 0.0110 — the error is bounded and
-        // does not grow, the bound simply had no margin. 2e-2 is ~1.8x the observed max.
         if ops::gemm_bf16_enabled(gpu) || gpu.kernels.slab_bf16 {
             2e-2
         } else {
@@ -1514,9 +1324,7 @@ mod tests {
     }
 
     /// GPU `Block<MLstm>` (parallel-form cell) must match `nn2::MLstmBlock` (scalar
-    /// recurrence) for forward → backward → AdamW-step from identical parameters.
-    /// This closes Phase C: the block wiring is shared, so it also re-checks that
-    /// the mLSTM cell composes correctly inside the two residuals.
+    /// recurrence) for forward → backward → AdamW step from identical parameters.
     #[test]
     fn mlstm_block_matches_cpu() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -1569,15 +1377,9 @@ mod tests {
         );
     }
 
-    /// Parking the FFN activations on the host must not change a single bit.
-    ///
-    /// Offload only moves bytes — it reorders no arithmetic and renormalizes nothing —
-    /// so this is **exact** equality on the output, every gradient, and the weights
-    /// after a step. A tolerance here would hide precisely the bugs that matter: a
-    /// stale buffer, a chunk restored out of order, a missing cross-stream event.
-    ///
-    /// Both cell kinds run, because the block's saved set is the same either way but
-    /// the surrounding cell's memory traffic is not.
+    /// Offload moves bytes and reorders no arithmetic, so this is **exact** — a
+    /// tolerance would hide the bugs it exists for (stale buffer, chunk out of order,
+    /// missing event).
     #[test]
     fn offload_matches_resident_exactly() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -1647,12 +1449,8 @@ mod tests {
         );
     }
 
-    /// Several forward/backward cycles on one offloaded block must stay exact.
-    ///
-    /// A single cycle would not catch a park that leaks state across steps — a pinned
-    /// slot reused at the wrong shape, or an event left un-awaited so step `n+1`'s
-    /// eviction races step `n`'s restore. The shapes deliberately change between
-    /// cycles, which is what the real dataset does.
+    /// Several cycles at changing shapes: one cycle misses a park that leaks across
+    /// steps — a slot reused at the wrong shape, or an eviction racing a restore.
     #[test]
     fn offload_is_stable_across_steps_and_shapes() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -1693,13 +1491,8 @@ mod tests {
         }
     }
 
-    /// A **chunked** sLSTM sweep must be bit-exact under offload.
-    ///
-    /// The unchunked tests above never reach the cell's park: it only holds the caches
-    /// a chunked sweep sets aside (`SLstm::chunk_saved`), because the live buffers are
-    /// about to be written again and stay resident. So this is the test
-    /// that actually covers `SLstm::enable_offload` — several chunks forwarded before
-    /// any is unwound, then unwound right to left, which is the backbone's shape.
+    /// A **chunked** sLSTM sweep, bit-exact under offload — the only test that reaches
+    /// the cell's park, which holds only what a chunked sweep sets aside.
     #[test]
     fn slstm_chunked_offload_matches_resident_exactly() {
         let Some(gpu) = super::super::test_gpu() else {

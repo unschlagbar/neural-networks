@@ -84,6 +84,7 @@ const NAMES: &[&str] = &[
     "slstm_step_fused_bwd",
     "add",
     "swiglu_forward",
+    "swiglu_forward_slab",
     "swiglu_backward",
     "scale_inplace",
     "sigmoid_inplace",

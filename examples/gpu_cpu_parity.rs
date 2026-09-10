@@ -39,7 +39,10 @@ fn main() {
     let mut words: Vec<Range<usize>> = Vec::new();
     let mut start = 0;
     for e in segment::word_ends(&tokens) {
-        words.push(Range { start, end: e as usize });
+        words.push(Range {
+            start,
+            end: e as usize,
+        });
         start = e as usize;
     }
     println!("{} tokens, {} words", tokens.len(), words.len());
@@ -50,6 +53,8 @@ fn main() {
     let (cpu_char, cpu_word) = cpu.eval_decode_loss(std::iter::once(WordBatch {
         tokens: &tokens,
         words: words.clone(),
+        continues: false,
+        doc_starts: Vec::new(),
     }));
 
     // GPU: the path the model was trained with.
@@ -63,8 +68,14 @@ fn main() {
     let ids: Vec<usize> = tokens.iter().map(|&t| t as usize).collect();
     let gpu_char = g.eval_loss(&gpu, &ids, &words);
 
-    println!("\nCPU  mean per-token decode CE : {cpu_char:.6}  (ppl {:.4})", cpu_char.exp());
-    println!("GPU  mean per-token decode CE : {gpu_char:.6}  (ppl {:.4})", gpu_char.exp());
+    println!(
+        "\nCPU  mean per-token decode CE : {cpu_char:.6}  (ppl {:.4})",
+        cpu_char.exp()
+    );
+    println!(
+        "GPU  mean per-token decode CE : {gpu_char:.6}  (ppl {:.4})",
+        gpu_char.exp()
+    );
     let rel = (cpu_char - gpu_char).abs() / cpu_char.abs().max(1e-6);
     println!("relative difference           : {:.4}%", 100.0 * rel);
     println!("CPU per-word loss             : {cpu_word:.6}");

@@ -4,65 +4,14 @@
 //! length: step 0's saved tensors must survive until backward unwinds to `t = 0`, so
 //! no reordering of the forward loop frees them. Only moving them off the device — or
 //! recomputing them — changes the scaling.
-//!
-//! An [`OffloadRing`] is the third storage kind, alongside [`buf`](super::buf) and
-//! [`temp`](super::temp):
-//!
-//! | | lives | sized by |
-//! |---|---|---|
-//! | [`TempCache`](super::TempCache) | within one call | a fixed slot count |
-//! | [`Buf`](super::Buf) | across calls, on device | one activation |
-//! | `OffloadRing` | across calls, **on the host** | K timesteps of device staging |
-//!
-//! The device cost of a ring is `2·K` timesteps of staging regardless of `T`; the
-//! full `T` timeline sits in pinned host memory. That is the whole point — device
-//! memory stops growing with `T`.
-//!
-//! # How the overlap works
-//!
-//! Forward writes chunk `i` into one half of the double buffer while the previous
-//! chunk's device→host copy drains from the other half, on a second stream. Backward
-//! runs it in reverse, prefetching chunk `i-1` while compute consumes chunk `i`.
-//! Measured on this machine (`examples/offload_probe.rs`): a 55 MB chunk round-trips
-//! in ~2.6 ms against ~16.5 ms of compute, and ~95% of the transfer hides.
-//!
-//! # Ordering is by hand
-//!
-//! `Gpu::new` calls `disable_event_tracking` (see [`super::Gpu::new`]), so cudarc
-//! places **no** automatic cross-stream ordering. Every handoff between the compute
-//! stream and this module's transfer stream is an explicit [`CudaEvent`]. A missing
-//! event is silent corruption rather than an error, so the two directions are named
-//! and documented individually below, and `ring_roundtrip_survives_contention` pins
-//! them by value under deliberate contention.
-//!
-//! # Pinned host memory
-//!
-//! Host staging is page-locked ([`CudaContext::alloc_pinned`]), which is what makes
-//! the copies async and fast: measured 37.9 GB/s D2H against 1.5 GB/s pageable. Note
-//! that cudarc allocates it **write-combined** — fast for the device to write and
-//! read over PCIe, but slow to read from the CPU. Nothing here reads it on the host,
-//! and nothing should start: the host is only a DMA endpoint.
-//!
-//! # What a "chunk" is
-//!
-//! The ring indexes chunks; it does not care what one contains. The backbone sweeps
-//! **block by block** over the whole sequence (`Hierarchical::forward_backward`
-//! runs block `i` to completion before block `i+1`, and unwinds in reverse), so its
-//! natural chunk is one block's saved activations — written once in forward, read
-//! once in backward, ~15 blocks of compute apart. A per-timestep consumer would
-//! index the same ring by time instead. Both get the same events.
-
-use std::sync::Arc;
 
 use cudarc::driver::{CudaEvent, CudaStream, PinnedHostSlice};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use super::{GTensor, Gpu};
+use crate::gpu::ops::SlabBuf;
 
 /// Where one chunk of a tensor's timeline lives while it is off the device.
-///
-/// One `PinnedHostSlice` per chunk rather than a single slab: the chunks are copied
-/// independently and each copy needs its own completion event, which
-/// `PinnedHostSlice` already carries internally.
 struct HostChunk {
     mem: PinnedHostSlice<f32>,
     /// Elements actually used. The last chunk of a ragged `T` is shorter than the
@@ -72,18 +21,6 @@ struct HostChunk {
 }
 
 /// A set of device tensors with a leading time axis, staged through host memory.
-///
-/// Construct with [`new`](Self::new), then in forward: [`write`](Self::write) each
-/// chunk in order. In backward: [`read`](Self::read) each chunk in reverse. Both
-/// place their own events; the caller never touches the transfer stream.
-///
-/// **Currently exercised only by its own tests.** The offloaded consumer that exists
-/// today — the backbone's FFN — sweeps block by block rather than timestep by
-/// timestep, so it uses [`HostPark`] instead. This is the mechanism for a per-timestep
-/// consumer (the sLSTM's `[·, T, ·]` slabs, the mLSTM's saved fields), which is where
-/// the remaining per-T activation memory lives. Kept rather than deleted because the
-/// hard parts — the double buffer, the four hand-placed events, the ragged last chunk
-/// — are done and tested; see `ring_roundtrip_survives_contention`.
 pub struct OffloadRing {
     /// The full `T` timeline, one entry per chunk, in host memory.
     host: Vec<HostChunk>,
@@ -108,11 +45,6 @@ pub struct OffloadRing {
 
 impl OffloadRing {
     /// A ring for a `[T, per_step]` timeline cut into chunks of `k` timesteps.
-    ///
-    /// Allocates the whole host timeline up front (`T · per_step` floats, pinned) plus
-    /// `2 · k · per_step` floats of device staging. Both are one-time: reuse the ring
-    /// across steps rather than rebuilding it, or the pinned allocation — which is
-    /// expensive, it page-locks — lands on the hot path.
     pub fn new(gpu: &Gpu, t: usize, per_step: usize, k: usize) -> Result<Self, String> {
         assert!(k > 0, "OffloadRing: chunk length must be positive");
         assert!(per_step > 0, "OffloadRing: per-step width must be positive");
@@ -172,11 +104,6 @@ impl OffloadRing {
     }
 
     /// Device staging for chunk `i`, ready to be written by compute.
-    ///
-    /// Waits — on the compute stream, so the wait costs nothing on the host — until
-    /// the previous copy **out of** this half has finished. Without that wait, a
-    /// forward two chunks ahead would overwrite data the transfer stream is still
-    /// draining.
     pub fn stage(&mut self, gpu: &Gpu, i: usize) -> &mut GTensor<f32> {
         let half = i % 2;
         if let Some(ev) = &self.drained[half] {
@@ -188,11 +115,6 @@ impl OffloadRing {
     }
 
     /// Send chunk `i` to the host, having filled [`stage`](Self::stage) with it.
-    ///
-    /// Two events, one per direction of the handoff:
-    ///   * `produced` — the transfer may not start until compute has finished writing.
-    ///   * `drained` — a later [`stage`](Self::stage) of this half must wait for this
-    ///     copy, recorded for that half.
     pub fn write(&mut self, gpu: &Gpu, i: usize) {
         let half = i % 2;
         let produced = gpu
@@ -211,11 +133,6 @@ impl OffloadRing {
     }
 
     /// Start chunk `i`'s host→device copy without waiting for it.
-    ///
-    /// Call this one chunk *ahead* of the consumer so the transfer overlaps compute;
-    /// [`read`](Self::read) then returns it without stalling. Prefetching a chunk
-    /// whose half still holds an unconsumed one is the caller's error to avoid — with
-    /// a double buffer that means never prefetching more than one chunk ahead.
     pub fn prefetch(&mut self, gpu: &Gpu, i: usize) {
         let half = i % 2;
         // The staging half may still be feeding a consumer on the compute stream, so
@@ -236,10 +153,6 @@ impl OffloadRing {
     }
 
     /// Chunk `i` back on the device, ready for compute to read.
-    ///
-    /// Issues the copy first if [`prefetch`](Self::prefetch) was not called for `i`
-    /// (correct, just not overlapped). Waits on the compute stream until the fill has
-    /// landed — the event that makes the returned tensor safe to read.
     pub fn read(&mut self, gpu: &Gpu, i: usize) -> &GTensor<f32> {
         let half = i % 2;
         if self.filled[half].is_none() {
@@ -253,22 +166,12 @@ impl OffloadRing {
     }
 
     /// Block until every queued transfer has completed.
-    ///
-    /// Only needed at a teardown or measurement boundary — the per-chunk events
-    /// already order the streams against each other, so the training loop does not
-    /// call this.
     pub fn sync(&self) {
         self.xfer.synchronize().expect("offload: sync");
     }
 }
 
 /// A buffer a [`HostPark`] can move: an fp32 tensor or a bf16 slab.
-///
-/// The two differ only in element width, and the park's job is to move bytes — so it
-/// carries the kind through the round trip and hands back exactly what it was given.
-/// Widening a bf16 slab on the way out would double its transfer *and* its restored
-/// footprint, and narrowing an fp32 one would silently break the stabilizer arithmetic
-/// that `gpu::bf16` deliberately keeps wide.
 pub enum Parked {
     F32(GTensor<f32>),
     Bf16(GTensor<u16>),
@@ -284,10 +187,7 @@ impl Parked {
 
     /// Size in `u16` units — the pinned slots' element type, so fp32 counts double.
     fn u16_len(&self) -> usize {
-        match self {
-            Parked::F32(t) => t.len() * 2,
-            Parked::Bf16(t) => t.len(),
-        }
+        self.bytes() / 2
     }
 
     pub fn bytes(&self) -> usize {
@@ -302,11 +202,6 @@ impl Parked {
     }
 
     /// Copy this buffer's bytes into a pinned `u16` host slot, on `xfer`.
-    ///
-    /// The fp32 case views its `CudaSlice<f32>` as `u16` so both widths take the same
-    /// path. That is a pure reinterpretation of the same bytes — the host slot is only
-    /// ever written here and read back by `fill_from_host` below, which applies the
-    /// inverse view, so no value is ever interpreted at the wrong width.
     fn copy_to_host(&self, xfer: &Arc<CudaStream>, dst: &mut PinnedHostSlice<u16>) {
         // The slot is reused by capacity and may be longer than this buffer, so both
         // sides are cut to `u16_len()` — the copy must not be sized by the slot.
@@ -354,10 +249,6 @@ impl Parked {
     }
 
     /// Download to the host as fp32, widening a bf16 slab.
-    ///
-    /// For tests and debugging only — it allocates and synchronizes. Nothing on the
-    /// training path reads a parked buffer from the host; see the module note on
-    /// write-combined memory.
     pub fn to_host(&self, gpu: &Gpu) -> crate::tensor::Tensor {
         match self {
             Parked::F32(t) => t.to_host(gpu),
@@ -394,20 +285,20 @@ impl From<GTensor<f32>> for Parked {
 
 /// A slab is the same fp32-or-bf16 pair, chosen by `Kernels::slab_bf16` rather than
 /// per value — so it parks directly, at whatever width it was built with.
-impl From<super::ops::SlabBuf> for Parked {
-    fn from(s: super::ops::SlabBuf) -> Self {
+impl From<SlabBuf> for Parked {
+    fn from(s: SlabBuf) -> Self {
         match s {
-            super::ops::SlabBuf::F32(t) => Parked::F32(t),
-            super::ops::SlabBuf::Bf16(t) => Parked::Bf16(t),
+            SlabBuf::F32(t) => Parked::F32(t),
+            SlabBuf::Bf16(t) => Parked::Bf16(t),
         }
     }
 }
 
-impl From<Parked> for super::ops::SlabBuf {
+impl From<Parked> for SlabBuf {
     fn from(p: Parked) -> Self {
         match p {
-            Parked::F32(t) => super::ops::SlabBuf::F32(t),
-            Parked::Bf16(t) => super::ops::SlabBuf::Bf16(t),
+            Parked::F32(t) => SlabBuf::F32(t),
+            Parked::Bf16(t) => SlabBuf::Bf16(t),
         }
     }
 }
@@ -425,69 +316,21 @@ struct ParkedShape {
 }
 
 /// Host parking space for one layer's saved activations.
-///
-/// [`OffloadRing`] suits a consumer that walks a time axis with a fixed per-step
-/// width. A [`Block`](super::block::Block) is the other shape: it saves a handful of
-/// differently-shaped buffers, all at once, and does not read any of them again until
-/// backward reaches it — 15 blocks of compute later, in the backbone's block-major
-/// sweep. There is nothing to double-buffer against, because the block's own compute
-/// is long since finished; the transfer just has to not race it.
-///
-/// So this is the simpler mechanism: [`evict`](Self::evict) sends a set of device
-/// buffers to pinned host memory and lets the device ones go, and
-/// [`restore`](Self::restore) brings them back. Same transfer stream, same hand-placed
-/// events, no ring.
 pub struct HostPark {
     /// One generation per parked chunk, in eviction order; within a generation, one
     /// pinned slot per parked buffer.
-    ///
-    /// A chunked backbone sweep evicts once per `(block, chunk)` and unwinds chunks
-    /// right to left, so a park owes as many restores as the sweep made evictions.
-    /// Holding a single generation would let chunk c+1's eviction overwrite the slots
-    /// chunk c's backward still has to read — a wrong gradient, not a crash. The
-    /// unchunked path is exactly this with `gens.len() == 1`.
-    ///
-    /// Slots are typed `u16` and sized in *elements of u16* so one park can hold both
-    /// fp32 tensors and bf16 slabs — see [`Parked`]. A bf16 slab must come back as
-    /// bf16: this module moves bytes and never changes a value's width, because the
-    /// precision split is decided at each value's production point (`gpu::bf16`), not
-    /// on the way to host memory.
     gens: Vec<ParkedGen>,
     /// How many of `gens` currently hold live data, i.e. how many restores are owed.
-    ///
-    /// Distinct from `gens.len()`: a restore pops the data but leaves the pinned slots
-    /// allocated so the next step's eviction of the same shape reuses them instead of
-    /// page-locking again. `gens[..live]` is live; `gens[live..]` is spare capacity.
     live: usize,
     xfer: Arc<CudaStream>,
     /// Device tensors handed over by [`evict`](Self::evict), held until their D2H copy
     /// completes.
-    ///
-    /// This is what makes eviction asynchronous. Freeing them at `evict` would mean
-    /// either blocking on the copy first — which serializes the transfer against
-    /// compute and costs the whole point of offloading (measured: a 24% step
-    /// regression, the full un-overlapped transfer time) — or freeing memory under a
-    /// live DMA. Holding them lets the copy proceed while compute runs on.
-    ///
-    /// The slot is **shared between every park in a model** (see
-    /// [`InFlight`](InFlight)): a park that held its own buffers until its *own* next
-    /// eviction would keep them for a whole step, and with one park per block that is
-    /// 16 blocks' worth alive at once — measured **1728 MB worse** than not offloading
-    /// at all. Sharing bounds it at one block's worth, released one block later.
     in_flight: SharedInFlight,
     /// Uploads started by [`prefetch`](Self::prefetch) but not yet consumed, with the
     /// event that says they have landed. Belongs to the generation that
     /// [`restore`](Self::restore) will take next — the last one evicted.
     prefetched: Option<(Vec<Parked>, CudaEvent)>,
     /// Pinned slots not currently held by a generation, reusable by capacity.
-    ///
-    /// Page-locking costs ~640 us per slot, so a park that allocated on every eviction
-    /// would spend most of a step in `cuMemHostAlloc`. Slots come back here when a
-    /// generation is displaced and are handed out again by [`evict`](Self::evict).
-    ///
-    /// Bounded by [`peak_slots`](Self::peak_slots) plus [`SPARE_SLACK`] — an unbounded
-    /// pool would pin host memory in proportion to the largest shape ever evicted and
-    /// never give it back.
     spare: Vec<PinnedHostSlice<u16>>,
     /// Most slots this park has ever needed LIVE at once — generations still owed a
     /// restore. The retention bound follows this, so a park keeps exactly the slots its
@@ -503,12 +346,6 @@ pub struct HostPark {
 }
 
 /// Headroom above a park's observed peak demand, in slots.
-///
-/// The retention bound cannot be a fixed constant: a chunked sweep keeps one generation
-/// per chunk, so peak demand scales with sequence length (at 4069 words a backbone park
-/// peaks at 40 slots — a fixed 32 dropped 256 slots per step and page-locked them again,
-/// ~225 ms of `cuMemHostAlloc` on the critical path). The slack absorbs the ragged last
-/// chunk and the alternating FFN/cell buffer counts without a second round of misses.
 const SPARE_SLACK: usize = 8;
 
 /// One eviction's pinned slots and the shapes needed to rebuild its tensors.
@@ -518,40 +355,16 @@ struct ParkedGen {
 }
 
 /// The one block's worth of evicted buffers that may be awaiting a copy at any time.
-///
-/// Every [`HostPark`] in a model holds a clone of the same slot, so each eviction
-/// releases the *previous* block's buffers — whose copy has by then had a full block
-/// of compute to finish in — and leaves its own in their place.
-///
-/// Shared rather than threaded through the call chain because eviction happens deep
-/// inside `Block::forward`, and `BlockLike::forward` is a trait method whose signature
-/// every caller and both cell kinds would otherwise have to grow a parameter for.
-pub type SharedInFlight = std::rc::Rc<std::cell::RefCell<InFlight>>;
+pub type SharedInFlight = Rc<RefCell<InFlight>>;
 
 /// One block's worth of evicted buffers, waiting for their copy to land.
 #[derive(Default)]
 pub struct InFlight {
     /// Evictions awaiting their copy, oldest first.
-    ///
-    /// Two deep, not one. Releasing a buffer makes the compute stream wait on its D2H,
-    /// so with a single generation block `i+1` waits on block `i`'s copy immediately
-    /// after issuing it — the transfer is exposed (measured: +20 ms of forward glue
-    /// against ~19 ms of D2H, i.e. no overlap). Holding two generations puts a whole
-    /// block of compute between a copy and the wait on it, at the cost of one extra
-    /// block's activations resident.
     pending: Vec<(Vec<Parked>, CudaEvent)>,
 }
 
 /// How many evictions may be awaiting their copy at once. See [`InFlight::pending`].
-///
-/// A block evicts twice — once for its FFN, once for its cell — so at depth 2 the two
-/// halves of one block are in flight together and each wait falls on a copy issued a
-/// whole block of compute ago. That is the guarantee that matters, and it is what
-/// keeps the transfers hidden.
-///
-/// Deeper is not better: raising this to 4 (a full two blocks) measured **384 MB worse
-/// at the same step time** — an extra generation of activations held resident for a
-/// wait that was never going to block.
 const IN_FLIGHT_DEPTH: usize = 2;
 
 impl InFlight {
@@ -561,25 +374,10 @@ impl InFlight {
     }
 
     /// Free the oldest eviction's buffers once its copy has landed.
-    ///
-    /// The wait has to be a HOST wait. Making the compute stream wait on the event and
-    /// then dropping is what this did, on the reasoning that the buffers are freed with
-    /// `cuMemFreeAsync` on that same stream and so cannot be reused before it — but the
-    /// free is not in fact ordered behind the wait, and the memory came back to a later
-    /// allocation while the transfer stream was still reading it. It read as
-    /// nondeterminism, not as a crash: gradients that differed run to run in whichever
-    /// blocks happened to lose the race. `examples/train_determinism.rs` is the probe
-    /// that catches it; the model's own forward loss does not, because the corrupted
-    /// buffers are only read in backward.
-    ///
-    /// It costs nothing. At `IN_FLIGHT_DEPTH` = 2 the copy being waited on was issued a
-    /// whole block of compute ago and has long since landed, so the sync returns
-    /// immediately: 153.2 ms/step against 153.4 for the racy version, at 1024 words.
     pub fn release(&mut self) {
         while self.pending.len() >= IN_FLIGHT_DEPTH {
-            let (bufs, ev) = self.pending.remove(0);
+            let (_, ev) = self.pending.remove(0);
             ev.synchronize().expect("offload: await park");
-            drop(bufs);
         }
     }
 
@@ -615,7 +413,7 @@ impl HostPark {
             xfer: gpu
                 .context
                 .new_stream()
-                .map_err(|e| format!("offload: transfer stream creation failed: {e:?}"))?,
+                .expect("offload: transfer stream creation failed"),
             in_flight,
             prefetched: None,
             spare: Vec::new(),
@@ -643,23 +441,6 @@ impl HostPark {
     }
 
     /// Copy `bufs` to pinned host memory.
-    ///
-    /// The copy is issued on the transfer stream after an event says compute has
-    /// finished producing them, and this returns **without waiting for it** — that is
-    /// what lets the DMA run underneath the next block's compute. The caller must
-    /// therefore keep the device buffers alive until
-    /// [`take_evicted`](Self::take_evicted) says the copy has landed; releasing them
-    /// earlier frees memory out from under an in-flight DMA.
-    ///
-    /// Reuses its pinned slots across steps when the shapes repeat, so a steady
-    /// training loop page-locks nothing after the first window.
-    /// Return displaced slots to the spare pool, within its bound.
-    ///
-    /// Full pool: keep the LARGER capacity and free the other. Dropping whichever slot
-    /// happened to arrive last would let a run of small evictions displace exactly the
-    /// big slots the next sweep needs, which is the page-locking churn the pool exists
-    /// to avoid — and `evict` matches best-fit, so a slot only earns its place by being
-    /// big enough for something.
     fn recycle(&mut self, slots: Vec<PinnedHostSlice<u16>>) {
         let spare_max = self.peak_slots + SPARE_SLACK;
         for s in slots {
@@ -682,13 +463,6 @@ impl HostPark {
     }
 
     pub fn evict(&mut self, gpu: &Gpu, bufs: Vec<Parked>) {
-        // Make room for this eviction. `Block::forward` and `MLstm::forward_alloc`
-        // release before allocating, which is what keeps the wait off the hot path, but
-        // a block releases twice and then evicts twice — so the second eviction can
-        // still arrive with the queue full. Draining here bounds the queue at the
-        // depth regardless of how the callers interleave.
-        // Scoped: `recycle` below needs `&mut self`, and the shared slot is re-borrowed
-        // at the end to hand it this eviction's sources.
         self.in_flight.borrow_mut().release();
 
         let produced = gpu
@@ -700,24 +474,7 @@ impl HostPark {
         // Append a generation rather than overwriting the last: a chunked sweep evicts
         // once per chunk and every one of them is owed a restore.
         let depth = self.live;
-        // Slots are matched by capacity rather than generation shape-for-shape. Two
-        // things defeat an exact per-depth match: one park serves both the cell and the
-        // FFN, whose evictions differ in buffer count and land at the same depth
-        // alternately, and a balanced `chunk_spans` makes the last chunk one row shorter
-        // than the rest. Either alone means a depth's shapes never repeat, and
-        // page-locking is expensive enough (~640 us per slot) that missing puts it
-        // squarely on the hot path.
-        //
-        // A slot is reusable when it is at least as large as the buffer: the copy writes
-        // `u16_len()` elements and `restore` rebuilds the tensor from `ParkedShape`, so
-        // the slot's own length is never read back. Reusing a larger slot wastes only
-        // the tail.
 
-        // Peak slots this park must hold LIVE at once: the generations still owed a
-        // restore, plus what this eviction takes. Deliberately not "everything the park
-        // owns" — the spare pool is what the bound below limits, so counting it here
-        // makes the bound track its own growth and it can never bind. The pool then
-        // never releases a slot, and every capacity miss page-locks one more for good.
         let live_slots: usize = self.gens[..depth]
             .iter()
             .map(|g| g.slots.len())
@@ -725,9 +482,6 @@ impl HostPark {
             + bufs.len();
         self.peak_slots = self.peak_slots.max(live_slots);
 
-        // Reclaim the generations this eviction displaces *first*, so their slots are
-        // available to it. Reclaiming afterwards would make every re-eviction at a
-        // depth allocate before the slot it is about to replace comes back.
         if self.gens.len() > depth {
             let displaced: Vec<_> = self.gens.drain(depth..).flat_map(|g| g.slots).collect();
             self.recycle(displaced);
@@ -737,12 +491,7 @@ impl HostPark {
         let mut shapes = Vec::with_capacity(bufs.len());
         for b in &bufs {
             let need = b.u16_len();
-            // Best fit, not first fit. The pool holds several capacities at once (the
-            // chunked sweep's ragged last chunk, the alternating FFN/cell shapes), and
-            // taking the first slot that merely fits lets a small request consume a
-            // large slot — the large requests then find nothing and page-lock, once per
-            // sweep, forever. Picking the tightest slot keeps each capacity class for
-            // the requests that need it.
+
             let hit = self
                 .spare
                 .iter()
@@ -788,10 +537,6 @@ impl HostPark {
     }
 
     /// Free the previous eviction's buffers, ordered on the compute stream.
-    ///
-    /// Call at the *start* of the next block's forward, before it allocates: freeing
-    /// returns memory to the allocator, and the allocator must not hand it back while
-    /// a copy is still reading it. See [`InFlight::release`].
     pub fn release_previous(&self) {
         self.in_flight.borrow_mut().release();
     }
@@ -803,11 +548,6 @@ impl HostPark {
 
     /// Drop every live generation without restoring it, for a sweep abandoned before
     /// its backward consumed the chunks.
-    ///
-    /// Blocks first: a generation may still have its D2H in flight, and the device
-    /// sources are owned by the in-flight slot until that copy lands. The pinned slots
-    /// go back to `spare` rather than being freed — they are the expensive part, and
-    /// the next sweep reuses them at the same capacities.
     pub fn discard_all(&mut self) {
         if self.live == 0 && self.prefetched.is_none() {
             return;
@@ -820,15 +560,6 @@ impl HostPark {
     }
 
     /// Start this park's uploads without waiting for them.
-    ///
-    /// Call one block *ahead* of the consumer: the H2D then runs underneath that
-    /// block's backward compute instead of stalling in front of its own. Without it,
-    /// restore issues a copy and immediately waits, and the transfer is fully exposed
-    /// — measured as +37 ms of "block glue" against 32 ms of raw transfer, i.e. no
-    /// overlap at all.
-    ///
-    /// Idempotent: a second call before [`take_prefetched`](Self::take_prefetched) is
-    /// a no-op.
     pub fn prefetch(&mut self, gpu: &Gpu) {
         if self.prefetched.is_some() || self.live == 0 {
             return;
@@ -837,9 +568,6 @@ impl HostPark {
     }
 
     /// The prefetched tensors, waiting for their uploads if they have not landed.
-    ///
-    /// Issues the uploads first if [`prefetch`](Self::prefetch) was not called
-    /// (correct, just not overlapped).
     pub fn take_prefetched(&mut self, gpu: &Gpu) -> Vec<Parked> {
         let (out, filled) = match self.prefetched.take() {
             Some(p) => p,
@@ -886,13 +614,6 @@ impl HostPark {
     }
 
     /// Bring the parked buffers back, in the order they were evicted.
-    ///
-    /// Waits — on the compute stream — until the uploads have landed, so the returned
-    /// tensors are safe for compute to read. Consumes a [`prefetch`](Self::prefetch)
-    /// if one is outstanding, which is how the transfer gets hidden; without one it
-    /// issues and waits, correct but fully exposed.
-    /// Pops the generation it consumed, so a chunked sweep's next restore reads the
-    /// chunk to its left. The pinned slots stay allocated for the next step to reuse.
     pub fn restore(&mut self, gpu: &Gpu) -> Vec<Parked> {
         let out = self.take_prefetched(gpu);
         self.live -= 1;

@@ -325,7 +325,7 @@ impl MLstm {
     /// `x` must stay alive and unchanged until this call's [`backward`](Self::backward),
     /// which takes it back: the three projections read it for their `dW`, and this cell
     /// keeps no copy of it. In a [`Block`](super::block::Block) that is the block's own
-    /// `xn1` — the pre-norm output it already holds for the norm's backward.
+    /// `norm1_out` — the pre-norm output it already holds for the norm's backward.
     pub fn forward(
         &mut self,
         gpu: &Gpu,
@@ -517,8 +517,20 @@ impl MLstm {
 
     /// Drop the carried state, so the next forward starts the recurrence at zero
     /// whatever `carry` says.
-    pub fn reset_state(&mut self, _gpu: &Gpu) {
+    pub fn reset_state(&mut self, gpu: &Gpu) {
+        self.zero_state(gpu);
+        self.reset_caches(gpu);
+    }
+
+    /// Start the recurrence over at the next forward, keeping everything already
+    /// cached. See [`Cell::zero_state`].
+    pub fn zero_state(&mut self, _gpu: &Gpu) {
         self.carry_state = None;
+    }
+
+    /// Drop the caches of an already-unwound sweep, keeping `C`/`n`/`m` — so the next
+    /// forward continues this recurrence. See [`Cell::reset_caches`].
+    pub fn reset_caches(&mut self, _gpu: &Gpu) {
         // A sweep that ended early (a caller that forwarded chunks and never unwound
         // them) would otherwise leave its host generations to accumulate across steps.
         self.saved.clear();
@@ -854,6 +866,12 @@ impl Cell for MLstm {
     }
     fn reset_state(&mut self, gpu: &Gpu) {
         MLstm::reset_state(self, gpu)
+    }
+    fn zero_state(&mut self, gpu: &Gpu) {
+        MLstm::zero_state(self, gpu)
+    }
+    fn reset_caches(&mut self, gpu: &Gpu) {
+        MLstm::reset_caches(self, gpu)
     }
     fn reset_bptt(&mut self, gpu: &Gpu) {
         MLstm::reset_bptt(self, gpu)

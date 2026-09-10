@@ -8,6 +8,12 @@ pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 pub const WORDS_PER_SEQ: usize = 1024 * 4; // K — words per window / backbone unroll length
 pub const MIN_WORDS_PER_SEQ: usize = 8; // keep a trailing window only if >= this
 
+// Documents are packed, so a window is K words whatever the documents in it are long
+// — which makes a window a fixed amount of data and every word equally weighted in the
+// loss. On `pretrain_v2` that is 4094 words per window against 1046 before, so a
+// window (and a `BATCH_SIZE` step, and everything the schedule below counts in
+// windows) covers 3.9x the corpus it used to.
+
 // Defines what a word is, so it lives with the splitter.
 pub use wordseg::MAX_WORD_BYTES;
 
@@ -25,7 +31,7 @@ pub const WARMUP_WINDOWS: usize = 1_200;
 pub const DECAY_WINDOWS: usize = 1_500_000;
 // Windows accumulated per optimizer step. Muon (Frobenius normalization) and
 // aux-Adam (second moment) are scale-invariant, so summed grads need no rescale.
-pub const BATCH_SIZE: usize = 32;
+pub const BATCH_SIZE: usize = 8;
 pub const EPOCHS: usize = 1;
 
 pub const SAVE_EVERY: usize = 1000;
@@ -45,8 +51,8 @@ pub const DECODER_WEIGHT_DECAY: f32 = 0.01;
 // `WORD_HIDDEN / CHAR_HIDDEN` times the backbone's rate. `1.0` is one rate for
 // the whole model, which is what every checkpoint before these existed trained
 // under.
-pub const ENCODER_LR_SCALE: f32 = 1.0;
-pub const DECODER_LR_SCALE: f32 = 1.0;
+pub const ENCODER_LR_SCALE: f32 = 2.0;
+pub const DECODER_LR_SCALE: f32 = 2.0;
 
 /// Weight decay for the flat model. `0.0` keeps it plain Adam.
 pub const FLAT_WEIGHT_DECAY: f32 = 0.0;
@@ -61,7 +67,7 @@ pub const TOP_P: f32 = 0.98;
 
 pub const CHAR_HIDDEN: usize = 256;
 pub const OUT_HIDDEN: usize = 256;
-pub const WORD_HIDDEN: usize = 1152;
+pub const WORD_HIDDEN: usize = 1024;
 
 /// SwiGLU inner width: the `8·hidden/3` paper default rounded up to a multiple
 /// of 64, keeping every up/down projection GEMM tile-aligned.
@@ -76,13 +82,19 @@ pub fn up_of(hidden: usize) -> usize {
 pub const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 32;
+pub const WORD_BLOCKS: usize = 28;
+
+/// Carry the backbone's recurrent state from one window into the next. Windows are
+/// cut from one packed stream, so every window but a chunk's first continues the one
+/// before it and the whole chunk is autoregressed as a single sequence, with the
+/// state zeroed only where a document begins. The state crosses a window border, the
+/// gradient does not — truncated BPTT, exactly what already happens at a
+/// `BACKBONE_CHUNK` border inside a window.
+pub const CARRY_WINDOW_STATE: bool = true;
 
 /// Backbone sweep chunk length in words (`0` = one whole-sequence sweep), which
 /// bounds resident activations at O(chunk) instead of O(words). Kept above the
-/// sLSTM's `FUSED_MIN_T` (32) so a chunk still runs time-fused. Measured at 4096
-/// words: 512 -> 566 ms / 9469 MiB, 1024 -> 536 / 11549, 2048 -> 531 / 14939,
-/// 4096 OOMs. `GPU_BACKBONE_CHUNK` overrides.
+/// sLSTM's `FUSED_MIN_T` (32) so a chunk still runs time-fused.
 pub const BACKBONE_CHUNK: usize = 512;
 
 /// Largest encoder/decoder group in rows (`words × tmax`), `0` = uncapped.

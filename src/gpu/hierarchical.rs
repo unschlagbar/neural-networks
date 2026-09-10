@@ -218,6 +218,18 @@ fn chunk_spans(n: usize, chunk: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// One span of the backbone sweep: `len` word steps starting at word `c0`.
+///
+/// A span is either a `BACKBONE_CHUNK` cut — the recurrence carries straight across
+/// it — or a document border, where `reset` says the state starts from zero. Both are
+/// the same loop, so a packed window and a single-document one run the same code.
+#[derive(Clone, Copy, Debug)]
+struct BbSpan {
+    c0: usize,
+    len: usize,
+    reset: bool,
+}
+
 /// Concatenate row-blocks back into one `[rows, width]` tensor, in order.
 fn concat_rows(gpu: &Gpu, parts: &[GTensor<f32>], rows: usize, width: usize) -> GTensor<f32> {
     let mut out = GTensor::uninit(gpu, &[rows, width]);
@@ -390,7 +402,7 @@ struct BackboneFwd {
     /// `[dw, HC]` context, one row per word — the decoder's slot-0 injection.
     o: GTensor<f32>,
     /// Chunk spans over the word axis; a single full-length span when unchunked.
-    spans: Vec<(usize, usize)>,
+    spans: Vec<BbSpan>,
     /// Each chunk's input to `bb_back`, kept because `forward_shared` saves nothing
     /// and the backward needs every chunk's `X` for `dW = XᵀdY`.
     back_in: Vec<GTensor<f32>>,
@@ -475,6 +487,20 @@ pub struct Hierarchical {
     /// per scored word). The divisor behind `last_word_loss`, exposed so a caller
     /// can recover the window's total NLL under SFT masking too.
     last_rows: usize,
+
+    /// Keep the backbone's recurrent state across windows, so a document longer than
+    /// `WORDS_PER_SEQ` words is autoregressed as one sequence instead of restarting at
+    /// every window border. Off by default: only a caller that feeds windows in corpus
+    /// order can say which of them continue (see [`set_continues`](Self::set_continues)).
+    stateful: bool,
+    /// The window about to run resumes the previous one. Consumed and cleared by
+    /// `backbone_forward`, so a caller that forgets to set it starts from zero rather
+    /// than silently inheriting a stale document's state.
+    continues: bool,
+
+    /// Where the documents inside the next window start, as word indices. Set per
+    /// window by [`set_doc_starts`](Self::set_doc_starts) and consumed by it.
+    doc_starts: Vec<usize>,
 }
 
 /// Bit-exact checksum of a device tensor, printed when `GPU_HASH` is set.
@@ -613,6 +639,9 @@ impl Hierarchical {
             loss_acc: None,
             last_word_loss: 0.0,
             last_rows: 0,
+            stateful: false,
+            continues: false,
+            doc_starts: Vec::new(),
         };
         model.enable_backbone_offload(gpu);
         model
@@ -690,6 +719,40 @@ impl Hierarchical {
     /// the two recovers the window's total NLL in nats.
     pub fn last_rows(&self) -> usize {
         self.last_rows
+    }
+
+    /// Carry the backbone state from one window into the next (truncated BPTT over a
+    /// whole document). The state crosses the border, the gradient does not: the next
+    /// window's backward stops at its own first word, exactly as it does today at a
+    /// chunk border inside a window.
+    ///
+    /// Only meaningful for a caller that walks windows in corpus order and marks each
+    /// continuation with [`set_continues`](Self::set_continues).
+    pub fn set_stateful(&mut self, on: bool) {
+        self.stateful = on;
+    }
+
+    pub fn is_stateful(&self) -> bool {
+        self.stateful
+    }
+
+    /// Declare that the next window continues the one just run, at the very word it
+    /// stopped at. Ignored unless [`set_stateful`](Self::set_stateful) is on, and
+    /// cleared by the window it applies to.
+    pub fn set_continues(&mut self, continues: bool) {
+        self.continues = continues;
+    }
+
+    /// Declare where the documents packed into the next window begin, as indices into
+    /// its `words` (see [`WordBatch::doc_starts`](crate::batches::WordBatch)). The
+    /// backbone starts from zero state at each of them, and the two words at each
+    /// border carry no loss: the document's first word, whose only available context
+    /// is the document before it, and the `<END>` closing that document, which is
+    /// there to mark the reset rather than to be predicted. Consumed by the window it
+    /// applies to.
+    pub fn set_doc_starts(&mut self, starts: &[usize]) {
+        self.doc_starts.clear();
+        self.doc_starts.extend_from_slice(starts);
     }
 
     pub fn forward_backward(&mut self, gpu: &Gpu, tokens: &[usize], words: &[Range<usize>]) -> f32 {
@@ -775,6 +838,9 @@ impl Hierarchical {
         word_loss: Option<&[bool]>,
         grad: bool,
     ) -> f32 {
+        // Taken first: a degenerate window returns below, and what it was told about
+        // must not survive into the next one.
+        let doc_starts = mem::take(&mut self.doc_starts);
         if words.len() < 2 {
             self.last_word_loss = 0.0;
             self.last_rows = 0;
@@ -782,6 +848,23 @@ impl Hierarchical {
         }
 
         let dw = words.len() - 1; // decoded words: word 0 is encode-only
+        // Word w decodes word w+1, so the two words at a border are `m[d-1]` (the
+        // document's first word, whose only context is the document before it) and
+        // `m[d-2]` (the `<END>` closing that document — a marker for the reset, not
+        // text, so nothing should learn to emit it). `d` can be `dw+1`, a document
+        // starting one past the window's last word, which scores only the `<END>`.
+        let packed_mask: Option<Vec<bool>> = (!doc_starts.is_empty()).then(|| {
+            let mut m = word_loss.map_or_else(|| vec![true; dw], <[bool]>::to_vec);
+            for &d in &doc_starts {
+                for i in [d.checked_sub(1), d.checked_sub(2)].into_iter().flatten() {
+                    if i < dw {
+                        m[i] = false;
+                    }
+                }
+            }
+            m
+        });
+        let word_loss = packed_mask.as_deref().or(word_loss);
         self.timer.reset();
         self.timer.mark(gpu, "drain prev step");
         if self.flags.mem {
@@ -830,7 +913,7 @@ impl Hierarchical {
         cache.temps.assert_drained("window start");
 
         let enc_rows = self.encoder_forward(gpu, tokens, words, &mut sc, &cache);
-        let bb = self.backbone_forward(gpu, &sc.word_embeds, dw, &cache);
+        let bb = self.backbone_forward(gpu, &sc.word_embeds, dw, &doc_starts, &cache);
 
         let bb_rows_max = bb.rows_max;
         let (loss, d_o, dec_rows_max) =
@@ -1068,16 +1151,43 @@ impl Hierarchical {
         enc_rows
     }
 
-    /// The word axis split into the spans the backbone sweeps, and whether that is
-    /// more than one. `chunk_spans(dw, dw)` is the unchunked sweep, so both modes run
-    /// the same code.
-    fn backbone_spans(&self, dw: usize) -> Vec<(usize, usize)> {
+    /// The word axis split into the spans the backbone sweeps.
+    ///
+    /// Cut first at the document borders `doc_starts` names — the recurrence must not
+    /// run across one — then each of those segments into `BACKBONE_CHUNK`-sized pieces.
+    /// `resume` is whether the state carried in from the previous window survives into
+    /// span 0. `chunk_spans(dw, dw)` is the unchunked sweep, so both modes run the same
+    /// code.
+    fn backbone_spans(&self, dw: usize, doc_starts: &[usize], resume: bool) -> Vec<BbSpan> {
         let chunk = match self.bb_chunk {
             Some(c) => c.min(dw).max(1),
             None if BACKBONE_CHUNKED_BACKWARD => backbone_chunk(dw),
             None => dw,
         };
-        chunk_spans(dw, chunk)
+        // Segment borders: every document start with a backbone step of its own, plus
+        // the two ends. A start at word 0 is span 0's own reset, not a cut.
+        let mut cuts = vec![0];
+        cuts.extend(doc_starts.iter().copied().filter(|&d| d > 0 && d < dw));
+        cuts.push(dw);
+
+        let mut out = Vec::new();
+        for seg in cuts.windows(2) {
+            let (s0, s1) = (seg[0], seg[1]);
+            let first = out.len();
+            out.extend(
+                chunk_spans(s1 - s0, chunk.min(s1 - s0).max(1))
+                    .into_iter()
+                    .map(|(c0, len)| BbSpan {
+                        c0: s0 + c0,
+                        len,
+                        reset: false,
+                    }),
+            );
+            // Only the segment's first span resets; the chunks inside it carry.
+            out[first].reset = true;
+        }
+        out[0].reset = !resume;
+        out
     }
 
     /// PHASE 2 — autoregress the backbone over the word embeddings.
@@ -1097,20 +1207,29 @@ impl Hierarchical {
         gpu: &Gpu,
         word_embeds: &GTensor<f32>,
         dw: usize,
+        doc_starts: &[usize],
         cache: &TrainingCache,
     ) -> BackboneFwd {
         let (hc, wh) = (self.cfg.hc, self.cfg.wh);
         let bb_in = self.bb_front.forward_alloc(gpu, word_embeds); // [dw, WH]
-        let spans = self.backbone_spans(dw);
-        let rows_max = spans.iter().map(|&(_, len)| len).max().unwrap_or(0);
+        // A window that starts a document starts the recurrence too, single-chunk ones
+        // included: without the reset it would resume the previous window's state.
+        let resume = self.stateful && mem::take(&mut self.continues) && !doc_starts.contains(&0);
+        let spans = self.backbone_spans(dw, doc_starts, resume);
+        let rows_max = spans.iter().map(|s| s.len).max().unwrap_or(0);
 
-        // Runs for every window, single-chunk ones included: a window that fits in one
-        // chunk is an unchunked sweep, and without the reset it would resume the
-        // previous window's state and BPTT gradient across a document border.
-        let carry = spans.len() > 1;
+        // Under `stateful` the state has to be captured on every window, single-chunk
+        // ones included, because the next window may be the one that continues it.
+        let carry = spans.len() > 1 || self.stateful;
         for blk in self.bb_blocks.iter_mut() {
             blk.set_carry(carry);
-            blk.reset_state(gpu);
+            if resume {
+                // The state stays, the previous window's caches must not: their backward
+                // has already run.
+                blk.reset_caches(gpu);
+            } else {
+                blk.reset_state(gpu);
+            }
         }
         // `bb_back`'s input per chunk. `Linear::forward` saves its input for `dW` and a
         // later chunk's forward overwrites it, so each chunk's is kept here and handed
@@ -1121,7 +1240,15 @@ impl Hierarchical {
         // tensor and there is nothing left to concatenate afterwards.
         let o = GTensor::uninit(gpu, &[dw, hc]);
         debug_assert!(!self.bb_blocks.is_empty(), "backbone with no blocks");
-        for &(c0, len) in &spans {
+        for &BbSpan { c0, len, reset } in &spans {
+            // A document border inside the window: the recurrence starts over, but the
+            // caches of the spans to its left are still waiting for their backward, so
+            // only the state is zeroed.
+            if reset && c0 != 0 {
+                for blk in self.bb_blocks.iter_mut() {
+                    blk.zero_state(gpu);
+                }
+            }
             // A block never writes its input, so the first one reads this chunk's rows
             // out of the window tensor directly; only the two buffers the rest
             // alternate between are the chunk's own.
@@ -1419,7 +1546,7 @@ impl Hierarchical {
         let d_bb_out = self.bb_back_backward(gpu, &back_in, &spans, d_o, dw, cache);
 
         let mut d_parts: Vec<Option<GTensor<f32>>> = (0..spans.len()).map(|_| None).collect();
-        for (ci, &(c0, len)) in spans.iter().enumerate().rev() {
+        for (ci, &BbSpan { c0, len, .. }) in spans.iter().enumerate().rev() {
             // The last block is wanted first in every chunk, not just the first one:
             // the prefetch above covers only the leftmost pass, so without this each
             // later chunk opens with an unhidden upload. Issued before the slicing and
@@ -1428,8 +1555,11 @@ impl Hierarchical {
                 last.prefetch_act(gpu);
             }
 
-            // The rightmost chunk starts with no gradient coming from its right.
-            if chunked && ci + 1 == spans.len() {
+            // The rightmost chunk starts with no gradient coming from its right — under
+            // `stateful` an unchunked window too, since it carries and so would take the
+            // gradient the previous window's leftmost chunk left behind. So does the
+            // chunk left of a document border: the forward did not cross it either.
+            if spans.get(ci + 1).is_none_or(|next| next.reset) {
                 for blk in self.bb_blocks.iter_mut() {
                     blk.reset_bptt(gpu);
                 }
@@ -1464,7 +1594,7 @@ impl Hierarchical {
         &mut self,
         gpu: &Gpu,
         back_in: &[GTensor<f32>],
-        spans: &[(usize, usize)],
+        spans: &[BbSpan],
         d_o: &GTensor<f32>,
         dw: usize,
         cache: &TrainingCache,
@@ -1478,7 +1608,7 @@ impl Hierarchical {
         // The chunks tile both sides: each reads its rows of `d_o` and writes its rows
         // of the result, so neither end needs a copy.
         let out = GTensor::uninit(gpu, &[dw, wh]);
-        for (i, &(c0, len)) in spans.iter().enumerate() {
+        for (i, &BbSpan { c0, len, .. }) in spans.iter().enumerate() {
             let d_o_c = GTensor::view(gpu, &d_o.buf, c0 * hc, &[len, hc]);
             let mut dx = GTensor::view(gpu, &out.buf, c0 * wh, &[len, wh]);
             self.bb_back
@@ -2667,6 +2797,235 @@ mod tests {
         };
         check(&table_c, &table_u, "tied table");
         check(&front_c, &front_u, "backbone blocks");
+    }
+
+    /// Two windows run back to back with the state carried must decode the second one
+    /// exactly as one long window decodes its tail.
+    ///
+    /// The two windows overlap by one word, the way `build_word_windows` cuts them: a
+    /// window's last word is a decode target only, so the word it ends on is the next
+    /// window's first backbone step. With that layout the split covers exactly the
+    /// backbone steps and the predictions of the long window, and the comparison is
+    /// against a masked whole-window run whose loss covers precisely the targets the
+    /// second window scores — the same rows, so the same mean.
+    ///
+    /// The stateless leg is the control: without the carry the second window decodes
+    /// from a zeroed backbone and the loss moves by orders of magnitude more than the
+    /// reassociation floor.
+    #[test]
+    fn carried_window_decodes_like_one_long_window() {
+        carry_vs_long_window(usize::MAX);
+    }
+
+    /// The same with a backbone chunked *inside* each window, which is the shape the
+    /// real config runs: the carry then has to cross a window border whose two sides
+    /// are already carrying across chunk borders of their own.
+    #[test]
+    fn carried_window_decodes_like_one_long_window_chunked() {
+        carry_vs_long_window(8);
+    }
+
+    fn carry_vs_long_window(chunk: usize) {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let cfg = ModelCfg {
+            vocab: 12,
+            hc: 16,
+            wh: 24,
+            enc_blocks: 1,
+            bb_blocks: 3,
+            dec_blocks: 1,
+            heads: 2,
+            dqk: 8,
+            w_token: 11,
+            cap: 30.0,
+        };
+        // Two `n`-word windows overlapping by one, two tokens per word.
+        let n = 24;
+        let total = 2 * n - 1;
+        let tokens: Vec<usize> = (0..total * 2).map(|i| 1 + i % 9).collect();
+        let words: Vec<Range<usize>> = (0..total)
+            .map(|w| Range {
+                start: w * 2,
+                end: w * 2 + 2,
+            })
+            .collect();
+        let second: Vec<Range<usize>> = words[n - 1..]
+            .iter()
+            .map(|w| Range {
+                start: w.start - (n - 1) * 2,
+                end: w.end - (n - 1) * 2,
+            })
+            .collect();
+
+        let seed = std::env::temp_dir().join(format!("gpu_window_carry_seed_{chunk}.hier"));
+        let seed = seed.to_str().unwrap();
+        Hierarchical::new(&gpu, cfg)
+            .save(&gpu, seed, &[])
+            .expect("save seed");
+        let fresh = || {
+            let mut m = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
+            // Per-instance, so this test does not race the rest of the suite.
+            m.bb_chunk = Some(chunk);
+            m
+        };
+
+        // Word `w` decodes word `w+1`, so the second window's targets are the decoded
+        // words from `n-1` on. Masking the rest leaves a mean over exactly those rows.
+        let mask: Vec<bool> = (0..words.len() - 1).map(|w| w >= n - 1).collect();
+        let whole = fresh().forward_backward_masked(&gpu, &tokens, &words, &mask);
+
+        let run = |stateful: bool| -> f32 {
+            let mut model = fresh();
+            model.set_stateful(stateful);
+            let _ = model.forward_backward(&gpu, &tokens[..n * 2], &words[..n]);
+            model.set_continues(true);
+            model.forward_backward(&gpu, &tokens[(n - 1) * 2..], &second)
+        };
+        let carried = run(true);
+        let restarted = run(false);
+
+        // Same rows, summed in a different order — the floor is reassociation, not
+        // structure. See `backbone_chunked_matches_unchunked`.
+        let slab = if gpu.kernels.slab_bf16 { 8.0 } else { 1.0 };
+        let drift = (carried - whole).abs();
+        assert!(
+            drift < 2e-4 * slab,
+            "carried window loss {carried} != masked whole-window loss {whole}"
+        );
+        assert!(
+            (restarted - whole).abs() > 10.0 * drift.max(1e-6),
+            "restarting the backbone changed nothing ({restarted} vs {whole}) — \
+             the carry cannot be what the first assert measured"
+        );
+    }
+
+    /// A window packing two documents must decode the second exactly as a window
+    /// holding that document alone does.
+    ///
+    /// That is the whole claim packing rests on: concatenating documents changes which
+    /// window a word lands in and nothing else. It holds because `doc_starts` cuts the
+    /// backbone sweep at the border and zeroes the recurrent state there, and because
+    /// the one prediction that would reach across — the second document's first word,
+    /// whose only context is the first document's last step — carries no loss.
+    ///
+    /// The control runs the same packed window with the border undeclared, which is
+    /// the bug this pins: the second document then autoregresses out of the first.
+    ///
+    /// A third leg pins which words the border masks cover: masking them again by hand
+    /// must change nothing, so the derived mask reaches at least as far as `<END>` and
+    /// the word after it.
+    #[test]
+    fn packed_document_decodes_like_its_own_window() {
+        packed_vs_own_window(usize::MAX);
+    }
+
+    /// The same with the backbone chunked inside each document, the shape the real
+    /// config runs: a border reset then lands among chunk borders that must keep
+    /// carrying.
+    #[test]
+    fn packed_document_decodes_like_its_own_window_chunked() {
+        packed_vs_own_window(8);
+    }
+
+    fn packed_vs_own_window(chunk: usize) {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let cfg = ModelCfg {
+            vocab: 12,
+            hc: 16,
+            wh: 24,
+            enc_blocks: 1,
+            bb_blocks: 3,
+            dec_blocks: 1,
+            heads: 2,
+            dqk: 8,
+            w_token: 11,
+            cap: 30.0,
+        };
+        // Two documents of `a` and `b` words packed back to back, two tokens per word.
+        let (a, b) = (20, 24);
+        let tokens: Vec<usize> = (0..(a + b) * 2).map(|i| 1 + i % 9).collect();
+        let words: Vec<Range<usize>> = (0..a + b)
+            .map(|w| Range {
+                start: w * 2,
+                end: w * 2 + 2,
+            })
+            .collect();
+        let second: Vec<Range<usize>> = words[a..]
+            .iter()
+            .map(|w| Range {
+                start: w.start - a * 2,
+                end: w.end - a * 2,
+            })
+            .collect();
+
+        let seed = std::env::temp_dir().join(format!("gpu_packed_docs_seed_{chunk}.hier"));
+        let seed = seed.to_str().unwrap();
+        Hierarchical::new(&gpu, cfg)
+            .save(&gpu, seed, &[])
+            .expect("save seed");
+        let fresh = || {
+            let mut m = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
+            // Per-instance, so this test does not race the rest of the suite.
+            m.bb_chunk = Some(chunk);
+            m
+        };
+
+        // The second document alone: word `a` is its encode-only prefix, so its scored
+        // targets are words `a+1 ..`. Masking the packed window to the same targets
+        // makes both losses a mean over exactly those rows.
+        let own = fresh().forward_backward(&gpu, &tokens[a * 2..], &second);
+        let mask: Vec<bool> = (0..words.len() - 1).map(|w| w >= a).collect();
+
+        let run = |declare: bool| -> f32 {
+            let mut model = fresh();
+            if declare {
+                model.set_doc_starts(&[0, a]);
+            }
+            model.forward_backward_masked(&gpu, &tokens, &words, &mask)
+        };
+        let packed = run(true);
+        let unbroken = run(false);
+
+        // Over the whole window this time, with no mask of our own: `doc_starts` alone
+        // must already drop the `<END>` at word `a-1` and the second document's first
+        // word at `a`. ANDing exactly those in by hand can only remove rows, so an
+        // equal loss says the derivation reaches both.
+        let by_hand: Vec<bool> = (0..words.len() - 1)
+            .map(|w| w + 1 != a && w + 2 != a)
+            .collect();
+        let derived = {
+            let mut model = fresh();
+            model.set_doc_starts(&[0, a]);
+            model.forward_backward(&gpu, &tokens, &words)
+        };
+        let spelled = {
+            let mut model = fresh();
+            model.set_doc_starts(&[0, a]);
+            model.forward_backward_masked(&gpu, &tokens, &words, &by_hand)
+        };
+
+        // Same rows, summed in a different order — the floor is reassociation, not
+        // structure. See `backbone_chunked_matches_unchunked`.
+        let slab = if gpu.kernels.slab_bf16 { 8.0 } else { 1.0 };
+        let drift = (packed - own).abs();
+        assert!(
+            drift < 2e-4 * slab,
+            "packed document loss {packed} != own-window loss {own}"
+        );
+        assert!(
+            (unbroken - own).abs() > 10.0 * drift.max(1e-6),
+            "leaving the border undeclared changed nothing ({unbroken} vs {own}) — \
+             the reset cannot be what the first assert measured"
+        );
+        assert!(
+            (spelled - derived).abs() < 2e-4 * slab,
+            "spelling the border mask out changed the loss ({spelled} vs {derived}) — \
+             `doc_starts` does not mask everything at the border"
+        );
     }
 
     /// A backbone sweep of three or more chunks must give the same gradients as one.

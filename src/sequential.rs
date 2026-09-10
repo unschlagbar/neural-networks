@@ -338,6 +338,7 @@ impl Sequential {
             let WordBatch {
                 tokens: window,
                 words,
+                ..
             } = batch;
 
             // Need a prefix word plus at least one decoded word.

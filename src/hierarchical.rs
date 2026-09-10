@@ -95,6 +95,9 @@ pub struct Hierarchical {
     /// flows from them, and they are excluded from the reported loss. Set per
     /// window right before `forward_over`/`backwards_sequence`.
     dec_word_loss: Option<Vec<bool>>,
+    /// Word indices where a document starts inside the current window (see
+    /// [`set_doc_starts`](Self::set_doc_starts)).
+    doc_starts: Vec<usize>,
 
     /// Cross-word context ablation applied during `forward_over` (probing only).
     pub backbone_mode: BackboneMode,
@@ -171,6 +174,7 @@ impl Hierarchical {
             step: 0,
             seen: Seen::default(),
             dec_word_loss: None,
+            doc_starts: Vec::new(),
             backbone_mode: BackboneMode::Normal,
             trace_io: false,
         }
@@ -269,6 +273,12 @@ impl Hierarchical {
         // PHASE 2: BACKBONE — autoregress e_0 … e_{n-2}, carrying recurrent
         // state across words. Step w consumes e_w and emits o_{w+1}.
         for w in 0..decode_words {
+            // A document border: the recurrence must not run across it.
+            if w > 0 && self.doc_starts.contains(&w) {
+                for layer in &mut self.word_model.layers {
+                    layer.reset_state();
+                }
+            }
             // Probe: drop cross-word recurrent state so o reflects only this word.
             if self.backbone_mode == BackboneMode::ResetEachWord {
                 for layer in &mut self.word_model.layers {
@@ -397,11 +407,24 @@ impl Hierarchical {
         self.dec_word_loss = mask;
     }
 
-    /// Whether decoded word `w` contributes to loss/gradient (always true unless
-    /// an SFT mask is set).
+    /// Where the documents packed into the next window begin, as indices into its
+    /// words. The backbone starts from zero state at each of them, and the word at each
+    /// carries no loss — its only available context comes from the document before it.
+    /// The GPU twin is `gpu::Hierarchical::set_doc_starts`.
+    pub fn set_doc_starts(&mut self, starts: &[usize]) {
+        self.doc_starts.clear();
+        self.doc_starts.extend_from_slice(starts);
+    }
+
+    /// Whether decoded word `w` contributes to loss/gradient. False under an SFT mask,
+    /// and false at a document border: word `w+1` starting a document means its only
+    /// context is the document before, and a document starting at `w+2` means word
+    /// `w+1` is the `<END>` closing this one — a marker for the reset, not text.
     #[inline]
     fn word_on(&self, w: usize) -> bool {
         self.dec_word_loss.as_ref().is_none_or(|m| m[w])
+            && !self.doc_starts.contains(&(w + 1))
+            && !self.doc_starts.contains(&(w + 2))
     }
 
     pub fn backwards_sequence(&mut self) {
@@ -608,7 +631,13 @@ impl Hierarchical {
         let mut w_total = 0.0;
         let mut count = 0;
         for batch in data {
-            let WordBatch { tokens, words } = batch;
+            let WordBatch {
+                tokens,
+                words,
+                doc_starts,
+                ..
+            } = batch;
+            self.set_doc_starts(&doc_starts);
             self.reset();
             self.forward_over(tokens, &words);
             if self.word_segments.len() < 2 {
@@ -691,8 +720,11 @@ impl Hierarchical {
             let WordBatch {
                 tokens: window,
                 words,
+                doc_starts,
+                ..
             } = batch;
             self.reset();
+            self.set_doc_starts(&doc_starts);
             self.forward_over(window, &words);
 
             // Word 0 is the given prefix (encode-only); skip degenerate windows
