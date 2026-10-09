@@ -139,7 +139,7 @@ pub fn train_wake() {
         }
 
         println!(
-            "epoch {:2} | loss {:.4} | acc {:.1}% | {:.1?}",
+            "epoch {:2} | loss {:.3} | acc {:.1}% | {:.1?}",
             epoch + 1,
             total_loss / seqs.len() as f32,
             correct as f32 / total_frames as f32 * 100.0,

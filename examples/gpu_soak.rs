@@ -133,7 +133,7 @@ fn main() {
             if seen % 25 == 0 {
                 println!(
                     "  {seen:>5} windows | dw<32: {tiny}, 32..full: {short}, full: {full} \
-                     | mean loss {:.4} | {:.1?}",
+                     | mean loss {:.3} | {:.1?}",
                     loss_sum / seen as f32,
                     t0.elapsed(),
                 );

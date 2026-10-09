@@ -1,7 +1,7 @@
 use std::io::{Write, stdin, stdout};
 
 use crate::{
-    config::{MAX_LEN, MAX_SEQ_LEN, TEMPERATURE, TOP_P},
+    config::{MAX_LEN, MAX_SEQ_LEN, TEMPERATURE, TOOL_TEMPERATURE, TOP_P},
     hierarchical::Hierarchical,
     sequential::Sequential,
     sft::{Role, Turn},
@@ -155,9 +155,14 @@ pub fn sample_chat(model_path: &str) {
             print!(">>> ");
             stdout().flush().unwrap();
             let mut printer = Utf8Printer::default();
-            let reply = model.sample_chat(&prompt, MAX_LEN, TEMPERATURE, TOP_P, |token| {
-                printer.print(token, &tokenizer)
-            });
+            let reply = model.sample_chat(
+                &prompt,
+                MAX_LEN,
+                TEMPERATURE,
+                TOOL_TEMPERATURE,
+                TOP_P,
+                |token| printer.print(token, &tokenizer),
+            );
             println!();
             let called_tool = reply.contains(&TOOL_OPEN_TOKEN);
             // Markup is kept in the turn text so re-encoding the history

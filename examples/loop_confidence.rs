@@ -16,7 +16,10 @@ fn ranges(tokens: &[u16]) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut start = 0;
     for e in segment::word_ends(tokens) {
-        out.push(Range { start, end: e as usize });
+        out.push(Range {
+            start,
+            end: e as usize,
+        });
         start = e as usize;
     }
     out
@@ -26,7 +29,9 @@ fn disp(t: &Utf8Tokenizer, id: u16) -> String {
     if id as usize >= 256 {
         t.display(id)
     } else {
-        String::from_utf8_lossy(&[id as u8]).escape_debug().to_string()
+        String::from_utf8_lossy(&[id as u8])
+            .escape_debug()
+            .to_string()
     }
 }
 
@@ -50,13 +55,25 @@ fn main() {
         let next = words[w + 1];
         let len = next.end - next.start;
         for k in 0..=len {
-            let target = if k == len { tokenizer.w_token() } else { tokens[next.start + k] };
+            let target = if k == len {
+                tokenizer.w_token()
+            } else {
+                tokens[next.start + k]
+            };
             slots.push((cursor + k, target));
         }
         cursor += len + 1;
     }
 
-    println!("{:>5}  {:<6} {:<6}  {:>8} {:>8}  {:>7}", "slot", "target", "top-1", "p(T=1)", &format!("p(T={TEMPERATURE})"), "entropy");
+    println!(
+        "{:>5}  {:<6} {:<6}  {:>8} {:>8}  {:>7}",
+        "slot",
+        "target",
+        "top-1",
+        "p(T=1)",
+        &format!("p(T={TEMPERATURE})"),
+        "entropy"
+    );
     let mut sum_p1 = 0.0;
     let mut n = 0.0;
     for &(slot, target) in slots.iter().skip(slots.len().saturating_sub(tail)) {
@@ -64,8 +81,17 @@ fn main() {
         let p = softmax(z);
         let scaled: Vec<f32> = z.iter().map(|&v| v / TEMPERATURE).collect();
         let q = softmax(&scaled);
-        let top = p.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
-        let ent: f32 = -p.iter().filter(|&&v| v > 0.0).map(|&v| v * v.ln()).sum::<f32>();
+        let top = p
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        let ent: f32 = -p
+            .iter()
+            .filter(|&&v| v > 0.0)
+            .map(|&v| v * v.ln())
+            .sum::<f32>();
         sum_p1 += p[top];
         n += 1.0;
         println!(
@@ -76,5 +102,5 @@ fn main() {
             q[top],
         );
     }
-    println!("\nmean top-1 probability over this tail: {:.4}", sum_p1 / n);
+    println!("\nmean top-1 probability over this tail: {:.3}", sum_p1 / n);
 }

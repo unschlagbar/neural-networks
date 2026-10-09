@@ -1,0 +1,178 @@
+#:schema ../datamix/mixture.schema.json
+# SFT corpus for Jarvis, built from the whole of SmolTalk plus two human-written
+# sets, every record used at most once.
+#
+#   ./target/release/datamix build  mixes/assistant_full.toml
+#   ./target/release/datamix verify data/mix/assistant_full.jsonl
+#
+# Sources (all under ~/training_data, raw and unfiltered — scripts/fetch_sft_data.sh):
+#   smoltalk/<subset>/  HuggingFaceTB/smoltalk, train split per subset. Left out:
+#                       systemchats-30k (a persona per system prompt), apigen-80k
+#                       (function calls in a syntax that is not ours),
+#                       self-oss-instruct (all Python: the blocklist keeps 0 of
+#                       48k) and longalign (11 of 3.5k fit under max_tokens).
+#   no_robots/          HuggingFaceH4/no_robots, 9.5k human-written.
+#   oasst2.jsonl        OpenAssistant/oasst2, best-ranked English thread per tree
+#                       (scripts/oasst2_to_jsonl.py).
+#   wildchat/           allenai/WildChat-1M, English, non-toxic, GPT-4 half
+#                       (scripts/wildchat_to_jsonl.py). The only source whose
+#                       users are real: they follow up, push back, complain and
+#                       chat, which no synthetic set does. Its replies are 2023
+#                       GPT-4, so the assistant blocklist matters most here.
+#
+# The model is only ever Jarvis, so the filters drop every record that teaches
+# it to be someone else: roleplay setups on the user side, persona system
+# prompts, and assistant turns that introduce a different assistant.
+
+[output]
+kind = "sft"
+path = "data/mix/assistant_full.jsonl"
+report = "data/mix/assistant_full_report.md"
+seed = 1234
+holdout = 0.02
+weight_by = "records"
+# Every source's weight is its kept record count, so each is taken whole, once.
+# The budget is set by whichever runs out first; nudging a weight above its
+# kept count would make that source the binding one.
+
+[filter]
+max_words = 4096
+max_tokens = 28672
+min_bytes = 16
+dedup = "exact"
+trim_turns = true
+must_not_contain = [
+    "```python", "```py", "python",
+    "pip install", "numpy", "pandas", "matplotlib", "scikit", "PyTorch",
+    "Django", "Flask", "Jupyter", "virtualenv", "__init__",
+]
+# Roleplay and non-English requests. "^" anchors at the start of a turn.
+user_must_not_contain = [
+    "^you are a", "^you are an", "^you're a", "^you're an", "^act as",
+    "^imagine you are", "^imagine you're", "^pretend", "^assume you are", "^assume the role",
+    "^take on the role", "^you will be playing", "^you are playing", "^you are still in character",
+    "roleplay", "role-play", "role play", "assume the role of", "play the role of",
+    "pretend you are", "pretend to be", "pretend you're", "stay in character", "in character as",
+    "i want you to act", "i'd like you to be a", "i'd like you to be an",
+    "translate to ", "translate it into", "translate the following", "translate this sentence",
+    "into english",
+    # API scripts and content farms rather than people (WildChat).
+    "ignore previous instructions", "ignore all previous instructions", "^constraints:",
+    "midjourney", "/imagine prompt", "seo writer", "seo-optimized", "seo optimized",
+    "write a current and up to date",
+]
+# Another assistant's identity, and the "as an AI language model" register.
+assistant_must_not_contain = [
+    "i'm an ai assistant", "i am an ai assistant", "as an ai assistant",
+    "as an ai,", "as an ai ", "i'm an ai ", "i'm an ai,", "i am an ai ",
+    "as an ai language model", "as a language model", "as a large language model",
+    "i'm a large language model", "i am a large language model",
+    "my training data", "knowledge cutoff", "i was trained on", "chatgpt",
+    "i'm a creative writing assistant", "i'm a writing assistant",
+    "open assistant", "openassistant", "laion",
+]
+# A system turn that survives system_strip and gives the model a persona.
+system_must_not_contain = [
+    "^you are a", "^you are an", "^you're a", "^you're an", "^act as", "^as a ",
+    "your name is", "you are named", "roleplay", "role-play", "role play", "in character",
+]
+system_strip = [
+    "You are an AI rewriting assistant. You will be provided with a text and you need to rewrite it according to the user's instructions.",
+    "You are an AI assistant that helps people find information.",
+    "You are an AI assistant that follows instruction extremely well.",
+    "You are a helpful assistant, who always provide explanation.",
+    "You're an AI assistant for text re-writing.",
+    "You are an AI assistant.",
+]
+system_fold = false
+
+# Ours: tool calling and the Python half of SmolTalk translated to Rust. Their
+# own system prompts name Jarvis, so they skip the persona filters.
+[source.tools]
+kind = "dolly"
+path = "data/sources/tools.jsonl"
+epochs = 1
+weight = 6524
+system_must_not_contain = []
+user_must_not_contain = []
+assistant_must_not_contain = []
+
+[source.rustified]
+kind = "dolly"
+path = "data/sources/rustified.jsonl"
+epochs = 1
+weight = 3073
+
+[source.no_robots]
+kind = "chat"
+path = "/home/unschlagbar/training_data/no_robots"
+epochs = 1
+weight = 9213
+
+[source.oasst2]
+kind = "jsonl"
+path = "/home/unschlagbar/training_data/oasst2/oasst2.jsonl"
+epochs = 1
+weight = 4655
+
+[source.everyday]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smoltalk/everyday-conversations"
+epochs = 1
+weight = 2246
+
+[source.rewriting]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smoltalk/explore-instruct-rewriting"
+epochs = 1
+weight = 29585
+
+[source.constraints]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smoltalk/smol-constraints"
+epochs = 1
+weight = 34201
+
+[source.rewrite]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smoltalk/smol-rewrite"
+epochs = 1
+weight = 53001
+
+[source.summarize]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smoltalk/smol-summarize"
+epochs = 1
+weight = 95689
+
+[source.openhermes]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smoltalk/openhermes-100k"
+epochs = 1
+weight = 82168
+
+[source.metamath]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smoltalk/metamathqa-50k"
+epochs = 1
+weight = 47251
+
+[source.numina]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smoltalk/numina-cot-100k"
+epochs = 1
+weight = 105940
+
+[source.magpie]
+kind = "chat"
+path = "/home/unschlagbar/training_data/smoltalk/smol-magpie-ultra"
+# Its own labels are a cleaner cut than phrase matching.
+where = ["category!=role-playing", "quality!=poor|very poor"]
+epochs = 1
+weight = 299390
+
+[source.wildchat]
+kind = "jsonl"
+path = "/home/unschlagbar/training_data/wildchat/wildchat_gpt4.jsonl"
+epochs = 1
+weight = 59316

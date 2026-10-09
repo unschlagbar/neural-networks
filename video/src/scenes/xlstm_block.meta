@@ -1,0 +1,30 @@
+{
+  "version": 0,
+  "timeEvents": [
+    {
+      "name": "zoom",
+      "targetTime": 1.4249999999999998
+    },
+    {
+      "name": "input",
+      "targetTime": 3.7249999999999996
+    },
+    {
+      "name": "memory",
+      "targetTime": 5.924999999999999
+    },
+    {
+      "name": "residual",
+      "targetTime": 10.179956363879764
+    },
+    {
+      "name": "ffn",
+      "targetTime": 12.179956363879766
+    },
+    {
+      "name": "stack",
+      "targetTime": 21.679956363879764
+    }
+  ],
+  "seed": 894477712
+}

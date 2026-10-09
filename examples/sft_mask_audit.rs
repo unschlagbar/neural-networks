@@ -3,7 +3,7 @@
 // word 0 flagged for loss (nothing decodes it) and a scored `<SEP>` (the model
 // would learn to emit the separator as response text).
 //
-//   cargo run --release --example sft_mask_audit -- data/mix/assistant_qa.jsonl
+//   cargo run --release --example sft_mask_audit -- data/mix/assistant_full.jsonl
 use neural_networks::sft;
 use neural_networks::tokenizer_utf8::{SEP_TOKEN, Utf8Tokenizer};
 

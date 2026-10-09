@@ -69,14 +69,14 @@ fn main() {
     let gpu_char = g.eval_loss(&gpu, &ids, &words);
 
     println!(
-        "\nCPU  mean per-token decode CE : {cpu_char:.6}  (ppl {:.4})",
+        "\nCPU  mean per-token decode CE : {cpu_char:.6}  (ppl {:.3})",
         cpu_char.exp()
     );
     println!(
-        "GPU  mean per-token decode CE : {gpu_char:.6}  (ppl {:.4})",
+        "GPU  mean per-token decode CE : {gpu_char:.6}  (ppl {:.3})",
         gpu_char.exp()
     );
     let rel = (cpu_char - gpu_char).abs() / cpu_char.abs().max(1e-6);
-    println!("relative difference           : {:.4}%", 100.0 * rel);
+    println!("relative difference           : {:.3}%", 100.0 * rel);
     println!("CPU per-word loss             : {cpu_word:.6}");
 }

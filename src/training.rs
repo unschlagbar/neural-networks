@@ -493,11 +493,11 @@ pub fn probe_hierarchical(model_path: &str) {
         model.backbone_mode = mode;
         let (ce, we) = model.eval_decode_loss(chunk.iter().take(n));
         println!(
-            "  {label:<34} Char loss = {ce:.4} nats   ppl = {:.3}",
+            "  {label:<34} Char loss = {ce:.3} nats   ppl = {:.3}",
             ce.exp()
         );
         println!(
-            "  {label:<34} Word loss = {we:.4} nats   ppl = {:.3}",
+            "  {label:<34} Word loss = {we:.3} nats   ppl = {:.3}",
             we.exp()
         );
         results.push((label, ce, we));
@@ -510,7 +510,7 @@ pub fn probe_hierarchical(model_path: &str) {
     let w_reset = results[1].2;
     println!("\n  ── context usage ──");
     println!(
-        "  long-range history (Reset → Normal): Char {:.4} nats, Word {:.4} <- what the deep backbone actually buys",
+        "  long-range history (Reset → Normal): Char {:.3} nats, Word {:.3} <- what the deep backbone actually buys",
         c_reset - c_normal,
         w_reset - w_normal,
     );
@@ -564,7 +564,7 @@ pub fn probe_hierarchical(model_path: &str) {
             .collect();
         let block_mean = means.iter().sum::<f32>() / means.len().max(1) as f32;
         println!(
-            "  block {b:>2}: mean f̄ = {block_mean:.4} (~{:.1} words)",
+            "  block {b:>2}: mean f̄ = {block_mean:.3} (~{:.1} words)",
             horizon(block_mean),
         );
         println!("      head   f̄ mean    horizon      min      max   rest σ(bf)    swing");
@@ -578,7 +578,7 @@ pub fn probe_hierarchical(model_path: &str) {
                 static_heads += 1;
             }
             println!(
-                "      {h:>4}   {mean:.4}   {:>7.1} w   {min:.4}   {max:.4}       {rest:.4}   {swing:.4}{}",
+                "      {h:>4}   {mean:.3}   {:>7.1} w   {min:.3}   {max:.3}       {rest:.3}   {swing:.3}{}",
                 horizon(mean),
                 if swing < STATIC_SWING {
                     "  (static)"
@@ -670,7 +670,7 @@ pub fn validate_hierarchical(model_path: &str) {
         w_total += w;
         windows += n;
         println!(
-            "  {windows} windows  char {:.4}  word {:.4}  ({:.0?})",
+            "  {windows} windows  char {:.3}  word {:.3}  ({:.0?})",
             c_total / windows.max(1) as f32,
             w_total / windows.max(1) as f32,
             start.elapsed(),
@@ -687,8 +687,8 @@ pub fn validate_hierarchical(model_path: &str) {
         "\n── validation ({windows} windows, {:.0?}) ──",
         start.elapsed()
     );
-    println!("  Char loss = {c_loss:.4} nats   ppl = {:.3}", c_loss.exp());
-    println!("  Word loss = {w_loss:.4} nats   ppl = {:.3}", w_loss.exp());
+    println!("  Char loss = {c_loss:.3} nats   ppl = {:.3}", c_loss.exp());
+    println!("  Word loss = {w_loss:.3} nats   ppl = {:.3}", w_loss.exp());
 }
 
 /// 1/e memory horizon in words for a mean per-step retention `f̄ ∈ (0,1]`.
@@ -760,11 +760,12 @@ pub struct TrainingState {
     tokens_since_log: usize,
     extra_cols: Vec<String>,
     extra_vals: Vec<(f32, usize)>,
-    /// Total decode NLL (nats) and the byte count it was measured over, since the
-    /// last save. Byte-weighted rather than a mean of per-window means, so windows
+    /// Total decode NLL (nats) and the byte and word counts it was measured over,
+    /// since the last save. Pooled rather than a mean of per-window means, so windows
     /// count by how much text they actually carry.
     bpb_nats: f64,
     bpb_bytes: usize,
+    bpb_words: usize,
 }
 
 impl TrainingState {
@@ -795,33 +796,39 @@ impl TrainingState {
             extra_vals: Vec::new(),
             bpb_nats: 0.0,
             bpb_bytes: 0,
+            bpb_words: 0,
         }
     }
 
-    /// Accumulate one window's decode loss for the bits-per-byte metric. `loss` is
+    /// Accumulate one window's decode loss for the save-time metrics. `loss` is
     /// the mean NLL per decoder ROW, `rows` the count it was averaged over (chars
-    /// plus one `[W]` per word) and `bytes` the raw UTF-8 bytes those rows cover.
+    /// plus one `[W]` per word), `bytes` the raw UTF-8 bytes those rows cover and
+    /// `words` the scored words they belong to.
     /// The `[W]` rows are part of the model's cost but not of the text, so the
-    /// total nats are charged against bytes only — that is what makes the number
+    /// total nats are charged against bytes only — that is what makes bpb
     /// comparable to a byte-level model that never emits a word marker.
-    pub fn log_bpb(&mut self, loss: f32, rows: usize, bytes: usize) {
+    pub fn log_bpb(&mut self, loss: f32, rows: usize, bytes: usize, words: usize) {
         if bytes == 0 || !loss.is_finite() {
             return;
         }
         self.bpb_nats += loss as f64 * rows as f64;
         self.bpb_bytes += bytes;
+        self.bpb_words += words;
     }
 
-    /// Mean bits per byte since the last `take_bpb`, or `None` if nothing was
-    /// accumulated.
-    pub fn take_bpb(&mut self) -> Option<f32> {
+    /// Since the last take: bits per byte, and nats per word with each word's `[W]`
+    /// row in the numerator — both pooled over every scored word, unlike the logged
+    /// `word_loss`, which averages per-window means. `None` if nothing accumulated.
+    pub fn take_bpb(&mut self) -> Option<(f32, f32)> {
         if self.bpb_bytes == 0 {
             return None;
         }
         let bpb = self.bpb_nats / self.bpb_bytes as f64 / std::f64::consts::LN_2;
+        let word = self.bpb_nats / self.bpb_words.max(1) as f64;
         self.bpb_nats = 0.0;
         self.bpb_bytes = 0;
-        Some(bpb as f32)
+        self.bpb_words = 0;
+        Some((bpb as f32, word as f32))
     }
 
     pub fn init_log(&mut self, model_path: &str, extra_cols: &[&str]) {
@@ -940,7 +947,7 @@ impl TrainingState {
                 .collect();
             let _ = writeln!(
                 writer,
-                "{},{},{:e},{:.6},{:.4},{:.2},{:.4}{extra}",
+                "{},{},{:e},{:.6},{:.3},{:.2},{:.3}{extra}",
                 self.step,
                 batch_num,
                 self.current_lr,
@@ -990,9 +997,11 @@ mod tests {
         let mut s = TrainingState::new();
         let ln256 = 256f32.ln();
         // 4 words x 4 bytes = 16 bytes, 20 rows (4 markers).
-        s.log_bpb(ln256, 20, 16);
-        let bpb = s.take_bpb().expect("accumulated");
+        s.log_bpb(ln256, 20, 16, 4);
+        let (bpb, word) = s.take_bpb().expect("accumulated");
         assert!((bpb - 8.0 * 20.0 / 16.0).abs() < 1e-4, "got {bpb}");
+        // 20 rows of ln 256 nats over 4 words, the markers included.
+        assert!((word - ln256 * 5.0).abs() < 1e-3, "got {word}");
         assert!(s.take_bpb().is_none(), "take must reset the accumulator");
     }
 
@@ -1001,9 +1010,11 @@ mod tests {
     fn bpb_is_byte_weighted_across_windows() {
         let ln2 = std::f32::consts::LN_2;
         let mut s = TrainingState::new();
-        s.log_bpb(ln2, 10, 10); // 1 bpb over 10 bytes
-        s.log_bpb(3.0 * ln2, 90, 90); // 3 bpb over 90 bytes
-        let bpb = s.take_bpb().expect("accumulated");
+        s.log_bpb(ln2, 10, 10, 2); // 1 bpb over 10 bytes
+        s.log_bpb(3.0 * ln2, 90, 90, 3); // 3 bpb over 90 bytes
+        let (bpb, word) = s.take_bpb().expect("accumulated");
+        // Pooled over the 5 words: (10 + 270) ln 2 / 5, not a mean of window means.
+        assert!((word - 56.0 * ln2).abs() < 1e-4, "got {word}");
         // Byte-weighted: (10*1 + 90*3)/100 = 2.8, not the naive mean of 2.
         assert!((bpb - 2.8).abs() < 1e-4, "got {bpb}");
     }
@@ -1012,9 +1023,9 @@ mod tests {
     #[test]
     fn bpb_ignores_empty_and_nonfinite_windows() {
         let mut s = TrainingState::new();
-        s.log_bpb(1.0, 0, 0);
+        s.log_bpb(1.0, 0, 0, 0);
         assert!(s.take_bpb().is_none());
-        s.log_bpb(f32::NAN, 5, 5);
+        s.log_bpb(f32::NAN, 5, 5, 1);
         assert!(s.take_bpb().is_none());
     }
 }

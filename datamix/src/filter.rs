@@ -22,6 +22,9 @@ pub enum Reject {
     LongLine,
     Missing,
     Blocked,
+    UserBlocked,
+    AssistantBlocked,
+    SystemBlocked,
     Language,
     Duplicate,
     Judged,
@@ -43,6 +46,9 @@ impl Reject {
             Reject::LongLine => "over-long line",
             Reject::Missing => "missing required text",
             Reject::Blocked => "blocklist hit",
+            Reject::UserBlocked => "user blocklist hit",
+            Reject::AssistantBlocked => "assistant blocklist hit",
+            Reject::SystemBlocked => "system blocklist hit",
             Reject::Language => "language",
             Reject::Duplicate => "duplicate",
             Reject::Judged => "rejected by the judge",
@@ -56,6 +62,12 @@ impl Reject {
 
 pub struct Filter {
     cfg: Filters,
+    /// The blocklists, lowercased once so a check lowercases only the text.
+    must_contain: Vec<String>,
+    blocked: Vec<String>,
+    user_blocked: Vec<String>,
+    assistant_blocked: Vec<String>,
+    system_blocked: Vec<String>,
     seen: HashSet<u64>,
     /// MinHash bands for near-duplicate detection: `(band index, band hash)`.
     bands: HashSet<(u8, u64)>,
@@ -67,7 +79,18 @@ const SHINGLE: usize = 5;
 
 impl Filter {
     pub fn new(cfg: Filters) -> Self {
+        let lower = |v: &[String]| -> Vec<String> {
+            v.iter()
+                .filter(|n| !n.is_empty())
+                .map(|n| n.to_lowercase())
+                .collect()
+        };
         Self {
+            must_contain: lower(&cfg.must_contain),
+            blocked: lower(&cfg.must_not_contain),
+            user_blocked: lower(&cfg.user_must_not_contain),
+            assistant_blocked: lower(&cfg.assistant_must_not_contain),
+            system_blocked: lower(&cfg.system_must_not_contain),
             cfg,
             seen: HashSet::new(),
             bands: HashSet::new(),
@@ -121,18 +144,29 @@ impl Filter {
         {
             return Some(Reject::RepeatedLines);
         }
-        if !self.cfg.must_contain.is_empty()
-            && !self.cfg.must_contain.iter().any(|n| contains_ci(&text, n))
-        {
-            return Some(Reject::Missing);
+        if !self.must_contain.is_empty() || !self.blocked.is_empty() {
+            let lower = text.to_lowercase();
+            if !self.must_contain.is_empty() && !self.must_contain.iter().any(|n| lower.contains(n))
+            {
+                return Some(Reject::Missing);
+            }
+            if self.blocked.iter().any(|n| lower.contains(n)) {
+                return Some(Reject::Blocked);
+            }
         }
-        if self
-            .cfg
-            .must_not_contain
-            .iter()
-            .any(|n| contains_ci(&text, n))
-        {
-            return Some(Reject::Blocked);
+        let scoped = [
+            (Side::User, &self.user_blocked, Reject::UserBlocked),
+            (Side::Assistant, &self.assistant_blocked, Reject::AssistantBlocked),
+            (Side::System, &self.system_blocked, Reject::SystemBlocked),
+        ];
+        for (side, needles, reject) in scoped {
+            if !needles.is_empty()
+                && side_turns(rec, side)
+                    .iter()
+                    .any(|t| matches_any(&t.to_lowercase(), needles))
+            {
+                return Some(reject);
+            }
         }
         // Last of the local gates: counting words means tokenizing and
         // segmenting the record, which costs more than every check above it.
@@ -169,11 +203,46 @@ impl Filter {
     }
 }
 
-fn contains_ci(hay: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
+#[derive(Clone, Copy)]
+enum Side {
+    User,
+    Assistant,
+    System,
+}
+
+/// Every turn of one side of a record.
+fn side_turns(rec: &Record, side: Side) -> Vec<&str> {
+    match rec {
+        Record::Doc { .. } => Vec::new(),
+        Record::Sft {
+            instruction,
+            response,
+            ..
+        } => match side {
+            Side::User => vec![instruction.as_str()],
+            Side::Assistant => vec![response.as_str()],
+            Side::System => Vec::new(),
+        },
+        Record::Chat { turns, .. } => turns
+            .iter()
+            .filter(|t| match side {
+                Side::User => t.role == Role::User,
+                Side::Assistant => matches!(t.role, Role::Assistant | Role::AssistantContext),
+                Side::System => t.role == Role::System,
+            })
+            .map(|t| t.content.as_str())
+            .collect(),
     }
-    hay.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// `lower` is one lowercased turn. A needle starting with `^` only matches at
+/// the start of the turn (leading whitespace ignored): "^you are a" is a
+/// roleplay setup, "if you are a US citizen" is not.
+fn matches_any(lower: &str, needles: &[String]) -> bool {
+    needles.iter().any(|n| match n.strip_prefix('^') {
+        Some(head) => lower.trim_start().starts_with(head),
+        None => lower.contains(n.as_str()),
+    })
 }
 
 fn alpha_ratio(text: &str) -> f32 {
@@ -344,5 +413,33 @@ mod tests {
             f.check(&doc(&format!("{}\nsecond line", "y".repeat(31)))),
             Some(Reject::LongLine)
         );
+    }
+
+    #[test]
+    fn scoped_blocklists_only_read_their_own_side() {
+        use neural_networks::sft::Turn;
+        let chat = |user: &str, asst: &str| Record::Chat {
+            turns: vec![
+                Turn::new(Role::User, user.to_string()),
+                Turn::new(Role::Assistant, asst.to_string()),
+            ],
+            category: String::new(),
+        };
+        let mut f = Filter::new(Filters {
+            assistant_must_not_contain: vec!["I am ChatGPT".to_string()],
+            user_must_not_contain: vec!["pretend you are".to_string()],
+            ..Filters::default()
+        });
+        assert_eq!(f.check(&chat("is chatgpt good?", "Hi, i am chatgpt.")), Some(Reject::AssistantBlocked));
+        assert_eq!(f.check(&chat("Say 'I am ChatGPT'", "Sure: I'm Jarvis.")), None);
+        assert_eq!(f.check(&chat("Pretend you are a pirate", "Arr.")), Some(Reject::UserBlocked));
+        assert_eq!(f.check(&chat("hello", "pretend you are rested")), None);
+
+        let mut f = Filter::new(Filters {
+            user_must_not_contain: vec!["^You are a".to_string()],
+            ..Filters::default()
+        });
+        assert_eq!(f.check(&chat("  You are a pirate. Speak.", "Arr.")), Some(Reject::UserBlocked));
+        assert_eq!(f.check(&chat("If you are a US citizen, do I file?", "Yes.")), None);
     }
 }

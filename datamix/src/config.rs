@@ -93,6 +93,12 @@ pub struct Filters {
     pub max_line_bytes: usize,
     pub must_contain: Vec<String>,
     pub must_not_contain: Vec<String>,
+    /// Blocklists scoped to one role's turns. For a dolly-style record the user
+    /// side is the instruction and the assistant side the response; its
+    /// context is material, not a system turn.
+    pub user_must_not_contain: Vec<String>,
+    pub assistant_must_not_contain: Vec<String>,
+    pub system_must_not_contain: Vec<String>,
     pub dedup: Dedup,
     /// ISO codes kept from a parquet `language` column. Empty = no filtering.
     pub languages: Vec<String>,
@@ -171,6 +177,9 @@ impl Default for Filters {
             max_line_bytes: usize::MAX,
             must_contain: Vec::new(),
             must_not_contain: Vec::new(),
+            user_must_not_contain: Vec::new(),
+            assistant_must_not_contain: Vec::new(),
+            system_must_not_contain: Vec::new(),
             dedup: Dedup::Off,
             languages: Vec::new(),
             judge: String::new(),
@@ -188,6 +197,36 @@ impl Default for Filters {
             verify: String::new(),
             verify_repair: String::new(),
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowCond {
+    pub column: String,
+    pub values: Vec<String>,
+    /// True keeps a row holding one of `values`, false drops it.
+    pub keep: bool,
+}
+
+impl RowCond {
+    pub fn parse(s: &str) -> Option<Self> {
+        let (column, values, keep) = match s.split_once("!=") {
+            Some((c, v)) => (c, v, false),
+            None => {
+                let (c, v) = s.split_once('=')?;
+                (c, v, true)
+            }
+        };
+        let column = column.trim().to_string();
+        let values: Vec<String> = values.split('|').map(|v| v.trim().to_string()).collect();
+        if column.is_empty() || values.iter().all(|v| v.is_empty()) {
+            return None;
+        }
+        Some(Self { column, values, keep })
+    }
+
+    pub fn admits(&self, value: &str) -> bool {
+        self.values.iter().any(|v| v == value) == self.keep
     }
 }
 
@@ -223,6 +262,11 @@ pub struct Source {
     /// than topic: answer length varies 10x between them.
     pub select_column: String,
     pub select_values: Vec<String>,
+    /// `chat`: further row conditions on flat columns, all of which must hold.
+    /// Written `"column=a|b"` (keep rows holding one of the values) or
+    /// `"column!=a|b"` (drop them) — magpie's `category` and `quality` sit
+    /// side by side, and one select cannot cut on both.
+    pub row_where: Vec<RowCond>,
     /// `synth`/`llm`: how many examples to generate (`synth`: 0 = every
     /// combination).
     pub count: usize,
@@ -629,6 +673,21 @@ fn filters_from(kv: &Kv, base: &Filters, path: &str) -> Result<Filters> {
         max_line_bytes: kv.num("max_line_bytes", base.max_line_bytes, path)?,
         must_contain: kv.list("must_contain", &base.must_contain, path)?,
         must_not_contain: kv.list("must_not_contain", &base.must_not_contain, path)?,
+        user_must_not_contain: kv.list(
+            "user_must_not_contain",
+            &base.user_must_not_contain,
+            path,
+        )?,
+        assistant_must_not_contain: kv.list(
+            "assistant_must_not_contain",
+            &base.assistant_must_not_contain,
+            path,
+        )?,
+        system_must_not_contain: kv.list(
+            "system_must_not_contain",
+            &base.system_must_not_contain,
+            path,
+        )?,
         dedup,
         languages: kv.list("languages", &base.languages, path)?,
         judge: kv.str("judge", &base.judge, path)?,
@@ -689,6 +748,16 @@ fn source_from(kv: &Kv, defaults: &Filters, path: &str) -> Result<Source> {
             kv.name
         ));
     }
+    let mut row_where = Vec::new();
+    for cond in kv.list("where", &[], path)? {
+        let Some(c) = RowCond::parse(&cond) else {
+            return Err(format!(
+                "{path}: [source {}] where entry {cond:?} is not \"column=a|b\" or \"column!=a|b\"",
+                kv.name
+            ));
+        };
+        row_where.push(c);
+    }
     Ok(Source {
         name: kv.name.clone(),
         kind,
@@ -705,6 +774,7 @@ fn source_from(kv: &Kv, defaults: &Filters, path: &str) -> Result<Source> {
         content_column: kv.str("content_column", "content", path)?,
         select_column,
         select_values,
+        row_where,
         count: kv.num("count", 0, path)?,
         category: kv.str("category", &kv.name, path)?,
         system: kv.str("system", "", path)?,
@@ -731,6 +801,17 @@ impl fmt::Display for OutKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_conditions_parse_and_admit() {
+        let keep = RowCond::parse("category=math|coding").unwrap();
+        assert!(keep.admits("math") && !keep.admits("role-playing"));
+        let drop = RowCond::parse("quality != poor | very poor").unwrap();
+        assert_eq!(drop.column, "quality");
+        assert!(!drop.admits("very poor") && drop.admits("good"));
+        assert_eq!(RowCond::parse("no equals sign"), None);
+        assert_eq!(RowCond::parse("=x"), None);
+    }
 
     const MIX: &str = r#"
 [output]

@@ -226,10 +226,15 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                     tokens_since_print += tokens.len();
                     state.log_tokens(tokens.len());
                     state.log_metric("word_loss", model.last_word_loss());
-                    // Bits per byte counts the decoded words' raw bytes only: the `[W]`
-                    // rows are part of the model's cost but not of the text.
-                    let dec_bytes: usize = words[1..].iter().map(|w| w.end - w.start).sum();
-                    state.log_bpb(loss, model.last_rows(), dec_bytes);
+                    // Bits per byte counts the scored words' raw bytes only: the `[W]`
+                    // rows are part of the model's cost but not of the text, and a
+                    // border word the loss masks costs no nats, so its bytes are out too.
+                    state.log_bpb(
+                        loss,
+                        model.last_rows(),
+                        model.last_scored_tokens(),
+                        model.last_scored_words(),
+                    );
 
                     // `state.step` returns Some(lr) only on a batch boundary, so grads
                     // accumulate over BATCH_SIZE windows before each optimizer step.
@@ -247,7 +252,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                         let word_loss = state.metric_mean("word_loss");
                         let loss = state.get_loss();
                         println!(
-                            "{} | char loss {:.4} | ppl {:.4} | word loss {:.4} | lr {:.2e} | {} tok | {:.1?}",
+                            "{} | char loss {:.3} | ppl {:.3} | word loss {:.3} | lr {:.1e} | {} bytes | {:.1?}",
                             state.step,
                             loss,
                             loss.exp(),
@@ -266,8 +271,8 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                                 // past the checkpoint just written.
                                 state.flush_log();
                                 println!("saved -> {}", state.save_path());
-                                if let Some(bpb) = state.take_bpb() {
-                                    println!("  bpb {bpb:.4} (mean since last save)");
+                                if let Some((bpb, word)) = state.take_bpb() {
+                                    println!("  bpb {bpb:.3} | word loss {word:.3}");
                                 }
                                 println!("  trained on: {}", model.seen.save_line());
                                 // Written after the weights, so the recorded position
@@ -314,8 +319,8 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         Ok(()) => {
             state.flush_log();
             println!("final save -> {}", state.save_path());
-            if let Some(bpb) = state.take_bpb() {
-                println!("  bpb {bpb:.4} (mean since last save)");
+            if let Some((bpb, word)) = state.take_bpb() {
+                println!("  bpb {bpb:.3} | word loss {word:.3}");
             }
             println!("  trained on: {}", model.seen.save_line());
         }
@@ -391,7 +396,7 @@ pub fn validate_hierarchical_gpu(model_path: &str) {
             windows += 1;
         }
         println!(
-            "  {windows} windows  char {:.4}  word {:.4}  ({:.0?})",
+            "  {windows} windows  char {:.3}  word {:.3}  ({:.0?})",
             c_total / windows.max(1) as f32,
             w_total / windows.max(1) as f32,
             start.elapsed(),
@@ -408,8 +413,8 @@ pub fn validate_hierarchical_gpu(model_path: &str) {
         "\n── validation ({windows} windows, {:.0?}) ──",
         start.elapsed()
     );
-    println!("  Char loss = {c_loss:.4} nats   ppl = {:.3}", c_loss.exp());
-    println!("  Word loss = {w_loss:.4} nats   ppl = {:.3}", w_loss.exp());
+    println!("  Char loss = {c_loss:.3} nats   ppl = {:.3}", c_loss.exp());
+    println!("  Word loss = {w_loss:.3} nats   ppl = {:.3}", w_loss.exp());
 }
 
 /// GPU supervised fine-tuning (Q-A instruction tuning) of a pretrained
@@ -565,7 +570,7 @@ pub fn train_sft_gpu(model_path: &str) {
             if state.print() {
                 let loss = state.get_loss();
                 println!(
-                    "{} | resp loss {:.4} | ppl {:.4} | lr {:.2e} | {} tok | {:.1?}",
+                    "{} | resp loss {:.3} | ppl {:.3} | lr {:.2e} | {} tok | {:.1?}",
                     state.step,
                     loss,
                     loss.exp(),

@@ -135,6 +135,9 @@ trim_turns = true        # chat: keep the exchanges that fit rather than drop
                          # the conversation (98% vs 56% of SmolTalk at 4096)
 must_contain = ["fn", "impl"]        # keep only documents matching one of these
 must_not_contain = "TODO: generated" # a lone string is a one-element list
+user_must_not_contain = ["^you are a", "roleplay"]  # one role's turns only;
+assistant_must_not_contain = ["as an ai,"]         # "^" anchors at the turn start
+system_must_not_contain = ["your name is"]         # (dolly: instruction / response)
 dedup = "near"           # "off" | "exact" | "near" (MinHash over 5-grams)
 languages = ["en", "de"] # parquet `language` column only
 

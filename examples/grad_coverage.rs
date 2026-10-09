@@ -323,7 +323,7 @@ fn main() {
 
         let total: f32 = share.iter().map(|(_, _, n)| n).sum();
         println!(
-            "{name:<15}{:>5} words {:>6} tokens  loss {whole_loss:.4}  rows {rows_whole:.0}",
+            "{name:<15}{:>5} words {:>6} tokens  loss {whole_loss:.3}  rows {rows_whole:.0}",
             spans.len(),
             tokens.len()
         );

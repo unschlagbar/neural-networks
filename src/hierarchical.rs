@@ -18,7 +18,7 @@ use crate::{
     parallel::{ReplicaPool, WorkerChunk, chunk_words, split_by_words},
     segment,
     sequential::Sequential,
-    tokenizer_utf8::{BYTE_TOKENS, Utf8Tokenizer},
+    tokenizer_utf8::{BYTE_TOKENS, TOOL_CLOSE_TOKEN, TOOL_OPEN_TOKEN, Utf8Tokenizer},
     training::TrainingState,
     word_encoder::WordEncoder,
 };
@@ -770,7 +770,7 @@ impl Hierarchical {
                 let loss = state.get_loss();
                 let elapsed = time.elapsed();
                 println!(
-                    "{} | char loss {:.4} | ppl {:.4} | word loss {:.4} | word ppl {:.1} | high ∇ {:.4} | char1 ∇ {:.4} | {} tok | {:.1?}",
+                    "{} | char loss {:.3} | ppl {:.3} | word loss {:.3} | word ppl {:.1} | high ∇ {:.3} | char1 ∇ {:.3} | {} tok | {:.1?}",
                     state.step,
                     loss,
                     loss.exp(),
@@ -857,7 +857,7 @@ impl Hierarchical {
                 let loss = state.get_loss();
                 let elapsed = time.elapsed();
                 println!(
-                    "{} | resp loss {:.4} | ppl {:.4} | high ∇ {:.4} | char1 ∇ {:.4} | {} tok | {:.1?}",
+                    "{} | resp loss {:.3} | ppl {:.3} | high ∇ {:.3} | char1 ∇ {:.3} | {} tok | {:.1?}",
                     state.step,
                     loss,
                     loss.exp(),
@@ -1021,6 +1021,7 @@ impl Hierarchical {
         prompt: &[u16],
         max_len: usize,
         temperature: f32,
+        tool_temperature: f32,
         top_p: f32,
         callback: impl FnMut(u16) -> bool,
     ) -> Vec<u16> {
@@ -1030,7 +1031,7 @@ impl Hierarchical {
         if prompt.is_empty() {
             self.encode_word_advance(&[rand::random_range(0..BYTE_TOKENS) as u16]);
         }
-        self.chat_continue(max_len, temperature, top_p, callback)
+        self.chat_continue(max_len, temperature, tool_temperature, top_p, callback)
     }
 
     /// Drop the conversation the recurrent state is holding. The start of a
@@ -1071,10 +1072,14 @@ impl Hierarchical {
     /// is what it just committed to; re-encoding the reply as text would instead
     /// use `segment`'s split, and the two agree only as far as the model has
     /// learned the segmentation.
+    ///
+    /// From a sampled `<tool>` through its `</tool>` the decoder samples at
+    /// `tool_temperature` instead of `temperature`.
     pub fn chat_continue(
         &mut self,
         max_len: usize,
         temperature: f32,
+        tool_temperature: f32,
         top_p: f32,
         mut callback: impl FnMut(u16) -> bool,
     ) -> Vec<u16> {
@@ -1087,6 +1092,7 @@ impl Hierarchical {
         let mut out = Vec::with_capacity(max_len);
         let mut word_chars: Vec<u16> = Vec::new();
         let mut empty_words = 0;
+        let mut in_tool = false;
         for layer in &mut self.char2_model.layers {
             layer.reset_state();
         }
@@ -1098,7 +1104,17 @@ impl Hierarchical {
                 &self.char2_input,
             );
             let logits = self.char2_model.cache[0].last().unwrap().output();
-            let tok = sample_top_p(logits, temperature, top_p) as u16;
+            let temp = if in_tool {
+                tool_temperature
+            } else {
+                temperature
+            };
+            let tok = sample_top_p(logits, temp, top_p) as u16;
+            match tok {
+                TOOL_OPEN_TOKEN => in_tool = true,
+                TOOL_CLOSE_TOKEN => in_tool = false,
+                _ => {}
+            }
 
             if tok == end_tok {
                 break; // end of response

@@ -77,7 +77,7 @@ fn main() {
     }
     let (train, eval) = (train / iters as u32, eval / iters as u32);
     println!(
-        "{words_n} words / {} tokens\n  forward_backward {train:.1?}\n  eval_loss        {eval:.1?}  ({:.2}x)\n  loss {train_loss:.4} / {eval_loss:.4}",
+        "{words_n} words / {} tokens\n  forward_backward {train:.1?}\n  eval_loss        {eval:.1?}  ({:.2}x)\n  loss {train_loss:.3} / {eval_loss:.3}",
         tokens.len(),
         train.as_secs_f64() / eval.as_secs_f64(),
     );

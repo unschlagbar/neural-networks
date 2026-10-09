@@ -1,0 +1,26 @@
+{
+  "version": 0,
+  "timeEvents": [
+    {
+      "name": "lookup",
+      "targetTime": 1.6600000000000004
+    },
+    {
+      "name": "letters",
+      "targetTime": 6.5600000000000005
+    },
+    {
+      "name": "end",
+      "targetTime": 13.900000000000018
+    },
+    {
+      "name": "word_vector",
+      "targetTime": 17.200000000000017
+    },
+    {
+      "name": "all_words",
+      "targetTime": 19.000000000000018
+    }
+  ],
+  "seed": 2988669530
+}

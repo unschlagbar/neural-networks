@@ -23,15 +23,15 @@ pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 7;
 
 // Training-Schedule
 
-pub const LR: f32 = 1e-4;
-pub const MIN_LR: f32 = 1e-5;
+pub const LR: f32 = 8e-5;
+pub const MIN_LR: f32 = 5e-6;
 // Warmup/decay horizons count *windows* (data seen), not optimizer steps, so
 // BATCH_SIZE does not reshape the curve over the corpus.
 pub const WARMUP_WINDOWS: usize = 1_200;
-pub const DECAY_WINDOWS: usize = 1_500_000;
+pub const DECAY_WINDOWS: usize = 5_000_000;
 // Windows accumulated per optimizer step. Muon (Frobenius normalization) and
 // aux-Adam (second moment) are scale-invariant, so summed grads need no rescale.
-pub const BATCH_SIZE: usize = 8;
+pub const BATCH_SIZE: usize = 48;
 pub const EPOCHS: usize = 1;
 
 pub const SAVE_EVERY: usize = 1000;
@@ -51,8 +51,8 @@ pub const DECODER_WEIGHT_DECAY: f32 = 0.01;
 // `WORD_HIDDEN / CHAR_HIDDEN` times the backbone's rate. `1.0` is one rate for
 // the whole model, which is what every checkpoint before these existed trained
 // under.
-pub const ENCODER_LR_SCALE: f32 = 2.0;
-pub const DECODER_LR_SCALE: f32 = 2.0;
+pub const ENCODER_LR_SCALE: f32 = 1.0;
+pub const DECODER_LR_SCALE: f32 = 1.0;
 
 /// Weight decay for the flat model. `0.0` keeps it plain Adam.
 pub const FLAT_WEIGHT_DECAY: f32 = 0.0;
@@ -62,12 +62,15 @@ pub const FLAT_WEIGHT_DECAY: f32 = 0.0;
 pub const MAX_LEN: usize = 2000;
 pub const TEMPERATURE: f32 = 0.4;
 pub const TOP_P: f32 = 0.98;
+/// Temperature between a sampled `<tool>` and its `</tool>`: a call is a syntax
+/// to get exactly right, not prose to vary.
+pub const TOOL_TEMPERATURE: f32 = 0.1;
 
 // Modell-Dimensions
 
 pub const CHAR_HIDDEN: usize = 256;
 pub const OUT_HIDDEN: usize = 256;
-pub const WORD_HIDDEN: usize = 1024;
+pub const WORD_HIDDEN: usize = 1280;
 
 /// SwiGLU inner width: the `8·hidden/3` paper default rounded up to a multiple
 /// of 64, keeping every up/down projection GEMM tile-aligned.
@@ -82,7 +85,7 @@ pub fn up_of(hidden: usize) -> usize {
 pub const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// Number of mLSTM backbone blocks in the hierarchical word model.
-pub const WORD_BLOCKS: usize = 28;
+pub const WORD_BLOCKS: usize = 48;
 
 /// Carry the backbone's recurrent state from one window into the next. Windows are
 /// cut from one packed stream, so every window but a chunk's first continues the one
@@ -141,7 +144,7 @@ pub const VAL_DATA: &str = "../../training_data/TinyStoriesV2-GPT4-valid.txt";
 
 /// Instruction dataset (JSONL), formatted into masked chat windows by
 /// `crate::sft`; the loss counts only the response tokens.
-pub const SFT_DATA: &str = "data/mix/assistant_qa.jsonl";
+pub const SFT_DATA: &str = "data/mix/assistant_full.jsonl";
 /// Passes over the SFT set. Too many overfits a small set.
 pub const SFT_EPOCHS: usize = 1;
 /// An order of magnitude below `LR`, so fine-tuning nudges the pretrained

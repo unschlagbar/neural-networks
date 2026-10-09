@@ -78,6 +78,6 @@ fn main() {
         model.backbone_mode = mode;
         let (acc, ce) = score(&mut model, &tokens, &words, w_tok);
         println!("{mode:?}");
-        println!("   top-1 {acc:.2}%   CE {ce:.4}   ppl {:.3}", ce.exp());
+        println!("   top-1 {acc:.2}%   CE {ce:.3}   ppl {:.3}", ce.exp());
     }
 }

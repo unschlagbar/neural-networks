@@ -19,7 +19,10 @@ fn ranges(tokens: &[u16]) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut start = 0;
     for e in segment::word_ends(tokens) {
-        out.push(Range { start, end: e as usize });
+        out.push(Range {
+            start,
+            end: e as usize,
+        });
         start = e as usize;
     }
     out
@@ -32,7 +35,10 @@ fn main() {
     let budget: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1500);
 
     let mut text = std::fs::read_to_string(&file).unwrap();
-    let cut = (0..=budget.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap();
+    let cut = (0..=budget.min(text.len()))
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap();
     text.truncate(cut);
 
     let tokenizer = Utf8Tokenizer::new();
@@ -70,8 +76,11 @@ fn main() {
     let n = n as f32;
     println!("slots: {n}");
     println!("max |logit| seen            : {max_abs:.3}  (SoftCap = 30)");
-    println!("mean top-1 prob  (T = 1.0)  : {:.4}", sum_top1 / n);
-    println!("mean top-1 prob  (T = {TEMPERATURE}) : {:.4}", sum_top1_t / n);
+    println!("mean top-1 prob  (T = 1.0)  : {:.3}", sum_top1 / n);
+    println!(
+        "mean top-1 prob  (T = {TEMPERATURE}) : {:.3}",
+        sum_top1_t / n
+    );
     println!(
         "slots where top-p={TOP_P} keeps ONE candidate: {nucleus_1}/{n} = {:.1}%",
         100.0 * nucleus_1 as f32 / n

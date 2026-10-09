@@ -117,7 +117,7 @@ fn main() {
             .map(|s| s.grad.to_host(&gpu).data.to_vec())
             .collect();
         println!(
-            "{label} (acc {acc}): |y|max {:.4}  |dx|max {:.4}  extremes(min|n|, max|c|, max|c/n|) = {:?}",
+            "{label} (acc {acc}): |y|max {:.3}  |dx|max {:.3}  extremes(min|n|, max|c|, max|c/n|) = {:?}",
             yh.iter().fold(0.0f32, |m, v| m.max(v.abs())),
             dxh.iter().fold(0.0f32, |m, v| m.max(v.abs())),
             extremes

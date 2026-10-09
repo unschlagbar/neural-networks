@@ -221,6 +221,18 @@
           "$ref": "#/definitions/strings",
           "description": "Drop documents matching any of these."
         },
+        "user_must_not_contain": {
+          "$ref": "#/definitions/strings",
+          "description": "Drop records whose user turns (or dolly instruction) match any of these (case-insensitive). A leading ^ anchors the needle at the start of a turn."
+        },
+        "assistant_must_not_contain": {
+          "$ref": "#/definitions/strings",
+          "description": "Drop records whose assistant turns (or dolly response) match any of these — e.g. another model's identity claim."
+        },
+        "system_must_not_contain": {
+          "$ref": "#/definitions/strings",
+          "description": "Drop records whose system turn, after system_strip, matches any of these — e.g. a roleplay persona."
+        },
         "dedup": {
           "enum": [
             "off",
@@ -455,6 +467,15 @@
         "must_not_contain": {
           "$ref": "#/definitions/strings"
         },
+        "user_must_not_contain": {
+          "$ref": "#/definitions/strings"
+        },
+        "assistant_must_not_contain": {
+          "$ref": "#/definitions/strings"
+        },
+        "system_must_not_contain": {
+          "$ref": "#/definitions/strings"
+        },
         "dedup": {
           "enum": [
             "off",
@@ -508,6 +529,20 @@
         "select_column": {
           "type": "string",
           "description": "chat: a flat column naming each row's subset (SmolTalk's \"source\"). Requires select_values."
+        },
+        "where": {
+          "description": "chat: row conditions on flat columns, all of which must hold: \"column=a|b\" keeps rows holding one of the values, \"column!=a|b\" drops them.",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
         },
         "select_values": {
           "description": "chat: keep only rows whose select_column holds one of these. Requires select_column.",

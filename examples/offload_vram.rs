@@ -102,7 +102,7 @@ fn main() {
     let hwm = free_mb();
 
     let held = after_init - hwm;
-    println!("\nloss {loss:.4}");
+    println!("\nloss {loss:.3}");
     println!("free at high-water mark  {hwm:8.0} MB");
     println!("activations + scratch    {held:8.0} MB   ({words} words)");
     println!(

@@ -498,6 +498,8 @@ pub struct Hierarchical {
     /// per scored word). The divisor behind `last_word_loss`, exposed so a caller
     /// can recover the window's total NLL under SFT masking too.
     last_rows: usize,
+    /// Words those rows belong to: each scored word is its tokens plus one `[W]` row.
+    last_scored_words: usize,
 
     /// Keep the backbone's recurrent state across windows, so a document longer than
     /// `WORDS_PER_SEQ` words is autoregressed as one sequence instead of restarting at
@@ -660,6 +662,7 @@ impl Hierarchical {
             loss_acc: None,
             last_word_loss: 0.0,
             last_rows: 0,
+            last_scored_words: 0,
             stateful: false,
             continues: false,
             doc_starts: Vec::new(),
@@ -762,6 +765,18 @@ impl Hierarchical {
     /// the two recovers the window's total NLL in nats.
     pub fn last_rows(&self) -> usize {
         self.last_rows
+    }
+
+    /// Tokens of the words the last window scored — its scored rows minus their
+    /// `[W]` rows. The text those nats were paid for: masked words (border words,
+    /// SFT prompts) are not in it.
+    pub fn last_scored_tokens(&self) -> usize {
+        self.last_rows - self.last_scored_words
+    }
+
+    /// Words the last window scored: the divisor behind `last_word_loss`.
+    pub fn last_scored_words(&self) -> usize {
+        self.last_scored_words
     }
 
     /// Carry the backbone state from one window into the next (truncated BPTT over a
@@ -888,6 +903,7 @@ impl Hierarchical {
         if words.len() < 2 {
             self.last_word_loss = 0.0;
             self.last_rows = 0;
+            self.last_scored_words = 0;
             return 0.0;
         }
 
@@ -1485,6 +1501,7 @@ impl Hierarchical {
         // already on the host, so the second metric costs no device work.
         self.last_word_loss = loss * (valid_rows as f32) / (scored_words.max(1) as f32);
         self.last_rows = valid_rows;
+        self.last_scored_words = scored_words;
         self.timer.accum(gpu, "decoder loss readback");
         self.timer.flush();
         (loss, d_o, dec_rows_max)
@@ -2719,6 +2736,31 @@ mod tests {
             (word_loss - expect).abs() <= 1e-4 * expect.abs().max(1.0),
             "word_loss {word_loss} != {expect} (char {char_loss}, {rows} rows, {} words)",
             decoded.len()
+        );
+        assert_eq!(model.last_rows(), rows);
+        assert_eq!(model.last_scored_tokens(), tokens.len() - words[0].end);
+
+        // With document borders, the two words at each border (the `<END>` before it
+        // and the document's first word) leave the loss, its rows, its word count and
+        // the bytes bpb charges against. Decoded word `w` is `words[w + 1]`, so a
+        // start at `d` drops `w = d-1` and `w = d-2`; 32 is one past the last word.
+        let starts = [0usize, 9, 21, 32];
+        let scored: Vec<&Range<usize>> = (0..decoded.len())
+            .filter(|&w| !starts.iter().any(|&d| w + 1 == d || w + 2 == d))
+            .map(|w| &decoded[w])
+            .collect();
+        model.set_doc_starts(&starts);
+        let char_loss = model.forward_backward(&gpu, &tokens, &words);
+        let rows: usize = scored.iter().map(|r| r.end - r.start + 1).sum();
+        let bytes: usize = scored.iter().map(|r| r.end - r.start).sum();
+        assert_eq!(scored.len(), decoded.len() - 5, "borders mask 5 words here");
+        assert_eq!(model.last_rows(), rows);
+        assert_eq!(model.last_scored_tokens(), bytes);
+        let expect = char_loss * rows as f32 / scored.len() as f32;
+        let word_loss = model.last_word_loss();
+        assert!(
+            (word_loss - expect).abs() <= 1e-4 * expect.abs().max(1.0),
+            "bordered word_loss {word_loss} != {expect}"
         );
     }
 

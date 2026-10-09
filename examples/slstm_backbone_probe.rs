@@ -121,7 +121,7 @@ fn main() {
         println!("\n== {nw} words ==");
         if steps == 0 {
             let loss = model.forward_backward(&gpu, &tokens, &words);
-            println!("loss {loss:.4}");
+            println!("loss {loss:.3}");
             report(&mut model, &gpu);
             continue;
         }

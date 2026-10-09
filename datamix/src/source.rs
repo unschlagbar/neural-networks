@@ -8,7 +8,7 @@ use std::path::Path;
 use neural_networks::parquet::ParquetColumnReader;
 use neural_networks::sft::{Role, Turn};
 
-use crate::config::{OutKind, Result, Source, SourceKind};
+use crate::config::{OutKind, Result, RowCond, Source, SourceKind};
 use crate::json;
 use crate::llm::Client;
 use std::cell::RefCell;
@@ -456,34 +456,44 @@ fn read_chat_parquet(src: &Source, sink: &mut impl FnMut(Record) -> bool) -> Res
             &path,
             &[&src.role_column, &src.content_column],
         )?;
-        // The subset column is flat, not inside the repeated messages group, so
-        // it needs its own reader. Row groups are the same on both sides of the
-        // file, so the two stay row-aligned group by group.
-        let mut subset = match src.select_column.is_empty() {
-            true => None,
-            false => Some(ParquetColumnReader::open(&path, &src.select_column)?),
-        };
+        // Row conditions read flat columns, not the repeated messages group, so
+        // each needs its own reader. Row groups are the same on both sides of
+        // the file, so they stay row-aligned group by group.
+        let mut conds: Vec<RowCond> = src.row_where.clone();
+        if !src.select_column.is_empty() {
+            conds.insert(
+                0,
+                RowCond {
+                    column: src.select_column.clone(),
+                    values: src.select_values.clone(),
+                    keep: true,
+                },
+            );
+        }
+        let mut readers = conds
+            .iter()
+            .map(|c| ParquetColumnReader::open(&path, &c.column))
+            .collect::<Result<Vec<_>>>()?;
         while let Some(rows) = reader.next_row_group_lists()? {
-            let names = match subset.as_mut() {
-                Some(r) => r.next_row_group()?.unwrap_or_default(),
-                None => Vec::new(),
-            };
-            for (i, row) in rows.into_iter().enumerate() {
-                if subset.is_some() {
-                    // A missing name would silently pass the filter and let the
-                    // whole corpus through — the one failure that must be loud.
-                    let Some(name) = names.get(i) else {
+            let mut cols = Vec::with_capacity(readers.len());
+            for r in readers.iter_mut() {
+                cols.push(r.next_row_group()?.unwrap_or_default());
+            }
+            'row: for (i, row) in rows.into_iter().enumerate() {
+                for (cond, col) in conds.iter().zip(&cols) {
+                    // A missing value would silently pass the filter and let
+                    // the whole corpus through — the one failure that must be loud.
+                    let Some(value) = col.get(i) else {
                         return Err(format!(
                             "[source {}] {path}: column '{}' has {} rows but the \
                              messages column has more",
                             src.name,
-                            src.select_column,
-                            names.len()
+                            cond.column,
+                            col.len()
                         ));
                     };
-                    let name = String::from_utf8_lossy(name);
-                    if !src.select_values.iter().any(|v| v == name.as_ref()) {
-                        continue;
+                    if !cond.admits(&String::from_utf8_lossy(value)) {
+                        continue 'row;
                     }
                 }
                 let mut turns = Vec::with_capacity(row.len());
@@ -567,6 +577,7 @@ mod tests {
             path: path.into(),
             select_column: String::new(),
             select_values: Vec::new(),
+            row_where: Vec::new(),
             weight: 1.0,
             epochs: 1.0,
             ext: Vec::new(),

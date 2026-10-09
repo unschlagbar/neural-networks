@@ -304,7 +304,7 @@ impl Sequential {
                 let loss = state.get_loss();
                 let elapsed = time.elapsed();
                 println!(
-                    "{} | loss {:.4} | ppl {:.4} | {} tok | {:.1?}",
+                    "{} | loss {:.3} | ppl {:.3} | {} tok | {:.1?}",
                     state.step,
                     loss,
                     loss.exp(),
@@ -386,7 +386,7 @@ impl Sequential {
                 let loss = state.get_loss();
                 let elapsed = time.elapsed();
                 println!(
-                    "{} | char loss {:.4} | ppl {:.4} | word loss {:.4} | word ppl {:.1} | {} tok | {:.1?}",
+                    "{} | char loss {:.3} | ppl {:.3} | word loss {:.3} | word ppl {:.1} | {} tok | {:.1?}",
                     state.step,
                     loss,
                     loss.exp(),
