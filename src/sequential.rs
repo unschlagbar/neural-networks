@@ -523,6 +523,21 @@ impl Sequential {
         }
     }
 
+    /// Backward for per-frame weighted BCE on a single-logit head:
+    /// `delta[t] = weights[t] · (σ(z_t) − label_t)`.
+    ///
+    /// A weight of zero removes the loss at that frame while BPTT still flows
+    /// through it, so the caller fully owns the loss policy — max-pooling the
+    /// positive window, hard-negative mining, class balancing — by shaping
+    /// `weights`.
+    pub fn backwards_wake_bce_weighted(&mut self, seq: &Sequence, weights: &[f32]) {
+        debug_assert_eq!(weights.len(), seq.frames.len());
+        self.backwards_driver(seq.frames.len(), |t, logits, delta_buf| {
+            delta_buf[0] = weights[t] * (sigmoid(logits[0]) - seq.frames[t].label);
+            1
+        });
+    }
+
     /// Backward for binary BCE classification with dense per-frame loss.
     /// Intermediate frames use label=0; only the final frame uses the sequence label.
     /// All frames contribute gradients (BPTT through the full sequence).
