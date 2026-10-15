@@ -28,7 +28,7 @@ pub const MIN_LR: f32 = 1e-5;
 // Warmup/decay horizons count *windows* (data seen), not optimizer steps, so
 // BATCH_SIZE does not reshape the curve over the corpus.
 pub const WARMUP_WINDOWS: usize = 1_200;
-pub const DECAY_WINDOWS: usize = 1_000_000;
+pub const DECAY_WINDOWS: usize = 1_500_000;
 // Windows accumulated per optimizer step. Muon (Frobenius normalization) and
 // aux-Adam (second moment) are scale-invariant, so summed grads need no rescale.
 pub const BATCH_SIZE: usize = 12;
@@ -174,19 +174,35 @@ pub const SFT_MAX_WORDS: usize = WORDS_PER_SEQ;
 /// The per-example cache holds one slot per token.
 pub const SFT_MAX_TOKENS: usize = MAX_WINDOW_TOKENS;
 
-// Wake Word
+// Audio encoder
 
-pub const WAKE_HIDDEN: usize = 128;
-pub const WAKE_SR: usize = 16_000;
-pub const WAKE_FRAME_LEN: usize = 320;
-pub const WAKE_FRAME_SHIFT: usize = 320;
-pub const WAKE_N_FFT: usize = 512;
-pub const WAKE_N_MELS: usize = 80;
-pub const WAKE_INPUT_DIM: usize = WAKE_N_MELS;
-pub const WAKE_THRESHOLD: f32 = 0.6;
-pub const WAKE_POS_WEIGHT: f32 = 1.0;
-pub const WAKE_LR: f32 = 1e-3;
-pub const WAKE_EPOCHS: usize = 35;
-pub const WAKE_MODEL_LOC: &str = "models/wake_word3";
-pub const WAKE_DATA_POS: &str = "data/wake_word/positive";
-pub const WAKE_DATA_NEG: &str = "data/wake_word/negative";
+pub const AUDIO_SR: usize = 16_000;
+/// Analysis window and hop in samples: 25 ms every 10 ms, so features run at 100 Hz.
+pub const AUDIO_WIN: usize = 400;
+pub const AUDIO_HOP: usize = 160;
+/// FFT length; the window is zero-padded up to it.
+pub const AUDIO_N_FFT: usize = 512;
+pub const AUDIO_N_MELS: usize = 128;
+/// Per-frame features: the mel bins plus the frame's absolute log energy, which
+/// carries loudness past any normalization.
+pub const AUDIO_FEATS: usize = AUDIO_N_MELS + 1;
+
+/// The stem reads `AUDIO_STACK` consecutive feature frames per output frame and
+/// advances `AUDIO_STRIDE` of them, so the encoder runs at 25 Hz (40 ms). 12.5 Hz
+/// would put two short function words into one frame in fast speech.
+pub const AUDIO_STACK: usize = 7;
+pub const AUDIO_STRIDE: usize = 4;
+
+pub const AUDIO_HIDDEN: usize = 512;
+pub const AUDIO_BLOCKS: usize = 12;
+pub const AUDIO_HEADS: usize = 8;
+pub const AUDIO_DQK: usize = AUDIO_HIDDEN / AUDIO_HEADS;
+/// Blocks of the per-word segment encoder, reset at every segment.
+pub const AUDIO_SEG_BLOCKS: usize = 1;
+
+/// The boundary head decides about a word end up to this many encoder frames
+/// late (5 = 200 ms); the segment encoder reads the same frames past the end.
+pub const BOUNDARY_DELAY: usize = 5;
+/// Encoder frames on either side of a labelled word end that still count as it:
+/// forced alignment is good to about ±20 ms, a frame is 40 ms.
+pub const BOUNDARY_TOLERANCE: usize = 1;

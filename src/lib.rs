@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod batches;
 pub mod config;
 pub mod format;
@@ -27,7 +28,6 @@ pub mod sft;
 pub mod sft_progress;
 pub mod tensor;
 pub mod training;
-pub mod wake_word;
 pub mod word_encoder;
 
 use std::{
@@ -63,9 +63,6 @@ pub fn run() {
         "hs" => sampling::sample_hierarchical(&read_model_path()),
         "hqs" => sampling::sample_chat(&read_model_path()),
         "i" => inspect::inspect_model(),
-        "wr" => wake_word::record::record_samples(),
-        "wt" => wake_word::training::train_wake(),
-        "w" => wake_word::detector::run_detector(),
         other => {
             eprintln!(
                 "Unknown mode {other:?}. Modes: '' train_normal | 'h' train_hierarchical | \
@@ -74,8 +71,7 @@ pub fn run() {
                  'hq' SFT (Q-A) fine-tune on CPU | 'hqg' SFT fine-tune on GPU | \
                  'av' add SFT vocab to a model | \
                  's' sample_normal | 'hs' sample_hierarchical | 'hqs' chat/Q-A sampling | \
-                 'i' inspect model | \
-                 'wr' record wake-word samples | 'wt' train wake-word | 'w' run detector",
+                 'i' inspect model",
             );
             std::process::exit(2);
         }

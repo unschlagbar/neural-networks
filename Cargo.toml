@@ -26,7 +26,6 @@ wordseg = { path = "wordseg" }
 iron_oxide = { path = "../iron_oxide", default-features = false }
 rand = "0.10.0"
 rayon = "1.11"
-cpal = "0.18.1"
 hound = "3"
 half = { version = "2.7.1", optional = true }
 # NVRTC (runtime kernel compilation) + driver API + cuBLAS. `dynamic-loading`

@@ -15,7 +15,6 @@ use crate::{
     },
     nn_layer::{DynCache, NnLayer},
     training::TrainingState,
-    wake_word::training::Sequence,
 };
 
 pub struct Sequential {
@@ -458,95 +457,16 @@ impl Sequential {
         }
     }
 
-    /// Backward with max-pooling loss over the positive label window.
+    /// Backward for per-step weighted BCE on a single-logit head:
+    /// `delta[t] = weights[t] · (σ(z_t) − labels[t])`.
     ///
-    /// Positive window frames: only the frame with the highest sigmoid output receives
-    /// the positive gradient (`weight_pos * (p - 1)`).  All other frames in the window
-    /// get zero gradient from the loss (BPTT still flows through them).
-    /// Frames outside the window receive the standard negative BCE gradient.
-    ///
-    /// Pass `weight_pos = 1.0` and `weight_neg = 1.0 / n_neg_frames` at the call site.
-    pub fn backwards_wake_bce_maxpool(&mut self, seq: &Sequence, weight_pos: f32, weight_neg: f32) {
-        let n_frames = seq.frames.len();
-        let n_layers = self.layers.len();
-        let last = n_layers - 1;
-
-        // Locate the positive label window.
-        let w0 = seq
-            .frames
-            .iter()
-            .position(|f| f.label > 0.5)
-            .unwrap_or(usize::MAX);
-        let w1 = seq.frames.iter().rposition(|f| f.label > 0.5).unwrap_or(0);
-
-        // Find the frame in [w0, w1] with the highest sigmoid output.
-        let max_frame: Option<usize> = if w0 <= w1 {
-            (w0..=w1).max_by(|&a, &b| {
-                let pa = sigmoid(self.cache[a][last].output()[0]);
-                let pb = sigmoid(self.cache[b][last].output()[0]);
-                pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
-            })
-        } else {
-            None
-        };
-
-        let Sequential {
-            layers,
-            cache,
-            delta_buf,
-            ..
-        } = self;
-
-        for t in (0..n_frames).rev() {
-            let in_window = t >= w0 && t <= w1;
-            let logit = cache[t][last].output()[0];
-
-            delta_buf[0] = if Some(t) == max_frame {
-                weight_pos * (sigmoid(logit) - 1.0)
-            } else if in_window {
-                0.0
-            } else {
-                weight_neg * sigmoid(logit)
-            };
-
-            let mut delta_len = 1;
-            for l in (0..n_layers).rev() {
-                layers[l].backward(&mut delta_buf[..delta_len], cache[t][l].as_mut());
-                if l == 0 {
-                    break;
-                }
-                let dx = cache[t][l].input_grad();
-                let new_len = dx.len();
-                delta_buf[..new_len].copy_from_slice(dx);
-                delta_len = new_len;
-            }
-        }
-    }
-
-    /// Backward for per-frame weighted BCE on a single-logit head:
-    /// `delta[t] = weights[t] · (σ(z_t) − label_t)`.
-    ///
-    /// A weight of zero removes the loss at that frame while BPTT still flows
-    /// through it, so the caller fully owns the loss policy — max-pooling the
-    /// positive window, hard-negative mining, class balancing — by shaping
-    /// `weights`.
-    pub fn backwards_wake_bce_weighted(&mut self, seq: &Sequence, weights: &[f32]) {
-        debug_assert_eq!(weights.len(), seq.frames.len());
-        self.backwards_driver(seq.frames.len(), |t, logits, delta_buf| {
-            delta_buf[0] = weights[t] * (sigmoid(logits[0]) - seq.frames[t].label);
-            1
-        });
-    }
-
-    /// Backward for binary BCE classification with dense per-frame loss.
-    /// Intermediate frames use label=0; only the final frame uses the sequence label.
-    /// All frames contribute gradients (BPTT through the full sequence).
-    pub fn backwards_wake_bce(&mut self, seq: &Sequence, weight_pos: f32, weight_neg: f32) {
-        self.backwards_driver(seq.frames.len(), |t, logits, delta_buf| {
-            // Weighted BCE gradient on the single output logit: w·(σ(z) − y).
-            let label = seq.frames[t].label;
-            let weight = if label > 0.5 { weight_pos } else { weight_neg };
-            delta_buf[0] = weight * (sigmoid(logits[0]) - label);
+    /// A weight of zero removes the loss at that step while BPTT still flows
+    /// through it, so the caller owns the loss policy — max-pooling a positive
+    /// window, hard-negative mining, class balancing — by shaping `weights`.
+    pub fn backwards_bce(&mut self, labels: &[f32], weights: &[f32]) {
+        assert_eq!(labels.len(), weights.len(), "backwards_bce: one weight per label");
+        self.backwards_driver(labels.len(), |t, logits, delta_buf| {
+            delta_buf[0] = weights[t] * (sigmoid(logits[0]) - labels[t]);
             1
         });
     }

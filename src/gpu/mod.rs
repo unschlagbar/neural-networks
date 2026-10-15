@@ -20,6 +20,7 @@ use cudarc::cublaslt::CudaBlasLT;
 use cudarc::driver::{CudaContext, CudaStream};
 
 pub mod arena;
+pub mod audio;
 pub mod bf16;
 pub mod block;
 pub mod buf;
