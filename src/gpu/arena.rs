@@ -191,6 +191,8 @@ pub struct ParamArena {
     /// and a bound model steps the arena rather than its slots.
     #[allow(dead_code, reason = "held to keep the allocation the slots view alive")]
     dummy: CudaSlice<f32>,
+    /// A device `1.0`, the gradient factor of a step no norm clip ran before.
+    one: CudaSlice<f32>,
     /// Elements before this are weight-decayed.
     decay_end: usize,
     /// Elements before this are stepped; the rest are frozen.
@@ -261,11 +263,13 @@ impl ParamArena {
             signed_map,
             unsigned_map,
         };
+        let one = gpu.stream.clone_htod(&[1.0]).expect("arena unit scale");
         Self {
             param,
             grad,
             moments,
             dummy,
+            one,
             decay_end,
             step_end,
         }
@@ -273,6 +277,12 @@ impl ParamArena {
 
     /// One AdamW step over every parameter, then clear every gradient.
     pub fn step(&mut self, gpu: &Gpu, cfg: &AdamCfg) {
+        self.step_scaled(gpu, cfg, None);
+    }
+
+    /// [`step`](Self::step) with every gradient first multiplied by a factor that
+    /// lives on the device — a [`GradNorm`] clip, read without a host round-trip.
+    pub fn step_scaled(&mut self, gpu: &Gpu, cfg: &AdamCfg, norm: Option<&GradNorm>) {
         let bc1 = 1.0 - cfg.beta1.powi(cfg.t as i32);
         let bc2 = 1.0 - cfg.beta2.powi(cfg.t as i32);
         let (lr, b1, b2, eps, wd) = (cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay);
@@ -286,10 +296,12 @@ impl ParamArena {
             signed_map,
             unsigned_map,
         } = &mut self.moments;
+        let gscale = norm.map_or(&self.one, |c| &c.out);
         let f = gpu.kernels.get("adamw_arena_q8");
         let mut lb = gpu.stream.launch_builder(&f);
         lb.arg(&mut self.param)
             .arg(&self.grad)
+            .arg(gscale)
             .arg(m)
             .arg(v)
             .arg(m_scale)
@@ -334,6 +346,74 @@ impl ParamArena {
         gpu.stream
             .memset_zeros(&mut self.grad)
             .expect("zero param arena grads");
+    }
+}
+
+/// Global-norm gradient clipping across several arenas: one L2 norm over every
+/// stepped gradient, and the factor `min(1, max_norm / norm)` that
+/// [`ParamArena::step_scaled`] multiplies them all by. Unlike the per-element clip
+/// this keeps the update's direction and only shrinks its length.
+pub struct GradNorm {
+    /// `NORM_BLOCKS` partial sums of squares per arena.
+    partials: CudaSlice<f32>,
+    /// `[factor, norm]`; the kernel reads the factor through this pointer.
+    out: CudaSlice<f32>,
+    arenas: usize,
+}
+
+/// Blocks per arena in the sum-of-squares pass. Fixed, so the partials buffer and the
+/// order of the final sum do not depend on the arena sizes.
+const NORM_BLOCKS: usize = 512;
+/// Matches `NORM_THREADS` in `common.cu`.
+const NORM_THREADS: u32 = 256;
+
+impl GradNorm {
+    pub fn new(gpu: &Gpu, arenas: usize) -> Self {
+        Self {
+            partials: gpu
+                .stream
+                .alloc_zeros::<f32>(arenas * NORM_BLOCKS)
+                .expect("grad norm partials"),
+            out: gpu.stream.clone_htod(&[1.0, 0.0]).expect("grad norm out"),
+            arenas,
+        }
+    }
+
+    /// Measure the norm of `arenas`' gradients and set the factor that clips it to
+    /// `max_norm`. `f32::INFINITY` measures without clipping.
+    pub fn clip(&mut self, gpu: &Gpu, arenas: &[&ParamArena], max_norm: f32) {
+        assert_eq!(arenas.len(), self.arenas, "GradNorm built for another arena count");
+        let part = gpu.kernels.get("grad_sumsq_part");
+        for (i, a) in arenas.iter().enumerate() {
+            let (n, off) = (a.step_end as i32, (i * NORM_BLOCKS) as i32);
+            let mut lb = gpu.stream.launch_builder(&part);
+            lb.arg(&a.grad).arg(&n).arg(&mut self.partials).arg(&off);
+            let cfg = LaunchConfig {
+                grid_dim: (NORM_BLOCKS as u32, 1, 1),
+                block_dim: (NORM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { lb.launch(cfg) }.expect("grad_sumsq_part");
+        }
+        let fold = gpu.kernels.get("grad_clip_scale");
+        let count = (arenas.len() * NORM_BLOCKS) as i32;
+        let mut lb = gpu.stream.launch_builder(&fold);
+        lb.arg(&self.partials)
+            .arg(&count)
+            .arg(&max_norm)
+            .arg(&mut self.out);
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (NORM_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { lb.launch(cfg) }.expect("grad_clip_scale");
+    }
+
+    /// The norm the last [`clip`](Self::clip) measured, before clipping. Synchronizes.
+    pub fn norm(&self, gpu: &Gpu) -> f32 {
+        let out = gpu.stream.clone_dtoh(&self.out).expect("grad norm readback");
+        out[1]
     }
 }
 
@@ -820,6 +900,68 @@ mod tests {
         assert!(worst < 0.05, "quantized step is {worst} off the fp32 step");
     }
 
+    /// An element far below its range's absmax must not step further than fp32 AdamW
+    /// steps it. `v` spans twice the decades `m` does, so rounded to nearest it reached
+    /// zero while `m` survived, and the next step divided by `sqrt((1-β2)·g²)` alone:
+    /// on a resumed checkpoint 1.5% of the backbone stepped past the fp32 bound and one
+    /// encoder weight moved 2593x lr. `v` rounds up, so quantization can only shrink a
+    /// step.
+    #[test]
+    fn small_moments_never_step_further_than_fp32() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let n = QBLOCK;
+        let start: Vec<f32> = (0..n).map(|i| (i as f32 * 0.03).sin()).collect();
+        // One element sets the range absmax; the rest sit 1e4 below it, so their `v`
+        // sits 1e8 below, past the map's smallest code.
+        let grad: Vec<f32> = (0..n).map(|i| if i == 0 { 1.0 } else { 1e-4 }).collect();
+        let build = |lazy: bool| {
+            let moment = || {
+                if lazy {
+                    unbacked(&gpu)
+                } else {
+                    GTensor::zeros(&gpu, &[n])
+                }
+            };
+            [
+                GTensor::from_host(&gpu, &Tensor::new(&[n], start.clone())),
+                GTensor::zeros(&gpu, &[n]),
+                moment(),
+                moment(),
+            ]
+        };
+        let (mut q8, mut fp32) = (build(true), build(false));
+        let [p, g, m, v] = &mut q8;
+        let mut arena =
+            ParamArena::bind(&gpu, vec![ParamSlot::new(p, g, m, v, ParamKind::NoDecay)]);
+        let src = GTensor::from_host(&gpu, &Tensor::new(&[n], grad));
+        // Bias correction near 1, as deep into a run: there it no longer hides that the
+        // stored `v` lost its history.
+        let mut cfg = AdamCfg::new(1e-3, 0.0);
+        cfg.t = 5000;
+        for _ in 0..4 {
+            cfg.t += 1;
+            q8[1].copy_from(&gpu, &src);
+            fp32[1].copy_from(&gpu, &src);
+            arena.step(&gpu, &cfg);
+            let [p, g, m, v] = &mut fp32;
+            step_slots(
+                &gpu,
+                &mut [ParamSlot::new(p, g, m, v, ParamKind::NoDecay)],
+                &cfg,
+            );
+        }
+        let (a, b) = (q8[0].to_host(&gpu).data, fp32[0].to_host(&gpu).data);
+        for i in 0..n {
+            let (dq, df) = ((a[i] - start[i]).abs(), (b[i] - start[i]).abs());
+            assert!(
+                dq <= df * 1.05 + 1e-7,
+                "element {i}: q8 moved {dq}, fp32 {df}"
+            );
+        }
+    }
+
     /// What the 8-bit moments actually cost, over a run rather than a step: the two
     /// arenas see the same gradients and must stay together.
     ///
@@ -971,6 +1113,91 @@ mod tests {
                     grad[i]
                 );
             }
+        }
+    }
+
+    /// The global norm spans every arena it is given and skips frozen gradients, and a
+    /// clipped step is bit-for-bit the step those gradients would take pre-scaled by
+    /// the factor on the host. Two arenas of uneven size, so a norm that read one
+    /// arena, or that included the frozen tail, gives a different number.
+    #[test]
+    fn grad_norm_clip_scales_the_whole_update() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let sizes = [3000, 700];
+        let frozen = 300;
+        let grads: Vec<Vec<f32>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(a, &n)| (0..n).map(|i| ((i + 7 * a) as f32 * 0.13).sin()).collect())
+            .collect();
+        let frozen_grad = vec![50.0; frozen];
+        let mk = |d: &[f32]| GTensor::from_host(&gpu, &Tensor::new(&[d.len()], d.to_vec()));
+        let start = |n: usize| -> Vec<f32> { (0..n).map(|i| (i as f32 * 0.05).cos()).collect() };
+
+        // Each arena: its stepped tensor, plus a frozen one in the first.
+        let build = || -> Vec<Vec<[GTensor<f32>; 4]>> {
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(a, &n)| {
+                    let mut ts = vec![[mk(&start(n)), mk(&vec![0.0; n]), unbacked(&gpu), unbacked(&gpu)]];
+                    if a == 0 {
+                        ts.push([mk(&start(frozen)), mk(&vec![0.0; frozen]), unbacked(&gpu), unbacked(&gpu)]);
+                    }
+                    ts
+                })
+                .collect()
+        };
+        let bind = |ts: &mut Vec<[GTensor<f32>; 4]>| {
+            let slots = ts
+                .iter_mut()
+                .enumerate()
+                .map(|(i, [p, g, m, v])| {
+                    let kind = if i == 0 { ParamKind::NoDecay } else { ParamKind::Frozen };
+                    ParamSlot::new(p, g, m, v, kind)
+                })
+                .collect();
+            ParamArena::bind(&gpu, slots)
+        };
+        let (mut clipped, mut twin) = (build(), build());
+        let mut a_clip: Vec<ParamArena> = clipped.iter_mut().map(bind).collect();
+        let mut a_twin: Vec<ParamArena> = twin.iter_mut().map(bind).collect();
+
+        let want: f32 = grads.iter().flatten().map(|g| g * g).sum::<f32>().sqrt();
+        let mut norm = GradNorm::new(&gpu, 2);
+        let seed = |ts: &mut Vec<Vec<[GTensor<f32>; 4]>>, scale: f32| {
+            for (a, g) in grads.iter().enumerate() {
+                let g: Vec<f32> = g.iter().map(|x| x * scale).collect();
+                ts[a][0][1].copy_from(&gpu, &mk(&g));
+            }
+            ts[0][1][1].copy_from(&gpu, &mk(&frozen_grad));
+        };
+
+        seed(&mut clipped, 1.0);
+        norm.clip(&gpu, &[&a_clip[0], &a_clip[1]], f32::INFINITY);
+        let out = gpu.stream.clone_dtoh(&norm.out).unwrap();
+        assert!((out[1] - want).abs() < want * 1e-5, "norm {} vs {want}", out[1]);
+        assert_eq!(out[0], 1.0, "an infinite max_norm must not scale");
+
+        norm.clip(&gpu, &[&a_clip[0], &a_clip[1]], want / 4.0);
+        let factor = gpu.stream.clone_dtoh(&norm.out).unwrap()[0];
+        assert!((factor - 0.25).abs() < 1e-5, "factor {factor}");
+
+        seed(&mut twin, factor);
+        let cfg = AdamCfg {
+            t: 1,
+            ..AdamCfg::new(1e-2, 0.0)
+        };
+        for (c, t) in a_clip.iter_mut().zip(a_twin.iter_mut()) {
+            c.step_scaled(&gpu, &cfg, Some(&norm));
+            t.step(&gpu, &cfg);
+        }
+        for a in 0..sizes.len() {
+            let (got, exp) = (clipped[a][0][0].to_host(&gpu).data, twin[a][0][0].to_host(&gpu).data);
+            assert_eq!(got, exp, "arena {a}: clipped step differs from the pre-scaled one");
+            assert_ne!(got, start(sizes[a]), "arena {a} did not step");
         }
     }
 }

@@ -9,8 +9,8 @@ use crate::{
     batches::ChunkedWordDataSet,
     config::{
         BATCH_SIZE, CHUNK_BYTES, DECAY_WINDOWS, EPOCHS, LOG_EVERY, LR, MAX_WINDOW_TOKENS, MIN_LR,
-        MIN_WORDS_PER_SEQ, SAVE_EVERY, SEQ_LEN, TRAIN_DATA, VAL_DATA, WARMUP_WINDOWS,
-        WORDS_PER_SEQ,
+        MIN_WORDS_PER_SEQ, RESUME_WARMUP_WINDOWS, SAVE_EVERY, SEQ_LEN, TRAIN_DATA, VAL_DATA,
+        WARMUP_WINDOWS, WORDS_PER_SEQ,
     },
     hierarchical::{BackboneMode, Hierarchical},
     model::{build_hierarchical_model, build_normal_model},
@@ -712,6 +712,13 @@ pub struct LrSchedule {
     pub warmup_windows: usize,
     pub decay_windows: usize,
     pub min_lr: f32,
+    /// A second linear ramp from `rewarm_origin`, multiplied onto the curve above;
+    /// `rewarm_windows == 0` disables it. A resumed run needs it because its AdamW
+    /// moments restart at zero: the first steps are then sign-like, every parameter
+    /// moving by ~lr, and on `s5` one such step at the full rate took the held-out
+    /// loss from 1.24 to 2.13 (at 0.1x the rate it improved it).
+    pub rewarm_origin: usize,
+    pub rewarm_windows: usize,
 }
 
 impl LrSchedule {
@@ -722,6 +729,17 @@ impl LrSchedule {
             warmup_windows: WARMUP_WINDOWS,
             decay_windows: DECAY_WINDOWS,
             min_lr: MIN_LR,
+            rewarm_origin: 0,
+            rewarm_windows: 0,
+        }
+    }
+
+    /// Pretraining resumed at window `from`: the same curve, ramped up again from there.
+    pub fn pretrain_resumed(from: usize) -> Self {
+        Self {
+            rewarm_origin: from,
+            rewarm_windows: RESUME_WARMUP_WINDOWS,
+            ..Self::pretrain()
         }
     }
 
@@ -732,6 +750,8 @@ impl LrSchedule {
             warmup_windows: crate::config::SFT_WARMUP_WINDOWS,
             decay_windows: 0,
             min_lr: 0.0,
+            rewarm_origin: 0,
+            rewarm_windows: 0,
         }
     }
 }
@@ -845,6 +865,18 @@ impl TrainingState {
             || std::fs::metadata(&path)
                 .map(|m| m.len() == 0)
                 .unwrap_or(true);
+        let extra_header: String = extra_cols.iter().map(|c| format!(",{c}")).collect();
+        let header = format!("step,batch,lr,loss,perplexity,ms_per_step,s_per_norm_seq{extra_header}");
+        if !is_new {
+            // A resumed log written before a column existed: replace its header so the
+            // new rows line up. Older rows simply end before the new columns.
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Some((first, rest)) = text.split_once('\n')
+                && first != header
+            {
+                let _ = std::fs::write(&path, format!("{header}\n{rest}"));
+            }
+        }
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -853,11 +885,7 @@ impl TrainingState {
             Ok(f) => {
                 let mut writer = BufWriter::new(f);
                 if is_new {
-                    let extra_header: String = extra_cols.iter().map(|c| format!(",{c}")).collect();
-                    let _ = writeln!(
-                        writer,
-                        "step,batch,lr,loss,perplexity,ms_per_step,s_per_norm_seq{extra_header}"
-                    );
+                    let _ = writeln!(writer, "{header}");
                 }
                 self.log_writer = Some(writer);
                 println!("Logging to '{path}'");
@@ -904,6 +932,10 @@ impl TrainingState {
                 sched.min_lr + 0.5 * (self.lr - sched.min_lr) * (1.0 + (PI * t).cos())
             };
             self.current_lr = self.warmup_lr.min(self.decay_lr);
+            if sched.rewarm_windows > 0 {
+                let since = self.step.saturating_sub(sched.rewarm_origin) as f32;
+                self.current_lr *= (since / sched.rewarm_windows as f32).min(1.0);
+            }
             Some(self.current_lr)
         } else {
             None

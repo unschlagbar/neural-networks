@@ -34,7 +34,7 @@ use std::{io, mem};
 
 use cudarc::driver::CudaSlice;
 
-use super::arena::{ParamArena, ParamKind, ParamSlot};
+use super::arena::{GradNorm, ParamArena, ParamKind, ParamSlot};
 
 /// The three stages' optimizer state, one [`ParamArena`] each.
 ///
@@ -56,6 +56,10 @@ struct StageArenas {
     encoder: ParamArena,
     backbone: ParamArena,
     decoder: ParamArena,
+    /// One norm across all three stages, so the clip sees the whole update.
+    norm: GradNorm,
+    /// Whether `norm` holds a factor measured since the last step.
+    clip_pending: bool,
 }
 
 impl StageArenas {
@@ -576,18 +580,21 @@ impl Flags {
     }
 }
 
-impl Hierarchical {
-    pub fn new(gpu: &Gpu, cfg: ModelCfg) -> Self {
-        let mut model = Self::unbound(gpu, cfg);
-        model.bind_params(gpu);
-        model
-    }
+/// The weight-bearing layers of a [`Hierarchical`], before the model is assembled
+/// around them.
+struct Parts {
+    table: GTensor<f32>,
+    enc_blocks: Vec<Box<dyn BlockLike>>,
+    bb_front: Linear,
+    bb_blocks: Vec<Box<dyn BlockLike>>,
+    bb_back: Linear,
+    dec_blocks: Vec<Box<dyn BlockLike>>,
+    dec_norm: RmsNorm,
+    dec_head: Linear,
+}
 
-    /// The model with its parameters still in per-tensor allocations.
-    ///
-    /// Only [`load`](Self::load) uses this directly: it swaps whole layers in after
-    /// construction, so it must pack the arena once, afterwards.
-    fn unbound(gpu: &Gpu, cfg: ModelCfg) -> Self {
+impl Parts {
+    fn random(gpu: &Gpu, cfg: ModelCfg) -> Self {
         let bb_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.bb_blocks)
             .map(|i| {
                 if (i + 2).is_multiple_of(6) {
@@ -626,16 +633,9 @@ impl Hierarchical {
                 }
             })
             .collect();
-        let flags = Flags::from_env();
-        let mut model = Self {
-            cfg,
+        Self {
             table: GTensor::from_host(gpu, &Tensor::random(&[cfg.vocab, cfg.hc], 0.02)),
-            dtable: GTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
-            m_tbl: super::arena::unbacked(gpu),
-            v_tbl: super::arena::unbacked(gpu),
-            encoder: WordEncoder::new(gpu, cfg.hc, cfg.enc_blocks),
-            bb_chunk: None,
-            group_cap: None,
+            enc_blocks: WordEncoder::new(gpu, cfg.hc, cfg.enc_blocks).blocks,
             bb_front: Linear::new_rand(gpu, cfg.hc, cfg.wh),
             bb_blocks,
             bb_back: Linear::new_rand(gpu, cfg.wh, cfg.hc),
@@ -651,6 +651,48 @@ impl Hierarchical {
                 head_optimizer_convention(&mut h);
                 h
             },
+        }
+    }
+}
+
+impl Hierarchical {
+    pub fn new(gpu: &Gpu, cfg: ModelCfg) -> Self {
+        let mut model = Self::unbound(gpu, cfg, Parts::random(gpu, cfg));
+        model.bind_params(gpu);
+        model
+    }
+
+    /// The model around `parts`, with its parameters still in per-tensor allocations.
+    ///
+    /// Only [`load`](Self::load) uses this directly: it hands over the checkpoint's
+    /// layers, so the device never holds a random model beside the loaded one.
+    fn unbound(gpu: &Gpu, cfg: ModelCfg, parts: Parts) -> Self {
+        let Parts {
+            table,
+            enc_blocks,
+            bb_front,
+            bb_blocks,
+            bb_back,
+            dec_blocks,
+            dec_norm,
+            dec_head,
+        } = parts;
+        let flags = Flags::from_env();
+        let mut model = Self {
+            cfg,
+            table,
+            dtable: GTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
+            m_tbl: super::arena::unbacked(gpu),
+            v_tbl: super::arena::unbacked(gpu),
+            encoder: WordEncoder { blocks: enc_blocks },
+            bb_chunk: None,
+            group_cap: None,
+            bb_front,
+            bb_blocks,
+            bb_back,
+            dec_blocks,
+            dec_norm,
+            dec_head,
             arenas: None,
             step_count: 0,
             seen: Seen::default(),
@@ -692,6 +734,8 @@ impl Hierarchical {
             encoder: ParamArena::bind(gpu, encoder),
             backbone: ParamArena::bind(gpu, backbone),
             decoder: ParamArena::bind(gpu, decoder),
+            norm: GradNorm::new(gpu, 3),
+            clip_pending: false,
         };
         if self.flags.mem {
             let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
@@ -2139,16 +2183,52 @@ impl Hierarchical {
             .arenas
             .as_mut()
             .expect("parameters were never bound — see Hierarchical::bind_params");
-        arenas
-            .encoder
-            .step(gpu, &stage_cfg(cfg, ENCODER_LR_SCALE, ENCODER_WEIGHT_DECAY));
+        let clip = arenas.clip_pending.then_some(&arenas.norm);
+        arenas.encoder.step_scaled(
+            gpu,
+            &stage_cfg(cfg, ENCODER_LR_SCALE, ENCODER_WEIGHT_DECAY),
+            clip,
+        );
         arenas
             .backbone
-            .step(gpu, &stage_cfg(cfg, 1.0, BACKBONE_WEIGHT_DECAY));
-        arenas
-            .decoder
-            .step(gpu, &stage_cfg(cfg, DECODER_LR_SCALE, DECODER_WEIGHT_DECAY));
+            .step_scaled(gpu, &stage_cfg(cfg, 1.0, BACKBONE_WEIGHT_DECAY), clip);
+        arenas.decoder.step_scaled(
+            gpu,
+            &stage_cfg(cfg, DECODER_LR_SCALE, DECODER_WEIGHT_DECAY),
+            clip,
+        );
+        arenas.clip_pending = false;
         self.step_count += 1;
+    }
+
+    /// Clip the global L2 norm of the accumulated gradients to `max_norm` in the next
+    /// [`step`](Self::step), like `torch.nn.utils.clip_grad_norm_`. Call it after the
+    /// last backward of a batch; `f32::INFINITY` only measures. The gradients are
+    /// scaled inside the step kernel, so nothing is rewritten here.
+    pub fn clip_grad_norm(&mut self, gpu: &Gpu, max_norm: f32) {
+        let arenas = self
+            .arenas
+            .as_mut()
+            .expect("parameters were never bound — see Hierarchical::bind_params");
+        let StageArenas {
+            encoder,
+            backbone,
+            decoder,
+            norm,
+            clip_pending,
+        } = arenas;
+        norm.clip(gpu, &[encoder, backbone, decoder], max_norm);
+        *clip_pending = true;
+    }
+
+    /// The norm the last [`clip_grad_norm`](Self::clip_grad_norm) measured, before
+    /// clipping. Synchronizes the stream.
+    pub fn grad_norm(&self, gpu: &Gpu) -> f32 {
+        self.arenas
+            .as_ref()
+            .expect("parameters were never bound — see Hierarchical::bind_params")
+            .norm
+            .norm(gpu)
     }
 
     // checkpointing
@@ -2340,23 +2420,22 @@ impl Hierarchical {
             cap,
         };
 
-        // Build a fresh model (for the zeroed grads/moments), then swap in the
-        // loaded weight-bearing parts. Unbound: the parameters that end up in the
-        // arena are the loaded ones, packed once below.
-        let mut model = Hierarchical::unbound(gpu, cfg);
+        let mut model = Hierarchical::unbound(
+            gpu,
+            cfg,
+            Parts {
+                table,
+                enc_blocks,
+                bb_front,
+                bb_blocks,
+                bb_back,
+                dec_blocks,
+                dec_norm,
+                dec_head,
+            },
+        );
         model.step_count = stacks.step;
         model.seen = stacks.seen;
-        model.table = table;
-        model.encoder.blocks = enc_blocks;
-        model.bb_front = bb_front;
-        model.bb_blocks = bb_blocks;
-        model.bb_back = bb_back;
-        model.dec_blocks = dec_blocks;
-        model.dec_norm = dec_norm;
-        model.dec_head = dec_head;
-        // The loaded blocks replaced the ones `unbound` set up, so the offload opt-in
-        // and the parameter arena both apply to the stack that ends up in the model.
-        model.enable_backbone_offload(gpu);
         model.bind_params(gpu);
         Ok(model)
     }

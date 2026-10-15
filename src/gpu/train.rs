@@ -17,9 +17,9 @@ use rand::seq::SliceRandom;
 
 use crate::batches::ChunkedWordDataSet;
 use crate::config::{
-    BATCH_SIZE, CARRY_WINDOW_STATE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, LOG_EVERY, LOGIT_SOFTCAP, LR,
-    MAX_WINDOW_TOKENS, MIN_WORDS_PER_SEQ, SFT_BATCH_SIZE, SFT_DATA, SFT_EPOCHS, SFT_LR,
-    SFT_MAX_TOKENS, SFT_WARMUP_WINDOWS, TRAIN_DATA, VAL_DATA, WORD_BLOCKS, WORD_HIDDEN,
+    BATCH_SIZE, CARRY_WINDOW_STATE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, GRAD_CLIP_NORM, LOG_EVERY,
+    LOGIT_SOFTCAP, LR, MAX_WINDOW_TOKENS, MIN_WORDS_PER_SEQ, SFT_BATCH_SIZE, SFT_DATA, SFT_EPOCHS,
+    SFT_LR, SFT_MAX_TOKENS, SFT_WARMUP_WINDOWS, TRAIN_DATA, VAL_DATA, WORD_BLOCKS, WORD_HIDDEN,
     WORDS_PER_SEQ,
 };
 use crate::gpu::Gpu;
@@ -58,7 +58,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         cap: LOGIT_SOFTCAP,
     };
 
-    let mut model = match Hierarchical::load(&gpu, model_path, w_token) {
+    let (mut model, loaded) = match Hierarchical::load(&gpu, model_path, w_token) {
         Ok(m) => {
             println!(
                 "Loaded GPU hierarchical model from '{model_path}' (step {}).",
@@ -66,11 +66,11 @@ pub fn train_hierarchical_gpu(model_path: &str) {
             );
             println!("Trained on so far:");
             print!("{}", m.seen.report());
-            m
+            (m, true)
         }
         Err(e) => {
             println!("Could not load '{model_path}' ({e}) — creating new GPU model.");
-            Hierarchical::new(&gpu, cfg)
+            (Hierarchical::new(&gpu, cfg), false)
         }
     };
     if model.cfg != cfg {
@@ -109,7 +109,10 @@ pub fn train_hierarchical_gpu(model_path: &str) {
     );
 
     let mut state = TrainingState::from_step(model.step_count);
-    state.init_log(model_path, &["word_loss"]);
+    if loaded {
+        state.schedule = crate::training::LrSchedule::pretrain_resumed(model.step_count);
+    }
+    state.init_log(model_path, &["word_loss", "grad_norm"]);
     // Buffer CSV rows and only flush them when the model is saved (every
     // SAVE_EVERY steps), so the on-disk log never gets ahead of the checkpoint.
     state.set_defer_log_flush(true);
@@ -241,6 +244,11 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                     if let Some(lr) = state.step(loss) {
                         opt.lr = lr;
                         opt.t += 1;
+                        // The accumulated gradient is a sum over BATCH_SIZE windows; the
+                        // clip and the log are on the mean, so neither depends on it.
+                        let batch = BATCH_SIZE as f32;
+                        model.clip_grad_norm(&gpu, GRAD_CLIP_NORM * batch);
+                        state.log_metric("grad_norm", model.grad_norm(&gpu) / batch);
                         model.step(&gpu, &opt);
                     }
                     model.step_count = state.step;

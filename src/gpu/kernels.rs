@@ -66,6 +66,8 @@ const NAMES: &[&str] = &[
     "softmax_ce",
     "adamw",
     "adamw_arena_q8",
+    "grad_sumsq_part",
+    "grad_clip_scale",
     "quantize_blockwise",
     "concat_xh",
     "split_dxh",

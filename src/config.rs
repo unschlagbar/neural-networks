@@ -23,15 +23,23 @@ pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 7;
 
 // Training-Schedule
 
-pub const LR: f32 = 8e-5;
-pub const MIN_LR: f32 = 5e-6;
+pub const LR: f32 = 1e-4;
+pub const MIN_LR: f32 = 1e-5;
 // Warmup/decay horizons count *windows* (data seen), not optimizer steps, so
 // BATCH_SIZE does not reshape the curve over the corpus.
 pub const WARMUP_WINDOWS: usize = 1_200;
-pub const DECAY_WINDOWS: usize = 5_000_000;
+pub const DECAY_WINDOWS: usize = 1_000_000;
 // Windows accumulated per optimizer step. Muon (Frobenius normalization) and
 // aux-Adam (second moment) are scale-invariant, so summed grads need no rescale.
-pub const BATCH_SIZE: usize = 48;
+pub const BATCH_SIZE: usize = 12;
+// Windows over which a resumed GPU pretraining run ramps its rate up again from 0.
+// Checkpoints carry no AdamW moments; see `LrSchedule::rewarm_windows`.
+pub const RESUME_WARMUP_WINDOWS: usize = 960;
+// Global L2 norm the GPU pretrainer clips each step's mean (per-window) gradient to.
+// `f32::INFINITY` only measures it; the `grad_norm` log column is the unclipped norm.
+// s5 at 49k windows measured ~1.1 at batch 48 and ~1.4 at 16 (`grad_norm_probe`), so
+// 3.0 only catches outliers; the conventional 1.0 would clip nearly every step.
+pub const GRAD_CLIP_NORM: f32 = 5.0;
 pub const EPOCHS: usize = 1;
 
 pub const SAVE_EVERY: usize = 1000;
@@ -51,8 +59,8 @@ pub const DECODER_WEIGHT_DECAY: f32 = 0.01;
 // `WORD_HIDDEN / CHAR_HIDDEN` times the backbone's rate. `1.0` is one rate for
 // the whole model, which is what every checkpoint before these existed trained
 // under.
-pub const ENCODER_LR_SCALE: f32 = 1.0;
-pub const DECODER_LR_SCALE: f32 = 1.0;
+pub const ENCODER_LR_SCALE: f32 = 3.0;
+pub const DECODER_LR_SCALE: f32 = 3.0;
 
 /// Weight decay for the flat model. `0.0` keeps it plain Adam.
 pub const FLAT_WEIGHT_DECAY: f32 = 0.0;

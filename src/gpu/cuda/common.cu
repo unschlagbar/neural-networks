@@ -465,6 +465,35 @@ extern "C" __global__ void adamw(float* param, const float* grad, float* m, floa
     param[k] = p;
 }
 
+// Global gradient L2 norm, in two passes so the sum has a fixed order and the clip is
+// reproducible: `grad_sumsq_part` writes one partial per block at `part[off + block]`,
+// `grad_clip_scale` folds them in a single block. Launched with NORM_THREADS threads.
+#define NORM_THREADS 256
+extern "C" __global__ void grad_sumsq_part(const float* g, int n, float* part, int off) {
+    __shared__ float sh[NORM_THREADS / 32];
+    float s = 0.0f;
+    for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x) {
+        s += g[k] * g[k];
+    }
+    s = rmsn_block_sum(s, sh);
+    if (threadIdx.x == 0) part[off + blockIdx.x] = s;
+}
+
+// out[0] = min(1, max_norm / norm), out[1] = norm. A NaN norm compares false and
+// leaves the factor at 1, so a NaN gradient reaches the step instead of being masked.
+extern "C" __global__ void grad_clip_scale(const float* part, int count, float max_norm,
+                                           float* out) {
+    __shared__ float sh[NORM_THREADS / 32];
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < count; i += blockDim.x) s += part[i];
+    s = rmsn_block_sum(s, sh);
+    if (threadIdx.x == 0) {
+        float norm = sqrtf(s);
+        out[0] = norm > max_norm ? max_norm / norm : 1.0f;
+        out[1] = norm;
+    }
+}
+
 // 8-bit AdamW moments: blockwise dynamic quantization (Dettmers et al., arXiv 2110.02861).
 //
 // `m` and `v` are stored as one byte per parameter — an index into a 256-entry map of
@@ -483,6 +512,19 @@ extern "C" __global__ void adamw(float* param, const float* grad, float* m, floa
 #define ADAM_QTHREADS 256
 #define ADAM_QPT (ADAM_QBLOCK / ADAM_QTHREADS)
 #define ADAM_QWARPS (ADAM_QTHREADS / 32)
+
+// Smallest code >= x in a sorted 256-entry map, for x in [0, 1]. Used for `v`: a
+// stored `v` below the true one divides the update by too little, and one rounded to
+// zero next to a surviving `m` moves the element by up to ~30x lr every step. Rounding
+// up can only shrink an update.
+__device__ __forceinline__ unsigned char q_encode_up(const float* map, float x) {
+    int lo = 0, hi = 255;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (map[mid] < x) lo = mid + 1; else hi = mid;
+    }
+    return (unsigned char)lo;
+}
 
 // Nearest code in a sorted 256-entry map.
 __device__ __forceinline__ unsigned char q_encode(const float* map, float x) {
@@ -557,7 +599,11 @@ extern "C" __global__ void quantize_blockwise(const float* x, unsigned char* q, 
 //     are bandwidth-bound, and no amount of batching moves that.
 // The step still drops from ~900 launches and ~900 memsets to one of each, and the
 // arena is what gives every parameter a stable address.
+//
+// `gscale` is one device float every gradient is multiplied by before the per-element
+// clip: the global-norm clip factor from `grad_clip_scale`, or 1.
 extern "C" __global__ void adamw_arena_q8(float* param, const float* grad,
+                                          const float* gscale,
                                           unsigned char* mq, unsigned char* vq,
                                           float* ms, float* vs,
                                           const float* smap, const float* umap,
@@ -572,6 +618,7 @@ extern "C" __global__ void adamw_arena_q8(float* param, const float* grad,
     }
 
     int base = blockIdx.x * ADAM_QBLOCK;
+    float gs = *gscale;
     float sm = ms[blockIdx.x], sv = vs[blockIdx.x];
     float mn[ADAM_QPT], vn[ADAM_QPT];
     float am = 0.0f, av = 0.0f;
@@ -581,7 +628,7 @@ extern "C" __global__ void adamw_arena_q8(float* param, const float* grad,
         int k = base + i * ADAM_QTHREADS + threadIdx.x;
         float mk = 0.0f, vk = 0.0f;
         if (k < n) {
-            float g = clip_grad(grad[k], clip);
+            float g = clip_grad(grad[k] * gs, clip);
             mk = b1 * (map_s[mq[k]] * sm) + (1.0f - b1) * g;
             vk = b2 * (map_s[256 + vq[k]] * sv) + (1.0f - b2) * g * g;
             float mh = mk / bc1;
@@ -605,7 +652,7 @@ extern "C" __global__ void adamw_arena_q8(float* param, const float* grad,
         int k = base + i * ADAM_QTHREADS + threadIdx.x;
         if (k < n) {
             mq[k] = q_encode(map_s, mn[i] * rm);
-            vq[k] = q_encode(map_s + 256, vn[i] * rv);
+            vq[k] = q_encode_up(map_s + 256, vn[i] * rv);
         }
     }
 }
