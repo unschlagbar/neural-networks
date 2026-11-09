@@ -791,6 +791,14 @@ impl Cell for MLstm {
     fn reset_bptt(&mut self, gpu: &Gpu) {
         MLstm::reset_bptt(self, gpu)
     }
+    fn take_carried(&mut self, _gpu: &Gpu) -> super::block::CarriedState {
+        super::block::CarriedState::Mlstm(self.carry_state.take())
+    }
+    fn put_carried(&mut self, state: super::block::CarriedState) {
+        if let super::block::CarriedState::Mlstm(s) = state {
+            self.carry_state = s;
+        }
+    }
     fn set_resets(&mut self, r: &Resets) {
         MLstm::set_resets(self, r)
     }

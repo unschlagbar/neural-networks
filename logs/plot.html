@@ -223,6 +223,7 @@
   <h1>Training Log</h1>
   <button class="btn" id="open-btn">Open CSV</button>
   <button class="btn" id="reload-btn" disabled>Reload</button>
+  <button class="btn" id="xaxis-btn" title="x-axis: windows (step) or optimizer updates (batch)">X: windows</button>
   <div class="smooth-wrap">
     <label for="smooth-slider">Conv W</label>
     <input type="range" id="smooth-slider" min="1" max="51" step="2" value="1">
@@ -287,16 +288,23 @@ let lossChart, wlChart, dwChart, dcChart, lrChart;
 let convWindow = 1;
 let startOffset = 0;
 let endOffset = Infinity;
+// 'step' = windows seen, 'batch' = optimizer updates (step / BATCH_SIZE)
+let xKey = 'step';
+
+function inRange(r) {
+  const x = +r[xKey];
+  return x >= startOffset && x <= endOffset;
+}
 
 function smooth(rows, key) {
-  const filtered = rows.filter(r => +r.step >= startOffset && +r.step <= endOffset);
-  if (convWindow <= 1) return filtered.map(r => ({ x: +r.step, y: +r[key] }));
+  const filtered = rows.filter(inRange);
+  if (convWindow <= 1) return filtered.map(r => ({ x: +r[xKey], y: +r[key] }));
   // causal box filter: each point averages only its own past [i-W+1, i]
   return filtered.map((r, i) => {
     const lo = Math.max(0, i - convWindow + 1);
     let sum = 0;
     for (let j = lo; j <= i; j++) sum += +filtered[j][key];
-    return { x: +r.step, y: sum / (i - lo + 1) };
+    return { x: +r[xKey], y: sum / (i - lo + 1) };
   });
 }
 
@@ -342,7 +350,7 @@ const gradientPlugin = {
 };
 
 const chartCfg = (label, key, datasets) => {
-  const allSteps = datasets.flatMap(d => d.rows.filter(r => +r.step >= startOffset && +r.step <= endOffset).map(r => +r.step)).filter(v => !isNaN(v));
+  const allSteps = datasets.flatMap(d => d.rows.filter(inRange).map(r => +r[xKey])).filter(v => !isNaN(v));
   const minStep  = allSteps.length ? Math.min(...allSteps) : undefined;
   return ({
   type: 'line',
@@ -386,7 +394,7 @@ const chartCfg = (label, key, datasets) => {
         ticks: { color: '#fff', maxTicksLimit: 8, font: { size: 10 } },
         grid: { color: gridColor },
         border: { color: '#555566' },
-        title: { display: label === 'Learning rate', text: 'step', color: '#fff', font: { size: 10 } }
+        title: { display: label === 'Learning rate', text: xKey === 'step' ? 'windows' : 'updates', color: '#fff', font: { size: 10 } }
       },
       y: {
         ticks: { color: '#fff', font: { size: 10 } },
@@ -514,6 +522,15 @@ document.getElementById('open-btn').onclick = async () => {
 
 document.getElementById('file-input').onchange = e => loadStaticFiles(e.target.files);
 document.getElementById('reload-btn').onclick   = () => registry.size && buildCharts(getDatasets());
+
+document.getElementById('xaxis-btn').onclick = e => {
+  xKey = xKey === 'step' ? 'batch' : 'step';
+  e.target.textContent = xKey === 'step' ? 'X: windows' : 'X: updates';
+  const step = xKey === 'step' ? 100 : 10;
+  document.getElementById('offset-input').step = step;
+  document.getElementById('end-input').step = step;
+  if (registry.size) buildCharts(getDatasets());
+};
 
 document.getElementById('smooth-slider').oninput = e => {
   convWindow = +e.target.value;

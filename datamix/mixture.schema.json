@@ -12,10 +12,11 @@
       "additionalProperties": false,
       "properties": {
         "kind": {
-          "description": "sft = JSONL for src/sft.rs; text = <|endoftext|>-separated for ChunkedWordDataSet; none = report only.",
+          "description": "sft = JSONL for src/sft.rs; text = <|endoftext|>-separated for ChunkedWordDataSet; prompts = one sentence per line with its spoken form, for the voice recorder; none = report only.",
           "enum": [
             "sft",
             "text",
+            "prompts",
             "none",
             "report"
           ]
@@ -75,6 +76,32 @@
           "minimum": 0,
           "maximum": 0.9,
           "description": "Fraction diverted to <path>.eval."
+        },
+        "exclude": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "prompts: files (JSONL or text) whose sentences may never become a prompt. A directory reads every file in it; one * in a file name matches any run of characters (shard.*.txt)."
+        },
+        "min_sentence_words": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "prompts: fewest whitespace-separated words in a sentence (default 4)."
+        },
+        "max_sentence_words": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "prompts: most whitespace-separated words in a sentence (default 100)."
+        },
+        "long_sentence_words": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "prompts: past this many words a sentence is kept only at long_keep (default 25)."
+        },
+        "long_keep": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "prompts: share of the sentences over long_sentence_words that are kept, drawn from the sentence hash so a rebuild keeps the same ones (default 0.1)."
         },
         "shard_bytes": {
           "description": "Split the output into files of at most this size, at document borders. 0 = one file.",

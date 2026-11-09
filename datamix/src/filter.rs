@@ -32,6 +32,13 @@ pub enum Reject {
     Uncompilable,
     NotTransformed,
     Unjudged,
+    PromptLength,
+    PromptLong,
+    PromptCharset,
+    PromptMarkup,
+    PromptNumbers,
+    Unspeakable,
+    InCorpus,
 }
 
 impl Reject {
@@ -56,6 +63,13 @@ impl Reject {
             Reject::Uncompilable => "code does not compile",
             Reject::NotTransformed => "outside the rewrite",
             Reject::Unjudged => "not yet judged (cache_only)",
+            Reject::PromptLength => "sentence length",
+            Reject::PromptLong => "long, not drawn (long_keep)",
+            Reject::PromptCharset => "not plain ascii",
+            Reject::PromptMarkup => "code, markup or address",
+            Reject::PromptNumbers => "too many numbers",
+            Reject::Unspeakable => "no single spoken form",
+            Reject::InCorpus => "already in a training corpus",
         }
     }
 }

@@ -30,6 +30,9 @@ pub enum OutKind {
     Text,
     /// Analyze only; write the report, no corpus.
     None,
+    /// One sentence per line as `{id, source, text, spoken}` JSONL — the
+    /// prompts the voice recorder shows (`prompts.rs`).
+    Prompts,
 }
 
 /// What a `weight` is a share of, and what the budget counts.
@@ -306,6 +309,16 @@ pub struct Output {
     pub holdout: f32,
     /// Split the text output into files of at most this many bytes. `0` = one file.
     pub shard_bytes: usize,
+    /// `prompts`: files whose sentences may not become a prompt — every SFT
+    /// and pretraining corpus, so a recording stays an honest test.
+    pub exclude: Vec<String>,
+    /// `prompts`: sentence length, in whitespace-separated words.
+    pub min_sentence_words: usize,
+    pub max_sentence_words: usize,
+    /// `prompts`: a sentence over `long_sentence_words` is kept with
+    /// probability `long_keep`.
+    pub long_sentence_words: usize,
+    pub long_keep: f32,
 }
 
 /// The local OpenAI-compatible server (LM Studio's default is
@@ -596,7 +609,12 @@ fn output_from(kv: &Kv, path: &str) -> Result<Output> {
         "sft" => OutKind::Sft,
         "text" => OutKind::Text,
         "none" | "report" => OutKind::None,
-        other => return Err(format!("{path}: output kind must be sft|text|none, got {other:?}")),
+        "prompts" => OutKind::Prompts,
+        other => {
+            return Err(format!(
+                "{path}: output kind must be sft|text|prompts|none, got {other:?}"
+            ));
+        }
     };
     let weight_by = match kv.str("weight_by", "tokens", path)?.as_str() {
         "tokens" => WeightUnit::Tokens,
@@ -607,10 +625,10 @@ fn output_from(kv: &Kv, path: &str) -> Result<Output> {
             ));
         }
     };
-    let default_path = if kind == OutKind::Text {
-        "data/mix/out.txt"
-    } else {
-        "data/mix/out.jsonl"
+    let default_path = match kind {
+        OutKind::Text => "data/mix/out.txt",
+        OutKind::Prompts => "data/voice/prompts.jsonl",
+        _ => "data/mix/out.jsonl",
     };
     Ok(Output {
         kind,
@@ -623,6 +641,11 @@ fn output_from(kv: &Kv, path: &str) -> Result<Output> {
         report: kv.str("report", "", path)?,
         holdout: kv.float("holdout", 0.0, path)?,
         shard_bytes: kv.num("shard_bytes", 0, path)?,
+        exclude: kv.list("exclude", &[], path)?,
+        min_sentence_words: kv.num("min_sentence_words", 4, path)?,
+        max_sentence_words: kv.num("max_sentence_words", 100, path)?,
+        long_sentence_words: kv.num("long_sentence_words", 25, path)?,
+        long_keep: kv.float("long_keep", 0.1, path)?,
     })
 }
 
@@ -794,6 +817,7 @@ impl fmt::Display for OutKind {
             OutKind::Sft => "sft",
             OutKind::Text => "text",
             OutKind::None => "none",
+            OutKind::Prompts => "prompts",
         })
     }
 }

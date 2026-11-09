@@ -1,0 +1,46 @@
+#:schema ../datamix/mixture.schema.json
+# Text for the audio stage (mode `hga`), where the backbone trains again next to
+# the audio windows: text `s4` has never seen, so that stage does not repeat
+# pretraining.
+#
+#   cargo run -p datamix --release -- build mixes/pretrain_audio.toml
+#
+# 70% FineWeb-Edu from the same, newest dump `pretrain_v2` read (CC-MAIN-2025-26),
+# shards 000_00011 onwards; it read 000_00000-000_00010. 30% Reddit comments
+# from everyday subreddits: people writing the way they talk, which neither
+# FineWeb-Edu's textbook register nor the code and math sources carry.
+
+[output]
+kind = "text"
+path = "data/mix/pretrain_audio/shard.txt"
+shard_bytes = "512M"
+report = "data/mix/pretrain_audio/report.md"
+seed = 29
+tokens = 0            # 0 = everything the weights allow without repeating
+holdout = 0.001
+shuffle = true
+
+[filter]
+min_bytes = 200
+max_bytes = "400k"
+max_dup_line_ratio = 0.5
+dedup = "exact"
+
+[source.fineweb-edu]
+kind = "parquet"
+path = "/home/unschlagbar/training_data/FineWeb-new"
+languages = ["en"]
+min_alpha_ratio = 0.6
+weight = 70
+epochs = 1
+
+# One shard each of fifteen everyday subreddits (`HuggingFaceGECLM/REDDIT_comments`).
+# A comment is a document; most are a line or two and fall to `min_bytes`.
+[source.reddit]
+kind = "parquet"
+path = "/home/unschlagbar/training_data/reddit"
+text_column = "body"
+min_alpha_ratio = 0.6
+must_not_contain = ["[deleted]", "[removed]", "I am a bot", "^^"]
+weight = 30
+epochs = 1

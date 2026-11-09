@@ -42,8 +42,15 @@ impl Fft {
 
     /// `|X_k|²` for `k = 0..=n/2` of `input` zero-padded to the transform length.
     pub fn power(&mut self, input: &[f32], out: &mut [f32]) {
-        assert!(input.len() <= self.n, "Fft::power: input longer than the transform");
-        assert_eq!(out.len(), self.n / 2 + 1, "Fft::power: output is n/2 + 1 bins");
+        assert!(
+            input.len() <= self.n,
+            "Fft::power: input longer than the transform"
+        );
+        assert_eq!(
+            out.len(),
+            self.n / 2 + 1,
+            "Fft::power: output is n/2 + 1 bins"
+        );
         self.re[..input.len()].copy_from_slice(input);
         self.re[input.len()..].fill(0.0);
         self.im.fill(0.0);
@@ -51,6 +58,40 @@ impl Fft {
         for (k, p) in out.iter_mut().enumerate() {
             *p = self.re[k] * self.re[k] + self.im[k] * self.im[k];
         }
+    }
+
+    /// The linear convolution of `a` and `b`, `a.len() + b.len() − 1` long;
+    /// the transform must be at least that long. Both real inputs ride in one
+    /// complex transform (`a + ib`), whose spectrum separates them by symmetry.
+    pub fn convolve(&mut self, a: &[f32], b: &[f32]) -> Vec<f32> {
+        let n = self.n;
+        let len = a.len() + b.len() - 1;
+        assert!(
+            len <= n,
+            "Fft::convolve: {len} samples need a longer transform than {n}"
+        );
+        self.re[..a.len()].copy_from_slice(a);
+        self.re[a.len()..].fill(0.0);
+        self.im[..b.len()].copy_from_slice(b);
+        self.im[b.len()..].fill(0.0);
+        self.transform();
+        // A_k = (Z_k + conj Z_{n−k}) / 2, B_k = (Z_k − conj Z_{n−k}) / 2i, and the
+        // product A_k·B_k goes back into the buffers.
+        let mut prod = vec![(0.0f32, 0.0f32); n];
+        for (k, p) in prod.iter_mut().enumerate() {
+            let m = (n - k) % n;
+            let (zr, zi, cr, ci) = (self.re[k], self.im[k], self.re[m], -self.im[m]);
+            let (ar, ai) = (0.5 * (zr + cr), 0.5 * (zi + ci));
+            let (br, bi) = (0.5 * (zi - ci), -0.5 * (zr - cr));
+            *p = (ar * br - ai * bi, ar * bi + ai * br);
+        }
+        // The inverse as a forward transform of the conjugate.
+        for (k, &(r, i)) in prod.iter().enumerate() {
+            self.re[k] = r;
+            self.im[k] = -i;
+        }
+        self.transform();
+        self.re[..len].iter().map(|&r| r / n as f32).collect()
     }
 
     /// In-place decimation-in-time transform of `re`/`im`.
@@ -88,6 +129,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn convolution_matches_the_direct_sum() {
+        let a: Vec<f32> = (0..37).map(|i| ((i * 11) % 7) as f32 - 3.0).collect();
+        let b: Vec<f32> = (0..9).map(|i| ((i * 5) % 4) as f32 * 0.5 - 0.7).collect();
+        let got = Fft::new(64).convolve(&a, &b);
+        assert_eq!(got.len(), a.len() + b.len() - 1);
+        for (k, &g) in got.iter().enumerate() {
+            let want: f32 = (0..b.len())
+                .filter(|&j| j <= k && k - j < a.len())
+                .map(|j| a[k - j] * b[j])
+                .sum();
+            assert!((g - want).abs() < 1e-3, "sample {k}: {g} vs {want}");
+        }
+    }
+
+    #[test]
     fn matches_the_direct_dft() {
         let n = 16;
         let x: Vec<f32> = (0..12).map(|i| ((i * 7) % 5) as f32 - 2.0).collect();
@@ -101,7 +157,10 @@ mod tests {
                 im += v as f64 * a.sin();
             }
             let want = (re * re + im * im) as f32;
-            assert!((got - want).abs() < 1e-3 * want.max(1.0), "bin {k}: {got} vs {want}");
+            assert!(
+                (got - want).abs() < 1e-3 * want.max(1.0),
+                "bin {k}: {got} vs {want}"
+            );
         }
     }
 }

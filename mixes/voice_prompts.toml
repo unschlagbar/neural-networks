@@ -1,0 +1,97 @@
+#:schema ../datamix/mixture.schema.json
+# The sentences the voice recorder (harness, VOICE page) asks the user to read.
+#
+#   cargo run -p datamix --release -- build mixes/voice_prompts.toml
+#
+# Every staged record is cut into sentences; only what a person would say to
+# the assistant counts (user turns, instructions, documents — never a reply).
+# A sentence becomes a prompt when it is 4-100 words of plain ASCII with no
+# code or address in it and a single spoken form: `spoken` is what CTC aligns
+# against, so "$87.40" is written out and "1999" (year or count?) is dropped.
+#
+# The pool is held out: a sentence that appears anywhere in `exclude` is never
+# a prompt, so a recording stays an honest test of the voice and the text model
+# never trains on what the user read. Ids are a hash of the normalized text, so
+# a rebuild keeps every id a recording already points at.
+#
+# Sources (docs/voice-recorder-plan.md, Part A): general text from the
+# pretraining holdout, and Jarvis commands from the templates, expanded with a
+# seed of their own, minus what the SFT corpus already holds verbatim. Everyday
+# writing joins once its corpus exists.
+
+[output]
+kind = "prompts"
+path = "data/voice/prompts.jsonl"
+report = "data/voice/prompts_report.md"
+seed = 7311
+weight_by = "records"
+records = 1000000
+min_sentence_words = 4
+# Up to 100 words, but past 25 only one sentence in ten is kept: long prompts
+# are there so the encoder sees every length, not to be the bulk of the voice.
+max_sentence_words = 100
+long_sentence_words = 25
+long_keep = 0.1
+exclude = [
+    "data/sources/tools.jsonl",
+    "data/sources/tools.jsonl.eval",
+    "data/sources/voice.jsonl",
+    "data/sources/handmade.jsonl",
+    "data/sources/rustified.jsonl",
+    "data/mix/assistant_qa.jsonl",
+    "data/mix/assistant_qa.jsonl.eval",
+    "data/mix/assistant_full.jsonl",
+    "data/mix/assistant_full.jsonl.eval",
+    # The training shards only: `shard.txt.eval` beside them was never trained
+    # on and is a source below.
+    "data/mix/pretrain_v2/shard.*.txt",
+]
+
+[filter]
+min_bytes = 1
+dedup = "exact"
+
+# General text in the pretraining distribution that pretraining never saw: the
+# 3253 documents `pretrain_v2` held out for eval (FineWeb, FineMath, Rust). Code
+# and formulas fall to the gates; what is left is prose. FineWeb itself was
+# used up (1.00 epochs), so this is the only unseen slice of it on disk.
+[source.pretrain_holdout]
+kind = "file"
+path = "data/mix/pretrain_v2/shard.txt.eval"
+epochs = 1
+weight = 1
+
+[source.lamp]
+kind = "synth"
+path = "mixes/synth/lamp.syn"
+count = 4000
+epochs = 1
+weight = 1
+
+[source.apps]
+kind = "synth"
+path = "mixes/synth/apps.syn"
+count = 4000
+epochs = 1
+weight = 1
+
+[source.math]
+kind = "synth"
+path = "mixes/synth/math.syn"
+count = 4000
+epochs = 1
+weight = 1
+
+[source.in_context]
+kind = "synth"
+path = "mixes/synth/tools_in_context.syn"
+count = 4000
+epochs = 1
+weight = 1
+
+[source.persona]
+kind = "synth"
+path = "mixes/synth/persona.syn"
+count = 2000
+epochs = 1
+weight = 1

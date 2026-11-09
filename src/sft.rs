@@ -71,6 +71,9 @@ pub struct SftExample {
     /// counted in the loss. `words[0]` is never decoded (it is the encode-only
     /// prefix), so its flag is unused; masking begins at the response.
     pub loss: Vec<bool>,
+    /// The user turns heard instead of read: each turn's take id and the
+    /// token range its spoken words were written to.
+    pub heard: Vec<(String, Range<usize>)>,
 }
 
 impl SftExample {
@@ -126,6 +129,10 @@ pub struct Turn {
     /// inside a word is rounded out to the word border by the segmentation —
     /// words are the unit the mask is applied in.
     pub no_loss: Vec<(usize, usize)>,
+    /// The take a user turn was spoken as (`<session>/<id>` in the SFT speech
+    /// set). Where the take is not given to the loader the turn is read as
+    /// its `content`.
+    pub audio: Option<String>,
 }
 
 impl Turn {
@@ -134,6 +141,7 @@ impl Turn {
             role,
             content: content.into(),
             no_loss: Vec::new(),
+            audio: None,
         }
     }
 
@@ -250,6 +258,7 @@ pub fn parse_messages(line: &str) -> Option<Vec<Turn>> {
             role,
             content,
             no_loss: json_pairs(obj, "no_loss"),
+            audio: json_string_field(obj, "audio"),
         });
     }
     (!turns.is_empty()).then_some(turns)
@@ -335,8 +344,13 @@ fn json_objects(body: &str) -> Vec<&str> {
     out
 }
 
+/// The words a take was heard as, by take id: what a heard user turn is
+/// written as in place of its content. `None` reads the turn.
+pub type HeardTokens<'a> = &'a dyn Fn(&str) -> Option<Vec<u16>>;
+
 /// Assemble the token sequence for a conversation, plus the token spans that
-/// carry loss (one per assistant turn, its trailing `<END>` included).
+/// carry loss (one per assistant turn, its trailing `<END>` included) and the
+/// token ranges of the user turns `heard` writes.
 ///
 /// A leading `system` message is folded into the first user turn's <CONTEXT>
 /// slot. Anything before the first user turn, and any assistant turn with no
@@ -346,9 +360,11 @@ fn build_conversation(
     tok: &Utf8Tokenizer,
     turns: &[Turn],
     keep_open: bool,
-) -> (Vec<u16>, Vec<(usize, usize)>) {
+    heard: HeardTokens,
+) -> (Vec<u16>, Vec<(usize, usize)>, Vec<(String, Range<usize>)>) {
     let mut tokens: Vec<u16> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut heard_at: Vec<(String, Range<usize>)> = Vec::new();
     let mut system = String::new();
     let mut open_prompt = false;
 
@@ -364,7 +380,14 @@ fn build_conversation(
                 if content.is_empty() {
                     continue;
                 }
-                tokens.extend(tok.to_tokens_markup(content));
+                let spoken = turn.audio.as_ref().and_then(|id| Some((id, heard(id)?)));
+                if let Some((id, spoken)) = spoken {
+                    let start = tokens.len();
+                    tokens.extend(spoken);
+                    heard_at.push((id.clone(), (start..tokens.len()).into()));
+                } else {
+                    tokens.extend(tok.to_tokens_markup(content));
+                }
                 if !system.is_empty() {
                     tokens.push(CONTEXT_TOKEN);
                     tokens.extend(tok.to_tokens_markup(&system));
@@ -419,14 +442,21 @@ fn build_conversation(
     if open_prompt && !keep_open {
         let cut = spans.last().map(|&(_, e)| e).unwrap_or(0);
         tokens.truncate(cut);
+        heard_at.retain(|(_, r)| r.end <= cut);
     }
-    (tokens, spans)
+    (tokens, spans, heard_at)
 }
 
 /// Build one example from a conversation of any length, or `None` if no
 /// assistant turn survives.
 pub fn build_example_turns(tok: &Utf8Tokenizer, turns: &[Turn]) -> Option<SftExample> {
-    let (tokens, spans) = build_conversation(tok, turns, false);
+    build_example_heard(tok, turns, &|_| None)
+}
+
+/// [`build_example_turns`] with the user turns `heard` has a take for written
+/// as that take's words.
+pub fn build_example_heard(tok: &Utf8Tokenizer, turns: &[Turn], heard: HeardTokens) -> Option<SftExample> {
+    let (tokens, spans, heard) = build_conversation(tok, turns, false, heard);
     if spans.is_empty() {
         return None;
     }
@@ -438,6 +468,7 @@ pub fn build_example_turns(tok: &Utf8Tokenizer, turns: &[Turn]) -> Option<SftExa
         tokens,
         words,
         loss,
+        heard,
     })
 }
 
@@ -461,7 +492,7 @@ pub fn format_prompt(tok: &Utf8Tokenizer, instruction: &str, context: &str) -> V
 /// [`Hierarchical::sample_chat`](crate::hierarchical::Hierarchical::sample_chat)
 /// and append the reply as an `Assistant` turn to continue.
 pub fn format_chat_prompt(tok: &Utf8Tokenizer, turns: &[Turn]) -> Vec<u16> {
-    build_conversation(tok, turns, true).0
+    build_conversation(tok, turns, true, &|_| None).0
 }
 
 /// Segment `tokens` into words and build the loss mask: a word is a response
@@ -512,6 +543,7 @@ pub fn build_example(
         tokens,
         words,
         loss,
+        heard: Vec::new(),
     })
 }
 
@@ -525,6 +557,17 @@ pub fn load_jsonl(
     tok: &Utf8Tokenizer,
     path: &str,
     max_tokens: usize,
+) -> std::io::Result<Vec<SftExample>> {
+    load_jsonl_heard(tok, path, max_tokens, &|_| None)
+}
+
+/// [`load_jsonl`] with the user turns `heard` has a take for written as that
+/// take's words.
+pub fn load_jsonl_heard(
+    tok: &Utf8Tokenizer,
+    path: &str,
+    max_tokens: usize,
+    heard: HeardTokens,
 ) -> std::io::Result<Vec<SftExample>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -544,7 +587,7 @@ pub fn load_jsonl(
             Some(turns) => {
                 multi +=
                     usize::from(turns.iter().filter(|t| t.role == Role::Assistant).count() > 1);
-                build_example_turns(tok, &turns)
+                build_example_heard(tok, &turns, heard)
             }
             None => match parse_record(&line) {
                 Some((instruction, context, response)) => {
@@ -611,7 +654,7 @@ fn key_position(line: &str, key: &str) -> Option<usize> {
     }
 }
 
-fn json_string_field(line: &str, key: &str) -> Option<String> {
+pub(crate) fn json_string_field(line: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     // Scan for the key as an object key: `"key"` followed (after whitespace) by
     // a colon. A plain `find` could match the same text inside a value, so the

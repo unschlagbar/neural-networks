@@ -14,6 +14,7 @@ mod filter;
 mod json;
 mod llm;
 mod mix;
+mod prompts;
 mod record;
 mod report;
 mod rng;

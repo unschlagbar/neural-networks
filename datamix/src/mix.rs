@@ -1,13 +1,14 @@
 // The build itself: stage every source, size the shares, draw the mixture,
 // write the corpus.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use crate::config::{Filters, Mix, OutKind, Result, Source, WeightUnit};
 use crate::filter::{Filter, Reject};
 use crate::llm::Client;
+use crate::prompts::{self, Gate};
 use std::cell::RefCell;
 use crate::record::Record;
 use crate::rng::Rng;
@@ -103,10 +104,22 @@ pub fn build(mix: &Mix, opts: &Options) -> Result<BuildStats> {
     // A `RefCell` because both halves of staging reach for it: the generator
     // (making records) and the judge (vetting them) run inside one another.
     let llm = RefCell::new(Client::new(&mix.llm)?);
+    let gate = match mix.output.kind {
+        OutKind::Prompts => Some(Gate {
+            min_words: mix.output.min_sentence_words,
+            max_words: mix.output.max_sentence_words,
+            long_words: mix.output.long_sentence_words,
+            long_keep: mix.output.long_keep,
+            origins: RefCell::new(prompts::Origins::create(
+                std::path::Path::new(&stage_dir()).join("prompt_docs.jsonl"),
+            )?),
+        }),
+        _ => None,
+    };
 
     for (si, src) in mix.sources.iter().enumerate() {
         println!("[{}/{}] staging '{}'", si + 1, mix.sources.len(), src.name);
-        let (reader, st) = stage(src, mix.output.seed ^ (si as u64 + 1), &llm)?;
+        let (reader, st) = stage(src, mix.output.seed ^ (si as u64 + 1), &llm, gate.as_ref())?;
         println!(
             "      {} read, {} kept ({} tokens)",
             st.read,
@@ -115,6 +128,14 @@ pub fn build(mix: &Mix, opts: &Options) -> Result<BuildStats> {
         );
         readers.push(reader);
         stats.push(SourceStats { unit, ..st });
+    }
+
+    // Which staged records may be drawn. Every one, except that a prompt pool
+    // drops a sentence an earlier source already has or a training corpus
+    // already holds.
+    let mut usable: Vec<Vec<usize>> = readers.iter().map(|r| (0..r.len()).collect()).collect();
+    if gate.is_some() {
+        usable = unique_prompts(mix, &mut readers, &mut stats)?;
     }
 
     // Shares are relative weights; a source with nothing left after filtering
@@ -193,7 +214,7 @@ pub fn build(mix: &Mix, opts: &Options) -> Result<BuildStats> {
         let cap = (st.kept_units() as f64 * src.epochs.max(0.0) as f64) as usize;
         st.wanted = target;
         let target = target.min(cap);
-        let mut order: Vec<usize> = (0..readers[si].len()).collect();
+        let mut order = std::mem::take(&mut usable[si]);
         rng.shuffle(&mut order);
         let mut drawn = 0usize;
         let mut i = 0usize;
@@ -281,12 +302,14 @@ pub fn build(mix: &Mix, opts: &Options) -> Result<BuildStats> {
             out.written_tokens += rec.tokens();
         }
     } else {
-        write_corpus(mix, &plan, &mut readers, &mut out)?;
+        write_corpus(mix, &plan, &mut readers, &mut out, gate.as_ref())?;
     }
 
     for r in readers {
         r.remove();
     }
+    // A pool that was only checked never moved its staged records out.
+    let _ = std::fs::remove_file(std::path::Path::new(&stage_dir()).join("prompt_docs.jsonl"));
     let _ = std::fs::remove_dir(stage_dir());
     Ok(out)
 }
@@ -546,10 +569,71 @@ fn transform_batch(
     out
 }
 
+/// Drops the prompts that repeat an earlier source's or appear in one of
+/// `[output] exclude`, and returns the indices left per source. The staged
+/// prompts are the needles: the corpora are streamed against them, never held.
+fn unique_prompts(
+    mix: &Mix,
+    readers: &mut [crate::shard::ShardReader],
+    stats: &mut [SourceStats],
+) -> Result<Vec<Vec<usize>>> {
+    let mut keys: Vec<Vec<(u64, usize)>> = Vec::with_capacity(readers.len());
+    let mut candidates = HashSet::new();
+    for r in readers.iter_mut() {
+        let mut ks = Vec::with_capacity(r.len());
+        for i in 0..r.len() {
+            let rec = r.get(i)?;
+            let k = prompts::key(&rec.train_text());
+            candidates.insert(k);
+            ks.push((k, rec.tokens()));
+        }
+        keys.push(ks);
+    }
+    let excluded = if mix.output.exclude.is_empty() {
+        HashSet::new()
+    } else {
+        println!(
+            "checking {} prompts against {} excluded corpora",
+            candidates.len(),
+            mix.output.exclude.len()
+        );
+        let started = std::time::Instant::now();
+        let hits = prompts::find_in(&mix.output.exclude, &candidates)?;
+        println!(
+            "      {} already in a training corpus ({:.0} s)",
+            hits.len(),
+            started.elapsed().as_secs_f32()
+        );
+        hits
+    };
+
+    let mut seen = HashSet::new();
+    let mut usable = Vec::with_capacity(keys.len());
+    for (ks, st) in keys.iter().zip(stats.iter_mut()) {
+        let mut keep = Vec::with_capacity(ks.len());
+        for (i, &(k, tokens)) in ks.iter().enumerate() {
+            let reason = if excluded.contains(&k) {
+                Reject::InCorpus
+            } else if !seen.insert(k) {
+                Reject::Duplicate
+            } else {
+                keep.push(i);
+                continue;
+            };
+            *st.rejects.entry(reason).or_insert(0) += 1;
+            st.kept -= 1;
+            st.kept_tokens -= tokens;
+        }
+        usable.push(keep);
+    }
+    Ok(usable)
+}
+
 fn stage(
     src: &Source,
     seed: u64,
     llm: &RefCell<Client>,
+    gate: Option<&Gate>,
 ) -> Result<(crate::shard::ShardReader, SourceStats)> {
     let mut shard = Shard::create(&stage_dir(), &src.name)?;
     let mut filter = Filter::new(src.filters.clone());
@@ -589,6 +673,25 @@ fn stage(
         let mut judging: Vec<Record> = Vec::new();
         let skipped = source::read(src, seed, llm, &mut |mut rec| {
             st.read += 1;
+            // A prompt pool keeps sentences, not records: each one goes through
+            // the gates on its own, as a document of one sentence.
+            if let Some(gate) = gate {
+                for (index, sentence) in prompts::sentences(&rec).into_iter().enumerate() {
+                    if let Err(reason) = gate.check(&sentence) {
+                        *st.rejects.entry(reason).or_insert(0) += 1;
+                        continue;
+                    }
+                    if let Err(e) = gate.origins.borrow_mut().note(&rec, &src.name, index, &sentence) {
+                        *err = Some(e);
+                        return false;
+                    }
+                    let doc = Record::Doc { text: sentence };
+                    if !accept(doc, src, llm, st, &mut filter, shard, &mut judging, err) {
+                        return false;
+                    }
+                }
+                return true;
+            }
             // Before anything else: the record's own text decides its rewrite
             // cache key, so the system turn has to be settled first or the
             // same record hashes two ways.
@@ -725,7 +828,9 @@ fn write_corpus(
     plan: &[(usize, usize)],
     readers: &mut [crate::shard::ShardReader],
     out: &mut BuildStats,
+    gate: Option<&Gate>,
 ) -> Result<()> {
+    let mut docs_used = HashSet::new();
     if let Some(parent) = std::path::Path::new(&mix.output.path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
@@ -744,7 +849,18 @@ fn write_corpus(
     let mut writer = Writer::new(mix)?;
     for (n, (si, idx)) in plan.iter().enumerate() {
         let rec = readers[*si].get(*idx)?;
-        let Some(text) = render(&rec, mix.output.kind) else {
+        let text = match mix.output.kind {
+            OutKind::Prompts => {
+                let text = rec.train_text();
+                let origin = gate.and_then(|g| g.origins.borrow().get(&text));
+                if let Some((doc, _)) = origin {
+                    docs_used.insert(doc);
+                }
+                prompts::render(&text, &mix.sources[*si].name, origin)
+            }
+            kind => render(&rec, kind),
+        };
+        let Some(text) = text else {
             out.dropped_shape += 1;
             continue;
         };
@@ -761,6 +877,15 @@ fn write_corpus(
     writer.finish(out)?;
     if let Some(mut w) = eval {
         w.flush().map_err(|e| e.to_string())?;
+    }
+    if let Some(gate) = gate {
+        let path = match mix.output.path.strip_suffix(".jsonl") {
+            Some(stem) => format!("{stem}_docs.jsonl"),
+            None => format!("{}_docs.jsonl", mix.output.path),
+        };
+        let n = gate.origins.borrow_mut().write_docs(&path, &docs_used)?;
+        println!("{n} source records -> {path}");
+        out.out_paths.push(path);
     }
     Ok(())
 }
@@ -829,6 +954,7 @@ pub fn render(rec: &Record, kind: OutKind) -> Option<String> {
         // An instruction pair still makes a usable pretraining document; the
         // chat markers are dropped because they are token ids, not text.
         (OutKind::Text, rec) => Some(format!("{}<|endoftext|>", rec.train_text())),
+        (OutKind::Prompts, rec) => Some(format!("{}\n", rec.train_text())),
         (OutKind::None, _) => None,
     }
 }

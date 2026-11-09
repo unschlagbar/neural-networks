@@ -425,6 +425,48 @@ impl BackboneFwd {
     }
 }
 
+/// Backbone input supplied from outside the text encoder.
+pub enum Given<'a> {
+    /// Every row (`[words − 1, HC]`), replacing the encoder; the second tensor,
+    /// when there is a backward, receives the gradient with respect to it.
+    All(&'a GTensor<f32>, Option<&'a mut GTensor<f32>>),
+    /// The rows `rows` (word indices, each below `words − 1`) from `embeds`,
+    /// the rest from the encoder; `d` receives their gradient and the encoder
+    /// trains on the others.
+    Rows {
+        embeds: &'a GTensor<f32>,
+        rows: &'a [usize],
+        d: &'a mut GTensor<f32>,
+    },
+}
+
+/// Where the gradient of the backbone's input goes.
+enum Back<'a> {
+    Encoder,
+    Out(Option<&'a mut GTensor<f32>>),
+    Split(&'a [usize], &'a mut GTensor<f32>),
+}
+
+/// Soft decoder targets carried from one window to another of the same tokens,
+/// words and loss mask, which therefore decode in the same length groups.
+enum Distill {
+    Off,
+    /// Each group's CE gradient on the teacher's logits, `inv · mask · (p_t − y)`.
+    Record(Vec<GTensor<f32>>),
+    /// Recorded gradients, in group order, and the weight `α` on the teacher.
+    Apply(std::collections::VecDeque<GTensor<f32>>, f32),
+}
+
+/// The backbone's per-word context (`[dw, HC]`, what the decoder is given)
+/// carried from a teacher window to a student window of the same words.
+enum StateDistill {
+    Off,
+    Record(Option<GTensor<f32>>),
+    /// The teacher's context and the weight `β` of
+    /// `β/2 · mean_w ‖o_w − o_t,w‖² / mean_w ‖o_t,w‖²`.
+    Apply(GTensor<f32>, f32),
+}
+
 pub struct Hierarchical {
     pub cfg: ModelCfg,
 
@@ -519,6 +561,14 @@ pub struct Hierarchical {
     /// window by [`set_doc_starts`](Self::set_doc_starts) and consumed by it.
     doc_starts: Vec<usize>,
 
+    /// Distillation targets passed from a teacher window to a student window. See
+    /// [`record_distill`](Self::record_distill).
+    distill: Distill,
+    state_distill: StateDistill,
+    /// `mean_w ‖o_w − o_t,w‖² / mean_w ‖o_t,w‖²` in the last window run under
+    /// [`apply_state`](Self::apply_state).
+    last_state_mse: f32,
+
     /// The backbone's frames between forward and backward, shared by every backbone
     /// block: `None` with offload off. See [`enable_backbone_offload`](Self::enable_backbone_offload).
     offload: Option<SharedOffload>,
@@ -595,9 +645,12 @@ struct Parts {
 
 impl Parts {
     fn random(gpu: &Gpu, cfg: ModelCfg) -> Self {
+        // GPT-2's residual init: each block writes twice into the residual stream,
+        // so unscaled the stream's variance grows with depth.
+        let resid_scale = 1.0 / ((2 * cfg.bb_blocks) as f32).sqrt();
         let bb_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.bb_blocks)
-            .map(|i| {
-                if (i + 2).is_multiple_of(6) {
+            .map(|_i| {
+                if false {
                     Box::new(Block::from_cell(
                         gpu,
                         cfg.wh,
@@ -605,11 +658,14 @@ impl Parts {
                         SLstm::new_rand(gpu, cfg.wh, cfg.wh),
                     )) as Box<dyn BlockLike>
                 } else {
-                    Box::new(Block::from_cell(
+                    let mut cell = crate::nn2::MLstm::new(cfg.wh, cfg.wh, cfg.heads, cfg.dqk);
+                    cell.w_out.data.iter_mut().for_each(|w| *w *= resid_scale);
+                    Box::new(Block::from_cell_scaled(
                         gpu,
                         cfg.wh,
                         up_of(cfg.wh),
-                        MLstm::new_rand(gpu, cfg.wh, cfg.wh, cfg.heads, cfg.dqk),
+                        MLstm::from_cpu(gpu, &cell),
+                        resid_scale,
                     )) as Box<dyn BlockLike>
                 }
             })
@@ -708,6 +764,9 @@ impl Hierarchical {
             stateful: false,
             continues: false,
             doc_starts: Vec::new(),
+            distill: Distill::Off,
+            state_distill: StateDistill::Off,
+            last_state_mse: 0.0,
             offload: None,
             bb_bufs: BackboneBufs::default(),
             reset_mask: None,
@@ -765,6 +824,11 @@ impl Hierarchical {
         if !self.flags.offload {
             return;
         }
+        // An offloaded block saves less, so its frame is measured after `set_offload`.
+        let off = Offload::shared(gpu, 0);
+        for blk in self.bb_blocks.iter_mut() {
+            blk.set_offload(Some(off.clone()));
+        }
         let rows = self.bb_rows_max();
         let slot = self
             .bb_blocks
@@ -772,10 +836,7 @@ impl Hierarchical {
             .map(|b| b.frame_bytes(gpu, 1, rows))
             .max()
             .unwrap_or(0);
-        let off = Offload::shared(gpu, slot);
-        for blk in self.bb_blocks.iter_mut() {
-            blk.set_offload(Some(off.clone()));
-        }
+        off.borrow_mut().reserve(gpu, 0, slot);
         if self.flags.mem {
             println!(
                 "  offload: {} backbone blocks, ring {} x {:.1} MB",
@@ -858,7 +919,7 @@ impl Hierarchical {
     }
 
     pub fn forward_backward(&mut self, gpu: &Gpu, tokens: &[usize], words: &[Range<usize>]) -> f32 {
-        let loss = self.run_window(gpu, tokens, words, None, true);
+        let loss = self.run_window(gpu, tokens, words, None, true, None);
         gpu.stream.synchronize().expect("stream sync");
         loss
     }
@@ -877,7 +938,7 @@ impl Hierarchical {
         words: &[Range<usize>],
         word_loss: &[bool],
     ) -> f32 {
-        let loss = self.run_window(gpu, tokens, words, Some(word_loss), true);
+        let loss = self.run_window(gpu, tokens, words, Some(word_loss), true, None);
         // The window's temporaries have dropped by now, so their `cuMemFreeAsync`
         // frees are queued on the stream. CUDA's stream-ordered pool only hands
         // that memory back at a synchronization point — without one it just keeps
@@ -923,16 +984,252 @@ impl Hierarchical {
     /// Activations are released before returning: nothing will unwind them, and the
     /// backbone holds one row per word per block until something does.
     pub fn eval_loss(&mut self, gpu: &Gpu, tokens: &[usize], words: &[Range<usize>]) -> f32 {
-        let loss = self.run_window(gpu, tokens, words, None, false);
+        let loss = self.run_window(gpu, tokens, words, None, false, None);
         self.drop_all_act(gpu);
         gpu.stream.synchronize().expect("stream sync");
         loss
+    }
+
+    /// [`forward_backward_masked`](Self::forward_backward_masked) with the word
+    /// embeddings supplied instead of encoded from `tokens`: `embeds` is
+    /// `[words.len() − 1, HC]`, the backbone's input for every word but the last
+    /// (which nothing after it is predicted from). `tokens` and `words` still
+    /// define what the decoder is scored against. The text encoder takes no part;
+    /// the gradient that would have reached it is written to `d_embeds`, same
+    /// shape. Every other stage accumulates its gradient as usual — a caller
+    /// training only what produced `embeds` simply never steps this model.
+    pub fn forward_backward_embeds(
+        &mut self,
+        gpu: &Gpu,
+        embeds: &GTensor<f32>,
+        tokens: &[usize],
+        words: &[Range<usize>],
+        word_loss: Option<&[bool]>,
+        d_embeds: &mut GTensor<f32>,
+    ) -> f32 {
+        let loss = self.run_window(
+            gpu,
+            tokens,
+            words,
+            word_loss,
+            true,
+            Some(Given::All(embeds, Some(d_embeds))),
+        );
+        gpu.stream.synchronize().expect("stream sync");
+        loss
+    }
+
+    /// [`forward_backward`](Self::forward_backward) with some words heard rather
+    /// than read: the backbone rows `rows` come from `embeds` (see
+    /// [`Given::Rows`]), their gradient goes to `d_embeds`, and every stage —
+    /// text encoder on the other words, backbone, decoder — accumulates its own.
+    pub fn forward_backward_mixed(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[usize],
+        words: &[Range<usize>],
+        embeds: &GTensor<f32>,
+        rows: &[usize],
+        d_embeds: &mut GTensor<f32>,
+    ) -> f32 {
+        self.forward_backward_mixed_masked(gpu, tokens, words, None, embeds, rows, d_embeds)
+    }
+
+    /// [`forward_backward_mixed`](Self::forward_backward_mixed) under a
+    /// per-decoded-word loss mask, as in
+    /// [`forward_backward_masked`](Self::forward_backward_masked).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_backward_mixed_masked(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[usize],
+        words: &[Range<usize>],
+        word_loss: Option<&[bool]>,
+        embeds: &GTensor<f32>,
+        rows: &[usize],
+        d_embeds: &mut GTensor<f32>,
+    ) -> f32 {
+        let given = Given::Rows {
+            embeds,
+            rows,
+            d: d_embeds,
+        };
+        let loss = self.run_window(gpu, tokens, words, word_loss, true, Some(given));
+        gpu.stream.synchronize().expect("stream sync");
+        loss
+    }
+
+    /// [`eval_loss`](Self::eval_loss) with some words heard, as in
+    /// [`forward_backward_mixed`](Self::forward_backward_mixed).
+    pub fn eval_loss_mixed(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[usize],
+        words: &[Range<usize>],
+        embeds: &GTensor<f32>,
+        rows: &[usize],
+        word_loss: Option<&[bool]>,
+    ) -> f32 {
+        let mut d = GTensor::zeros(gpu, &[rows.len().max(1), self.cfg.hc]);
+        let given = Given::Rows {
+            embeds,
+            rows,
+            d: &mut d,
+        };
+        let loss = self.run_window(gpu, tokens, words, word_loss, false, Some(given));
+        self.drop_all_act(gpu);
+        gpu.stream.synchronize().expect("stream sync");
+        loss
+    }
+
+    /// [`eval_loss`](Self::eval_loss) with the word embeddings supplied, as in
+    /// [`forward_backward_embeds`](Self::forward_backward_embeds).
+    pub fn eval_loss_embeds(
+        &mut self,
+        gpu: &Gpu,
+        embeds: &GTensor<f32>,
+        tokens: &[usize],
+        words: &[Range<usize>],
+        word_loss: Option<&[bool]>,
+    ) -> f32 {
+        let loss = self.run_window(
+            gpu,
+            tokens,
+            words,
+            word_loss,
+            false,
+            Some(Given::All(embeds, None)),
+        );
+        self.drop_all_act(gpu);
+        gpu.stream.synchronize().expect("stream sync");
+        loss
+    }
+
+    /// The backbone's carried state, moved out: the next window starts from zero
+    /// whatever `continues` says, and [`restore_carried`](Self::restore_carried)
+    /// puts this back, so a window from another sequence can run in between.
+    pub fn stash_carried(&mut self, gpu: &Gpu) -> Vec<super::block::CarriedState> {
+        self.bb_blocks
+            .iter_mut()
+            .map(|b| b.take_carried(gpu))
+            .collect()
+    }
+
+    pub fn restore_carried(&mut self, state: Vec<super::block::CarriedState>) {
+        for (b, s) in self.bb_blocks.iter_mut().zip(state) {
+            b.put_carried(s);
+        }
+    }
+
+    /// [`eval_loss`](Self::eval_loss) under a per-decoded-word loss mask, as in
+    /// [`forward_backward_masked`](Self::forward_backward_masked).
+    pub fn eval_loss_masked(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[usize],
+        words: &[Range<usize>],
+        word_loss: Option<&[bool]>,
+    ) -> f32 {
+        let loss = self.run_window(gpu, tokens, words, word_loss, false, None);
+        self.drop_all_act(gpu);
+        gpu.stream.synchronize().expect("stream sync");
+        loss
+    }
+
+    /// The text encoder's embeddings of every word of `words` but the last,
+    /// `[words.len() − 1, HC]` — what the backbone would read for them. Forward
+    /// only; the encoder keeps no activations.
+    pub fn encode_embeds(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[usize],
+        words: &[Range<usize>],
+    ) -> GTensor<f32> {
+        let hc = self.cfg.hc;
+        let n = words.len().saturating_sub(1);
+        let mut out = GTensor::zeros(gpu, &[n.max(1), hc]);
+        if n == 0 {
+            return out;
+        }
+        let (mut sc, cache) = self.take_window_scratch(gpu);
+        self.encoder_forward(gpu, tokens, words, &mut sc, &cache);
+        out.copy_from(gpu, &sc.word_embeds);
+        self.scratch = Some(sc);
+        self.cache = Some(cache);
+        out
+    }
+
+    /// The next window that decodes runs as the teacher: its per-group CE
+    /// gradients are kept for [`apply_distill`](Self::apply_distill) instead of
+    /// being used. Only meaningful on a forward-only window.
+    pub fn record_distill(&mut self) {
+        self.distill = Distill::Record(Vec::new());
+    }
+
+    /// The teacher's recorded targets, ending the recording.
+    pub fn take_distill(&mut self) -> Vec<GTensor<f32>> {
+        match mem::replace(&mut self.distill, Distill::Off) {
+            Distill::Record(t) => t,
+            _ => panic!("take_distill without record_distill"),
+        }
+    }
+
+    /// The next window trains against `(1 − alpha)·y + alpha·p_t` instead of the
+    /// one-hot target `y`, `targets` being what [`take_distill`](Self::take_distill)
+    /// returned for a window of the same tokens, words and loss mask. Its reported
+    /// loss stays the CE against `y`.
+    pub fn apply_distill(&mut self, targets: Vec<GTensor<f32>>, alpha: f32) {
+        self.distill = Distill::Apply(targets.into(), alpha);
+    }
+
+    /// Ends [`apply_distill`](Self::apply_distill); every target must have been used.
+    pub fn end_distill(&mut self) {
+        if let Distill::Apply(left, _) = mem::replace(&mut self.distill, Distill::Off) {
+            assert!(
+                left.is_empty(),
+                "{} distillation groups left over",
+                left.len()
+            );
+        }
+    }
+
+    /// The next window runs as the teacher for the backbone's context: its
+    /// per-word context is kept for [`apply_state`](Self::apply_state).
+    pub fn record_state(&mut self) {
+        self.state_distill = StateDistill::Record(None);
+    }
+
+    /// The recorded context, ending the recording.
+    pub fn take_state(&mut self) -> GTensor<f32> {
+        match mem::replace(&mut self.state_distill, StateDistill::Off) {
+            StateDistill::Record(Some(t)) => t,
+            _ => panic!("take_state without a recorded window"),
+        }
+    }
+
+    /// The next window, of the same words as the one `target` was recorded on,
+    /// also pulls its backbone context towards `target` with weight `beta`:
+    /// `β/2 · mean_w ‖o_w − o_t,w‖² / mean_w ‖o_t,w‖²` (the teacher's scale held
+    /// constant) joins the loss through the backbone's output gradient. Its
+    /// reported loss stays the CE alone.
+    pub fn apply_state(&mut self, target: GTensor<f32>, beta: f32) {
+        self.state_distill = StateDistill::Apply(target, beta);
+    }
+
+    pub fn end_state(&mut self) {
+        self.state_distill = StateDistill::Off;
+    }
+
+    pub fn last_state_mse(&self) -> f32 {
+        self.last_state_mse
     }
 
     /// The five phases of a window, in order: encode the words, sweep the backbone,
     /// decode (forward, and backward when `grad`) per length group, unwind the
     /// backbone, unwind the encoder. Each phase is a method below; this is the order
     /// and the plumbing. With `grad` false it stops after the decode forward.
+    /// `given` replaces the encoder for all of the backbone's input or for some
+    /// of its rows; see [`Given`].
     fn run_window(
         &mut self,
         gpu: &Gpu,
@@ -940,6 +1237,7 @@ impl Hierarchical {
         words: &[Range<usize>],
         word_loss: Option<&[bool]>,
         grad: bool,
+        given: Option<Given>,
     ) -> f32 {
         // Taken first: a degenerate window returns below, and what it was told about
         // must not survive into the next one.
@@ -976,7 +1274,126 @@ impl Hierarchical {
         }
 
         let hc = self.cfg.hc;
-        let mut sc = self.scratch.take().unwrap_or_else(|| {
+        let (mut sc, cache) = self.take_window_scratch(gpu);
+
+        let (enc_rows, d_given) = match given {
+            Some(Given::All(embeds, d_out)) => {
+                assert_eq!(
+                    embeds.dims(),
+                    [dw, hc],
+                    "given embeddings must be [words - 1, HC]"
+                );
+                sc.word_embeds.shrink_to(&[dw, hc]);
+                sc.word_embeds.copy_from(gpu, embeds);
+                (0, Back::Out(d_out))
+            }
+            Some(Given::Rows { embeds, rows, d }) => {
+                assert_eq!(
+                    embeds.dims(),
+                    [rows.len(), hc],
+                    "one given row per listed word"
+                );
+                let enc_rows = self.encoder_forward(gpu, tokens, words, &mut sc, &cache);
+                let mut all = sc.word_embeds.to_host(gpu).data;
+                let given = embeds.to_host(gpu).data;
+                for (i, &r) in rows.iter().enumerate() {
+                    assert!(r < dw, "row {r} is past the last word the backbone reads");
+                    all[r * hc..(r + 1) * hc].copy_from_slice(&given[i * hc..(i + 1) * hc]);
+                }
+                sc.word_embeds
+                    .copy_from(gpu, &GTensor::from_host(gpu, &Tensor::new(&[dw, hc], all)));
+                (enc_rows, Back::Split(rows, d))
+            }
+            None => (
+                self.encoder_forward(gpu, tokens, words, &mut sc, &cache),
+                Back::Encoder,
+            ),
+        };
+        let bb = self.backbone_forward(gpu, &sc.word_embeds, dw, &doc_starts, &cache);
+        if let StateDistill::Record(slot) = &mut self.state_distill {
+            let mut t = GTensor::zeros(gpu, &[dw, hc]);
+            t.copy_from(gpu, bb.o());
+            *slot = Some(t);
+        }
+
+        let bb_rows_max = bb.rows_max;
+        let (loss, mut d_o, dec_rows_max) =
+            self.decode_groups(gpu, tokens, words, word_loss, bb.o(), &mut sc, &cache, grad);
+        if let StateDistill::Apply(target, beta) = &self.state_distill {
+            assert_eq!(
+                target.dims(),
+                [dw, hc],
+                "state distillation needs the teacher's words"
+            );
+            let mut diff = GTensor::zeros(gpu, &[dw, hc]);
+            diff.copy_from(gpu, bb.o());
+            let mut neg = GTensor::zeros(gpu, &[dw, hc]);
+            neg.copy_from(gpu, target);
+            ops::scale_(gpu, &mut neg, -1.0);
+            ops::add_assign(gpu, &mut diff, &neg);
+            let sq = |t: &GTensor<f32>| t.to_host(gpu).data.iter().map(|x| x * x).sum::<f32>();
+            let energy = sq(target).max(f32::MIN_POSITIVE);
+            self.last_state_mse = sq(&diff) / energy;
+            if let Some(d_o) = d_o.as_mut() {
+                ops::scale_(gpu, &mut diff, *beta / energy);
+                ops::add_assign(gpu, d_o, &diff);
+            }
+        }
+
+        self.bb_bufs = match d_o {
+            Some(d_o) => {
+                let bufs = self.backbone_backward(gpu, bb, &sc.word_embeds, &d_o, dw, &cache);
+                let d_embeds = bufs.d_embeds.expect("backbone backward wrote d_embeds");
+                match d_given {
+                    Back::Out(Some(out)) => {
+                        out.shrink_to(&[dw, hc]);
+                        out.copy_from(gpu, d_embeds);
+                    }
+                    Back::Out(None) => {}
+                    Back::Encoder => self.encoder_backward(gpu, d_embeds, &mut sc, &cache),
+                    Back::Split(rows, d) => {
+                        // The given rows' gradient leaves; the encoder gets the rest.
+                        let mut all = d_embeds.to_host(gpu).data;
+                        let mut out = vec![0.0; rows.len() * hc];
+                        for (i, &r) in rows.iter().enumerate() {
+                            out[i * hc..(i + 1) * hc].copy_from_slice(&all[r * hc..(r + 1) * hc]);
+                            all[r * hc..(r + 1) * hc].fill(0.0);
+                        }
+                        d.shrink_to(&[rows.len(), hc]);
+                        d.copy_from(
+                            gpu,
+                            &GTensor::from_host(gpu, &Tensor::new(&[rows.len(), hc], out)),
+                        );
+                        let rest = GTensor::from_host(gpu, &Tensor::new(&[dw, hc], all));
+                        self.encoder_backward(gpu, &rest, &mut sc, &cache);
+                    }
+                }
+                bufs
+            }
+            None => bb.bufs,
+        };
+
+        self.scratch = Some(sc);
+        if self.flags.mem {
+            // What SLOTS actually had to be. A high water well under the count means
+            // slots are being held that nothing asks for.
+            let (high, of) = cache.temps.high_water();
+            let (shigh, sof) = cache.temps.small_high_water();
+            let (chigh, cof) = cache.temps.chunk_high_water();
+            println!("  temp peak: {high}/{of}  small {shigh}/{sof}  chunk {chigh}/{cof}");
+        }
+        self.cache = Some(cache);
+
+        // Release pooled scratch far larger than this window needed.
+        self.trim_pools(bb_rows_max, enc_rows, dec_rows_max);
+        loss
+    }
+
+    /// The per-window scratch and temp cache, built on first use. A window hands
+    /// them back through `self.scratch` / `self.cache` when it ends.
+    fn take_window_scratch(&mut self, gpu: &Gpu) -> (Scratch, TrainingCache) {
+        let hc = self.cfg.hc;
+        let sc = self.scratch.take().unwrap_or_else(|| {
             let sc = Scratch::new(gpu, hc, self.group_cap());
             if self.flags.mem {
                 let mib = |b: usize| b as f64 / (1 << 20) as f64;
@@ -1015,38 +1432,7 @@ impl Hierarchical {
         });
         // Every temporary of the previous window must have been released with it.
         cache.temps.assert_drained("window start");
-
-        let enc_rows = self.encoder_forward(gpu, tokens, words, &mut sc, &cache);
-        let bb = self.backbone_forward(gpu, &sc.word_embeds, dw, &doc_starts, &cache);
-
-        let bb_rows_max = bb.rows_max;
-        let (loss, d_o, dec_rows_max) =
-            self.decode_groups(gpu, tokens, words, word_loss, bb.o(), &mut sc, &cache, grad);
-
-        self.bb_bufs = match d_o {
-            Some(d_o) => {
-                let bufs = self.backbone_backward(gpu, bb, &sc.word_embeds, &d_o, dw, &cache);
-                let d_embeds = bufs.d_embeds.expect("backbone backward wrote d_embeds");
-                self.encoder_backward(gpu, d_embeds, &mut sc, &cache);
-                bufs
-            }
-            None => bb.bufs,
-        };
-
-        self.scratch = Some(sc);
-        if self.flags.mem {
-            // What SLOTS actually had to be. A high water well under the count means
-            // slots are being held that nothing asks for.
-            let (high, of) = cache.temps.high_water();
-            let (shigh, sof) = cache.temps.small_high_water();
-            let (chigh, cof) = cache.temps.chunk_high_water();
-            println!("  temp peak: {high}/{of}  small {shigh}/{sof}  chunk {chigh}/{cof}");
-        }
-        self.cache = Some(cache);
-
-        // Release pooled scratch far larger than this window needed.
-        self.trim_pools(bb_rows_max, enc_rows, dec_rows_max);
-        loss
+        (sc, cache)
     }
 
     /// Print the window's actual shape under `GPU_MEM`.
@@ -1505,7 +1891,7 @@ impl Hierarchical {
             let dec_in = self.build_decoder_input(gpu, o, n_words, tmax, rows, n_chars);
             let (capped, hdn) = self.decoder_stack_forward(gpu, dec_in, n_words, tmax, rows, cache);
 
-            let (_, d_capped) = ops::masked_softmax_ce_u32_into(
+            let (_, mut d_capped) = ops::masked_softmax_ce_u32_into(
                 gpu,
                 &capped,
                 &self.ids.list(dec_id::TARGETS),
@@ -1513,10 +1899,32 @@ impl Hierarchical {
                 inv,
                 Some(&mut acc),
             );
+            // Against the soft target (1 − α)·y + α·p_t the gradient is
+            // inv · mask · (p_s − y) − α · inv · mask · (p_t − y).
+            let d_capped = match &mut self.distill {
+                Distill::Off => Some(d_capped),
+                Distill::Record(out) => {
+                    out.push(d_capped);
+                    None
+                }
+                Distill::Apply(targets, alpha) => {
+                    let mut t = targets
+                        .pop_front()
+                        .expect("fewer recorded decoder groups than this window has");
+                    assert_eq!(
+                        t.dims(),
+                        d_capped.dims(),
+                        "distillation group shapes differ"
+                    );
+                    ops::scale_(gpu, &mut t, -*alpha);
+                    ops::add_assign(gpu, &mut d_capped, &t);
+                    Some(d_capped)
+                }
+            };
 
             self.timer.accum(gpu, "decoder fwd");
 
-            if let Some(d_o) = d_o.as_mut() {
+            if let (Some(d_o), Some(d_capped)) = (d_o.as_mut(), d_capped) {
                 let d_dec_in = self.decoder_stack_backward(
                     gpu, &d_capped, &capped, &hdn, n_words, tmax, rows, cache,
                 );
@@ -2639,6 +3047,163 @@ mod tests {
         assert_eq!(model.last_rows(), eval_rows, "scored row count differs");
     }
 
+    /// `encode_embeds` hands back what the window itself would encode, and a
+    /// student distilled from a teacher reading the very same input sees its
+    /// gradient scaled by `1 − α`: there `p_t = p_s`, so the soft target only
+    /// moves `y` towards the student's own prediction.
+    #[test]
+    fn encode_embeds_and_distillation_from_an_identical_teacher() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let cfg = ModelCfg {
+            vocab: 9,
+            hc: 16,
+            wh: 24,
+            enc_blocks: 1,
+            bb_blocks: 2,
+            dec_blocks: 1,
+            heads: 2,
+            dqk: 8,
+            w_token: 8,
+            cap: 30.0,
+        };
+        let mut model = Hierarchical::new(&gpu, cfg);
+        let tokens = vec![1usize, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4];
+        let words = vec![
+            Range { start: 0, end: 3 },
+            Range { start: 3, end: 5 },
+            Range { start: 5, end: 8 },
+            Range { start: 8, end: 9 },
+            Range { start: 9, end: 11 },
+        ];
+        let mask = [false, true, true, true];
+
+        let text = model.eval_loss_masked(&gpu, &tokens, &words, Some(&mask));
+        let embeds = model.encode_embeds(&gpu, &tokens, &words);
+        let given = model.eval_loss_embeds(&gpu, &embeds, &tokens, &words, Some(&mask));
+        assert_eq!(text, given, "encoded embeddings decode differently");
+
+        let mut plain = GTensor::zeros(&gpu, &[4, 16]);
+        model.forward_backward_embeds(&gpu, &embeds, &tokens, &words, Some(&mask), &mut plain);
+        let alpha = 0.25;
+        model.record_distill();
+        model.eval_loss_masked(&gpu, &tokens, &words, Some(&mask));
+        let targets = model.take_distill();
+        model.apply_distill(targets, alpha);
+        let mut distilled = GTensor::zeros(&gpu, &[4, 16]);
+        let loss = model.forward_backward_embeds(
+            &gpu,
+            &embeds,
+            &tokens,
+            &words,
+            Some(&mask),
+            &mut distilled,
+        );
+        model.end_distill();
+        assert_eq!(
+            loss, text,
+            "the reported loss is the CE against the transcript"
+        );
+
+        let (plain, distilled) = (plain.to_host(&gpu).data, distilled.to_host(&gpu).data);
+        let norm = plain.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(norm > 0.0);
+        let err = plain
+            .iter()
+            .zip(&distilled)
+            .map(|(p, d)| (p * (1.0 - alpha) - d).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        // The backward's GEMMs read bf16, whose rounding (2^-8) a scaled input
+        // does not share; the α-change itself is 25% of the norm.
+        assert!(
+            err < 1e-2 * norm,
+            "distilled gradient off by {err} (norm {norm})"
+        );
+    }
+
+    /// A window distilled towards its own reading has no distance to it, and
+    /// for a perturbed input the gradient the state term sends back is a
+    /// descent direction: a small step along it brings the backbone's context
+    /// closer to the teacher's.
+    #[test]
+    fn state_distillation_pulls_the_backbone_context_towards_the_teacher() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let cfg = ModelCfg {
+            vocab: 9,
+            hc: 16,
+            wh: 24,
+            enc_blocks: 1,
+            bb_blocks: 2,
+            dec_blocks: 1,
+            heads: 2,
+            dqk: 8,
+            w_token: 8,
+            cap: 30.0,
+        };
+        let mut model = Hierarchical::new(&gpu, cfg);
+        let tokens = vec![1usize, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4];
+        let words = vec![
+            Range { start: 0, end: 3 },
+            Range { start: 3, end: 5 },
+            Range { start: 5, end: 8 },
+            Range { start: 8, end: 9 },
+            Range { start: 9, end: 11 },
+        ];
+        let embeds = model.encode_embeds(&gpu, &tokens, &words);
+        model.record_state();
+        model.eval_loss_embeds(&gpu, &embeds, &tokens, &words, None);
+        let target = model.take_state();
+        let copy = |t: &GTensor<f32>| {
+            let mut c = GTensor::zeros(&gpu, t.dims());
+            c.copy_from(&gpu, t);
+            c
+        };
+
+        model.apply_state(copy(&target), 1.0);
+        model.eval_loss_embeds(&gpu, &embeds, &tokens, &words, None);
+        model.end_state();
+        assert!(
+            model.last_state_mse() < 1e-8,
+            "own reading at {}",
+            model.last_state_mse()
+        );
+
+        let base = embeds.to_host(&gpu).data;
+        let student: Vec<f32> = base
+            .iter()
+            .enumerate()
+            .map(|(i, x)| x + 0.5 * ((i as f32 * 0.37).sin()))
+            .collect();
+        let dims = embeds.dims().to_vec();
+        let student_t = GTensor::from_host(&gpu, &Tensor::new(&dims, student.clone()));
+        let mut d = GTensor::zeros(&gpu, &dims);
+        model.apply_state(copy(&target), 1000.0);
+        model.forward_backward_embeds(&gpu, &student_t, &tokens, &words, None, &mut d);
+        model.end_state();
+        let before = model.last_state_mse();
+        assert!(before > 0.0);
+        let d = d.to_host(&gpu).data;
+        let norm = d.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let gap = student
+            .iter()
+            .zip(&base)
+            .map(|(s, b)| (s - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        let step = 0.02 * gap / norm;
+        let moved: Vec<f32> = student.iter().zip(&d).map(|(s, g)| s - step * g).collect();
+        let moved = GTensor::from_host(&gpu, &Tensor::new(&dims, moved));
+        model.apply_state(target, 1000.0);
+        model.eval_loss_embeds(&gpu, &moved, &tokens, &words, None);
+        model.end_state();
+        let after = model.last_state_mse();
+        assert!(after < before, "state distance {before} -> {after}");
+    }
+
     /// The GPU hierarchical stack must actually learn: memorize one tiny window,
     /// driving the decode loss down. Exercises the full wiring — tied char table
     /// (encoder input + decoder char slots), backbone context injection at the
@@ -2997,6 +3562,123 @@ mod tests {
     #[test]
     fn carried_window_decodes_like_one_long_window_chunked() {
         carry_vs_long_window(8);
+    }
+
+    /// Rows handed in that are exactly what the text encoder makes decode the
+    /// window exactly as the encoder alone, and their gradient is the one the
+    /// backbone sends to those rows when everything is given.
+    #[test]
+    fn mixed_rows_from_the_encoder_change_nothing() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let cfg = ModelCfg {
+            vocab: 9,
+            hc: 16,
+            wh: 24,
+            enc_blocks: 1,
+            bb_blocks: 2,
+            dec_blocks: 1,
+            heads: 2,
+            dqk: 8,
+            w_token: 8,
+            cap: 30.0,
+        };
+        let mut model = Hierarchical::new(&gpu, cfg);
+        let tokens = vec![1usize, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4, 5];
+        let words: Vec<Range<usize>> = (0..6)
+            .map(|w| Range {
+                start: w * 2,
+                end: w * 2 + 2,
+            })
+            .collect();
+        let all = model.encode_embeds(&gpu, &tokens, &words);
+        let all_host = all.to_host(&gpu).data;
+        let rows = [1usize, 3, 4];
+        let picked: Vec<f32> = rows
+            .iter()
+            .flat_map(|&r| all_host[r * 16..(r + 1) * 16].to_vec())
+            .collect();
+        let picked = GTensor::from_host(&gpu, &Tensor::new(&[3, 16], picked));
+
+        let plain = model.eval_loss(&gpu, &tokens, &words);
+        let mut d = GTensor::zeros(&gpu, &[3, 16]);
+        let mixed = model.forward_backward_mixed(&gpu, &tokens, &words, &picked, &rows, &mut d);
+        assert_eq!(mixed, plain, "encoder rows handed back decode differently");
+
+        let mut d_all = GTensor::zeros(&gpu, &[5, 16]);
+        model.forward_backward_embeds(&gpu, &all, &tokens, &words, None, &mut d_all);
+        let (d, d_all) = (d.to_host(&gpu).data, d_all.to_host(&gpu).data);
+        for (i, &r) in rows.iter().enumerate() {
+            assert_eq!(
+                &d[i * 16..(i + 1) * 16],
+                &d_all[r * 16..(r + 1) * 16],
+                "row {r}"
+            );
+        }
+    }
+
+    /// A window of another sequence run between two carried windows, with the
+    /// carried state stashed around it, leaves the second window's loss exactly
+    /// as it was — and without the stash, it does not.
+    #[test]
+    fn a_stashed_window_in_between_leaves_the_carry_alone() {
+        let Some(gpu) = super::super::test_gpu() else {
+            return;
+        };
+        let cfg = ModelCfg {
+            vocab: 12,
+            hc: 16,
+            wh: 24,
+            enc_blocks: 1,
+            bb_blocks: 3,
+            dec_blocks: 1,
+            heads: 2,
+            dqk: 8,
+            w_token: 11,
+            cap: 30.0,
+        };
+        let words = |n: usize| -> Vec<Range<usize>> {
+            (0..n)
+                .map(|w| Range {
+                    start: w * 2,
+                    end: w * 2 + 2,
+                })
+                .collect()
+        };
+        let a: Vec<usize> = (0..40).map(|i| 1 + i % 9).collect();
+        let b: Vec<usize> = (0..40).map(|i| 1 + (i * 5) % 9).collect();
+        let other: Vec<usize> = (0..30).map(|i| 1 + (i * 7) % 10).collect();
+        let seed = std::env::temp_dir().join("gpu_stash_carry_seed.hier");
+        let seed = seed.to_str().unwrap();
+        Hierarchical::new(&gpu, cfg)
+            .save(&gpu, seed, &[])
+            .expect("save seed");
+        let run = |between: Option<bool>| -> f32 {
+            let mut m = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
+            m.set_stateful(true);
+            let _ = m.forward_backward(&gpu, &a, &words(20));
+            if let Some(stash) = between {
+                let saved = stash.then(|| m.stash_carried(&gpu));
+                let _ = m.forward_backward(&gpu, &other, &words(15));
+                if let Some(saved) = saved {
+                    m.restore_carried(saved);
+                }
+            }
+            m.set_continues(true);
+            m.forward_backward(&gpu, &b, &words(20))
+        };
+        let direct = run(None);
+        let stashed = run(Some(true));
+        let clobbered = run(Some(false));
+        assert_eq!(
+            stashed, direct,
+            "the stashed window changed the carried state"
+        );
+        assert_ne!(
+            clobbered, direct,
+            "the window in between never touched the state"
+        );
     }
 
     fn carry_vs_long_window(chunk: usize) {

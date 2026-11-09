@@ -138,6 +138,14 @@ impl Resets {
 ///
 /// The cell saves nothing of its own: what its backward needs is carved from the
 /// surrounding block's frame ([`carve`](Self::carve)) and handed to both directions.
+/// A cell's carried forward state, moved out so another sequence can run on
+/// the same weights and moved back to continue the first.
+pub enum CarriedState {
+    None,
+    Mlstm(Option<ops::MlstmState>),
+    Slstm([GTensor<f32>; 4]),
+}
+
 pub trait Cell {
     /// What this cell's forward saves for its backward.
     type Saved;
@@ -209,6 +217,12 @@ pub trait Cell {
     /// Zero the carried BPTT state (before the last chunk's backward — backward
     /// unwinds chunks right to left).
     fn reset_bptt(&mut self, _gpu: &Gpu) {}
+    /// Move the carried forward state out, leaving a cell that starts from zero.
+    fn take_carried(&mut self, _gpu: &Gpu) -> CarriedState {
+        CarriedState::None
+    }
+    /// Put back what [`take_carried`](Self::take_carried) moved out.
+    fn put_carried(&mut self, _state: CarriedState) {}
     /// Where documents start inside the next call, forward or backward. Holds until
     /// replaced; a caller that never sets it runs every call as one sequence.
     fn set_resets(&mut self, r: &Resets);
@@ -239,6 +253,14 @@ impl Cell for SLstm {
     type Saved = SlstmSaved;
     /// The post-cell norm's backward rebuilds `x̂` from it.
     const NEEDS_Y: bool = true;
+    fn take_carried(&mut self, gpu: &Gpu) -> CarriedState {
+        CarriedState::Slstm(SLstm::take_carried(self, gpu))
+    }
+    fn put_carried(&mut self, state: CarriedState) {
+        if let CarriedState::Slstm(s) = state {
+            SLstm::put_carried(self, s)
+        }
+    }
     fn carve(&self, gpu: &Gpu, f: &mut Frame, b: usize, t: usize) -> SlstmSaved {
         SLstm::carve(self, gpu, f, b, t)
     }
@@ -417,6 +439,10 @@ pub trait BlockLike {
     fn reset_caches(&mut self, gpu: &Gpu);
     /// Zero the carried BPTT state (before a sweep's last chunk backward).
     fn reset_bptt(&mut self, gpu: &Gpu);
+    /// See [`Cell::take_carried`].
+    fn take_carried(&mut self, gpu: &Gpu) -> CarriedState;
+    /// See [`Cell::put_carried`].
+    fn put_carried(&mut self, state: CarriedState);
     /// Where documents start inside the next call. See [`Cell::set_resets`].
     fn set_resets(&mut self, r: &Resets);
     /// The cell's `(saved_cache, other)` activation split. See [`Cell::act_split`].
@@ -493,6 +519,12 @@ impl<C: Cell> BlockLike for Block<C> {
     fn reset_bptt(&mut self, gpu: &Gpu) {
         self.cell.reset_bptt(gpu)
     }
+    fn take_carried(&mut self, gpu: &Gpu) -> CarriedState {
+        self.cell.take_carried(gpu)
+    }
+    fn put_carried(&mut self, state: CarriedState) {
+        self.cell.put_carried(state)
+    }
     fn set_resets(&mut self, r: &Resets) {
         self.cell.set_resets(r)
     }
@@ -524,6 +556,10 @@ pub struct Block<C: Cell> {
     /// Whether this block is part of a chunked sweep, i.e. whether its frame must
     /// survive the next chunk's forward. Set alongside the cell's own carry.
     carry: bool,
+    /// Rebuild the FFN's `gate_pre`, `value` and `mixed` from `norm2_out` in backward
+    /// instead of saving them. On for an offloaded block: they are ~60% of its frame,
+    /// and the forward is PCIe-bound, so the two GEMMs cost less than the copy.
+    recompute_ffn: bool,
     /// `(B, T)` of the last forward, for [`state_extremes`](Self::state_extremes).
     last_shape: (usize, usize),
 }
@@ -543,17 +579,51 @@ pub struct Block<C: Cell> {
 /// ```
 ///
 /// Everything else (`z`, every `d_*`) comes from [`temp`](super::temp) instead, and
-/// `SiLU(gate_pre)` is recomputed by the backward rather than saved.
+/// `SiLU(gate_pre)` is recomputed by the backward rather than saved. `ffn` is `None`
+/// under [`recompute_ffn`](Block::recompute_ffn).
 struct BlockSaved<S> {
     norm1_out: ops::SlabBuf,        // [B, T, H], at the width the cell's GEMMs read
     cell_out: Option<GTensor<f32>>, // [B, T, H], only when `C::NEEDS_Y`
-    gate_pre: GTensor<f32>,         // [N, U]
-    value: GTensor<f32>,            // [N, U]
     norm2_out: ops::SlabBuf,        // [N, H], kept once for both projections
-    mixed: ops::SlabBuf,            // [N, U]
+    ffn: Option<FfnSaved>,
     norm1: ops::GpuRmsForward,
     norm2: ops::GpuRmsForward,
     cell: S,
+}
+
+struct FfnSaved {
+    gate_pre: GTensor<f32>, // [N, U]
+    value: GTensor<f32>,    // [N, U]
+    mixed: ops::SlabBuf,    // [N, U]
+}
+
+/// The FFN tensors in `temps` slots, for a block that does not save them.
+struct FfnScratch<'c> {
+    gate_pre: super::temp::Temp<'c, f32>,
+    value: super::temp::Temp<'c, f32>,
+    mixed: ops::SlabAt<'c>,
+}
+
+impl<'c> FfnScratch<'c> {
+    fn new(gpu: &Gpu, temps: &'c super::temp::TempCache, n: usize, u: usize, narrow: bool) -> Self {
+        Self {
+            gate_pre: temps.get::<f32>(gpu, &[n, u]),
+            value: temps.get::<f32>(gpu, &[n, u]),
+            mixed: ops::SlabAt::temp(gpu, temps, &[n, u], narrow),
+        }
+    }
+}
+
+/// `(gate_pre, value, mixed)` from the frame, or from `scratch` when the frame has none.
+fn ffn_parts<'a, 'c: 'a>(
+    saved: &'a mut Option<FfnSaved>,
+    scratch: &'a mut Option<FfnScratch<'c>>,
+) -> (&'a mut GTensor<f32>, &'a mut GTensor<f32>, &'a mut ops::SlabBuf) {
+    match (saved, scratch) {
+        (Some(s), _) => (&mut s.gate_pre, &mut s.value, &mut s.mixed),
+        (None, Some(t)) => (&mut t.gate_pre, &mut t.value, &mut t.mixed.x),
+        (None, None) => unreachable!("an FFN without a frame slot needs scratch"),
+    }
 }
 
 impl<C: Cell> Block<C> {
@@ -578,6 +648,7 @@ impl<C: Cell> Block<C> {
             frames: FrameStack::default(),
             narrow: gpu.kernels.slab_bf16 && ops::gemm_bf16_enabled(gpu),
             carry: false,
+            recompute_ffn: false,
             last_shape: (0, 0),
         }
     }
@@ -588,7 +659,10 @@ impl<C: Cell> Block<C> {
     /// **Only legal where the whole stack forwards before any of it unwinds**, and
     /// only for a stack whose blocks all push to the same `off` in sweep order — the
     /// frames form one LIFO across the stack. See [`Offload`](super::offload::Offload).
+    /// The frame layout depends on it, so set it before measuring a frame and never
+    /// between a forward and its backward.
     pub fn set_offload(&mut self, off: Option<SharedOffload>) {
+        self.recompute_ffn = off.is_some();
         self.frames = match off {
             Some(o) => FrameStack::Offload(o),
             None => FrameStack::default(),
@@ -602,10 +676,12 @@ impl<C: Cell> Block<C> {
         BlockSaved {
             norm1_out: f.slab(gpu, &[b, t, h], self.narrow),
             cell_out: C::NEEDS_Y.then(|| f.f32(gpu, &[b, t, h])),
-            gate_pre: f.f32(gpu, &[n, u]),
-            value: f.f32(gpu, &[n, u]),
             norm2_out: f.slab(gpu, &[n, h], self.narrow),
-            mixed: f.slab(gpu, &[n, u], self.narrow),
+            ffn: (!self.recompute_ffn).then(|| FfnSaved {
+                gate_pre: f.f32(gpu, &[n, u]),
+                value: f.f32(gpu, &[n, u]),
+                mixed: f.slab(gpu, &[n, u], self.narrow),
+            }),
             norm1: self.pre_norm1.carve(gpu, f, n),
             norm2: self.pre_norm2.carve(gpu, f, n),
             cell: self.cell.carve(gpu, f, b, t),
@@ -696,6 +772,13 @@ impl<C: Cell> Block<C> {
     /// Assemble a block around a cell, with fresh norms (γ=1) and Xavier `Linear`
     /// weights. `hidden` is the model width, `up` the SwiGLU inner width.
     pub fn from_cell(gpu: &Gpu, hidden: usize, up: usize, cell: C) -> Self {
+        Self::from_cell_scaled(gpu, hidden, up, cell, 1.0)
+    }
+
+    /// [`Block::from_cell`] with `lin_down`'s Xavier init multiplied by `down_scale`.
+    pub fn from_cell_scaled(gpu: &Gpu, hidden: usize, up: usize, cell: C, down_scale: f32) -> Self {
+        let mut down = Tensor::xavier(up, hidden);
+        down.data.iter_mut().for_each(|w| *w *= down_scale);
         Self::assemble(
             gpu,
             hidden,
@@ -706,7 +789,7 @@ impl<C: Cell> Block<C> {
             [
                 Linear::from_parts(gpu, &Tensor::xavier(hidden, up), &Tensor::zeros(&[up])),
                 Linear::from_parts(gpu, &Tensor::xavier(hidden, up), &Tensor::zeros(&[up])),
-                Linear::from_parts(gpu, &Tensor::xavier(up, hidden), &Tensor::zeros(&[hidden])),
+                Linear::from_parts(gpu, &down, &Tensor::zeros(&[hidden])),
             ],
         )
     }
@@ -784,21 +867,35 @@ impl<C: Cell> Block<C> {
             &mut sv.norm2,
         );
         drop((cell_flat, cell_tmp));
+        let mut scratch = sv
+            .ffn
+            .is_none()
+            .then(|| FfnScratch::new(gpu, &cache.temps, n, self.up, self.narrow));
+        let (gate_pre, value, mixed) = ffn_parts(&mut sv.ffn, &mut scratch);
         phase::timed(gpu, phase::Bucket::FfnFwd, || {
-            self.lin_gate
-                .forward_slab_lhs(gpu, &sv.norm2_out, &mut sv.gate_pre);
-            self.lin_value
-                .forward_slab_lhs(gpu, &sv.norm2_out, &mut sv.value);
-            ops::swiglu_forward_slab(gpu, &sv.gate_pre, &sv.value, &mut sv.mixed);
+            self.ffn_up(gpu, &sv.norm2_out, gate_pre, value, mixed);
             // `out = z + down(mixed)`: the residual rides in `lin_down`'s bias seed, so
             // there is no separate add and no buffer for `down`'s output.
             out.reshape_to(&[n, h]);
-            self.lin_down
-                .forward_slab_lhs_resid(gpu, &sv.mixed, &z, out);
+            self.lin_down.forward_slab_lhs_resid(gpu, mixed, &z, out);
         });
         out.reshape_to(&[b, t, h]);
-        drop((z, sv));
+        drop((z, scratch, sv));
         self.frames.pushed(gpu);
+    }
+
+    /// `gate_pre`, `value` and `mixed` from `norm2_out`: the FFN up to `lin_down`.
+    fn ffn_up(
+        &mut self,
+        gpu: &Gpu,
+        norm2_out: &ops::SlabBuf,
+        gate_pre: &mut GTensor<f32>,
+        value: &mut GTensor<f32>,
+        mixed: &mut ops::SlabBuf,
+    ) {
+        self.lin_gate.forward_slab_lhs(gpu, norm2_out, gate_pre);
+        self.lin_value.forward_slab_lhs(gpu, norm2_out, value);
+        ops::swiglu_forward_slab(gpu, gate_pre, value, mixed);
     }
 
     /// Backward over `[B, T, H]` → `dx` `[B, T, H]`.
@@ -827,21 +924,23 @@ impl<C: Cell> Block<C> {
             gpu.stream.synchronize().expect("sync");
             std::time::Instant::now()
         });
+        let mut scratch = sv
+            .ffn
+            .is_none()
+            .then(|| FfnScratch::new(gpu, &cache.temps, n, u, self.narrow));
+        let recompute = scratch.is_some();
+        let (gate_pre, value, mixed) = ffn_parts(&mut sv.ffn, &mut scratch);
+        if recompute {
+            self.ffn_up(gpu, &sv.norm2_out, gate_pre, value, mixed);
+        }
         self.lin_down
-            .backward_slab_x(gpu, &sv.mixed, &dy_flat, &mut d_mixed, 0.0, cache);
+            .backward_slab_x(gpu, mixed, &dy_flat, &mut d_mixed, 0.0, cache);
         // The deltas are written at the width `norm2_out` has: their only readers are
         // the two projections' GEMMs and bias sums, which take them narrow.
         let mut d_gate = ops::SlabAt::temp(gpu, &cache.temps, &[n, u], self.narrow);
         let mut d_value = ops::SlabAt::temp(gpu, &cache.temps, &[n, u], self.narrow);
-        ops::swiglu_backward_into_slab(
-            gpu,
-            &d_mixed,
-            &sv.value,
-            &sv.gate_pre,
-            &mut d_gate.x,
-            &mut d_value.x,
-        );
-        drop(d_mixed);
+        ops::swiglu_backward_into_slab(gpu, &d_mixed, value, gate_pre, &mut d_gate.x, &mut d_value.x);
+        drop((d_mixed, scratch));
         // Forward wrote `norm2_out` at the width both GEMMs want, so neither narrows here.
         // Both projections read `norm2_out`, so the value one accumulates its `dx` onto
         // the gate one's.

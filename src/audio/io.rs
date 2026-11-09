@@ -1,8 +1,9 @@
 //! Audio in and out of files and devices: WAV clips, channel mixdown and
 //! sample-rate conversion.
 
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
+use std::process::Command;
 
 /// A mono clip.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -19,9 +20,28 @@ impl Clip {
         }
     }
 
-    /// Reads a 16/24/32-bit integer or 32-bit float WAV, mixing it down to mono.
+    /// Reads a WAV, or a FLAC through the `flac` command-line decoder, mixing it
+    /// down to mono.
     pub fn read(path: impl AsRef<Path>) -> io::Result<Self> {
-        let reader = hound::WavReader::open(path).map_err(io::Error::other)?;
+        let path = path.as_ref();
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("flac")) {
+            let out = Command::new("flac").args(["-d", "-c", "-s"]).arg(path).output()?;
+            if !out.status.success() {
+                return Err(io::Error::other(format!(
+                    "flac failed on {}: {}",
+                    path.display(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            return Self::read_wav(io::Cursor::new(out.stdout));
+        }
+        Self::read_wav(io::BufReader::new(std::fs::File::open(path)?))
+    }
+
+    /// Decodes a 16/24/32-bit integer or 32-bit float WAV stream, mixing it down to
+    /// mono.
+    pub fn read_wav(source: impl Read) -> io::Result<Self> {
+        let reader = hound::WavReader::new(source).map_err(io::Error::other)?;
         let spec = reader.spec();
         let samples: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
             (hound::SampleFormat::Float, 32) => reader
@@ -53,6 +73,33 @@ impl Clip {
         Ok(Self::new(mono, spec.sample_rate as usize))
     }
 
+    /// `(samples per channel, sample rate)` of a FLAC file, from its STREAMINFO
+    /// block — no decoding.
+    pub fn flac_length(path: impl AsRef<Path>) -> io::Result<(usize, usize)> {
+        let mut head = [0u8; 4 + 4 + 18];
+        std::fs::File::open(path.as_ref())?.read_exact(&mut head)?;
+        if &head[..4] != b"fLaC" || head[4] & 0x7f != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: no FLAC STREAMINFO", path.as_ref().display()),
+            ));
+        }
+        // 20 bits sample rate, 3 channels, 5 bits per sample, 36 total samples.
+        let bits = u64::from_be_bytes(head[18..26].try_into().unwrap());
+        Ok(((bits & ((1 << 36) - 1)) as usize, (bits >> 44) as usize))
+    }
+
+    /// `(samples per channel, sample rate)` of a FLAC or WAV file from its
+    /// header.
+    pub fn length(path: impl AsRef<Path>) -> io::Result<(usize, usize)> {
+        let path = path.as_ref();
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("flac")) {
+            return Self::flac_length(path);
+        }
+        let reader = hound::WavReader::open(path).map_err(io::Error::other)?;
+        Ok((reader.duration() as usize, reader.spec().sample_rate as usize))
+    }
+
     /// Reads a WAV and converts it to `sample_rate`.
     pub fn read_at(path: impl AsRef<Path>, sample_rate: usize) -> io::Result<Self> {
         Ok(Self::read(path)?.resampled(sample_rate))
@@ -75,17 +122,57 @@ impl Clip {
         writer.finalize().map_err(io::Error::other)
     }
 
+    /// Converts to `sample_rate`. Downsampling low-passes first, so what lies
+    /// above the new Nyquist is removed rather than folded into the band.
     pub fn resampled(self, sample_rate: usize) -> Self {
         if sample_rate == self.sample_rate {
             return self;
         }
-        let samples = Resampler::new(self.sample_rate, sample_rate).process(&self.samples);
+        let source = if sample_rate < self.sample_rate {
+            lowpass(&self.samples, 0.5 * sample_rate as f32 / self.sample_rate as f32)
+        } else {
+            self.samples
+        };
+        let samples = Resampler::new(self.sample_rate, sample_rate).process(&source);
         Self::new(samples, sample_rate)
     }
 
     pub fn seconds(&self) -> f32 {
         self.samples.len() as f32 / self.sample_rate as f32
     }
+}
+
+/// Windowed-sinc (Blackman) low-pass at `cutoff` cycles per sample, 0.9 of it
+/// taken as the passband edge so the transition band ends at `cutoff`.
+fn lowpass(input: &[f32], cutoff: f32) -> Vec<f32> {
+    let fc = 0.9 * cutoff;
+    let half = (8.0 / cutoff).ceil() as isize;
+    let len = (2 * half + 1) as f32;
+    let mut taps: Vec<f32> = (-half..=half)
+        .map(|i| {
+            let x = i as f32;
+            let sinc = if i == 0 {
+                2.0 * fc
+            } else {
+                (2.0 * std::f32::consts::PI * fc * x).sin() / (std::f32::consts::PI * x)
+            };
+            let n = (i + half) as f32 / (len - 1.0);
+            let w = 0.42 - 0.5 * (2.0 * std::f32::consts::PI * n).cos()
+                + 0.08 * (4.0 * std::f32::consts::PI * n).cos();
+            sinc * w
+        })
+        .collect();
+    let gain: f32 = taps.iter().sum();
+    taps.iter_mut().for_each(|t| *t /= gain);
+    (0..input.len() as isize)
+        .map(|n| {
+            let from = (n - half).max(0);
+            let to = (n + half).min(input.len() as isize - 1);
+            (from..=to)
+                .map(|k| input[k as usize] * taps[(k - n + half) as usize])
+                .sum()
+        })
+        .collect()
 }
 
 /// Interleaved channel count of a device or file stream.
@@ -152,6 +239,22 @@ impl Resampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downsampling_removes_what_lies_above_the_new_nyquist() {
+        let tone = |hz: f32| {
+            let samples = (0..48_000)
+                .map(|i| (2.0 * std::f32::consts::PI * hz * i as f32 / 48_000.0).sin())
+                .collect();
+            Clip::new(samples, 48_000).resampled(16_000)
+        };
+        let rms = |c: &Clip| {
+            let s = &c.samples[1000..c.samples.len() - 1000];
+            (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt()
+        };
+        assert!((rms(&tone(1000.0)) - 0.5f32.sqrt()).abs() < 0.01);
+        assert!(rms(&tone(11_000.0)) < 0.01);
+    }
 
     #[test]
     fn mixdown_averages_channels() {

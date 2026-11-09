@@ -25,6 +25,8 @@ pub struct RmsNorm {
     /// Normalization group width: `== size` for plain RMSNorm, `== dhv` for the
     /// head-wise variant (`F/group` independent groups per row, one γ slice each).
     group: usize,
+    /// γ is a fixed scale rather than a learned one.
+    frozen: bool,
     /// Saved `inv_rms` of a standalone [`forward`](Self::forward), reused across calls.
     ///
     /// The only thing the forward keeps. `x̂` is NOT stored: backward is handed the
@@ -58,6 +60,7 @@ impl RmsNorm {
             v: arena::unbacked(gpu),
             size,
             group,
+            frozen: false,
             fwd: None,
         }
     }
@@ -252,15 +255,25 @@ impl RmsNorm {
         );
     }
 
+    /// Keep γ where it is: the optimizer skips it.
+    pub fn freeze(&mut self) {
+        self.frozen = true;
+    }
+
     /// Every learnable tensor, in a fixed order (used by checkpoint save/load).
     /// The norm scale with its gradient and AdamW moments. Never decayed.
     pub fn param_slots(&mut self) -> Vec<ParamSlot<'_>> {
+        let kind = if self.frozen {
+            ParamKind::Frozen
+        } else {
+            ParamKind::NoDecay
+        };
         vec![ParamSlot::new(
             &mut self.gamma,
             &mut self.dgamma,
             &mut self.m,
             &mut self.v,
-            ParamKind::NoDecay,
+            kind,
         )]
     }
 

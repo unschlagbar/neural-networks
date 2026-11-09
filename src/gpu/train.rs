@@ -17,12 +17,13 @@ use rand::seq::SliceRandom;
 
 use crate::batches::ChunkedWordDataSet;
 use crate::config::{
-    BATCH_SIZE, CARRY_WINDOW_STATE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, GRAD_CLIP_NORM, LOG_EVERY,
+    AUDIO_STAGE_LR, BATCH_SIZE, CARRY_WINDOW_STATE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, GRAD_CLIP_NORM, LOG_EVERY,
     LOGIT_SOFTCAP, LR, MAX_WINDOW_TOKENS, MIN_WORDS_PER_SEQ, SFT_BATCH_SIZE, SFT_DATA, SFT_EPOCHS,
     SFT_LR, SFT_MAX_TOKENS, SFT_WARMUP_WINDOWS, TRAIN_DATA, VAL_DATA, WORD_BLOCKS, WORD_HIDDEN,
     WORDS_PER_SEQ,
 };
 use crate::gpu::Gpu;
+use crate::gpu::audio_train::{AudioPretrain, SftAudio};
 use crate::gpu::hierarchical::{Hierarchical, ModelCfg};
 use crate::nn2::optim::AdamCfg;
 use crate::pretrain_progress;
@@ -31,7 +32,26 @@ use crate::sft_progress;
 use crate::tokenizer_utf8::Utf8Tokenizer;
 use crate::training::TrainingState;
 
-pub fn train_hierarchical_gpu(model_path: &str) {
+/// `audio` is the stage after text pretraining: the same loop, with audio
+/// windows among the text ones (`AudioPretrain`) and the backbone at the
+/// constant `AUDIO_STAGE_LR`, on a copy `<model>_audio` of the model.
+pub fn train_hierarchical_gpu(model_path: &str, audio: bool) {
+    // The audio stage never writes the text model it starts from: it trains
+    // `<model>_audio`, copied from `<model>` on the first run.
+    let stage_path;
+    let model_path = if audio {
+        stage_path = format!("{model_path}_audio");
+        if !std::path::Path::new(&stage_path).exists() {
+            println!("Copying '{model_path}' to '{stage_path}' for the audio stage.");
+            if let Err(e) = std::fs::copy(model_path, &stage_path) {
+                eprintln!("Cannot copy '{model_path}' to '{stage_path}': {e}");
+                return;
+            }
+        }
+        stage_path.as_str()
+    } else {
+        model_path
+    };
     let gpu = match Gpu::new() {
         Ok(g) => g,
         Err(e) => {
@@ -119,6 +139,17 @@ pub fn train_hierarchical_gpu(model_path: &str) {
 
     let mut opt = AdamCfg::new(LR, crate::optimizers::WEIGHT_DECAY);
     let mut capture = crate::gpu::profile::Capture::from_env();
+    let mut audio = if audio {
+        let a = AudioPretrain::open(&gpu, model_path, model.cfg.hc);
+        if a.is_none() {
+            eprintln!("The audio stage needs an audio encoder; nothing to train.");
+            return;
+        }
+        a
+    } else {
+        None
+    };
+    let mut text_windows = 0usize;
 
     // The loop below walks a file's windows in corpus order, which is what makes a
     // window's `continues` flag mean anything.
@@ -225,6 +256,10 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                         c.before_window(&gpu);
                     }
                     let loss = model.forward_backward(&gpu, &tokens, words);
+                    text_windows += 1;
+                    if let Some(a) = audio.as_mut().filter(|_| AudioPretrain::due(text_windows)) {
+                        a.window(&gpu, &mut model);
+                    }
                     model.seen.add_pretrain(tokens.len(), words.len());
                     tokens_since_print += tokens.len();
                     state.log_tokens(tokens.len());
@@ -242,7 +277,7 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                     // `state.step` returns Some(lr) only on a batch boundary, so grads
                     // accumulate over BATCH_SIZE windows before each optimizer step.
                     if let Some(lr) = state.step(loss) {
-                        opt.lr = lr;
+                        opt.lr = if audio.is_some() { AUDIO_STAGE_LR } else { lr };
                         opt.t += 1;
                         // The accumulated gradient is a sum over BATCH_SIZE windows; the
                         // clip and the log are on the mean, so neither depends on it.
@@ -269,10 +304,16 @@ pub fn train_hierarchical_gpu(model_path: &str) {
                             tokens_since_print,
                             time.elapsed(),
                         );
+                        if let Some(line) = audio.as_mut().and_then(AudioPretrain::report) {
+                            println!("{line}");
+                        }
                         tokens_since_print = 0;
                         time = Instant::now();
                     }
                     if state.save() {
+                        if let Some(a) = audio.as_mut() {
+                            a.save(&gpu);
+                        }
                         match model.save(&gpu, state.save_path(), &[]) {
                             Ok(()) => {
                                 // Flush the log only now, so it never reflects a step
@@ -323,6 +364,9 @@ pub fn train_hierarchical_gpu(model_path: &str) {
         }
     }
 
+    if let Some(a) = audio.as_mut() {
+        a.save(&gpu);
+    }
     match model.save(&gpu, state.save_path(), &[]) {
         Ok(()) => {
             state.flush_log();
@@ -480,17 +524,31 @@ pub fn train_sft_gpu(model_path: &str) {
         return;
     }
 
-    let mut examples = match sft::load_jsonl(&tokenizer, SFT_DATA, SFT_MAX_TOKENS) {
+    let mut audio = SftAudio::open(&gpu, model_path, model.cfg.hc);
+    let heard = |id: &str| audio.as_ref().and_then(|a| a.heard_tokens(id));
+    // `SFT_DATA` in the environment overrides the configured set.
+    let data = std::env::var("SFT_DATA").unwrap_or_else(|_| SFT_DATA.to_string());
+    let mut examples = match sft::load_jsonl_heard(&tokenizer, &data, SFT_MAX_TOKENS, &heard) {
         Ok(e) if !e.is_empty() => e,
         Ok(_) => {
-            eprintln!("SFT set '{SFT_DATA}' produced no trainable examples.");
+            eprintln!("SFT set '{data}' produced no trainable examples.");
             return;
         }
         Err(e) => {
-            eprintln!("Could not read SFT set '{SFT_DATA}': {e}");
+            eprintln!("Could not read SFT set '{data}': {e}");
             return;
         }
     };
+
+    let spoken = examples.iter().filter(|e| !e.heard.is_empty()).count();
+    if let Some(a) = audio.as_mut() {
+        println!(
+            "SFT: {spoken} of {} examples have a heard user turn ({:.1}%)",
+            examples.len(),
+            100.0 * spoken as f64 / examples.len() as f64
+        );
+        a.reserve(&gpu, examples.iter().map(|e| e.heard.len()).max().unwrap_or(0));
+    }
 
     // Size the caches to the longest example (word count + token span).
     let max_words = examples.iter().map(|e| e.words.len()).max().unwrap();
@@ -559,7 +617,10 @@ pub fn train_sft_gpu(model_path: &str) {
             // flag is ex.loss[w+1] (ex.loss[0] belongs to the encode-only prefix).
             let word_loss: Vec<bool> = ex.loss[1..].to_vec();
 
-            let loss = model.forward_backward_masked(&gpu, &tokens, words, &word_loss);
+            let loss = match audio.as_mut().filter(|_| !ex.heard.is_empty()) {
+                Some(a) => a.example(&gpu, &mut model, &tokens, words, &word_loss, &ex.heard),
+                None => model.forward_backward_masked(&gpu, &tokens, words, &word_loss),
+            };
             let (resp_chars, resp_words) = ex.response_extent();
             model
                 .seen
@@ -586,10 +647,16 @@ pub fn train_sft_gpu(model_path: &str) {
                     tokens_since_print,
                     time.elapsed(),
                 );
+                if let Some(line) = audio.as_mut().and_then(|a| a.report()) {
+                    println!("{line}");
+                }
                 tokens_since_print = 0;
                 time = Instant::now();
             }
             if state.save() {
+                if let Some(a) = audio.as_mut() {
+                    a.save(&gpu);
+                }
                 match model.save(&gpu, model_path, &[]) {
                     Ok(()) => {
                         state.flush_log();
@@ -609,6 +676,9 @@ pub fn train_sft_gpu(model_path: &str) {
         println!("SFT epoch {epoch} took {:.1?}", epoch_start.elapsed());
         // Save at every epoch boundary too. The recorded position is the START
         // of the next epoch, so a stop here resumes without redoing this one.
+        if let Some(a) = audio.as_mut() {
+            a.save(&gpu);
+        }
         if let Err(e) = model.save(&gpu, model_path, &[]) {
             eprintln!("epoch save failed: {e}");
         } else {
@@ -623,6 +693,9 @@ pub fn train_sft_gpu(model_path: &str) {
         }
     }
 
+    if let Some(a) = audio.as_mut() {
+        a.save(&gpu);
+    }
     match model.save(&gpu, model_path, &[]) {
         Ok(()) => {
             state.flush_log();

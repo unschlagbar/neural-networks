@@ -1224,6 +1224,22 @@ impl SLstm {
         self.reset_caches(gpu);
     }
 
+    /// The carried `h`, `c`, `n`, `m`, moved out; the cell is left with none,
+    /// as before its first forward.
+    pub fn take_carried(&mut self, gpu: &Gpu) -> [GTensor<f32>; 4] {
+        [
+            &mut self.h_state,
+            &mut self.c_state,
+            &mut self.n_state,
+            &mut self.m_state,
+        ]
+        .map(|s| std::mem::replace(s, GTensor::zeros(gpu, &[0, 0])))
+    }
+
+    pub fn put_carried(&mut self, [h, c, n, m]: [GTensor<f32>; 4]) {
+        (self.h_state, self.c_state, self.n_state, self.m_state) = (h, c, n, m);
+    }
+
     /// Start the recurrence over at the next forward, keeping everything already
     /// cached.
     pub fn zero_state(&mut self, gpu: &Gpu) {

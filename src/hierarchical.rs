@@ -891,10 +891,20 @@ impl Hierarchical {
     /// context in `char2_input` — the next word's first decoder input.
     fn encode_word_advance(&mut self, word: &[u16]) {
         let char_out = self.encoder.output_size;
-
-        // Encode the word → e_w, then step the backbone once on it.
         let e_w = self.encoder.encode_word_sample(word);
         self.delta_buf[..char_out].copy_from_slice(e_w);
+        self.advance_from_delta_buf();
+    }
+
+    /// Step the backbone once on an e_w produced elsewhere (the audio encoder).
+    fn embedding_advance(&mut self, e_w: &[f32]) {
+        self.delta_buf[..e_w.len()].copy_from_slice(e_w);
+        self.advance_from_delta_buf();
+    }
+
+    /// Step the backbone on the e_w in `delta_buf`.
+    fn advance_from_delta_buf(&mut self) {
+        let char_out = self.encoder.output_size;
         Self::forward_sample_step(
             &mut self.word_model.layers,
             &mut self.word_model.cache[0],
@@ -911,14 +921,13 @@ impl Hierarchical {
         max_len: usize,
         temperature: f32,
         top_p: f32,
-        mut callback: impl FnMut(u16) -> bool,
+        callback: impl FnMut(u16) -> bool,
     ) -> Vec<u16> {
         if !self.encoder.cache_ready() {
             self.make_cache(1, MAX_SEQ_LEN);
         }
 
         self.reset();
-        let w_tok = self.tokenizer.w_token() as usize;
 
         // Bootstrap the backbone from the prefix
         // Segment the prefix and encode every complete word to advance the
@@ -942,9 +951,42 @@ impl Hierarchical {
             }
         }
 
-        let mut forced = tail.into_iter();
+        self.generate(tail, max_len, temperature, top_p, callback)
+    }
 
-        // Generation
+    /// Generates the continuation of word embeddings `embeds` (`[n, hc]`
+    /// row-major), e.g. spoken words from the audio encoder: every one steps
+    /// the backbone, then words are sampled as in [`sample`](Self::sample).
+    pub fn sample_from_embeddings(
+        &mut self,
+        embeds: &[f32],
+        max_len: usize,
+        temperature: f32,
+        top_p: f32,
+        callback: impl FnMut(u16) -> bool,
+    ) -> Vec<u16> {
+        if !self.encoder.cache_ready() {
+            self.make_cache(1, MAX_SEQ_LEN);
+        }
+        self.reset();
+        for e_w in embeds.chunks_exact(self.encoder.output_size) {
+            self.embedding_advance(e_w);
+        }
+        self.generate(Vec::new(), max_len, temperature, top_p, callback)
+    }
+
+    /// Samples words from the context in `char2_input`, teacher-forcing
+    /// `forced` as the start of the first one.
+    fn generate(
+        &mut self,
+        forced: Vec<u16>,
+        max_len: usize,
+        temperature: f32,
+        top_p: f32,
+        mut callback: impl FnMut(u16) -> bool,
+    ) -> Vec<u16> {
+        let w_tok = self.tokenizer.w_token() as usize;
+        let mut forced = forced.into_iter();
         let mut out = Vec::with_capacity(max_len);
         let mut word_chars: Vec<u16> = Vec::new();
         let mut empty_words = 0;
@@ -1060,6 +1102,18 @@ impl Hierarchical {
             if !word.is_empty() {
                 self.encode_word_advance(word);
             }
+        }
+    }
+
+    /// [`chat_feed`](Self::chat_feed) for words that were heard rather than
+    /// typed: every row of `embeds` (`[n, hc]`, e.g. from the audio encoder)
+    /// steps the backbone in place of one encoded word.
+    pub fn chat_feed_embeddings(&mut self, embeds: &[f32]) {
+        if !self.encoder.cache_ready() {
+            self.make_cache(1, MAX_SEQ_LEN);
+        }
+        for e_w in embeds.chunks_exact(self.encoder.output_size) {
+            self.embedding_advance(e_w);
         }
     }
 

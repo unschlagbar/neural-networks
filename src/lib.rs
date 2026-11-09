@@ -49,7 +49,8 @@ pub fn run() {
         "" => training::train_normal(&read_model_path()),
         "h" => training::train_hierarchical(&read_model_path()),
         #[cfg(feature = "cuda")]
-        "hg" => gpu::train::train_hierarchical_gpu(&read_model_path()),
+        "hg" => gpu::train::train_hierarchical_gpu(&read_model_path(), false),
+        "hga" => gpu::train::train_hierarchical_gpu(&read_model_path(), true),
         #[cfg(feature = "cuda")]
         "hqg" => gpu::train::train_sft_gpu(&read_model_path()),
         "hq" => training::train_sft(&read_model_path()),
@@ -62,6 +63,14 @@ pub fn run() {
         "s" => sampling::sample_normal(&read_model_path()),
         "hs" => sampling::sample_hierarchical(&read_model_path()),
         "hqs" => sampling::sample_chat(&read_model_path()),
+        #[cfg(feature = "cuda")]
+        "ae2" => gpu::audio_train::train_audio_e2(&read_model_path()),
+        #[cfg(feature = "cuda")]
+        "ae2a" => gpu::audio_train::evaluate_alignment(&read_model_path()),
+        "ae2v" => gpu::audio_train::align_voice(&read_model_path()),
+        "ae2e" => gpu::audio_train::eval_audio_e2(&read_model_path()),
+        #[cfg(feature = "cuda")]
+        "ae2s" => gpu::audio_sample::sample_audio(&read_model_path()),
         "i" => inspect::inspect_model(),
         other => {
             eprintln!(
@@ -71,7 +80,7 @@ pub fn run() {
                  'hq' SFT (Q-A) fine-tune on CPU | 'hqg' SFT fine-tune on GPU | \
                  'av' add SFT vocab to a model | \
                  's' sample_normal | 'hs' sample_hierarchical | 'hqs' chat/Q-A sampling | \
-                 'i' inspect model",
+                 'i' inspect model | 'ae2' audio encoder against a frozen text model | 'ae2a' its count-constrained alignment vs MFA | 'ae2s' speak to the text model",
             );
             std::process::exit(2);
         }

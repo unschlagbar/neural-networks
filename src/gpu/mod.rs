@@ -21,6 +21,8 @@ use cudarc::driver::{CudaContext, CudaStream};
 
 pub mod arena;
 pub mod audio;
+pub mod audio_sample;
+pub mod audio_train;
 pub mod bf16;
 pub mod block;
 pub mod buf;

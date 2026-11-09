@@ -15,13 +15,13 @@ const MAX_TOOL_ROUNDS: usize = 6;
 /// Streams sampled byte tokens to stdout. A UTF-8 character spans several byte
 /// tokens, so bytes are held back until they form a complete character.
 #[derive(Default)]
-struct Utf8Printer {
+pub(crate) struct Utf8Printer {
     pending: Vec<u8>,
 }
 
 impl Utf8Printer {
     /// Print `token` once its character is complete. Returns false on `<END>`.
-    fn print(&mut self, token: u16, tokenizer: &Utf8Tokenizer) -> bool {
+    pub(crate) fn print(&mut self, token: u16, tokenizer: &Utf8Tokenizer) -> bool {
         if token == tokenizer.end_token() {
             return false;
         }
