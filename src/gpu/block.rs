@@ -20,8 +20,7 @@ use super::{
 };
 use crate::{
     gpu::arena::TrainingCache,
-    nn::{linear::LinearLayer, rms_norm::RMSNorm, slstm_block::SLSTMBlock},
-    nn_layer::NnLayer,
+    nn::linear::LinearLayer,
     nn2::{self, optim::AdamCfg},
     tensor::Tensor,
 };
@@ -233,20 +232,6 @@ pub trait Cell {
     /// Release every activation this cell holds (its projections and norms keep their
     /// own staging).
     fn drop_all_act(&mut self, gpu: &Gpu);
-    /// Build the matching CPU `nn` block (`SLSTMBlock` / `MLSTMBlock`) from this
-    /// cell plus the already-exported surrounding norms and projections.
-    #[allow(clippy::too_many_arguments)]
-    fn to_nn_block(
-        &self,
-        gpu: &Gpu,
-        hidden: usize,
-        up: usize,
-        pre_norm1: RMSNorm,
-        pre_norm2: RMSNorm,
-        lin_gate: LinearLayer,
-        lin_value: LinearLayer,
-        lin_down: LinearLayer,
-    ) -> Box<dyn NnLayer>;
 }
 
 impl Cell for SLstm {
@@ -322,32 +307,6 @@ impl Cell for SLstm {
     }
     fn set_resets(&mut self, r: &Resets) {
         SLstm::set_resets(self, r)
-    }
-    fn to_nn_block(
-        &self,
-        gpu: &Gpu,
-        hidden: usize,
-        up: usize,
-        pre_norm1: RMSNorm,
-        pre_norm2: RMSNorm,
-        lin_gate: LinearLayer,
-        lin_value: LinearLayer,
-        lin_down: LinearLayer,
-    ) -> Box<dyn NnLayer> {
-        // The CPU `SLSTMBlock` still keeps the post-cell norm at block level (it is
-        // the checkpoint layout), so the cell hands its own γ back out here.
-        let post = RMSNorm::from_loaded(hidden, super::dt_vec(gpu, self.post_norm_gamma()));
-        Box::new(SLSTMBlock::from_loaded(
-            hidden,
-            up,
-            pre_norm1,
-            post,
-            pre_norm2,
-            self.to_nn_cell(gpu),
-            lin_gate,
-            lin_value,
-            lin_down,
-        ))
     }
 }
 
@@ -447,9 +406,6 @@ pub trait BlockLike {
     fn set_resets(&mut self, r: &Resets);
     /// The cell's `(saved_cache, other)` activation split. See [`Cell::act_split`].
     fn cell_act_split(&self) -> (usize, usize);
-    /// Export the block into the matching CPU `nn` block (`SLSTMBlock` /
-    /// `MLSTMBlock`) for a `HIER` checkpoint.
-    fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn NnLayer>;
 }
 
 impl<C: Cell> BlockLike for Block<C> {
@@ -530,9 +486,6 @@ impl<C: Cell> BlockLike for Block<C> {
     }
     fn cell_act_split(&self) -> (usize, usize) {
         self.cell.act_split()
-    }
-    fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn NnLayer> {
-        Block::to_nn_layer(self, gpu)
     }
 }
 
@@ -1014,35 +967,6 @@ impl<C: Cell> Block<C> {
         v.extend(self.lin_value.param_slots());
         v.extend(self.lin_down.param_slots());
         v
-    }
-
-    /// Export into the matching CPU `nn` block for a `HIER` checkpoint: downloads the
-    /// norms/projections, then lets the cell assemble the concrete block.
-    pub fn to_nn_layer(&mut self, gpu: &Gpu) -> Box<dyn crate::nn_layer::NnLayer> {
-        use super::{dt_matrix, dt_vec};
-        let (h, u) = (self.hidden, self.up);
-        let pre1 = RMSNorm::from_loaded(h, dt_vec(gpu, &self.pre_norm1.gamma));
-        let pre2 = RMSNorm::from_loaded(h, dt_vec(gpu, &self.pre_norm2.gamma));
-        let gate = LinearLayer::from_loaded(
-            h,
-            u,
-            dt_matrix(gpu, &self.lin_gate.w),
-            dt_vec(gpu, &self.lin_gate.b),
-        );
-        let value = LinearLayer::from_loaded(
-            h,
-            u,
-            dt_matrix(gpu, &self.lin_value.w),
-            dt_vec(gpu, &self.lin_value.b),
-        );
-        let down = LinearLayer::from_loaded(
-            u,
-            h,
-            dt_matrix(gpu, &self.lin_down.w),
-            dt_vec(gpu, &self.lin_down.b),
-        );
-        self.cell
-            .to_nn_block(gpu, h, u, pre1, pre2, gate, value, down)
     }
 
     pub fn zero_grad(&mut self, gpu: &Gpu) {

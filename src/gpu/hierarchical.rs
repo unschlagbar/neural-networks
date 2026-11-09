@@ -21,11 +21,9 @@
 //! bookkeeping (which row is a `[W]` step, which slot is a char) is computed on
 //! the host and uploaded as id lists; only tensor *data* stays on the device.
 //!
-//! Checkpoints: `save`/`load` use the unified `NNM1` container (`src/format.rs`,
-//! kind = Hierarchical) — the same named-section layout the CPU model produces,
-//! so a GPU-trained model opens directly in the CPU sampler/probe (`hs` / `hp`).
-//! Weights only; the AdamW moments are not persisted, so a resumed run restarts
-//! them.
+//! Checkpoints: `save` writes the v2 format (`src/checkpoint.rs`) straight from the
+//! parameter slots; `load` reads v2 or the old `NNM1` container. Weights only; the
+//! AdamW moments are not persisted, so a resumed run restarts them.
 
 use std::ops::Deref;
 use std::range::Range;
@@ -103,10 +101,10 @@ use crate::config::{
     BACKBONE_WEIGHT_DECAY, DECODER_LR_SCALE, DECODER_WEIGHT_DECAY, ENCODER_LR_SCALE,
     ENCODER_WEIGHT_DECAY, GROUP_MAX_ROWS, WORDS_PER_SEQ,
 };
-use crate::format::{Meta, ModelKind, Seen, Writer};
+use crate::checkpoint::{self, BlockKind, Layout, Seen};
 use crate::gpu::arena::TrainingCache;
 use crate::gpu::block::BlockLike;
-use crate::gpu::{dt_matrix, dt_vec, tensor_from_matrix, tensor_from_slice};
+use crate::gpu::{tensor_from_matrix, tensor_from_slice};
 use crate::nn::embedding::EmbeddingLayer;
 use crate::nn::linear::LinearLayer;
 use crate::nn::linear_nb::LinearNBLayer;
@@ -116,26 +114,9 @@ use crate::nn::slstm_block::SLSTMBlock;
 use crate::nn::soft_cap::SoftCapLayer;
 use crate::nn_layer::NnLayer;
 use crate::nn2::optim::AdamCfg;
-use crate::sequential::Sequential;
 use crate::tensor::Tensor;
 
-/// Config for the hierarchical stack (mirrors `nn2::HierCfg`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ModelCfg {
-    pub vocab: usize,
-    /// char/context hidden (tied embedding + decoder width)
-    pub hc: usize,
-    /// backbone width
-    pub wh: usize,
-    pub enc_blocks: usize,
-    pub bb_blocks: usize,
-    pub dec_blocks: usize,
-    /// mLSTM heads
-    pub heads: usize,
-    pub dqk: usize,
-    pub w_token: usize,
-    pub cap: f32,
-}
+pub use crate::checkpoint::ModelCfg;
 
 /// SwiGLU inner width, derived per block from its own hidden width, exactly as
 /// `SequentialBuilder::{slstm,mlstm}_block` does. It therefore differs between
@@ -145,35 +126,39 @@ pub fn up_of(hidden: usize) -> usize {
     crate::config::up_of(hidden)
 }
 
-/// Per-word encoder: first block sLSTM, remaining blocks mLSTM (16 heads),
-/// `e_w` read out at the `[W]` step.
+/// Per-word encoder, `e_w` read out at the `[W]` step.
 pub struct WordEncoder {
     pub blocks: Vec<Box<dyn BlockLike>>,
 }
 
-impl WordEncoder {
-    fn new(gpu: &Gpu, hc: usize, n: usize) -> Self {
-        let dqk = hc / 16;
-        Self {
-            blocks: (0..n)
-                .map(|i| {
-                    if i.is_multiple_of(2) {
-                        Box::new(Block::from_cell(
-                            gpu,
-                            hc,
-                            up_of(hc),
-                            SLstm::new_rand(gpu, hc, hc),
-                        )) as Box<dyn BlockLike>
-                    } else {
-                        Box::new(Block::from_cell(
-                            gpu,
-                            hc,
-                            up_of(hc),
-                            MLstm::new_rand(gpu, hc, hc, 16, dqk),
-                        )) as Box<dyn BlockLike>
-                    }
-                })
-                .collect(),
+/// A residual block of `kind` at `width`, randomly initialized. `resid` scales the
+/// mLSTM's output projection and the block's down projection (the backbone's
+/// depth-scaled init); the sLSTM cell has no such scale.
+fn new_block(gpu: &Gpu, kind: BlockKind, width: usize, resid: Option<f32>) -> Box<dyn BlockLike> {
+    let up = up_of(width);
+    match (kind, resid) {
+        (BlockKind::SLstm, _) => Box::new(Block::from_cell(
+            gpu,
+            width,
+            up,
+            SLstm::new_rand(gpu, width, width),
+        )),
+        (BlockKind::MLstm { heads, dqk }, None) => Box::new(Block::from_cell(
+            gpu,
+            width,
+            up,
+            MLstm::new_rand(gpu, width, width, heads, dqk),
+        )),
+        (BlockKind::MLstm { heads, dqk }, Some(scale)) => {
+            let mut cell = crate::nn2::MLstm::new(width, width, heads, dqk);
+            cell.w_out.data.iter_mut().for_each(|w| *w *= scale);
+            Box::new(Block::from_cell_scaled(
+                gpu,
+                width,
+                up,
+                MLstm::from_cpu(gpu, &cell),
+                scale,
+            ))
         }
     }
 }
@@ -469,6 +454,8 @@ enum StateDistill {
 
 pub struct Hierarchical {
     pub cfg: ModelCfg,
+    /// The cell of every block; what a checkpoint needs beyond `cfg` to rebuild it.
+    pub layout: Layout,
 
     // Tied char table (encoder input + decoder char slots) + grad/moments.
     pub table: GTensor<f32>,
@@ -644,54 +631,18 @@ struct Parts {
 }
 
 impl Parts {
-    fn random(gpu: &Gpu, cfg: ModelCfg) -> Self {
+    fn random(gpu: &Gpu, cfg: &ModelCfg, layout: &Layout) -> Self {
         // GPT-2's residual init: each block writes twice into the residual stream,
         // so unscaled the stream's variance grows with depth.
         let resid_scale = 1.0 / ((2 * cfg.bb_blocks) as f32).sqrt();
-        let bb_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.bb_blocks)
-            .map(|_i| {
-                if false {
-                    Box::new(Block::from_cell(
-                        gpu,
-                        cfg.wh,
-                        up_of(cfg.wh),
-                        SLstm::new_rand(gpu, cfg.wh, cfg.wh),
-                    )) as Box<dyn BlockLike>
-                } else {
-                    let mut cell = crate::nn2::MLstm::new(cfg.wh, cfg.wh, cfg.heads, cfg.dqk);
-                    cell.w_out.data.iter_mut().for_each(|w| *w *= resid_scale);
-                    Box::new(Block::from_cell_scaled(
-                        gpu,
-                        cfg.wh,
-                        up_of(cfg.wh),
-                        MLstm::from_cpu(gpu, &cell),
-                        resid_scale,
-                    )) as Box<dyn BlockLike>
-                }
-            })
-            .collect();
-        let dec_blocks: Vec<Box<dyn BlockLike>> = (0..cfg.dec_blocks)
-            .map(|i| {
-                if i.is_multiple_of(2) {
-                    Box::new(Block::from_cell(
-                        gpu,
-                        cfg.hc,
-                        up_of(cfg.hc),
-                        SLstm::new_rand(gpu, cfg.hc, cfg.hc),
-                    )) as Box<dyn BlockLike>
-                } else {
-                    Box::new(Block::from_cell(
-                        gpu,
-                        cfg.hc,
-                        up_of(cfg.hc),
-                        MLstm::new_rand(gpu, cfg.hc, cfg.hc, 16, cfg.hc / 16),
-                    )) as Box<dyn BlockLike>
-                }
-            })
-            .collect();
+        let stage = |kinds: &[BlockKind], width: usize, resid: Option<f32>| -> Vec<Box<dyn BlockLike>> {
+            kinds.iter().map(|&k| new_block(gpu, k, width, resid)).collect()
+        };
+        let bb_blocks = stage(&layout.backbone, cfg.wh, Some(resid_scale));
+        let dec_blocks = stage(&layout.decoder, cfg.hc, None);
         Self {
             table: GTensor::from_host(gpu, &Tensor::random(&[cfg.vocab, cfg.hc], 0.02)),
-            enc_blocks: WordEncoder::new(gpu, cfg.hc, cfg.enc_blocks).blocks,
+            enc_blocks: stage(&layout.encoder, cfg.hc, None),
             bb_front: Linear::new_rand(gpu, cfg.hc, cfg.wh),
             bb_blocks,
             bb_back: Linear::new_rand(gpu, cfg.wh, cfg.hc),
@@ -712,8 +663,17 @@ impl Parts {
 }
 
 impl Hierarchical {
+    /// A new model in the [standard](Layout::standard) layout.
     pub fn new(gpu: &Gpu, cfg: ModelCfg) -> Self {
-        let mut model = Self::unbound(gpu, cfg, Parts::random(gpu, cfg));
+        Self::with_layout(gpu, cfg, Layout::standard(&cfg))
+    }
+
+    pub fn with_layout(gpu: &Gpu, cfg: ModelCfg, layout: Layout) -> Self {
+        if let Err(e) = layout.check(&cfg) {
+            panic!("layout does not fit {cfg:?}: {e}");
+        }
+        let parts = Parts::random(gpu, &cfg, &layout);
+        let mut model = Self::unbound(gpu, cfg, layout, parts);
         model.bind_params(gpu);
         model
     }
@@ -722,7 +682,7 @@ impl Hierarchical {
     ///
     /// Only [`load`](Self::load) uses this directly: it hands over the checkpoint's
     /// layers, so the device never holds a random model beside the loaded one.
-    fn unbound(gpu: &Gpu, cfg: ModelCfg, parts: Parts) -> Self {
+    fn unbound(gpu: &Gpu, cfg: ModelCfg, layout: Layout, parts: Parts) -> Self {
         let Parts {
             table,
             enc_blocks,
@@ -736,6 +696,7 @@ impl Hierarchical {
         let flags = Flags::from_env();
         let mut model = Self {
             cfg,
+            layout,
             table,
             dtable: GTensor::zeros(gpu, &[cfg.vocab, cfg.hc]),
             m_tbl: super::arena::unbacked(gpu),
@@ -2641,97 +2602,76 @@ impl Hierarchical {
 
     // checkpointing
 
-    /// Export the three stages into CPU `nn` `Sequential`s laid out exactly like
-    /// `model::build_hierarchical_model`, so the result serializes to the same
-    /// `NNM1` container a CPU-trained model would (readable by `hp` / `hs`).
-    fn to_sequentials(&mut self, gpu: &Gpu) -> (Sequential, Sequential, Sequential) {
-        let (vocab, hc, wh) = (self.cfg.vocab, self.cfg.hc, self.cfg.wh);
-
-        // Encoder: Embedding(tied table) → blocks.
-        let mut enc: Vec<Box<dyn NnLayer>> = Vec::new();
-        enc.push(Box::new(EmbeddingLayer::from_loaded(
-            vocab,
-            hc,
-            dt_matrix(gpu, &self.table),
-        )));
-        for b in self.encoder.blocks.iter_mut() {
-            enc.push(b.to_nn_layer(gpu));
+    /// Write a v2 checkpoint (`src/checkpoint.rs`): the config, the counters and
+    /// every parameter in [`param_slots`](Self::param_slots) order, copied off the
+    /// device one tensor at a time.
+    pub fn save(&mut self, gpu: &Gpu, path: &str) -> io::Result<()> {
+        let header = checkpoint::Header {
+            cfg: self.cfg,
+            layout: self.layout.clone(),
+            step: self.step_count as u64,
+            seen: self.seen,
+        };
+        let slots = self.param_slots();
+        let mut w = checkpoint::Writer::create(path, &header, slots.len())?;
+        for slot in &slots {
+            let t = slot.param.to_host(gpu);
+            w.tensor(t.dims(), &t.data)?;
         }
-
-        // Backbone: Linear(HC→WH) → blocks → Linear(WH→HC).
-        let mut wm: Vec<Box<dyn NnLayer>> = Vec::new();
-        wm.push(Box::new(LinearLayer::from_loaded(
-            hc,
-            wh,
-            dt_matrix(gpu, &self.bb_front.w),
-            dt_vec(gpu, &self.bb_front.b),
-        )));
-        for b in self.bb_blocks.iter_mut() {
-            wm.push(b.to_nn_layer(gpu));
-        }
-        wm.push(Box::new(LinearLayer::from_loaded(
-            wh,
-            hc,
-            dt_matrix(gpu, &self.bb_back.w),
-            dt_vec(gpu, &self.bb_back.b),
-        )));
-
-        // Decoder: sLSTM blocks → RMSNorm → LinearNoBias(head) → SoftCap.
-        let mut dec: Vec<Box<dyn NnLayer>> = Vec::new();
-        for b in self.dec_blocks.iter_mut() {
-            dec.push(b.to_nn_layer(gpu));
-        }
-        dec.push(Box::new(RMSNorm::from_loaded(
-            hc,
-            dt_vec(gpu, &self.dec_norm.gamma),
-        )));
-        dec.push(Box::new(LinearNBLayer::from_loaded(
-            hc,
-            vocab,
-            dt_matrix(gpu, &self.dec_head.w),
-        )));
-        dec.push(Box::new(SoftCapLayer::new(vocab, self.cfg.cap)));
-
-        (
-            Sequential::from_layers(enc),
-            Sequential::from_layers(wm),
-            Sequential::from_layers(dec),
-        )
+        w.finish()
     }
 
-    /// Write an `NNM1` hierarchical checkpoint — the same container the CPU
-    /// hierarchical model uses, so `hp` / `hs` can open a GPU-trained model
-    /// directly. Weights only (Adam moments are not persisted, so a resumed run
-    /// restarts them).
-    pub fn save(&mut self, gpu: &Gpu, path: &str, _boundary_token_ids: &[u16]) -> io::Result<()> {
-        let (encoder, word_model, char2_model) = self.to_sequentials(gpu);
-
-        // context_size == the backbone's output width == HC (the decoder's input),
-        // exactly what `Hierarchical::new` recomputes and debug-asserts on load.
-        let context_size = word_model.output_size;
-
-        let saved = Writer::new(
-            ModelKind::Hierarchical,
-            Meta {
-                vocab_size: self.cfg.vocab as u32,
-                context_size: context_size as u32,
-                step: self.step_count as u64,
-                seen: self.seen,
-            },
-        )
-        .section("encoder", &encoder.layers)
-        .section("word_model", &word_model.layers)
-        .section("char2_model", &char2_model.layers)
-        .save(path);
-        drop((encoder, word_model, char2_model));
-        super::trim_heap();
-        saved
-    }
-
-    /// Load a `HIER` checkpoint (written by this model or a CPU run), rebuilding
-    /// the device model. `w_token` is supplied by the caller (from the tokenizer)
-    /// because the HIER format does not store it.
+    /// Load a checkpoint, v2 or the old `NNM1` container. `w_token` comes from the
+    /// tokenizer; a v2 file stores its own and must agree.
     pub fn load(gpu: &Gpu, path: &str, w_token: usize) -> io::Result<Self> {
+        if checkpoint::is_v2(path)? {
+            Self::load_v2(gpu, path, w_token)
+        } else {
+            Self::load_nnm1(gpu, path, w_token)
+        }
+    }
+
+    fn load_v2(gpu: &Gpu, path: &str, w_token: usize) -> io::Result<Self> {
+        let err = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("{path}: {m}"));
+        let mut r = checkpoint::Reader::open(path)?;
+        let checkpoint::Header {
+            cfg,
+            layout,
+            step,
+            seen,
+        } = r.header.clone();
+        if cfg.w_token != w_token {
+            return Err(err(format!(
+                "checkpoint [W] token {} differs from the tokenizer's {w_token}",
+                cfg.w_token
+            )));
+        }
+        let mut model = Self::with_layout(gpu, cfg, layout);
+        let mut buf = Vec::new();
+        {
+            let slots = model.param_slots();
+            if slots.len() != r.remaining() {
+                return Err(err(format!(
+                    "{} tensors in the checkpoint, {} in a model of its layout",
+                    r.remaining(),
+                    slots.len()
+                )));
+            }
+            for slot in slots {
+                let dims = slot.param.dims().to_vec();
+                r.next_into(&dims, &mut buf).map_err(|e| err(e.to_string()))?;
+                slot.param.copy_from_host(gpu, &buf);
+            }
+        }
+        r.finish().map_err(|e| err(e.to_string()))?;
+        model.step_count = step as _;
+        model.seen = seen;
+        Ok(model)
+    }
+
+    /// Load an `NNM1` hierarchical container (written by an older build or a CPU run).
+    /// `w_token` is supplied by the caller because the container does not store it.
+    fn load_nnm1(gpu: &Gpu, path: &str, w_token: usize) -> io::Result<Self> {
         let stacks = crate::hierarchical::Hierarchical::load_stacks(path)?;
 
         let err = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
@@ -2830,10 +2770,24 @@ impl Hierarchical {
             w_token,
             cap,
         };
+        let kind = |l: &Box<dyn NnLayer>| match l.as_any().downcast_ref::<MLSTMBlock>() {
+            Some(m) => BlockKind::MLstm {
+                heads: m.cell.num_heads,
+                dqk: m.cell.dqk,
+            },
+            None => BlockKind::SLstm,
+        };
+        let layout = Layout {
+            encoder: enc[1..].iter().map(kind).collect(),
+            backbone: wm[1..wm.len() - 1].iter().map(kind).collect(),
+            decoder: dl[..norm_idx].iter().map(kind).collect(),
+        };
+        layout.check(&cfg).map_err(err)?;
 
         let mut model = Hierarchical::unbound(
             gpu,
             cfg,
+            layout,
             Parts {
                 table,
                 enc_blocks,
@@ -3231,7 +3185,10 @@ mod tests {
             w_token: 8,
             cap: 30.0,
         };
-        let mut model = Hierarchical::new(&gpu, cfg);
+        // A mixed backbone, so the checkpoint has to carry more than the config.
+        let mut layout = Layout::standard(&cfg);
+        layout.backbone[0] = BlockKind::SLstm;
+        let mut model = Hierarchical::with_layout(&gpu, cfg, layout);
 
         let tokens = vec![1usize, 2, 3, 4, 5, 6, 7, 1, 2, 3];
         let words = vec![
@@ -3254,22 +3211,33 @@ mod tests {
             "decode loss did not fall: {first} -> {last}"
         );
 
-        // Checkpoint round-trip: reloading must reproduce the exact same loss.
-        // Saves in the CPU HIER format; `w_token` is supplied on load.
-        let path = std::env::temp_dir().join("gpu_hier_test.hier");
+        // Checkpoint round-trip: every parameter comes back bit for bit, so the
+        // reloaded model gives exactly the same loss.
+        let path = std::env::temp_dir().join("gpu_hier_test.ckpt");
         let path = path.to_str().unwrap();
         model.seen.add_pretrain(tokens.len(), words.len());
         model.seen.add_sft(10, 4, 6, 2);
-        model.save(&gpu, path, &[cfg.w_token as u16]).expect("save");
+        model.save(&gpu, path).expect("save");
         let mut back = Hierarchical::load(&gpu, path, cfg.w_token).expect("load");
         assert_eq!(back.cfg, cfg, "config did not survive the round-trip");
+        assert_eq!(back.layout, model.layout, "layout did not survive the round-trip");
         assert_eq!(back.step_count, model.step_count, "step count lost");
         assert_eq!(back.seen, model.seen, "data counters lost");
+        let bits = |m: &mut Hierarchical| -> Vec<Vec<u32>> {
+            m.param_slots()
+                .iter()
+                .map(|s| s.param.to_host(&gpu).data.iter().map(|x| x.to_bits()).collect())
+                .collect()
+        };
+        assert!(bits(&mut back) == bits(&mut model), "a parameter changed in the round-trip");
         let reloaded = back.forward_backward(&gpu, &tokens, &words);
-        assert!(
-            (reloaded - last).abs() < 1e-4,
-            "reloaded model gives a different loss: {last} -> {reloaded}"
+        let again = model.forward_backward(&gpu, &tokens, &words);
+        assert_eq!(
+            reloaded.to_bits(),
+            again.to_bits(),
+            "reloaded model gives a different loss: {again} -> {reloaded}"
         );
+        assert!(Hierarchical::load(&gpu, path, cfg.w_token + 1).is_err(), "[W] mismatch accepted");
         let _ = std::fs::remove_file(path);
     }
 
@@ -3475,7 +3443,7 @@ mod tests {
             let seed = std::env::temp_dir().join(format!("gpu_chunk_seed_{nwords}.hier"));
             let seed = seed.to_str().unwrap();
             if chunk != usize::MAX {
-                model.save(&gpu, seed, &[]).expect("save seed");
+                model.save(&gpu, seed).expect("save seed");
             } else {
                 model = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
             }
@@ -3657,7 +3625,7 @@ mod tests {
         let seed = std::env::temp_dir().join("gpu_stash_carry_seed.hier");
         let seed = seed.to_str().unwrap();
         Hierarchical::new(&gpu, cfg)
-            .save(&gpu, seed, &[])
+            .save(&gpu, seed)
             .expect("save seed");
         let run = |between: Option<bool>| -> f32 {
             let mut m = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
@@ -3723,7 +3691,7 @@ mod tests {
         let seed = std::env::temp_dir().join(format!("gpu_window_carry_seed_{chunk}.hier"));
         let seed = seed.to_str().unwrap();
         Hierarchical::new(&gpu, cfg)
-            .save(&gpu, seed, &[])
+            .save(&gpu, seed)
             .expect("save seed");
         let fresh = || {
             let mut m = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
@@ -3828,7 +3796,7 @@ mod tests {
         let seed = std::env::temp_dir().join(format!("gpu_packed_docs_seed_{chunk}.hier"));
         let seed = seed.to_str().unwrap();
         Hierarchical::new(&gpu, cfg)
-            .save(&gpu, seed, &[])
+            .save(&gpu, seed)
             .expect("save seed");
         let fresh = || {
             let mut m = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
@@ -3959,7 +3927,7 @@ mod tests {
             let seed = std::env::temp_dir().join("gpu_three_chunk_seed.hier");
             let seed = seed.to_str().unwrap();
             if chunk != usize::MAX {
-                model.save(&gpu, seed, &[]).expect("save seed");
+                model.save(&gpu, seed).expect("save seed");
             } else {
                 model = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
             }
@@ -4047,7 +4015,7 @@ mod tests {
             let seed = std::env::temp_dir().join("gpu_groupcap_seed.hier");
             let seed = seed.to_str().unwrap();
             if cap == 0 {
-                model.save(&gpu, seed, &[]).expect("save seed");
+                model.save(&gpu, seed).expect("save seed");
             } else {
                 model = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
             }

@@ -240,6 +240,14 @@ impl GTensor<f32> {
         }
     }
 
+    /// Overwrite this tensor's elements from the host (blocking H2D copy).
+    pub fn copy_from_host(&mut self, gpu: &Gpu, src: &[f32]) {
+        assert_eq!(src.len(), self.len(), "copy_from_host: length mismatch");
+        gpu.stream
+            .memcpy_htod(src, &mut self.buf.slice_mut(..src.len()))
+            .expect("H2D copy");
+    }
+
     /// Download back to a host tensor (blocking D2H copy on the stream).
     ///
     /// Copies the elements the SHAPE covers, which for a pooled buffer may be

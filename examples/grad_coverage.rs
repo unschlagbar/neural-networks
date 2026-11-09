@@ -145,7 +145,7 @@ fn main() {
     let seed = std::env::temp_dir().join("grad_coverage_seed.hier");
     let seed = seed.to_str().unwrap();
     Hierarchical::new(&gpu, cfg)
-        .save(&gpu, seed, &[])
+        .save(&gpu, seed)
         .expect("save seed");
     let fresh = || {
         // The pool caches the previous model's blocks, and at production width

@@ -25,13 +25,16 @@ build plus the tests named in the step. Tick a step off here when it is done.
   them). Delete the examples listed below. Fix CLAUDE.md's mode table.
   Check: `cargo check --features cuda --examples --tests`, `cargo check -p harness`.
 
-- [ ] **2. Checkpoint format v2.** A header (`ModelCfg` + step/seen counters) plus the
+- [x] **2. Checkpoint format v2.** A header (`ModelCfg` + step/seen counters) plus the
   parameter tensors in `param_slots` order, written straight from device
   tensors by the GPU model and read by nn2. No CPU layer objects in between.
   Add a one-shot `convert` mode (old HIER → v2), which still uses `src/nn`, and
   convert `models/s4`–`s9` and `s4_sft_audio`. Keep the originals until step 5.
   Check: GPU save→load is bit-exact; a converted model gives the same `hvg` loss
   as the original.
+  Done: the header carries a per-stage `Layout` of block-kind tags (not just counts),
+  because s4/s5 have an sLSTM block at every backbone index ≡ 4 mod 6. All seven are
+  converted to `models/<name>.v2`; `hvg` on s4 vs s4.v2: char 0.501 / word 2.595 both.
 
 - [ ] **3. nn2 inference.** Stateful `feed` / `continue` / `sample` over the nn2
   hierarchical model (backbone state carried, encoder/decoder reset per word),
@@ -47,8 +50,8 @@ build plus the tests named in the step. Tick a step off here when it is done.
   `sequential.rs`, `nn_layer.rs`, `word_encoder.rs`, `parallel.rs`, `format.rs`
   (HIER), `loading.rs`/`saving.rs`, `gpu/nn_convert.rs`, the optimizers nn2 does
   not use (Muon, SGD, the `GradMatrix` aliases), `tests/parallel_parity.rs`
-  (already failing, see below), and the `convert` mode. Remove the `if false`
-  sLSTM backbone branch. Rename `src/nn2` → `src/cpu` (and every `nn2::` path,
+  (already failing, see below), and the `convert` mode. Keep sLSTM backbone
+  blocks: s4 (deployed) has them. Rename `src/nn2` → `src/cpu` (and every `nn2::` path,
   including the GPU side and the `.cu` comments).
   Check: `cargo test --release --features cuda --lib` with a narrow filter per
   module; `harness` builds.
@@ -86,5 +89,8 @@ Delete (one-off probes and benches whose finding is recorded):
 
 - `tests/parallel_parity.rs` fails on its "training lowers the loss" check. It
   trains the full 1B config on the CPU (8 min). It goes away in step 5.
+- GPU training now saves v2, which `hs`, `hqs`, `h`, `hq`, `hv`, `i`, `harness`
+  and the `ae2` text-scale pass (CPU `Hierarchical::load`) cannot read until step 3.
+  Point them at an untouched `NNM1` file meanwhile.
 - `harness` uses `hierarchical::Hierarchical` (old CPU) for chat and
   `gpu::audio` for the ear. `smart-light` uses `audio` only.

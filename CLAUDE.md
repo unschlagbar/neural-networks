@@ -27,7 +27,7 @@ The binary reads one line from stdin to select its mode:
 | Input | Action |
 |-------|--------|
 | `h` | `train_hierarchical` — trains the three-part hierarchical model (CPU) |
-| `hg` | `train_hierarchical_gpu` — same model, trained on the GPU (needs `--features cuda`); checkpoints to `models/hier_gpu` as a `GHIR` blob |
+| `hg` | `train_hierarchical_gpu` — same model, trained on the GPU (needs `--features cuda`); writes v2 checkpoints (`src/checkpoint.rs`) |
 | `hga` | the audio stage, after text pretraining: the `hg` loop with an audio window (a LibriSpeech run read as text with some utterances heard through `<model>.ae2`, or, for `AUDIO_PRETRAIN_VOICE_P` of them, a pretraining-holdout document the voice takes were read out of, those takes heard where their sentences stand) after every `AUDIO_PRETRAIN_EVERY` text windows, backbone at the constant `AUDIO_STAGE_LR`. Trains `<model>_audio`, copied from `<model>` on the first run, so the text model is never written. `hg` itself never runs audio |
 | `hq` | `train_sft` — CPU Q-A / instruction fine-tuning on `SFT_DATA`, loss masked to the response. The CPU twin of `hqg` |
 | `hqg` | `train_sft_gpu` — GPU Q-A / instruction fine-tuning on `SFT_DATA`, loss masked to the response (needs `--features cuda`). |
@@ -35,6 +35,7 @@ The binary reads one line from stdin to select its mode:
 | `hvg` | `validate_hierarchical_gpu` — the same validation on the GPU (needs `--features cuda`), through `Hierarchical::eval_loss`: forward only, no gradient, no step, backbone offload turned off. ~2.2-2.4x a training window (`examples/eval_win.rs`) |
 | `hs` | `sample_hierarchical` — interactive sampling from the hierarchical model |
 | `hqs` | `sample_chat` — interactive Q-A sampling from an SFT model (prompts for an instruction + optional context, generates the response until `<END>`) |
+| `convert` | `convert_checkpoint` — reads an old `NNM1` checkpoint on the GPU and writes it as v2 to `<model>.v2`, verified bit-exact and loaded back (needs `--features cuda`) |
 | `i` | `inspect_model` — prompts for a model name, looks it up in `models/` and prints all layers with their settings, plus how many chars/words it has trained on (pretraining and SFT counted separately) |
 
 ## Style 
@@ -58,6 +59,10 @@ headers. They add lines without adding information and make the file look more
 verbose than it is. A section heading is one plain comment line.
 
 ## Architecture
+
+### Checkpoints (`src/checkpoint.rs`)
+
+Format v2: a header (`ModelCfg` widths, a `Layout` with every block's `BlockKind` as a one-byte tag plus u64 arguments, step, `Seen`), then every parameter tensor in `param_slots` order as rank + dims + raw f32, in the GPU layouts (fused projections, the 1/√dqk folded into the mLSTM's `wk`/`bk`). A new cell type is a new tag. The GPU model writes it straight from the device and reads either v2 or `NNM1`; the CPU paths still read `NNM1` only (refactor step 3).
 
 ### Layer abstraction (`src/nn_layer.rs`)
 

@@ -16,6 +16,7 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 
 use crate::batches::ChunkedWordDataSet;
+use crate::checkpoint;
 use crate::config::{
     AUDIO_STAGE_LR, BATCH_SIZE, CARRY_WINDOW_STATE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, GRAD_CLIP_NORM, LOG_EVERY,
     LOGIT_SOFTCAP, LR, MAX_WINDOW_TOKENS, MIN_WORDS_PER_SEQ, SFT_BATCH_SIZE, SFT_DATA, SFT_EPOCHS,
@@ -314,7 +315,7 @@ pub fn train_hierarchical_gpu(model_path: &str, audio: bool) {
                         if let Some(a) = audio.as_mut() {
                             a.save(&gpu);
                         }
-                        match model.save(&gpu, state.save_path(), &[]) {
+                        match model.save(&gpu, state.save_path()) {
                             Ok(()) => {
                                 // Flush the log only now, so it never reflects a step
                                 // past the checkpoint just written.
@@ -367,7 +368,7 @@ pub fn train_hierarchical_gpu(model_path: &str, audio: bool) {
     if let Some(a) = audio.as_mut() {
         a.save(&gpu);
     }
-    match model.save(&gpu, state.save_path(), &[]) {
+    match model.save(&gpu, state.save_path()) {
         Ok(()) => {
             state.flush_log();
             println!("final save -> {}", state.save_path());
@@ -467,6 +468,86 @@ pub fn validate_hierarchical_gpu(model_path: &str) {
     );
     println!("  Char loss = {c_loss:.3} nats   ppl = {:.3}", c_loss.exp());
     println!("  Word loss = {w_loss:.3} nats   ppl = {:.3}", w_loss.exp());
+}
+
+/// Rewrite an `NNM1` checkpoint as v2 at `<model>.v2`, leaving the original in place.
+///
+/// The written file is read back tensor by tensor and compared bitwise against the
+/// device copy it came from, then loaded as a model.
+pub fn convert_checkpoint(model_path: &str) {
+    let gpu = match Gpu::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("No CUDA GPU available ({e}).");
+            return;
+        }
+    };
+    match checkpoint::is_v2(model_path) {
+        Ok(true) => {
+            println!("'{model_path}' is already a v2 checkpoint.");
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("Could not open '{model_path}': {e}");
+            std::process::exit(2);
+        }
+    }
+    let w_token = Utf8Tokenizer::new().w_token() as usize;
+    let mut model = match Hierarchical::load(&gpu, model_path, w_token) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Could not load '{model_path}': {e}");
+            std::process::exit(2);
+        }
+    };
+    let out = format!("{model_path}.v2");
+    if let Err(e) = model.save(&gpu, &out) {
+        eprintln!("Could not write '{out}': {e}");
+        std::process::exit(2);
+    }
+
+    let mut verify = || -> std::io::Result<usize> {
+        let mut r = checkpoint::Reader::open(&out)?;
+        let bad = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
+        if r.header.cfg != model.cfg
+            || r.header.step != model.step_count as u64
+            || r.header.seen != model.seen
+        {
+            return Err(bad("header differs from the loaded model".into()));
+        }
+        let mut buf = Vec::new();
+        let mut params = 0;
+        for (i, slot) in model.param_slots().into_iter().enumerate() {
+            let want = slot.param.to_host(&gpu);
+            r.next_into(want.dims(), &mut buf)?;
+            if buf.iter().zip(&want.data).any(|(a, b)| a.to_bits() != b.to_bits()) {
+                return Err(bad(format!("tensor {i} differs")));
+            }
+            params += buf.len();
+        }
+        r.finish()?;
+        Ok(params)
+    };
+    let params = match verify() {
+        Ok(params) => params,
+        Err(e) => {
+            eprintln!("'{out}' does not match the loaded model: {e}");
+            let _ = std::fs::remove_file(&out);
+            std::process::exit(2);
+        }
+    };
+    let (cfg, step) = (model.cfg, model.step_count);
+    drop(model);
+
+    // The v2 loader rebuilds the layers from the config alone, so a checkpoint whose
+    // layer pattern the config does not describe is written fine and cannot be read.
+    if let Err(e) = Hierarchical::load(&gpu, &out, w_token) {
+        eprintln!("'{out}' does not load back ({e}); removed it.");
+        let _ = std::fs::remove_file(&out);
+        std::process::exit(2);
+    }
+    println!("Wrote '{out}': {cfg:?}, step {step}, {params} parameters, verified bit-exact.");
 }
 
 /// GPU supervised fine-tuning (Q-A instruction tuning) of a pretrained
@@ -652,7 +733,7 @@ pub fn train_sft_gpu(model_path: &str) {
                 if let Some(a) = audio.as_mut() {
                     a.save(&gpu);
                 }
-                match model.save(&gpu, model_path, &[]) {
+                match model.save(&gpu, model_path) {
                     Ok(()) => {
                         state.flush_log();
                         // Written right after the weights, so the recorded
@@ -674,7 +755,7 @@ pub fn train_sft_gpu(model_path: &str) {
         if let Some(a) = audio.as_mut() {
             a.save(&gpu);
         }
-        if let Err(e) = model.save(&gpu, model_path, &[]) {
+        if let Err(e) = model.save(&gpu, model_path) {
             eprintln!("epoch save failed: {e}");
         } else {
             state.flush_log();
@@ -691,7 +772,7 @@ pub fn train_sft_gpu(model_path: &str) {
     if let Some(a) = audio.as_mut() {
         a.save(&gpu);
     }
-    match model.save(&gpu, model_path, &[]) {
+    match model.save(&gpu, model_path) {
         Ok(()) => {
             state.flush_log();
             // The run finished every epoch — drop the sidecar so the next

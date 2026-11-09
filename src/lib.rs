@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod batches;
+pub mod checkpoint;
 pub mod config;
 pub mod format;
 #[cfg(feature = "cuda")]
@@ -55,6 +56,8 @@ pub fn run() {
         "hv" => training::validate_hierarchical(&read_model_path()),
         #[cfg(feature = "cuda")]
         "hvg" => gpu::train::validate_hierarchical_gpu(&read_model_path()),
+        #[cfg(feature = "cuda")]
+        "convert" => gpu::train::convert_checkpoint(&read_model_path()),
         "hs" => sampling::sample_hierarchical(&read_model_path()),
         "hqs" => sampling::sample_chat(&read_model_path()),
         #[cfg(feature = "cuda")]
@@ -73,7 +76,7 @@ pub fn run() {
                  'hg' train_hierarchical on GPU | \
                  'hq' SFT (Q-A) fine-tune on CPU | 'hqg' SFT fine-tune on GPU | \
                  'hs' sample_hierarchical | 'hqs' chat/Q-A sampling | \
-                 'i' inspect model | 'ae2' audio encoder against a frozen text model | 'ae2a' its count-constrained alignment vs MFA | 'ae2s' speak to the text model",
+                 'i' inspect model | 'convert' NNM1 checkpoint to v2 | 'ae2' audio encoder against a frozen text model | 'ae2a' its count-constrained alignment vs MFA | 'ae2s' speak to the text model",
             );
             std::process::exit(2);
         }

@@ -802,29 +802,6 @@ impl Cell for MLstm {
     fn set_resets(&mut self, r: &Resets) {
         MLstm::set_resets(self, r)
     }
-    fn to_nn_block(
-        &self,
-        gpu: &Gpu,
-        hidden: usize,
-        up: usize,
-        pre_norm1: crate::nn::rms_norm::RMSNorm,
-        pre_norm2: crate::nn::rms_norm::RMSNorm,
-        lin_gate: crate::nn::linear::LinearLayer,
-        lin_value: crate::nn::linear::LinearLayer,
-        lin_down: crate::nn::linear::LinearLayer,
-    ) -> Box<dyn crate::nn_layer::NnLayer> {
-        // mLSTM blocks have no post-cell norm (the cell's head norm normalizes).
-        Box::new(crate::nn::mlstm_block::MLSTMBlock::from_loaded(
-            hidden,
-            up,
-            pre_norm1,
-            pre_norm2,
-            self.to_nn_cell(gpu),
-            lin_gate,
-            lin_value,
-            lin_down,
-        ))
-    }
 }
 
 #[cfg(test)]

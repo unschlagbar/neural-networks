@@ -148,7 +148,7 @@ fn main() {
     let seed = std::env::temp_dir().join("window_determinism_seed.hier");
     let seed = seed.to_str().unwrap();
     Hierarchical::new(&gpu, cfg)
-        .save(&gpu, seed, &[])
+        .save(&gpu, seed)
         .expect("save seed");
     let fresh = |chunk, cap| {
         let mut m = Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed");
