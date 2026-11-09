@@ -3,7 +3,6 @@ use std::io::{Write, stdin, stdout};
 use crate::{
     config::{MAX_LEN, MAX_SEQ_LEN, TEMPERATURE, TOOL_TEMPERATURE, TOP_P},
     hierarchical::Hierarchical,
-    sequential::Sequential,
     sft::{Role, Turn},
     tokenizer_utf8::{BYTE_TOKENS, TOOL_OPEN_TOKEN, Utf8Tokenizer},
 };
@@ -48,49 +47,6 @@ impl Utf8Printer {
             Err(_) => self.pending.clear(),
         }
         true
-    }
-}
-
-pub fn sample_normal(model_path: &str) {
-    let tokenizer = Utf8Tokenizer::new();
-
-    let mut model = match Sequential::load(model_path) {
-        Ok(m) => {
-            println!("Loaded sequential model from '{model_path}'.");
-            m
-        }
-        Err(e) => {
-            eprintln!("Failed to load '{model_path}': {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // For single-step sampling, cache[0] is sufficient.
-    model.make_cache(1);
-
-    loop {
-        println!("\nSample mode — type a prefix (empty = random start, Ctrl+D = quit):");
-        let mut input = String::new();
-        if stdin().read_line(&mut input).unwrap() == 0 {
-            println!();
-            return;
-        }
-
-        let prefix: Vec<u16> = if !input.trim().is_empty() {
-            tokenizer.to_tokens(input.trim())
-        } else {
-            Vec::new()
-        };
-
-        print!(">>> ");
-        stdout().flush().unwrap();
-
-        let mut printer = Utf8Printer::default();
-        model.sample(&prefix, MAX_LEN, TEMPERATURE, TOP_P, |token| {
-            printer.print(token, &tokenizer)
-        });
-
-        println!();
     }
 }
 

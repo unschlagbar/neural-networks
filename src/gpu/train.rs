@@ -476,11 +476,8 @@ pub fn validate_hierarchical_gpu(model_path: &str) {
 /// windows (see `crate::sft`) — the corpus is small — and fine-tunes the model
 /// with loss counted only on the response tokens (`forward_backward_masked`).
 ///
-/// A model built by this crate already has the full SFT vocabulary (new models
-/// are created at `tokenizer.vocab_size()`), so it just works. Only an *older*
-/// checkpoint — pretrained back when the vocab was smaller — lacks the SFT
-/// marker rows; such a checkpoint is rejected with a hint to run `av`
-/// (`grow_vocab`) once, rather than silently indexing past the tied table.
+/// A checkpoint with a smaller vocab than the tokenizer is rejected: its tied
+/// table has no rows for the SFT markers.
 pub fn train_sft_gpu(model_path: &str) {
     let gpu = match Gpu::new() {
         Ok(g) => g,
@@ -516,9 +513,7 @@ pub fn train_sft_gpu(model_path: &str) {
     if model.cfg.vocab != vocab {
         eprintln!(
             "This is an older checkpoint: its vocab is {} but the tokenizer now has \
-             {vocab} tokens (the SFT markers were added later). Upgrade it once with \
-             the 'av' mode, then fine-tune the grown model. Newly trained models \
-             already have the full vocab and skip this step.",
+             {vocab}: it predates the SFT markers and cannot be fine-tuned.",
             model.cfg.vocab
         );
         return;

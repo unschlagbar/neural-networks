@@ -2,22 +2,8 @@ use crate::{
     config::{CHAR_HIDDEN, LOGIT_SOFTCAP, OUT_HIDDEN, WORD_BLOCKS, WORD_HIDDEN},
     hierarchical::Hierarchical,
     nn_layer::SequentialBuilder,
-    sequential::Sequential,
     tokenizer_utf8::Utf8Tokenizer,
 };
-
-pub fn build_normal_model(vocab: usize) -> Sequential {
-    pub const NUM_HEADS: usize = 16;
-    pub const DQK: usize = WORD_HIDDEN / NUM_HEADS / 2;
-    SequentialBuilder::new(vocab)
-        .embedding(WORD_HIDDEN)
-        .mlstm_block(NUM_HEADS, DQK)
-        .slstm_block(WORD_HIDDEN)
-        .mlstm_block(NUM_HEADS, DQK)
-        .rms_norm()
-        .linear(vocab)
-        .build()
-}
 
 // Hierarchical Autoregressive Transformer (HAT)-style model (arXiv 2501.10322).
 //

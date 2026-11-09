@@ -1,0 +1,90 @@
+# Refactor plan
+
+Goal: one CPU implementation, one checkpoint path, no dead code, short comments.
+Baseline commit: `448e5f5`. Do one step per session, and finish each with a green
+build plus the tests named in the step. Tick a step off here when it is done.
+
+## Decisions
+
+- **Keep `src/nn2`, delete `src/nn`, then rename `nn2` → `cpu`** (beside `gpu`:
+  `cpu::Hierarchical`, `cpu::MLstm`, `cpu::Block`). No "2" or "new"/"old" in any
+  name; rename types the same way where they carry such a suffix. nn2 is batched and is already the GPU's
+  reference and init source. nn is per-timestep, and the checkpoint round trip
+  through it is what cost 17 GB of host RAM.
+- CPU modes that stay: `h`, `hq`, `hv` (training/validation), `hs`, `hqs`
+  (sampling), `i` (inspect). GPU modes all stay.
+- Removed: `""` + `s` (flat model), `av` (grow_vocab), `hp` (probe), `ht` (trace).
+- Inference gets its own small module (no training state, no grads): it is what
+  `harness` links against.
+
+## Steps
+
+- [x] **1. Dead modes and examples.** Delete the `""`, `s`, `av`, `hp`, `ht` modes
+  and the code only they reach (`grow_vocab.rs`, flat-model parts of `model.rs` /
+  `training.rs` / `sampling.rs`, `gpu/flat.rs` + `gpu/lm.rs` if nothing else uses
+  them). Delete the examples listed below. Fix CLAUDE.md's mode table.
+  Check: `cargo check --features cuda --examples --tests`, `cargo check -p harness`.
+
+- [ ] **2. Checkpoint format v2.** A header (`ModelCfg` + step/seen counters) plus the
+  parameter tensors in `param_slots` order, written straight from device
+  tensors by the GPU model and read by nn2. No CPU layer objects in between.
+  Add a one-shot `convert` mode (old HIER → v2), which still uses `src/nn`, and
+  convert `models/s4`–`s9` and `s4_sft_audio`. Keep the originals until step 5.
+  Check: GPU save→load is bit-exact; a converted model gives the same `hvg` loss
+  as the original.
+
+- [ ] **3. nn2 inference.** Stateful `feed` / `continue` / `sample` over the nn2
+  hierarchical model (backbone state carried, encoder/decoder reset per word),
+  loading v2. Port `hs`, `hqs` and `harness` (`session.rs`, `listen.rs`) to it.
+  Check: identical sampled tokens (greedy) vs the old `Hierarchical` on `s4`.
+
+- [ ] **4. CPU training on nn2.** `h`, `hq`, `hv` on nn2 + v2 checkpoints, with
+  the same masking (SFT loss mask, document borders) as the GPU path.
+  Check: the hierarchical mask tests ported to nn2, and a short `h` run lowers
+  the loss.
+
+- [ ] **5. Delete the old CPU stack.** `src/nn/`, `src/hierarchical.rs`,
+  `sequential.rs`, `nn_layer.rs`, `word_encoder.rs`, `parallel.rs`, `format.rs`
+  (HIER), `loading.rs`/`saving.rs`, `gpu/nn_convert.rs`, the optimizers nn2 does
+  not use (Muon, SGD, the `GradMatrix` aliases), `tests/parallel_parity.rs`
+  (already failing, see below), and the `convert` mode. Remove the `if false`
+  sLSTM backbone branch. Rename `src/nn2` → `src/cpu` (and every `nn2::` path,
+  including the GPU side and the `.cu` comments).
+  Check: `cargo test --release --features cuda --lib` with a narrow filter per
+  module; `harness` builds.
+
+- [ ] **6. Comment and doc pass.** File by file, per CLAUDE.md style: cut
+  restating comments, history ("was X"), paragraphs where one line will do,
+  German comments. Shrink CLAUDE.md to what is true after steps 1–5. Move
+  measurement history out of doc comments (it lives in memory/commits).
+  Check: no code change (`git diff --stat` shows only comment lines; build green).
+
+## Examples
+
+Keep (current tools):
+`gpu_soak`, `vram_audit`, `offload_vram`, `phase_table`, `gpu_prof`, `kern_prof`,
+`ncu_blocks`, `step_time`, `eval_win`, `determinism`, `window_determinism`,
+`grad_coverage`, `gpu_cpu_parity`, `param_count`, `parquet_demo`, `seg_demo`,
+`win_carry_stats`, and the audio ones from 2026-11 (`ae2_*`, `augment_*`).
+
+Delete (one-off probes and benches whose finding is recorded):
+`bgrad_probe`, `chunk_ab`, `colsum_bench`, `ctx_ablation`, `encdec_baseline`,
+`enc_shapes`, `eval_leak`, `e_w_cosine`, `forget_collapse`, `fused_bf16_parity`,
+`gemm_issue`, `geom_probe`, `gpu_bench`, `gpu_fit`, `gpu_memcheck`,
+`gpu_occupancy`, `gpu_win`, `grad_dump`, `grad_norm_probe`, `grad_seed`,
+`_grp_probe`, `launch_cost`, `logit_scale`, `loop_confidence`, `mlstm_bench`,
+`mlstm_bw_bench`, `mlstm_chunk_bench`, `mlstm_determinism`, `mlstm_fw_bench`,
+`mlstm_oracle`, `mlstm_path_check`, `mlstm_spec_ab`, `mlstm_stage_prof`,
+`mlstm_xtree`, `nn2_bench`, `path_parity`, `proj_merge_bench`, `rms_bench`,
+`sample_parity`, `sft_mask_audit`, `slstm_backbone_probe`, `slstm_bench`,
+`slstm_bwd_bench`, `slstm_fit`, `slstm_fwd_bench`, `slstm_launch_bench`,
+`slstm_path_ab`, `slstm_roofline`, `slstm_state_prec`, `smoltalk_sources`,
+`temp_sweep`, `tloop_only`, `train_determinism`, `vary_win`, `viz_words`,
+`weight_delta`, `weight_stats`, `window_count`, `window_spans`, `win_seq`.
+
+## Known state
+
+- `tests/parallel_parity.rs` fails on its "training lowers the loss" check. It
+  trains the full 1B config on the CPU (8 min). It goes away in step 5.
+- `harness` uses `hierarchical::Hierarchical` (old CPU) for chat and
+  `gpu::audio` for the ear. `smart-light` uses `audio` only.

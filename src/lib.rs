@@ -4,7 +4,6 @@ pub mod config;
 pub mod format;
 #[cfg(feature = "cuda")]
 pub mod gpu;
-pub mod grow_vocab;
 pub mod hierarchical;
 pub mod inspect;
 pub mod loading;
@@ -46,7 +45,6 @@ pub fn run() {
     let cmd = line.trim();
 
     match cmd {
-        "" => training::train_normal(&read_model_path()),
         "h" => training::train_hierarchical(&read_model_path()),
         #[cfg(feature = "cuda")]
         "hg" => gpu::train::train_hierarchical_gpu(&read_model_path(), false),
@@ -54,13 +52,9 @@ pub fn run() {
         #[cfg(feature = "cuda")]
         "hqg" => gpu::train::train_sft_gpu(&read_model_path()),
         "hq" => training::train_sft(&read_model_path()),
-        "av" => grow_vocab::grow_model_interactive(),
-        "hp" => training::probe_hierarchical(&read_model_path()),
         "hv" => training::validate_hierarchical(&read_model_path()),
         #[cfg(feature = "cuda")]
         "hvg" => gpu::train::validate_hierarchical_gpu(&read_model_path()),
-        "ht" => training::trace_hierarchical(&read_model_path()),
-        "s" => sampling::sample_normal(&read_model_path()),
         "hs" => sampling::sample_hierarchical(&read_model_path()),
         "hqs" => sampling::sample_chat(&read_model_path()),
         #[cfg(feature = "cuda")]
@@ -74,12 +68,11 @@ pub fn run() {
         "i" => inspect::inspect_model(),
         other => {
             eprintln!(
-                "Unknown mode {other:?}. Modes: '' train_normal | 'h' train_hierarchical | \
+                "Unknown mode {other:?}. Modes: 'h' train_hierarchical | \
                  'hv' validate_hierarchical | 'hvg' validate_hierarchical on GPU | \
                  'hg' train_hierarchical on GPU | \
                  'hq' SFT (Q-A) fine-tune on CPU | 'hqg' SFT fine-tune on GPU | \
-                 'av' add SFT vocab to a model | \
-                 's' sample_normal | 'hs' sample_hierarchical | 'hqs' chat/Q-A sampling | \
+                 'hs' sample_hierarchical | 'hqs' chat/Q-A sampling | \
                  'i' inspect model | 'ae2' audio encoder against a frozen text model | 'ae2a' its count-constrained alignment vs MFA | 'ae2s' speak to the text model",
             );
             std::process::exit(2);
