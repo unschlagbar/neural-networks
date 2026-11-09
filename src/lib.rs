@@ -6,6 +6,7 @@ pub mod format;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 pub mod hierarchical;
+pub mod infer;
 pub mod inspect;
 pub mod loading;
 pub mod model;

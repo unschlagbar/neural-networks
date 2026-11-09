@@ -33,7 +33,7 @@ The binary reads one line from stdin to select its mode:
 | `hqg` | `train_sft_gpu` — GPU Q-A / instruction fine-tuning on `SFT_DATA`, loss masked to the response (needs `--features cuda`). |
 | `hv` | `validate_hierarchical` — forward-only pass over `VAL_DATA` (CPU), reporting mean char and word loss; no backward, no weight update |
 | `hvg` | `validate_hierarchical_gpu` — the same validation on the GPU (needs `--features cuda`), through `Hierarchical::eval_loss`: forward only, no gradient, no step, backbone offload turned off. ~2.2-2.4x a training window (`examples/eval_win.rs`) |
-| `hs` | `sample_hierarchical` — interactive sampling from the hierarchical model |
+| `hs` | `sample_hierarchical` — interactive sampling from the hierarchical model (`src/infer.rs`, v2 checkpoints) |
 | `hqs` | `sample_chat` — interactive Q-A sampling from an SFT model (prompts for an instruction + optional context, generates the response until `<END>`) |
 | `convert` | `convert_checkpoint` — reads an old `NNM1` checkpoint on the GPU and writes it as v2 to `<model>.v2`, verified bit-exact and loaded back (needs `--features cuda`) |
 | `i` | `inspect_model` — prompts for a model name, looks it up in `models/` and prints all layers with their settings, plus how many chars/words it has trained on (pretraining and SFT counted separately) |
@@ -62,7 +62,7 @@ verbose than it is. A section heading is one plain comment line.
 
 ### Checkpoints (`src/checkpoint.rs`)
 
-Format v2: a header (`ModelCfg` widths, a `Layout` with every block's `BlockKind` as a one-byte tag plus u64 arguments, step, `Seen`), then every parameter tensor in `param_slots` order as rank + dims + raw f32, in the GPU layouts (fused projections, the 1/√dqk folded into the mLSTM's `wk`/`bk`). A new cell type is a new tag. The GPU model writes it straight from the device and reads either v2 or `NNM1`; the CPU paths still read `NNM1` only (refactor step 3).
+Format v2: a header (`ModelCfg` widths, a `Layout` with every block's `BlockKind` as a one-byte tag plus u64 arguments, step, `Seen`), then every parameter tensor in `param_slots` order as rank + dims + raw f32, in the GPU layouts (fused projections, the 1/√dqk folded into the mLSTM's `wk`/`bk`). A new cell type is a new tag. The GPU model writes it straight from the device and reads either v2 or `NNM1`; `src/infer.rs` (sampling, `harness`) reads v2 only, the CPU trainers still `NNM1` only (refactor step 4).
 
 ### Layer abstraction (`src/nn_layer.rs`)
 

@@ -1,8 +1,8 @@
 use std::io::{Write, stdin, stdout};
 
 use crate::{
-    config::{MAX_LEN, MAX_SEQ_LEN, TEMPERATURE, TOOL_TEMPERATURE, TOP_P},
-    hierarchical::Hierarchical,
+    config::{MAX_LEN, TEMPERATURE, TOOL_TEMPERATURE, TOP_P},
+    infer::Hierarchical,
     sft::{Role, Turn},
     tokenizer_utf8::{BYTE_TOKENS, TOOL_OPEN_TOKEN, Utf8Tokenizer},
 };
@@ -57,7 +57,7 @@ impl Utf8Printer {
 pub fn sample_chat(model_path: &str) {
     let tokenizer = Utf8Tokenizer::new();
 
-    let mut model = match Hierarchical::load(model_path, tokenizer) {
+    let mut model = match Hierarchical::load(model_path) {
         Ok(m) => {
             println!("Loaded SFT model from '{model_path}' (step {}).", m.step);
             m
@@ -67,7 +67,6 @@ pub fn sample_chat(model_path: &str) {
             std::process::exit(1);
         }
     };
-    model.make_cache(1, MAX_SEQ_LEN);
 
     // The conversation so far. Each generated reply is appended as an
     // `Assistant` turn, so the next prompt carries the whole history — the same
@@ -145,9 +144,10 @@ pub fn sample_chat(model_path: &str) {
 pub fn sample_hierarchical(model_path: &str) {
     let tokenizer = Utf8Tokenizer::new();
 
-    let mut model = Hierarchical::load(model_path, tokenizer).unwrap();
-
-    model.make_cache(1, MAX_SEQ_LEN);
+    let mut model = Hierarchical::load(model_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load '{model_path}': {e}");
+        std::process::exit(1);
+    });
 
     loop {
         println!("\nSample mode — type a prefix (empty = random start, Ctrl+D = quit):");

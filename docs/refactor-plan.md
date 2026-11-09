@@ -36,10 +36,16 @@ build plus the tests named in the step. Tick a step off here when it is done.
   because s4/s5 have an sLSTM block at every backbone index ≡ 4 mod 6. All seven are
   converted to `models/<name>.v2`; `hvg` on s4 vs s4.v2: char 0.501 / word 2.595 both.
 
-- [ ] **3. nn2 inference.** Stateful `feed` / `continue` / `sample` over the nn2
+- [x] **3. nn2 inference.** Stateful `feed` / `continue` / `sample` over the nn2
   hierarchical model (backbone state carried, encoder/decoder reset per word),
   loading v2. Port `hs`, `hqs` and `harness` (`session.rs`, `listen.rs`) to it.
   Check: identical sampled tokens (greedy) vs the old `Hierarchical` on `s4`.
+  Done: `src/infer.rs`, standalone (no nn/nn2 types, no grads), weights kept in the
+  v2/GPU layouts, `feed` / `feed_embeddings` / `continue_chat` / `sample` /
+  `sample_chat`. Greedy output is identical to the old model on `s4` and
+  `s4_sft_audio` (three prompts × 300 tokens plus a chat reply), at ~2x its speed
+  (~32 ms per backbone word, bandwidth-bound). `examples/infer_parity.rs` is the
+  check; it goes with the old model in step 5.
 
 - [ ] **4. CPU training on nn2.** `h`, `hq`, `hv` on nn2 + v2 checkpoints, with
   the same masking (SFT loss mask, document borders) as the GPU path.
@@ -89,8 +95,7 @@ Delete (one-off probes and benches whose finding is recorded):
 
 - `tests/parallel_parity.rs` fails on its "training lowers the loss" check. It
   trains the full 1B config on the CPU (8 min). It goes away in step 5.
-- GPU training now saves v2, which `hs`, `hqs`, `h`, `hq`, `hv`, `i`, `harness`
-  and the `ae2` text-scale pass (CPU `Hierarchical::load`) cannot read until step 3.
-  Point them at an untouched `NNM1` file meanwhile.
-- `harness` uses `hierarchical::Hierarchical` (old CPU) for chat and
-  `gpu::audio` for the ear. `smart-light` uses `audio` only.
+- `hs`, `hqs` and `harness` read v2 only (`models/<name>.v2`). `h`, `hq`, `hv`,
+  `i` and the `ae2` text-scale pass (CPU `Hierarchical::load`) still read `NNM1`
+  only; point them at an untouched `NNM1` file until step 4.
+- `harness` uses `infer::Hierarchical` for chat and `gpu::audio` for the ear. `smart-light` uses `audio` only.
