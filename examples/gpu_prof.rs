@@ -1,10 +1,4 @@
 //! Phase profile of one hierarchical GPU training window.
-//!
-//!   cargo run --release --features cuda --example gpu_prof
-//!
-//! Times the three stages at their real training shapes (encoder/decoder: words
-//! are the batch axis, T is short; backbone: batch 1, T = words) so we can see
-//! which one owns the step time before optimizing anything.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -46,8 +40,6 @@ fn main() {
 
     let up = |h: usize| h * 8 / 3;
 
-    // The real training step: one full hierarchical forward+backward window at
-    // config.rs shapes (2048 words, ~5 chars each).
     {
         use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
         let words_n = 2048usize;
@@ -165,8 +157,6 @@ fn main() {
         use neural_networks::gpu::ops::{SlabBuf, SlstmSlabs};
         let (b, t, h) = (1usize, 2047usize, 512usize);
         let h4 = 4 * h;
-        // The plain-activation slabs follow the compiled kernels' width (bf16 unless
-        // GPU_NO_BF16); the stabilizer-carrying ones follow `state_bf16`.
         let act = || SlabBuf::new(&gpu, &[b, t, h]);
         let state = || SlabBuf::new_width(&gpu, &[b, t, h], gpu.kernels.state_bf16);
         let entry = || SlabBuf::new_width(&gpu, &[b, h], gpu.kernels.state_bf16);
@@ -241,8 +231,6 @@ fn main() {
         );
     }
 
-    // Bare cell (no block wrapper) at backbone shape, to separate cell cost from
-    // the surrounding norms/SwiGLU.
     {
         let mut cell = SLstm::new_rand(&gpu, wh, wh);
         let x = GTensor::zeros(&gpu, &[1, words, wh]);

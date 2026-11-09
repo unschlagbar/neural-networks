@@ -1,51 +1,4 @@
 //! Fixed scratch slots for every temporary a forward or backward needs.
-//!
-//! A temporary is a value one op writes and the next op or two read, dead before
-//! the phase that made it returns: the deltas threading through a block's backward,
-//! a projection's staged operand, the `dq‖dk‖dv‖do` slab. They are most of what a
-//! step allocates, and none of them has to survive the call that made them.
-//!
-//! # Why fixed slots rather than a sized pool
-//!
-//! The obvious design is a free list keyed by size, handing each request a buffer
-//! that fits. It does not work here, and the reason is worth stating because it
-//! looks like it should. Real windows vary continuously — a window's word count runs
-//! `MIN_WORDS_PER_SEQ..WORDS_PER_SEQ`, and the encoder and decoder run one rectangle
-//! per word-length bucket — so nearly every window asks for sizes no previous window
-//! used. A free list therefore grows one entry per distinct shape ever seen, and every
-//! device buffer it holds is one the next window probably cannot use. Bounding that
-//! needs slack rules, size classes, eviction at pass boundaries and a cap on the
-//! class count, and the result is still a footprint you can only discover by running
-//! it.
-//!
-//! The observation that removes all of it: **the stages never run at once**. The
-//! encoder finishes before the backbone starts, which finishes before the decoder.
-//! So there is no benefit to sizing a slot for the stage that borrows it — a small
-//! encoder-shaped slot would simply sit unused through the backbone sweep while a
-//! large one sat unused through the encoder's. One size, big enough for the widest
-//! temporary any stage asks for, wastes nothing that a mixed set would have saved.
-//!
-//! What that buys: a slot count and a slot size fixed before the first window,
-//! device memory that is one number rather than an emergent property of the corpus,
-//! `acquire` that is a `trailing_ones` on a `u32`, and a device address per slot that
-//! never moves for the life of the run.
-//!
-//! # Widths
-//!
-//! Slots are allocated as `f32` and handed out at whatever width the caller asks for.
-//! A slot is a device address and a byte length; [`GTensor::view_at`] builds a tensor
-//! of any storage type over it, so a bf16 temporary of `n` elements is the same slot
-//! as an fp32 one of `n/2`. There is no separate bf16 array and no cast.
-//!
-//! # Contract
-//!
-//! [`TempCache::get`] returns **uninitialised** memory — a recycled slot holds
-//! whatever the last borrower left. Write every element you later read, or use
-//! [`get_zeroed`](TempCache::get) for an accumulator.
-//!
-//! A [`Temp`] releases its slot when dropped, so a temporary's life is its scope and
-//! there is nothing to call at the end. Two `Temp`s never alias: the slot is marked
-//! busy for as long as the guard exists.
 
 use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
@@ -55,45 +8,12 @@ use cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr, ValidAsZeroBits};
 use super::{GTensor, Gpu};
 
 /// How many slots the cache holds.
-///
-/// The bound is the deepest nesting a step reaches: a backbone block's backward with
-/// its cell's backward running inside it. The block holds three deltas across the
-/// cell call and the mLSTM's shell holds two at its own peak, so a real window at
-/// `WORDS_PER_SEQ = 4096` measures **5** (`examples/vram_audit`, `GPU_MEM=1`). The
-/// margin above that covers the paths a single audit does not reach.
-///
-/// Slots are cheap in count and expensive in bytes, so this stays close to what is
-/// measured rather than padded — running out is a panic naming the caller, not a
-/// silent fallback to the allocator, because at a fixed size it means a new temporary
-/// appeared and the bound needs re-deriving rather than hiding.
-///
-/// [`TempCache::high_water`] reports what a run actually used; `GPU_MEM=1` prints it.
 pub const SLOTS: usize = 8;
 
 /// How many **small** slots the cache holds.
-///
-/// The stage-sized array is scarce and megabytes wide. A good part of what a step
-/// allocates is not stage-sized at all: `[BH, T]` gate strips and `[N, 2·heads]` gate
-/// deltas are tens of kilobytes, ~250x smaller than a rectangle, and spending a
-/// stage-sized slot on one wastes the difference and pushes up the count of the array
-/// that actually costs memory.
-///
-/// This array is the same mechanism at the other size — see [`widest_small`] for how
-/// one is sized. The whole array is a rounding error against a single stage-sized
-/// slot, so its count can be generous where [`SLOTS`] cannot.
 pub const SMALL_SLOTS: usize = 4;
 
 /// The widest *small* temporary a stage of `rows` x `heads` asks for, in elements.
-///
-/// Two shapes, both `rows`-by-a-head-count rather than `rows`-by-a-width: the gate
-/// deltas at `[rows, 2·heads]`, and the per-timestep dψ at `[BH, T]`, which is
-/// `heads · rows` however the rows are split between batch and time. The first
-/// dominates, so it is the bound.
-///
-/// Derived, not a round number: at the backbone this is 16K elements but the encoder
-/// runs four times the rows, and a constant picked from the backbone alone would send
-/// every encoder group to the stage-sized array — or, before the bound was checked,
-/// past the end of a slot.
 pub fn widest_small(rows: usize, heads: usize) -> usize {
     rows * 2 * heads
 }
@@ -103,12 +23,6 @@ pub fn widest_small(rows: usize, heads: usize) -> usize {
 pub const CHUNK_SLOTS: usize = 2;
 
 /// Elements the chunk-state gradients need for one call.
-///
-/// `dcst` is `[bh, nc+1, dqk, dhv]` — one state per chunk *boundary*, so unlike every
-/// other temporary its size grows as the chunk length `l` SHRINKS. That is why it gets
-/// its own array rather than a stage-sized slot: sizing those for the smallest `l`
-/// would make every one of them many times larger for a buffer only this one function
-/// uses.
 pub fn widest_chunk(
     rows: usize,
     t: usize,
@@ -123,15 +37,6 @@ pub fn widest_chunk(
 }
 
 /// The widest temporary a stage of `rows` × `hidden` asks for, in elements.
-///
-/// Three candidates, and which one wins depends on the head geometry rather than on
-/// the stage:
-///
-///   * the `q‖k‖v‖o` slab and its delta, `heads·(2·dqk + 2·dhv)` wide — at the usual
-///     `dqk = dhv = hidden/heads` that is `4·hidden`, the widest thing in the model;
-///   * the SwiGLU operands at `up_of(hidden)`;
-///   * `extra`, for a stage with a wider tail than its hidden width — the decoder's
-///     logits at `[rows, vocab]`.
 pub fn widest(rows: usize, hidden: usize, heads: usize, dqk: usize, extra: usize) -> usize {
     let dhv = hidden / heads;
     let qkvo = 2 * heads * dqk + 2 * heads * dhv;
@@ -140,9 +45,6 @@ pub fn widest(rows: usize, hidden: usize, heads: usize, dqk: usize, extra: usize
 }
 
 /// One fixed-size array of equally sized slots, with a bitmask of what is on loan.
-///
-/// Two of these make a [`TempCache`]: the stage-sized array and the small one. Same
-/// code, different `N` and `elems` — see [`SLOTS`] and [`SMALL_SLOTS`].
 struct Slots<const N: usize> {
     /// The allocations. Held for ownership — every access goes through `addr`, so
     /// this field is what keeps the memory mapped and frees it when the model drops.
@@ -153,8 +55,7 @@ struct Slots<const N: usize> {
     addr: [u64; N],
     /// Bit `i` set means slot `i` is out on loan.
     used: Cell<u32>,
-    /// The most slots ever live at once. Diagnostic: this is the number `N` has to
-    /// cover, measured rather than reasoned about.
+    /// The most slots ever live at once: the number `N` has to cover.
     high: Cell<u32>,
     /// `f32` elements per slot.
     elems: usize,
@@ -211,8 +112,6 @@ impl<const N: usize> Slots<N> {
             self.high.set(live);
         }
         if self.poison {
-            // The whole slot, not just `dims`: a temporary presented small must not be
-            // able to read plausible data just past its own shape either.
             let mut whole = GTensor::<f32>::view_at(gpu, self.addr[bit as usize], &[self.elems]);
             super::ops::fill(gpu, &mut whole, 1e30);
         }
@@ -225,11 +124,6 @@ impl<const N: usize> Slots<N> {
 }
 
 /// Scratch slots shared by every stage, every layer and both directions.
-///
-/// Owned by the model and reached through
-/// [`TrainingCache`](super::arena::TrainingCache). Borrowed shared, not mutably: a
-/// caller holds several temporaries while calling further down the stack, which a
-/// `&mut` would forbid, so the busy masks are [`Cell`]s.
 pub struct TempCache {
     /// Stage-sized temporaries — the `[N, ·]` rectangles. See [`SLOTS`].
     big: Slots<SLOTS>,
@@ -241,20 +135,6 @@ pub struct TempCache {
 
 impl TempCache {
     /// Allocate both arrays; `elems` sizes a *stage-sized* slot.
-    ///
-    /// The caller sizes that one, because only it knows the shapes its stages present
-    /// — see [`widest`], and [`Hierarchical`](super::hierarchical::Hierarchical) for
-    /// the three stages it maxes over. Sizing from the config rather than from a
-    /// measured window is what makes the footprint knowable before the first step.
-    /// `small_elems` sizes a small slot — see [`widest_small`].
-    ///
-    /// `GPU_TEMP_POISON=1` fills every slot with a sentinel before handing it out.
-    /// The one hazard a shared slot has that a private buffer does not: a temporary
-    /// that is only *partly* written, whose unwritten part a later op reads. With
-    /// private buffers that read returns the previous window's plausible-looking data
-    /// and the error is small enough to hide inside a tolerance; with a sentinel it
-    /// returns 1e30 and the very next assertion fails. Read once here, not per `get` —
-    /// `std::env::var` takes a process-wide lock.
     pub fn new(gpu: &Gpu, elems: usize, small_elems: usize, chunk_elems: usize) -> Self {
         let poison = std::env::var("GPU_TEMP_POISON").is_ok_and(|v| v != "0");
         Self {
@@ -280,9 +160,6 @@ impl TempCache {
     }
 
     /// The most slots ever live at once, and how many there are: `(big, SLOTS)`.
-    ///
-    /// The first number is what [`SLOTS`] actually had to be. A run whose high water
-    /// sits well under the count is holding memory nothing asks for.
     pub fn high_water(&self) -> (usize, usize) {
         (self.big.high.get() as usize, SLOTS)
     }
@@ -304,20 +181,12 @@ impl TempCache {
 
     /// An uninitialised stage-sized temporary of shape `dims`, held until the guard
     /// is dropped.
-    ///
-    /// Contents are whatever the previous borrower left. Panics if every slot is busy
-    /// (see [`SLOTS`]) or if `dims` exceeds a slot.
     pub fn get<T: DeviceRepr + ValidAsZeroBits>(&self, gpu: &Gpu, dims: &[usize]) -> Temp<'_, T> {
         self.big.get(gpu, dims, "temp")
     }
 
     /// [`get`](Self::get) from the **small** array, for a temporary that is a vector
     /// or a gate strip rather than an `[N, ·]` rectangle.
-    ///
-    /// A stage-sized slot is [`SLOTS`]-scarce and megabytes wide; spending one on a
-    /// `[BH, T]` strip wastes ~250x its size and pushes up the count of the array
-    /// that actually costs memory. Panics past [`SMALL_ELEMS`] — if a temporary grew
-    /// past that it belongs in [`get`](Self::get).
     pub fn get_small<T: DeviceRepr + ValidAsZeroBits>(
         &self,
         gpu: &Gpu,
@@ -376,10 +245,6 @@ impl TempCache {
 }
 
 /// A borrowed scratch slot, presented as a tensor.
-///
-/// Derefs to the tensor, so it is used exactly like an owned one. Releasing is the
-/// drop: a temporary's life is its scope, and there is no `put` to forget. It borrows
-/// only its array's busy mask, so one type serves both arrays.
 pub struct Temp<'a, T> {
     t: GTensor<T>,
     used: &'a Cell<u32>,

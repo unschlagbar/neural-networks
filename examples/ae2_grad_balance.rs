@@ -2,8 +2,6 @@
 //! gradient norm from the boundary loss alone and from the next-word loss alone,
 //! on a few held-out utterances, plus the raw (pre-norm) embedding norm the
 //! output RMSNorm divides by.
-//!
-//!   cargo run --release --features cuda --example ae2_grad_balance -- s4
 
 use std::range::Range;
 

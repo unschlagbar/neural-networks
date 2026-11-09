@@ -1,15 +1,4 @@
 // Sentences for the voice recorder: what the user reads aloud.
-//
-// Every staged record is cut into sentences, each sentence passes the gates
-// below, and what survives is written as `{id, source, text, spoken}`. `text`
-// stays as written, for the text model; `spoken` is what is actually said —
-// lower case, no punctuation, digits and symbols written out — because that is
-// what CTC aligns against. A sentence the normalizer cannot read one way only
-// is dropped rather than guessed: a wrong transcript is worse than a missing
-// prompt.
-//
-// The ids are a hash of the normalized text, so a rebuild keeps every id a
-// recording already points at.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -214,8 +203,6 @@ pub fn sentences(rec: &Record) -> Vec<String> {
 /// capitals to go by, so there every end mark counts. Line breaks always end a
 /// sentence.
 pub fn split(text: &str) -> Vec<String> {
-    // Typographic quotes and dashes have plain forms, and the harness font
-    // draws nothing else.
     let text = text
         .replace(['\u{2019}', '\u{2018}'], "'")
         .replace(['\u{201c}', '\u{201d}'], "\"")
@@ -356,8 +343,6 @@ pub fn spoken(sentence: &str) -> Option<String> {
             out.push(domain);
             continue;
         }
-        // A lone letter other than a word ("a", "i") is a unit or a label:
-        // "4 m" is metres or minutes.
         if core_lower.len() == 1 && !matches!(core_lower.as_str(), "a" | "i") {
             return None;
         }
@@ -634,8 +619,6 @@ fn json_strings(line: &str) -> Vec<String> {
     while let Some(at) = rest.find('"') {
         let body = &rest[at + 1..];
         let Some(value) = crate::json::decode(body) else { break };
-        // Step past the closing quote: the decoded length differs from the raw
-        // one, so find it by scanning the raw text for an unescaped quote.
         let mut escaped = false;
         let mut close = body.len();
         for (i, b) in body.bytes().enumerate() {

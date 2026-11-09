@@ -1,9 +1,4 @@
 //! One model, one window shape, N steps — a clean target for `nsys` and `ncu`.
-//!
-//! `chunk_ab` builds four models in one process, so a trace of it mixes four
-//! configurations' kernels under the same names. Profiling needs exactly one.
-//!
-//! Run: cargo run --release --features cuda --example kern_prof [words] [steps]
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -26,8 +21,6 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(WORDS_PER_SEQ);
     let steps: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(8);
-    // Steps to run before the measured region, so JIT and the allocator's growth are
-    // not counted. `ncu` replays kernels anyway, but `nsys` traces everything.
     let warmup: usize = std::env::var("PROF_WARMUP")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -52,9 +45,6 @@ fn main() {
         "decoder ties the encoder char table"
     );
 
-    // Same length histogram `vram_audit` uses — the one measured off a real `hg` run.
-    // A uniform-length window collapses the encoder/decoder into one length bucket and
-    // profiles a shape training never sees.
     let mut tokens = Vec::with_capacity(words * 6);
     let mut spans: Vec<std::range::Range<usize>> = Vec::with_capacity(words);
     for w in 0..words {

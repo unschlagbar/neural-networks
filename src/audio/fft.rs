@@ -75,8 +75,6 @@ impl Fft {
         self.im[..b.len()].copy_from_slice(b);
         self.im[b.len()..].fill(0.0);
         self.transform();
-        // A_k = (Z_k + conj Z_{n−k}) / 2, B_k = (Z_k − conj Z_{n−k}) / 2i, and the
-        // product A_k·B_k goes back into the buffers.
         let mut prod = vec![(0.0f32, 0.0f32); n];
         for (k, p) in prod.iter_mut().enumerate() {
             let m = (n - k) % n;

@@ -1,13 +1,4 @@
 //! AdamW for the `cpu` layers.
-//!
-//! Each layer owns its per-parameter optimizer state (`m`, `v`) and steps
-//! itself; the model passes a shared `AdamCfg` carrying the hyperparameters and
-//! the global step count `t`. Decoupled weight decay (AdamW): the decay term
-//! acts on the raw parameter, not through the gradient, and is applied only to
-//! `decay = true` params — the project convention is interior projection
-//! matrices decay, while embeddings, logit heads, biases and norm scales do not.
-//!
-//! Gradients are clipped per element to `±cfg.clip` before they enter the moments.
 
 /// Shared optimizer configuration. `t` is the global step count (>= 1 at step
 /// time); the model increments it once per optimizer step.
@@ -67,9 +58,6 @@ impl AdamState {
         let bc2 = 1.0 - b2.powi(cfg.t as i32);
         let wd = if decay { cfg.weight_decay } else { 0.0 };
         for k in 0..n {
-            // Comparisons, not `min`/`max`: those return the other operand on a NaN,
-            // which would turn a NaN gradient into a full-size ±clip step instead of
-            // leaving it visible.
             let g = grad[k];
             let g = if g > cfg.clip {
                 cfg.clip

@@ -1,39 +1,4 @@
 // Resume state for pretraining runs.
-//
-// A checkpoint stores weights and a step count, but the step count alone cannot
-// say where in the corpus a run stopped: it counts optimizer steps across every
-// corpus the weights have ever seen. Deriving a window offset from it
-// (`step % windows`) silently breaks in two ways — a finished epoch resumes into
-// the middle of the corpus instead of starting over, and pointing the trainer at
-// a different corpus reuses an offset that means nothing there.
-//
-// This module stores the missing piece: WHICH corpus the run was walking and how
-// far it got, as a small sidecar file next to the checkpoint.
-//
-// A corpus is a *directory* of shards (what `datamix` writes) or a single file.
-// A run walks the sorted listing one file at a time, and the sidecar records
-// both which file it is on and where inside it, so a stop anywhere resumes
-// exactly there and a finished file is never re-read.
-//
-// Sidecar layout (`<model_path>.pretrainprog`, plain text, one `key value` per line):
-//
-//   version 2
-//   corpus <string>     corpus root the run was pointed at (dir or file)
-//   files_done <usize>  files of the sorted listing already finished
-//   file <string>       the file in progress (empty between files)
-//   windows <usize>     window count of THAT file when it started; 0 means the
-//                       counting pass never ran, so the offset is unvalidated
-//   epoch <usize>       1-based epoch (one epoch = one pass over every file)
-//   done <usize>        windows completed WITHIN the file in progress
-//   step <usize>        trainer step count, cross-checked against the checkpoint
-//
-// The file is written together with every checkpoint save, so the pair stays
-// consistent: the sidecar never describes a position past the saved weights.
-//
-// It is never deleted. A finished run leaves the sidecar behind saying so —
-// that is what lets a run be stopped and restarted freely, and what makes
-// "which shards have I trained on?" answerable after the fact. To start over,
-// delete it by hand or point the run at a different corpus.
 
 use std::{
     fs,
@@ -109,8 +74,6 @@ impl Corpus {
             .flatten()
             .map(|e| e.path())
             .filter(|p| p.is_file())
-            // A corpus folder also holds the build's report and its eval
-            // holdout; neither is training data.
             .filter(|p| {
                 let name = p.file_name().unwrap_or_default().to_string_lossy();
                 !name.ends_with(".md") && !name.ends_with(".eval")
@@ -253,10 +216,6 @@ pub fn resume_or_fresh(
     };
 
     let Some(p) = load(model_path) else {
-        // No sidecar: either a genuinely new run, or a checkpoint written before
-        // progress files existed. Both start at the beginning of this corpus —
-        // the alternative (guessing an offset from the step count) is what this
-        // module exists to remove.
         return fresh((step > 0).then(|| {
             format!(
                 "no progress file next to '{model_path}' — starting at the beginning of \
@@ -299,9 +258,6 @@ pub fn resume_or_fresh(
             corpus.len()
         )));
     }
-    // The listing may have grown (new shards dropped into the folder) or been
-    // rebuilt. The recorded name is what says whether `files_done` still points
-    // at the same place.
     let at = p.files_done;
     if at < corpus.len() && !p.file.is_empty() && p.file != corpus.name_of(at) {
         return fresh(Some(format!(

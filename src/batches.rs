@@ -25,27 +25,6 @@ const PARQUET_TEXT_COLUMN: &str = "text";
 //const SPLIT: &str = "---FILE---";
 
 // ── Word-grouped dataset (hierarchical + flat word training) ────────────────
-//
-// Instead of fixed-token windows, group the corpus into words and emit
-// fixed-size *K-word* sequences. Every sample then unrolls the backbone for
-// the same number of word steps. Token counts still vary per window, so a window
-// is closed early if it would exceed `max_tokens` (the token-cache cap).
-//
-// A chunk's documents are *packed*: they are concatenated, each closed by an
-// `<END>` token, and the windows are cut from that one stream. A window therefore
-// holds K words whatever the documents in it are long, instead of ending wherever
-// the document did — which is what makes every window the same shape and gives
-// every word the same weight in the loss. Where a document starts inside a window
-// is reported as `WordBatch::doc_starts`, and the trainer resets the backbone
-// there so nothing is autoregressed across the border.
-//
-// The corpus is streamed in chunks (`ChunkedWordDataSet`) instead of being
-// loaded and tokenized whole: each chunk covers only complete documents (split
-// on `SPLIT`), the trailing partial document is carried into the next chunk.
-// Peak memory is bounded by the chunk size, not the corpus size (> 1 GB corpora
-// stream fine). Packing makes the cut points part of the windowing, so which
-// documents share a window depends on `chunk_bytes` — a given chunk size is
-// reproducible, a different one is not.
 
 #[derive(Clone, Copy, Debug)]
 struct WordWindow {
@@ -53,8 +32,7 @@ struct WordWindow {
     word_count: u32,
 }
 
-/// One streamed chunk of the corpus, fully tokenized and windowed. Everything
-/// that used to live on the whole-file `WordDataSet` lives here per chunk.
+/// One streamed chunk of the corpus, fully tokenized and windowed.
 pub struct WordChunk {
     /// This chunk's documents, tokenized and concatenated in file order, each
     /// closed by `<END>`. Windows hold offsets into it.
@@ -192,9 +170,6 @@ impl ChunkedWordDataSet {
             let column = std::env::var("PARQUET_TEXT_COLUMN")
                 .unwrap_or_else(|_| PARQUET_TEXT_COLUMN.to_string());
 
-            // Read the language column alongside the text when filtering is on.
-            // A corpus without that column is not an error — it just means there
-            // is nothing to filter on, so fall back to reading the text alone.
             let (reader, filter_language) = if ALLOWED_LANGUAGES.is_empty() {
                 (None, false)
             } else {
@@ -314,10 +289,6 @@ impl ChunkedWordDataSet {
 
     /// Tokenize one raw document and close it with `<END>`. `None` for anything
     /// too short to yield a decoded word.
-    ///
-    /// `<END>` is a real target: the model is trained to emit it, which is what makes
-    /// "this document is over" something it can predict rather than something only the
-    /// loader knows. It is also the marker the trainer resets the backbone after.
     fn tokenize_document(&self, doc: &str) -> Option<Vec<u16>> {
         let doc = doc.trim();
         if doc.is_empty() {
@@ -342,8 +313,6 @@ impl ChunkedWordDataSet {
 
         let mut buf = mem::take(carry);
 
-        // Fill: normally one chunk-sized read. Keep growing only when a
-        // single document is larger than the chunk (no separator yet).
         let mut last_split = None;
         while !*eof {
             let want = if buf.len() < chunk_bytes {
@@ -364,9 +333,6 @@ impl ChunkedWordDataSet {
             }
         }
 
-        // Cut right after the last separator; the tail is carried into the
-        // next chunk. The separator is ASCII, so the cut always lands on a
-        // UTF-8 boundary. At EOF the whole rest is the final chunk.
         let cut = if *eof {
             buf.len()
         } else {
@@ -389,10 +355,6 @@ impl ChunkedWordDataSet {
     /// text has accumulated. Each row is already one complete document, so
     /// there is no separator to find and nothing to carry across chunks. `None`
     /// once the last row group has been consumed.
-    ///
-    /// When language filtering is on, the language column decodes alongside the
-    /// text and rows whose code is not in `ALLOWED_LANGUAGES` are dropped here —
-    /// before tokenizing, which is the expensive part.
     fn next_parquet_sequences(&mut self) -> Option<Vec<Vec<u16>>> {
         let chunk_bytes = self.chunk_bytes;
         let mut sequences: Vec<Vec<u16>> = Vec::new();
@@ -417,16 +379,11 @@ impl ChunkedWordDataSet {
                 break;
             };
 
-            // Columns come back in the order requested: text first, language
-            // second when we asked for it.
             let languages = if filter_language { group.pop() } else { None };
             let texts = group.swap_remove(0);
 
             for (i, raw) in texts.into_iter().enumerate() {
                 if let Some(langs) = &languages {
-                    // A row whose language is missing or not allowed is skipped.
-                    // Missing means the columns fell out of alignment (a null),
-                    // in which case dropping is the safe choice.
                     let keep = langs
                         .get(i)
                         .map(|l| ALLOWED_LANGUAGES.iter().any(|a| a.as_bytes() == &l[..]))
@@ -437,8 +394,6 @@ impl ChunkedWordDataSet {
                 }
 
                 bytes += raw.len();
-                // A corpus row that is not valid UTF-8 is a broken document,
-                // not a broken file — drop it and keep streaming.
                 let Ok(doc) = String::from_utf8(raw) else {
                     continue;
                 };
@@ -536,8 +491,6 @@ mod tests {
         assert_eq!(chunk.num_docs(), 3);
 
         let batch = chunk.iter().next().expect("one window");
-        // Three documents, and the window's last word closes the third — so the
-        // document after it is reported as a start one past the end.
         assert_eq!(batch.doc_starts.len(), 4);
         assert_eq!(batch.doc_starts[0], 0);
         assert_eq!(*batch.doc_starts.last().unwrap(), batch.words.len());
@@ -557,10 +510,6 @@ pub struct WordBatch<'a> {
     /// Indices into `words` where a document begins, ascending. The backbone must
     /// start from zero state at each of them, and neither that word nor the `<END>`
     /// before it is a target the loss counts.
-    ///
-    /// `words.len()` itself appears when the window's last word closes a document:
-    /// the document starting there has no word *in* this window, but its `<END>` is
-    /// scored here and must be masked.
     pub doc_starts: Vec<usize>,
     /// This window resumes the stream the previous one ended in, at the very word it
     /// stopped at — so a stateful trainer may carry the backbone state into it instead
@@ -602,8 +551,6 @@ impl<'a> Iterator for WordIter<'a> {
         let lo = all.partition_point(|&d| (d as usize) < first);
         let hi = all.partition_point(|&d| (d as usize) <= first + count);
         let doc_starts = all[lo..hi].iter().map(|&d| d as usize - first).collect();
-        // Windows tile the stream contiguously in emission order, so a non-zero
-        // start is exactly a continuation of the window before it.
         let continues = !self.ds.shuffled && first != 0;
         Some(WordBatch {
             tokens,
@@ -625,14 +572,6 @@ impl ExactSizeIterator for WordIter<'_> {}
 /// a window's token span exceed `max_tokens` (the first word of a window is always
 /// included even if it alone is longer). The trailing window is kept only if it
 /// gathered at least `min_words` words.
-///
-/// Consecutive windows overlap by **one word**. A window's last word is a decode
-/// target only — the backbone stops one short of it, since nothing after it is
-/// predicted here — so windows that tiled edge to edge would leave the prediction
-/// across every border untrained and the backbone one word short of the next
-/// window's first. Repeating that word makes the windows a partition of the stream's
-/// backbone steps and of its predictions, which is what lets a trainer carry the
-/// recurrent state from one into the next (`WordBatch::continues`).
 fn build_word_windows(
     ends: &[u32],
     words_per_seq: usize,
@@ -661,10 +600,6 @@ fn build_word_windows(
                 word_count: count as u32,
             });
         }
-        // Overlap by one: the word this window ends on is the next one's first
-        // backbone step. `max(1)` because a window can be a single word when that
-        // word alone exceeds `max_tokens`, and stepping by zero would not
-        // terminate.
         wi += (count - 1).max(1);
     }
     (out, max_span)

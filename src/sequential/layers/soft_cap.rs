@@ -1,12 +1,4 @@
-// Logit soft-capping (xLSTM-7B / Gemma-2 style):
-//
-//   y = cap · tanh(x / cap)
-//
-// A weightless squashing layer placed after a logit head. Logits are bounded
-// to (−cap, cap), so the cross-entropy incentive to grow the head weights
-// without limit dies off as logits approach the cap (the tanh derivative
-// vanishes there). Backward is the exact derivative — no gradient clipping
-// or signal suppression involved.
+// Logit soft-capping (xLSTM-7B / Gemma-2 style): `cap · tanh(z / cap)`.
 
 use std::{any::Any, io};
 

@@ -1,8 +1,5 @@
 // Eager fused-gate sLSTM: one launch per timestep, gate pre-activation assembled
 // in-kernel from the input half, the recurrent half and the bias.
-//
-// Writes the same slabs as slstm_coop.cu, so both must be built at the same
-// `slab_t` width.
 
 // Fused-gate forward step. Same recurrence as slstm_cell_step, but a gate
 // pre-activation is assembled here from three pieces instead of arriving as one
@@ -10,44 +7,11 @@
 // timestep), the recurrent half `gh` (a [B, 4H] scratch holding h_{t-1}·Wh for
 // this timestep) and the bias. The saved tensors are [B, T, H] slabs indexed by
 // (b·T + t)·H + j rather than one small tensor per timestep.
-//
-// Keeping the recurrent half in its own *contiguous* [B, 4H] scratch is what lets
-// its GEMM stay one dense matmul at any batch size — accumulating straight into
-// g's strided [:, t, :] rows would force a batched GEMM of one-row matrices, which
-// is fine at batch 1 (the backbone) and disastrous at batch 2047 (the encoder).
-//
-// `g`'s forget block is overwritten in place with the *biased* forget
-// pre-activation: backward needs it, and the slot is dead once this step is done.
-// `h_prev` records h_{t-1} for the deferred dWh GEMM.
-// Recurrent gate half for ONE timestep: gh[b, c] = sum_r h[b, r] * Wh[r, c].
-//
-// This replaces a cuBLAS call inside the sLSTM's per-step loop, and the reason is
-// host overhead rather than device throughput. Measured at the backbone's shape
-// (B=1, H=1024, so M=1 x K=1024 x N=4096): the matvec itself is ~5.6 us of GPU work,
-// but the cuBLAS call costs **41 us per invocation** back-to-back, while a bare
-// kernel launch is 1.7 us. Across T=1024 timesteps that overhead IS the T-loop.
-//
-// The kernel is bandwidth-bound: arithmetic intensity is 2*H*4H / (H*4H*4) = 0.5
-// FLOP/byte, so every byte of Wh read is the cost. Two things follow, and getting
-// either wrong loses more than the cuBLAS overhead saved (both were measured):
-//
-//   * `h` goes in SHARED MEMORY, staged once per block. It is the operand reused by
-//     every column, so leaving it in global costs an extra H-length read per column.
-//   * the Wh read must COALESCE. Lanes hold consecutive columns `c` and walk rows
-//     together, so `wh[r*H4 + c]` at fixed r is one contiguous 128-byte transaction
-//     per warp. A warp-per-column arrangement (each lane striding `r`) reads the same
-//     bytes with a stride of H4 and measured 79.9 ms against cuBLAS's 44.5 ms.
-//
-// Wh itself cannot be staged: it is [H, 4H] = 16 MB at this width. Only `h` fits,
-// which is why this is a shared-memory *broadcast* rather than a tiled GEMM.
 extern "C" __global__ void slstm_gate_matvec(
         const float* __restrict__ h_state, const float* __restrict__ wh,
         float* __restrict__ gh, int H, int B, int cols_per_thread) {
     extern __shared__ float sh[];   // [H] — this block's copy of h for batch `b`
     int H4 = 4 * H;
-    // One block serves a contiguous run of columns from ONE batch element, so a
-    // single staged `h` row serves the whole block. Each thread takes
-    // `cols_per_thread` columns, strided by blockDim so the warp stays coalesced.
     int cols_per_block = blockDim.x * cols_per_thread;
     long long first = (long long)blockIdx.x * cols_per_block;
     long long total = (long long)B * H4;
@@ -56,8 +20,6 @@ extern "C" __global__ void slstm_gate_matvec(
     for (int r = threadIdx.x; r < H; r += blockDim.x) sh[r] = h_state[(long long)b * H + r];
     __syncthreads();
 
-    // Accumulate `cols_per_thread` columns at once: `h[r]` is read from shared ONCE
-    // per row and reused across them, so the inner loop is pure coalesced Wh traffic.
     for (int u = 0; u < cols_per_thread; ++u) {
         long long i = first + (long long)u * blockDim.x + threadIdx.x;
         if (i >= total) return;
@@ -70,10 +32,6 @@ extern "C" __global__ void slstm_gate_matvec(
 }
 
 // Backward twin: dh[b, r] = sum_c dg[b, c] * Wh[r, c]  (i.e. dg · Whᵀ).
-//
-// Same reasoning as `slstm_gate_matvec` — M=1, so cuBLAS's per-call cost dwarfs the
-// work. One warp per output ROW here, reducing over the 4H gate columns; that walk
-// is contiguous in `wh`, so these reads coalesce better than the forward's do.
 extern "C" __global__ void slstm_gate_matvec_t(
         const float* __restrict__ dg, const float* __restrict__ wh,
         float* __restrict__ dh, int H, int B) {
@@ -106,10 +64,6 @@ extern "C" __global__ void slstm_step_fused(
     long long s = (long long)(b * T + t) * H + j;
     int ho = b * 4 * H + j; // gh row for this batch element
 
-    // `first` is the start of a sequence that carries nothing in: h_{-1} is zero, so
-    // `gh = h_{-1}·Wh` is zero and the whole carried state is zero. Substituting the
-    // zeros here is what lets the host skip both that GEMM and the state's memset —
-    // exactly equivalent, since the values it would have read are these.
     float hp = first ? 0.0f : h_state[k];
     float mp = first ? 0.0f : m_state[k];
     float np = first ? 0.0f : n_state[k];
@@ -127,24 +81,12 @@ extern "C" __global__ void slstm_step_fused(
     float o = stable_sigmoid(o_pre);
     float log_f = log_sigmoid(f_pre);
     float fm = log_f + mp;
-    // See `slstm_cell_step`: n == 0 is the first step of a sequence, where m must be
-    // ĩ so that i' is exactly 1 and h = c/n cannot become 0/0.
     float m = (np == 0.0f) ? i_pre : fmaxf(fm, i_pre);
-    // Both gates are <= 1 by construction (m >= i_pre and m >= fm), so the clamp
-    // is a no-op in exact arithmetic; it only catches a rounded exp() landing a
-    // hair above 1. In the n == 0 branch fp is unbounded, but it multiplies
-    // np == 0 here and its BPTT carry is discarded at a sequence start, so
-    // clamping it there is equally invisible. NOTE: `n` itself must NOT be
-    // clamped -- it is the stabilized normalizer and exp(-m) cancels in c/n.
     float ip = fminf(1.0f, expf(i_pre - m));
     float fp = fminf(1.0f, expf(fm - m));
     float c = fp * cp + ip * z;
     float n = fp * np + ip;
 
-    // The cell and normalizer entering the sweep. Backward wants c_{t-1} at every
-    // step, but for t > 0 that is `c_out` one timestep back — the same buffer at
-    // `s - H`. Only t = 0 has no predecessor in it, so only t = 0 is stored, as
-    // [B, H] rather than a second [B, T, H] history.
     if (t == 0) {
         state_st(c_entry, k, cp);
         state_st(n_entry, k, np);
@@ -157,8 +99,6 @@ extern "C" __global__ void slstm_step_fused(
     // h = o·c/n — the exp(−m) in c and n cancels. See `slstm_cell_step`.
     float hh = o * c / n;
     h_state[k] = hh;
-    // The narrowed twin the next step's `h·Wh` GEMM reads. Writing it here is what
-    // keeps that GEMM's operand bf16 without a cast launch inside the loop.
     slab_st(h_narrow, k, hh);
     out[s] = hh;
 }
@@ -167,29 +107,6 @@ extern "C" __global__ void slstm_step_fused(
 // (whose forward contents are dead by now), so one buffer carries the gate
 // pre-activations forward and the gate deltas backward. Reads the biased forget
 // pre-activation out of g's forget block before overwriting it.
-//
-// The deltas are also written to the contiguous [B, 4H] scratch `dgh`, the mirror
-// of the forward's `gh`: this timestep's dh = dgh·Whᵀ is the one thing BPTT cannot
-// defer, and going through the scratch keeps that a dense GEMM at any batch size.
-// Parameters (all device pointers; one thread per (batch, hidden-unit) pair):
-//
-//   d_out        [B, T, H]   in   incoming grad of this layer's output h_t
-//   gates        [B, T, 4H]  both in: biased forget pre-activation (block 2);
-//                                 out: the four gate deltas (z, i, f, o)
-//   d_gates_flat [B, 4H]     out  this step's gate deltas, contiguous, for the
-//                                 dh = d_gates·Whᵀ GEMM (mirror of forward `gh`)
-//   d_h_recur    [B, H]      in   grad arriving from step t+1 through h
-//   o_act        [B, T, H]   in   saved sigmoid(o_pre)
-//   c_t, n_t     [B, T, H]   in   saved cell / normalizer AFTER this step
-//   c_entry,n_entry [B, H]   in   cell / normalizer entering the sweep, i.e. the
-//                                 t = 0 predecessor; every later t reads c_t/n_t
-//                                 one timestep back
-//   z_act        [B, T, H]   in   saved tanh(z_pre)
-//   i_gate,f_gate[B, T, H]   in   saved stabilized exp() gate values i', f'
-//   d_c_recur    [B, H]      both cell grad carried backward across steps
-//   d_n_recur    [B, H]      both normalizer grad carried backward across steps
-//   t, T, H, BH              in   current step, sequence length, width, B*H
-//   reset                    in   step t starts a document (its forward ran as `first`)
 extern "C" __global__ void slstm_step_fused_bwd(
         const float* d_out, float* gates, slab_t* d_gates_flat, const float* d_h_recur,
         const slab_t* o_act, const state_t* c_t, const state_t* n_t,
@@ -216,19 +133,12 @@ extern "C" __global__ void slstm_step_fused_bwd(
     float f = state_ld(f_gate, s);
     float i = state_ld(i_gate, s);
     float z = slab_ld(z_act, s);
-    // Grads w.r.t. the stabilized gate values i', f', before their exp/sigmoid.
-    // c_{t-1}, n_{t-1}: the same history one timestep back, except at the sweep's
-    // first step, whose predecessor is the carried-in state.
-    // A `reset` row (a document start) ran from zero state, so its predecessor is zero
-    // and nothing is carried past it.
     float c_pr = reset ? 0.0f : (t == 0) ? state_ld(c_entry, k) : state_ld(c_t, s - H);
     float n_pr = reset ? 0.0f : (t == 0) ? state_ld(n_entry, k) : state_ld(n_t, s - H);
     float d_f_gate = d_c * c_pr + d_n * n_pr;
     float d_i_gate = d_c * z + d_n;
     float d_z_act = d_c * i;
 
-    // Through the activations: tanh' = 1−z², exp' = the gate itself,
-    // and f' = exp(log σ(f_pre) + …) contributes σ'(f_pre)/σ(f_pre) = 1−σ(f_pre).
     float d_z_pre = d_z_act * (1.0f - z * z);
     float d_i_pre = d_i_gate * i;
     float d_f_pre = d_f_gate * f * (1.0f - stable_sigmoid(f_pre));

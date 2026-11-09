@@ -139,22 +139,6 @@ impl Sequential {
     }
 
     /// Layer-major BPTT driver shared by every backward variant.
-    ///
-    /// Fully unwinds one layer across all `n_steps` timesteps before descending
-    /// to the layer below, instead of hopping through all layers at each
-    /// timestep. This keeps a single layer's weights hot for the whole sequence
-    /// and is bit-identical to a time-major order, because the two gradient
-    /// channels are decoupled:
-    ///   • spatial — each layer persists dL/d(input) per timestep in its own
-    ///     cache (`input_grad()`), so the layer below reads it for every t once
-    ///     the layer above has finished.
-    ///   • temporal — each layer folds its own dh/dc BPTT channels in at the top
-    ///     of `backward` and only zeroes them at `reset_bptt_state`, so the inner
-    ///     reverse-t loop carries the recurrence correctly.
-    ///
-    /// The only thing that differs between loss heads is the gradient entering
-    /// the top layer, supplied by `top_delta(t, logits, delta_buf) -> len`: it
-    /// writes the seed delta into `delta_buf` and returns its length.
     fn backwards_driver(
         &mut self,
         n_steps: usize,
@@ -163,9 +147,6 @@ impl Sequential {
         let n = self.layers.len();
         let last = n - 1;
 
-        // Destructure so we can mutably borrow delta_buf independently of
-        // layers and cache. This is the key trick that avoids to_vec():
-        // all three fields are disjoint, the borrow checker accepts it.
         let Sequential {
             layers,
             cache,
@@ -262,10 +243,6 @@ impl Sequential {
 
     /// Backward for per-step weighted BCE on a single-logit head:
     /// `delta[t] = weights[t] · (σ(z_t) − labels[t])`.
-    ///
-    /// A weight of zero removes the loss at that step while BPTT still flows
-    /// through it, so the caller owns the loss policy — max-pooling a positive
-    /// window, hard-negative mining, class balancing — by shaping `weights`.
     pub fn backwards_bce(&mut self, labels: &[f32], weights: &[f32]) {
         assert_eq!(labels.len(), weights.len(), "backwards_bce: one weight per label");
         self.backwards_driver(labels.len(), |t, logits, delta_buf| {
@@ -277,8 +254,6 @@ impl Sequential {
     /// Optimizer step for every layer. `weight_decay` is the decoupled decay
     /// (λ); `0.0` is plain Adam.
     pub fn step(&mut self, lr: f32, weight_decay: f32) {
-        // Layer updates are independent, so they run layer-parallel; clearing
-        // folds into the same task while the buffers are hot.
         self.layers.par_iter_mut().for_each(|layer| {
             layer.apply_grads(lr, weight_decay);
             layer.clear_grads();

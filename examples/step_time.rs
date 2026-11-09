@@ -1,9 +1,4 @@
 //! Uninstrumented step time for a real window — the A/B instrument.
-//!
-//! `phase_table` syncs around every span, which inflates small kernels; this only
-//! syncs once per measured block. Prints the median of per-step times so one thermal
-//! excursion cannot move the answer, plus the SM clock, which varies enough on this
-//! box to swamp a small win.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {

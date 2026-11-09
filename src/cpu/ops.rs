@@ -1,21 +1,4 @@
 //! Backend op seam for the `cpu` layers.
-//!
-//! Every non-GEMM piece of elementwise / reduction / gather math that a layer
-//! used to write as an inline `.data[i]` loop lives here instead, as a named
-//! free function operating on `Tensor`s (never on raw host `&[f32]` — a `Tensor`
-//! will later be able to carry a *device* buffer, and the whole point of this
-//! seam is that no layer touches `.data` for math directly). Each function here
-//! maps one-to-one onto a future CUDA kernel: to add the GPU backend you
-//! implement these bodies against device buffers, one kernel at a time, and the
-//! layer code above them does not change.
-//!
-//! GEMM (`tensor::gemm`), the fused softmax/cross-entropy (`cpu::loss`) and the
-//! AdamW update (`cpu::optim`) are already single-choke-point free functions, so
-//! they are already "kernels" in this sense and are not duplicated here.
-//!
-//! The CPU implementations below are behaviour-preserving copies of the loops
-//! they replaced — same arithmetic, same order — so the layers' finite-
-//! difference tests keep passing unchanged.
 
 use crate::tensor::Tensor;
 
@@ -104,9 +87,6 @@ pub struct RmsForward {
 
 /// Grouped RMSNorm forward. Each row of `x` (`[B, F]`) is split into
 /// `F / group` contiguous groups of size `group`; RMS is computed per group.
-/// Plain RMSNorm is the `group == F` case; head-wise RMSNorm uses `group = dhv`
-/// (the per-head width). `gamma` is a per-column (`[F]`) learnable scale applied
-/// after normalization. Kernel: per-(row, group) reduction + scale.
 pub fn rms_norm_forward(x: &Tensor, gamma: &Tensor, group: usize, eps: f32) -> RmsForward {
     let (b, f) = (x.rows(), x.cols());
     debug_assert_eq!(f % group, 0, "rms group {group} does not divide width {f}");
@@ -141,11 +121,6 @@ pub fn rms_norm_forward(x: &Tensor, gamma: &Tensor, group: usize, eps: f32) -> R
 
 /// Grouped RMSNorm backward. Accumulates the γ gradient into `dgamma` and
 /// returns `dX` `[B, F]`. Uses the `x_hat` / `inv_rms` saved by the forward.
-///
-/// Per group:  S    = Σⱼ γⱼ · dYⱼ · x̂ⱼ
-///             dXᵢ  = inv_rms · ( γᵢ·dYᵢ − x̂ᵢ · S / group )
-/// Kernel: per-(row, group) reduction; `dgamma` accumulate is an atomicAdd on
-/// GPU (or a batched reduction).
 pub fn rms_norm_backward(
     dy: &Tensor,
     x_hat: &Tensor,

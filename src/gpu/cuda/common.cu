@@ -12,11 +12,6 @@ extern "C" __global__ void softcap_backward(const float* dy, const float* y, flo
 }
 
 // Copy bias[n] into every row of out[rows, n].
-//
-// Grid-stride over rows with the column from `threadIdx.x`, rather than one flat index
-// and `bias[i % n]`: the modulo was an integer division per element, and this shape is
-// pure bandwidth (every projection seeds its output here before the GEMM accumulates
-// on top). Threads of a warp still hold adjacent columns, so stores stay coalesced.
 extern "C" __global__ void broadcast_row(float* out, const float* bias, int rows, int n) {
     for (int r = blockIdx.x; r < rows; r += gridDim.x) {
         const float* b = bias;
@@ -26,12 +21,6 @@ extern "C" __global__ void broadcast_row(float* out, const float* bias, int rows
 }
 
 // out[r, c] = resid[r, c] + bias[c] — `broadcast_row` with a residual folded in.
-//
-// A projection that feeds a residual seeds its output here instead, so the trailing
-// `y = resid + proj(x)` add costs no kernel of its own: the GEMM then accumulates on
-// top at beta = 1 exactly as before. The add it replaces was a separate [N, H] pass
-// running at ~92 GB/s of a ~900 GB/s card, i.e. launch-bound rather than
-// bandwidth-bound, so what this saves is the launch, not the traffic.
 extern "C" __global__ void broadcast_row_resid(
         float* out, const float* resid, const float* bias, int rows, int n) {
     for (int r = blockIdx.x; r < rows; r += gridDim.x) {
@@ -45,28 +34,6 @@ extern "C" __global__ void broadcast_row_resid(
 // `use_mul` (`dgamma` for RMSNorm, which is the same reduction over an elementwise
 // product). `mul` is a live pointer either way — the caller passes `dy` again when it
 // has no second operand, which costs nothing and keeps the argument non-null.
-//
-// The row axis is split across `threadIdx.y` and folded by a fixed-order tree — NOT
-// by an atomicAdd across blocks. Float addition is not associative, so an atomic made
-// the last bits of every bias gradient depend on the order the blocks happened to be
-// scheduled in; one training step later that is a different model. Here ONE block
-// owns a column tile and every row of it, so the summation order is a property of the
-// shape alone and two runs of the same shape agree bit for bit.
-//
-// A thread still owns one column and a slice of the rows, so the parallelism the
-// atomic bought is kept: it moved from `blockIdx.y` into `threadIdx.y`. Threads of a
-// warp hold adjacent `o`, so each row read stays coalesced.
-//
-// `db` is an accumulator (`+=`) across calls; the caller zeroes it between steps.
-//
-// `div` scales each column by `1/div[o]` after the reduction, under `use_div`. It
-// serves RMSNorm's `dγ` when `x̂` is rebuilt from the norm's output: there
-// `x̂ = y/γ` and γ does not depend on the row, so `Σ_r dy·x̂ = (Σ_r dy·y)/γ` and the
-// divide comes out of the inner loop entirely.
-// `mul` is templated on its storage width for the same reason the RMSNorm pair below
-// is: the only tensor ever passed there is that norm's own output, and once the norm
-// writes it narrow this has to read it narrow. `csm_ld` widens on load, so the
-// reduction stays fp32 and stays bit-reproducible.
 __device__ __forceinline__ float csm_ld(const float* p, long i) { return p[i]; }
 #ifdef SLAB_BF16
 __device__ __forceinline__ float csm_ld(const slab_t* p, long i) { return slab_ld(p, i); }
@@ -119,21 +86,6 @@ extern "C" __global__ void add_col_sum_dy_slab(float* db, const slab_t* dy, cons
 
 // `add_col_sum` with the row axis cut into `bands` of `band` rows, one band per
 // `blockIdx.y`, each writing its own `part[band, n]` row.
-//
-// The single-block form above owns a column tile and EVERY row of it, so its grid is
-// `ceil(n / 32)` blocks — 8 blocks at `[2045, 256]`, one at `[rows, 16]`. That reads
-// at a tenth of the machine's bandwidth: the work is there, the parallelism is not.
-// Banding puts the row axis back into the grid.
-//
-// Still not an atomicAdd on the data: `band` is a function of the shape alone, so
-// which rows a band holds, the tree inside it, and the order the bands are folded in
-// are all fixed by the shape, and two runs of it agree bit for bit.
-//
-// The fold happens in the same launch: each block writes its band, then takes a
-// ticket for its column tile, and whichever block draws the last ticket folds all
-// bands of that tile in ascending order (the threadFenceReduction pattern). Which
-// block that is depends on scheduling; what it computes does not. The last block
-// also returns the ticket to 0, so `tickets` is all-zero between launches.
 template <typename DT, typename MT>
 __device__ __forceinline__ void col_sum_part_impl(float* db, float* part, const DT* dy,
                                         const MT* mul, int use_mul, const float* div,
@@ -208,13 +160,6 @@ extern "C" __global__ void embedding_gather(const float* table, const unsigned* 
 // atomicAdd per element is the obvious answer and is not reproducible: a token that
 // occurs 3000 times in a window has its 3000 contributions summed in whatever order
 // the blocks were scheduled in, and float addition does not associate.
-//
-// Instead the row axis is cut into `slices`, and one thread owns one (slice, column)
-// for the whole slice: it walks its rows in ASCENDING order into its slice's private
-// table, so no two threads ever touch the same slot. `embedding_scatter_merge` then
-// folds the slices in slice order. Both orders are properties of the shape.
-//
-// With one slice the "private table" is `dtable` itself and no merge is needed.
 extern "C" __global__ void embedding_scatter_add(float* part, const unsigned* ids,
                                                  const float* dy, int dim, int rows,
                                                  int vocab, int slices) {
@@ -240,23 +185,6 @@ extern "C" __global__ void embedding_scatter_merge(float* dtable, const float* p
 
 
 // Grouped RMSNorm backward. dgamma is shared across rows -> atomicAdd.
-// Block-per-group RMSNorm. One CUDA BLOCK owns one (row, group) and reduces over
-// the group cooperatively, instead of one thread walking it serially.
-//
-// The thread-per-group kernels below are correct but pathologically parallel-poor at
-// the shape this model actually runs: a block's norms are ungrouped, so
-// `group == hidden == 1024` and `total_groups == rows`. At T=1024 that launched
-// 1024 threads for the whole kernel — on an 84-SM card — with each thread doing a
-// 1024-element serial pass, twice. Measured, the three norms plus the residual adds
-// ("block glue") came to 44.7% of a training step, MORE than every recurrent cell
-// combined. This is that fix.
-//
-// One block per group turns the group loop into a strided read plus a tree
-// reduction: 256 threads each handle group/256 elements, a warp shuffle folds each
-// warp, and one shared slot per warp finishes it. The launch goes from
-// `total_groups` threads to `total_groups` BLOCKS.
-//
-// Grid: total_groups blocks. Block: RMSN_THREADS threads. Shared: one float per warp.
 #define RMSN_THREADS 256
 
 __device__ __forceinline__ float rmsn_block_sum(float v, float* sh) {
@@ -293,15 +221,6 @@ __device__ __forceinline__ void rmsn_st(slab_t* p, long long i, float v) { slab_
 // Saves `inv_rms` and nothing else. `x̂` is NOT written out: it is `[N, F]`, and
 // `rms_norm_backward` recovers it from this kernel's own output as `y/γ`. That is what
 // Apex's `memory_efficient` path does, and what Liger does from the input side.
-//
-// `OT` is the output's storage width. The narrow instantiation exists because the
-// consumer of a block's norm output is a GEMM that reads bf16 anyway: writing it
-// narrow here saves half the store, and saves the separate cast pass that would
-// otherwise read the fp32 result back out of HBM to produce the same bits.
-//
-// `x2`, when not null, is a residual branch: the norm runs over `z = x + x2`, and `z`
-// is written to `z_out` for the caller's next residual. Each thread writes only the
-// elements it reads, so `z_out` may alias `x`.
 template <typename OT>
 __device__ __forceinline__ void rms_norm_fwd_impl(const float* x, const float* x2,
                                                 float* z_out, const float* gamma, OT* out,
@@ -357,15 +276,6 @@ extern "C" __global__ void rms_norm_forward_slab(const float* x, const float* x2
 // block of this grid would have to contribute to; that is `add_col_sum`'s reduction,
 // and doing it here needed an atomicAdd per element, which is not reproducible. The
 // caller runs `add_col_sum` instead.
-//
-// `y` is the forward's own output, from which `x̂ = y/γ` — the forward keeps no `x̂`.
-// γ is undecayed and starts at 1, so the divisor stays well away from zero; that is
-// the standing caveat on this form in Apex too.
-// `YT` is the forward output's storage width, which is whatever the forward wrote.
-// `dy` and `dx` stay fp32: `dx` continues into the residual chain, which is the one
-// place the model cannot afford a narrowed accumulation.
-// `resid`, when not null, is added to `dx`: the gradient of the residual branch that
-// bypasses this norm, so a block's pre-norm needs no separate add.
 template <typename YT>
 __device__ __forceinline__ void rms_norm_bwd_impl(const float* dy, const YT* y,
                                                  const float* inv_rms, const float* gamma,
@@ -445,9 +355,6 @@ __device__ __forceinline__ float clip_grad(float g, float clip) {
 // AdamW over one tensor, with `wd` fixed for all of it: what a layer used on its own
 // and the parity tests step through, and the fp32 reference the arena's quantized step
 // is measured against.
-//
-// `clip` bounds every gradient element to [-clip, clip] before it enters the moments,
-// matching `cpu::optim`; a non-finite `clip` disables it.
 extern "C" __global__ void adamw(float* param, const float* grad, float* m, float* v,
                                  float lr, float b1, float b2, float eps, float wd,
                                  float bc1, float bc2, float clip, int n) {
@@ -495,19 +402,6 @@ extern "C" __global__ void grad_clip_scale(const float* part, int count, float m
 }
 
 // 8-bit AdamW moments: blockwise dynamic quantization (Dettmers et al., arXiv 2110.02861).
-//
-// `m` and `v` are stored as one byte per parameter — an index into a 256-entry map of
-// normalized magnitudes — times one fp32 scale per ADAM_QBLOCK elements, that range's
-// absmax. Only the state carried BETWEEN steps is quantized: the update below is
-// computed from the freshly recomputed fp32 moments, so a step is exactly as accurate
-// as the state it starts from.
-//
-// The map is non-uniform, fine near the range absmax and coarse seven decades below
-// it, because the error that matters is relative: `v` enters as 1/sqrt(v), where an
-// element flushed to zero would produce an unbounded update. See `arena::dynamic_map`.
-//
-// One CUDA block per quantization range: re-quantizing needs the range's NEW absmax,
-// so the updated moments have to stay in registers across a block-wide reduction.
 #define ADAM_QBLOCK 2048
 #define ADAM_QTHREADS 256
 #define ADAM_QPT (ADAM_QBLOCK / ADAM_QTHREADS)
@@ -586,22 +480,6 @@ extern "C" __global__ void quantize_blockwise(const float* x, unsigned char* q, 
 // non-negative by construction and so spends no code on a sign. A scale of zero (the
 // initial state, and any range that is still all zeros) dequantizes to zero whatever
 // the byte holds.
-//
-// The arena packs decayed parameters first and frozen ones last, so `decay_end` and
-// `n` replace what would otherwise be a per-tensor decay flag and bounds.
-//
-// What the arena buys is launches, not bandwidth. Measured against the two things
-// Apex's fused AdamW does:
-//   - `float4` (its ILP=4 vectorized path): total adamw time 71.2 -> 71.1 ms, i.e. no
-//     change. A warp's scalar accesses already coalesce into full sectors.
-//   - multi-tensor apply: 66% of this model's per-tensor adamw launches were under
-//     4 us but only 10% of its time — the kernel time sits in mid-sized tensors that
-//     are bandwidth-bound, and no amount of batching moves that.
-// The step still drops from ~900 launches and ~900 memsets to one of each, and the
-// arena is what gives every parameter a stable address.
-//
-// `gscale` is one device float every gradient is multiplied by before the per-element
-// clip: the global-norm clip factor from `grad_clip_scale`, or 1.
 extern "C" __global__ void adamw_arena_q8(float* param, const float* grad,
                                           const float* gscale,
                                           unsigned char* mq, unsigned char* vq,
@@ -705,8 +583,6 @@ extern "C" __global__ void split_dxh(const float* dxh, float* dx, float* dh_bptt
 // Elementwise sLSTM recurrence over B*H (cpu/slstm.rs lines 241-271). Reads the
 // four gate pre-activations and the running (c,n,m) state; writes the advanced
 // (c,n,m,h) state, the per-step saved tensors for backward, and out[:,t,:].
-// c_state/n_state are read (previous) then overwritten; the previous values are
-// saved into c_prev/n_prev for the weight/BPTT gradients.
 extern "C" __global__ void slstm_cell_step(
         const float* zt_pre, const float* it_pre, const float* ft_pre, const float* ot_pre,
         float* c_state, float* n_state, float* m_state, float* h_state,
@@ -721,10 +597,6 @@ extern "C" __global__ void slstm_cell_step(
     float fm = log_f + m_state[k];
     float it = it_pre[k];
     float np = n_state[k];
-    // First step of a sequence (n == 0): take m = ĩ, so i' is exactly 1 and n
-    // starts at 1. Otherwise max(logσ(f̃)+m_prev, ĩ) could make i' underflow to 0
-    // and leave h = c/n as 0/0. This is the reference's `if all(n == 0)` guard, and
-    // the state resets per word here, so it is hit constantly.
     float m = (np == 0.0f) ? it : fmaxf(fm, it);
     float ip = expf(it - m);
     float fp = expf(fm - m);
@@ -737,9 +609,6 @@ extern "C" __global__ void slstm_cell_step(
     i_prime[k] = ip; f_prime[k] = fp;
     c_out[k] = c; n_out[k] = n;
     c_state[k] = c; n_state[k] = n; m_state[k] = m;
-    // h = o·c/n, NOT o·c/max(|n|,1). c and n both carry exp(−m), so it cancels in
-    // the ratio — the sLSTM normalizer is stabilizer-invariant by construction, and
-    // clamping the STABILIZED n at 1 would let m leak into the model's output.
     float hh = o * c / n;
     h_state[k] = hh;
     int b = k / H, j = k % H;
@@ -782,11 +651,6 @@ extern "C" __global__ void slstm_cell_step_bwd(
 }
 
 // fused-gate sLSTM (see gpu/slstm.rs)
-// The kernels above run one gate GEMM per gate per timestep. These run the four
-// gates as one [.., 4H] block, so a timestep costs one GEMM + one kernel. The
-// weights of record stay the four [rows, H] gate matrices (checkpoint layout);
-// these pack them into the fused operands the GEMMs want, and unpack the grads
-// back. Gate order is z=0, i=1, f=2, o=3 — the column blocks of the fused [.,4H].
 
 // Pack the four gate matrices [rows, H] (rows = inp + H, input part on top of
 // the recurrent part) into wx [inp, 4H] and wh [H, 4H]. One thread per element
@@ -832,10 +696,6 @@ extern "C" __global__ void slstm_unpack_dw(const float* dwx, const float* dwh,
 }
 
 // Scatter the already-reduced fused bias gradient dbcat [4H] into the four db[g].
-// The reduction itself (summing the N rows of the gate-delta buffer) is left to a
-// ones-vector GEMM: doing it here, one thread per column looping over N, would put
-// a 2048-thread serial scan on the critical path — measurably slower than every
-// other part of the backward put together.
 extern "C" __global__ void slstm_unpack_db(const float* dbcat,
                                            float* db0, float* db1, float* db2, float* db3,
                                            int H) {
@@ -854,13 +714,6 @@ extern "C" __global__ void fill_const(float* out, float v, int n) {
 
 // Copy one slot per `bh` between a flat `[BH, stride]` state and slot `idx` of a
 // `[BH, slots, stride]` chunk-state array.
-//
-// This replaces a host-side `for b in 0..bh { memcpy_dtod(...) }`. That loop issued
-// one tiny async copy per `bh`, and the encoder runs at `bh = words_in_group * heads`
-// — thousands of launches for a few hundred KB. `cuMemcpyDtoDAsync` was 53% of all
-// CUDA API time in an nsys trace, ~54k calls per step, almost all of it from here.
-//
-// `gather` picks the direction: 0 writes the slot (seed), 1 reads it (extract).
 extern "C" __global__ void state_slot_copy(const float* src, float* dst,
                                            int bh, int slots, int idx, int stride,
                                            int gather) {
@@ -875,11 +728,6 @@ extern "C" __global__ void state_slot_copy(const float* src, float* dst,
 }
 
 // `*dst += inv * sum(src[..n])` — a whole-array reduction into a single accumulator.
-//
-// One block, grid-stride load then a shared-memory tree. The caller reduces at most a
-// decoder group's rows, and the point is to keep the per-group loss on the device: the
-// host-side alternative was a blocking `clone_dtoh` per group, which drained the stream
-// and page-locked a staging buffer in the middle of the decode loop.
 extern "C" __global__ void sum_accum(const float* src, float* dst, int n, float inv) {
     extern __shared__ float sdata[];
     int tid = threadIdx.x;

@@ -1,8 +1,4 @@
 // Quality gates and deduplication.
-//
-// Every rejection is counted by reason, so the report can tell you *why* a
-// source shrank — a filter that silently eats 90% of a corpus is the most
-// expensive kind of configuration bug.
 
 use std::collections::HashSet;
 
@@ -121,9 +117,6 @@ impl Filter {
             } if instruction.trim().is_empty() || response.trim().is_empty() => {
                 return Some(Reject::Missing);
             }
-            // A conversation needs a prompt and an answer: `sft.rs` masks the
-            // assistant turns into the loss and drops any turn with nothing in
-            // front of it, so one without an exchange trains on nothing.
             Record::Chat { turns, .. }
                 if !turns.iter().any(|t| t.role == Role::Assistant)
                     || !turns.iter().any(|t| t.role == Role::User) =>
@@ -182,8 +175,6 @@ impl Filter {
                 return Some(reject);
             }
         }
-        // Last of the local gates: counting words means tokenizing and
-        // segmenting the record, which costs more than every check above it.
         if self.cfg.max_words != usize::MAX && rec.words() > self.cfg.max_words {
             return Some(Reject::TooManyWords);
         }
@@ -199,9 +190,6 @@ impl Filter {
             Dedup::Exact => !self.seen.insert(hash_normalized(text)),
             Dedup::Near => {
                 let sig = minhash(text);
-                // Two documents collide when a whole band of signatures matches,
-                // the standard LSH trade: more bands catches more, at more
-                // false positives.
                 let mut hit = false;
                 for (b, chunk) in sig.chunks(BAND).enumerate() {
                     let h = chunk.iter().fold(0xcbf29ce484222325u64, |a, &x| {
@@ -340,8 +328,6 @@ fn minhash(text: &str) -> [u64; HASHES] {
         .collect();
     let mut sig = [u64::MAX; HASHES];
     if words.len() < SHINGLE {
-        // Too short to shingle: fall back to the whole-text hash so short
-        // records still deduplicate exactly.
         let h = hash_normalized(text);
         for (i, s) in sig.iter_mut().enumerate() {
             *s = h.wrapping_add(i as u64);
@@ -353,8 +339,6 @@ fn minhash(text: &str) -> [u64; HASHES] {
             .iter()
             .fold(0xcbf29ce484222325u64, |a, &x| (a ^ x).wrapping_mul(0x100000001b3));
         for (i, s) in sig.iter_mut().enumerate() {
-            // Cheap independent families: mix the shingle hash with a distinct
-            // odd constant per family.
             let h = (base ^ (i as u64).wrapping_mul(0x9e3779b97f4a7c15))
                 .wrapping_mul(0xff51afd7ed558ccd);
             *s = (*s).min(h ^ (h >> 33));

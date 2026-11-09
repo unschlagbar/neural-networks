@@ -2,11 +2,6 @@
 //! one line per kept take with the written prompt (`text`), what was said
 //! (`spoken`, lower case, numbers written out) and the session it belongs to;
 //! the audio is `<dir>/<speaker>/<file_name>`.
-//!
-//! There is no MFA alignment. Word ends come from the speech encoder's own CTC
-//! forced alignment (mode `ae2v`), kept beside the metadata in
-//! `alignment.jsonl` as `{"id", "ends"}`, `ends` the end of every spoken word in
-//! seconds, space-separated. A take without one is not usable yet.
 
 use std::collections::HashMap;
 use std::fs;

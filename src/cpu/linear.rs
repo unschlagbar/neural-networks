@@ -1,8 +1,4 @@
 //! Batched affine layer: `Y = X · W + b`.
-//!
-//! Weight layout matches the old `nn::linear::LinearLayer` (`W` is `[in, out]`,
-//! forward is `X · W`) so a checkpoint could in principle move between the two
-//! systems and so numeric comparisons line up.
 
 use crate::cpu::ops;
 use crate::cpu::optim::{AdamCfg, AdamState, ensure_states};
@@ -68,15 +64,11 @@ impl Linear {
         let (input, output) = (self.input_size(), self.output_size());
         assert_eq!(x.cols(), input, "Linear::forward — input width mismatch");
 
-        // Reuse the saved-input buffer across calls (no per-call clone); only
-        // reallocate when the batch size changes.
         if self.x.rank() != 2 || self.x.rows() != b {
             self.x = Tensor::zeros(&[b, input]);
         }
         self.x.data.copy_from_slice(&x.data);
 
-        // Seed each output row with the bias, then accumulate the matmul on top
-        // (gemm beta=1) — avoids both the double-zero and a separate bias pass.
         let mut y = Tensor::zeros(&[b, output]);
         ops::broadcast_row(&mut y, &self.b);
         gemm::gemm_nn(
@@ -117,8 +109,6 @@ impl Linear {
         // db += Σ_batch dY
         ops::add_col_sum(&mut self.db, dy);
 
-        // dX = dY · Wᵀ. Transpose W (in×out → out×in) once, then use the fast
-        // gemm_nn form: dX[B,in] = dY[B,out] · Wt[out,in].
         gemm::transpose(input, output, &self.w.data, &mut self.wt.data);
         let mut dx = Tensor::zeros(&[b, input]);
         gemm::gemm_nn(b, output, input, &dy.data, &self.wt.data, &mut dx.data, 0.0);

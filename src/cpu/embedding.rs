@@ -1,12 +1,4 @@
 //! Batched embedding table: token id -> row of a `[vocab, dim]` matrix.
-//!
-//! Forward gathers one row per id into a `[B, dim]` tensor; backward
-//! scatter-adds the upstream grad rows back into the table gradient. There is
-//! no input gradient (the input is a discrete id).
-//!
-//! The tied encoder/decoder char table in the hierarchical model is handled at
-//! the model level by sharing one `Embedding` (or by reducing the decoder-side
-//! table grad into the encoder's), exactly as the old system does.
 
 use crate::cpu::ops;
 use crate::cpu::optim::{AdamCfg, AdamState};

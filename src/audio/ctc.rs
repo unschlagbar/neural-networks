@@ -109,8 +109,6 @@ impl Ctc {
             return None;
         }
 
-        // dL/dz = softmax − (Σ over the label's positions of αβ / p(label)) / p.
-        // αβ counts the step's own emission twice, hence the − logp.
         let mut grad: Vec<f32> = logp.iter().map(|l| l.exp()).collect();
         let mut occ = vec![f32::NEG_INFINITY; v];
         for ti in 0..t {

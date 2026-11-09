@@ -1,35 +1,5 @@
 //! Device-side audio encoder: speech features in, one embedding per spoken word
 //! out, in the space the backbone reads text words in.
-//!
-//!   1. stem     — `stack` feature frames gathered per encoder frame, every
-//!                 `stride` frames, `→ Linear`: a causal strided convolution over
-//!                 time with a full-frequency kernel.
-//!   2. frames   — blocks over each utterance (mLSTM, every fourth an sLSTM),
-//!                 causal, utterances as the batch axis.
-//!   3. boundary — `Linear → delay + 1` logits per encoder frame
-//!                 (see [`BoundaryTargets`](crate::audio::segments::BoundaryTargets)):
-//!                 it may wait up to `delay` frames to decide where a word ended.
-//!   4. ctc      — `Linear → per_frame · alphabet` character logits per encoder
-//!                 frame (`per_frame` CTC steps each, since speech has more
-//!                 characters per second than 25 Hz has frames). Trains on the
-//!                 transcript alone; how much of its gradient reaches the frames is
-//!                 the caller's choice, down to none (a probe).
-//!   5. segments — every word's own frames, nothing after them, as one row of a
-//!                 batch of words, from a zero state, followed by a learned `[W]`
-//!                 step like the text encoder's (absent in pre-AEN4 checkpoints,
-//!                 which read the last frame); that step `→ Linear` plus a
-//!                 `Linear` of the word's timing,
-//!                 `→ RMSNorm` with a frozen scale, is its embedding. Frames past
-//!                 the word would carry the next word into the text model, which
-//!                 is asked to predict it. The scale is the text encoder's own
-//!                 per-dimension RMS: left free, the embeddings grow ~10x past
-//!                 anything the backbone read in training, which still predicts
-//!                 the next word but derails it once text follows.
-//!
-//! The output projection and its bias are the audio path's own, which is all a
-//! modality marker in front of the backbone would add.
-//!
-//! Host-side layout (stem ids, segment rows, targets) is in [`crate::audio`].
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -341,7 +311,6 @@ impl AudioEncoder {
     /// (`feats` is `[batch, t_in, cfg.feats]` row-major, already normalized), with
     /// each utterance's word segments in encoder frames. Saves what
     /// [`backward`](Self::backward) needs; call [`discard`](Self::discard)
-    /// instead when there will be none.
     pub fn forward(
         &mut self,
         gpu: &Gpu,
@@ -847,8 +816,6 @@ mod tests {
             let mut k = 0;
             for (b, utt) in segments.iter().enumerate() {
                 for (i, s) in utt.0.iter().enumerate() {
-                    // With the word before it, so the timing input sees the
-                    // same pause.
                     let mut alone = vec![WordSegments::default(); batch];
                     alone[b] = WordSegments(utt.0[i.saturating_sub(1)..=i].to_vec());
                     let one = embed(&mut enc, &alone);

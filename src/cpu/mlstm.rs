@@ -1,24 +1,4 @@
 //! Batched multi-head mLSTM cell (xLSTM, Beck et al. 2024).
-//!
-//! Per head the state is a matrix `C ∈ ℝ^{dhv×dqk}`, a normalizer `n ∈ ℝ^{dqk}`
-//! and a scalar stabilizer `m`. Per step:
-//!   q = x·Wq+bq, k = (x·Wk+bk)/√dqk, v = x·Wv+bv,
-//!   o = σ(x·Wo+bo), ĩ = x·Wi+bi, f̃ = x·Wf+bf
-//!   per head:  m = max(logσ(f̃)+m_prev, ĩ),  i'=exp(ĩ-m),  f'=exp(logσ(f̃)+m_prev-m)
-//!              C = f'·C_prev + i'·(v⊗k),  n = f'·n_prev + i'·k
-//!              ψ = max(|nᵀq|, exp(-m)),  ỹ = C·q / ψ,  ŷ = headnorm(ỹ),  y = o⊙ŷ
-//!   h = y·W_out + b_out
-//!
-//! The projections do not depend on the state, so they run as one GEMM over all
-//! `B·T` rows; only the per-head recurrence is sequential, and the `B·heads`
-//! recurrences are independent and run in parallel. `C` is not saved per step:
-//! the forward keeps it every [`SEGMENT`] steps and the backward recomputes each
-//! segment from there, bit-identically. Stabilizer `m` is treated as constant in
-//! backward (reference approximation), so grads use the directional whole-tensor
-//! finite-difference check.
-//!
-//! A step listed in [`set_resets`](MLstm::set_resets) starts from zero state, the
-//! same as step 0, and nothing flows back across it.
 
 use rand::random_range;
 use rayon::prelude::*;
@@ -192,10 +172,6 @@ impl Sweep<'_> {
             hc.n[s * dqk..(s + 1) * dqk].copy_from_slice(&n);
             let nqv = dot(&n, q_h);
             hc.nq[s] = nqv;
-            // ψ = max(|nᵀq|, exp(−m)), not max(|nᵀq|, 1): `n` and `C` are the
-            // stabilized values (true · exp(−m)), so xLSTM's max(|n_trueᵀq|, 1)
-            // becomes this once exp(m) cancels. Clamping at 1 would let the
-            // stabilizer change what the cell computes.
             let floor = (-mh).exp();
             hc.psi_floor[s] = floor;
             hc.psi[s] = nqv.abs().max(floor);
@@ -266,8 +242,6 @@ impl Sweep<'_> {
 
                 let inv_psi = 1.0 / hc.psi[s];
                 let dpsi = -(inv_psi * inv_psi) * dot(dht_h, cq_h);
-                // Grad flows through nᵀq only where it, not the floor, won the max
-                // (m is held constant in backward, so the floor has no grad).
                 let dnq = if hc.nq[s].abs() > hc.psi_floor[s] {
                     hc.nq[s].signum() * dpsi
                 } else {
@@ -801,8 +775,6 @@ mod tests {
         close(&y.data[cut * d..], &y_tail.data, "y");
         close(&dx.data[cut * inp..], &dx_tail.data, "dx");
 
-        // With the gradient only on the tail, the head before the reset gets none
-        // through the recurrence.
         let mut g_tail_only = g.clone();
         g_tail_only.data[..cut * d].fill(0.0);
         cell.set_resets(&[cut]);

@@ -1,22 +1,4 @@
 //! Storage for the activations a forward saves and its backward reads.
-//!
-//! Everything one block saves — its own FFN activations, its cell's cache, its norms'
-//! `inv_rms` — lives in one [`Frame`]: a byte range the layers carve typed views out of,
-//! in a fixed order that forward and backward both replay. So a block's saved state is
-//! one contiguous range, and moving it is one copy.
-//!
-//! A [`FrameStack`] hands the frames out, in one of two ways:
-//!
-//!   * **resident** ([`ResidentFrames`]) — one device buffer per stack depth, reused
-//!     across windows. The encoder, the decoder, eval and `GPU_NO_OFFLOAD`.
-//!   * **offloaded** ([`Offload`]) — the backbone. Every frame is copied to a pinned host
-//!     stack as its forward ends and comes back before its backward, through a fixed
-//!     ring of [`RING_SLOTS`] device slots. Nothing is allocated or freed per frame.
-//!
-//! Training is bounded by activation VRAM, and that bound is linear in the sequence
-//! length: step 0's saved tensors must survive until backward unwinds to `t = 0`, so
-//! no reordering of the forward loop frees them. Only moving them off the device — or
-//! recomputing them — changes the scaling.
 
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, result};
 use std::{cell::RefCell, rc::Rc, sync::Arc};
@@ -34,11 +16,6 @@ pub fn align_up(n: usize) -> usize {
 }
 
 /// A byte range that one block's saved activations are carved out of.
-///
-/// Carving is sequential: each call takes the next aligned region. A layer carves in a
-/// single function that its forward and its backward both call, so the two see the same
-/// regions without either storing an offset. The views own nothing; the storage stays the
-/// [`FrameStack`]'s.
 pub struct Frame {
     base: u64,
     cap: usize,
@@ -188,10 +165,6 @@ impl FrameStack {
 }
 
 /// Frames kept on the device: one buffer per stack depth, reused across windows.
-///
-/// A stack because a chunked sweep forwards every chunk before unwinding any, so chunk
-/// c's frame must survive chunk c+1's forward. Each depth reuses its buffer while it fits
-/// (see [`fits`]), so a steady window shape allocates nothing.
 #[derive(Default)]
 pub struct ResidentFrames {
     bufs: Vec<CudaSlice<u8>>,
@@ -219,8 +192,6 @@ impl ResidentFrames {
     pub fn pop(&mut self, gpu: &Gpu) -> Frame {
         assert!(self.depth > 0, "frame stack: pop with nothing pushed");
         self.depth -= 1;
-        // The address the matching push handed out: nothing reallocates this depth
-        // until it is pushed again.
         Frame::over(gpu, &self.bufs[self.depth])
     }
 
@@ -244,11 +215,6 @@ impl ResidentFrames {
 }
 
 /// Device slots in the offload ring.
-///
-/// Three because each direction wants a block of compute between a copy and the next
-/// write to its slot: forward writes frame j+3 into frame j's slot, so frame j's D2H has
-/// had frames j+1 and j+2 to hide behind; backward reads frame j while j-1 and j-2 are
-/// already on their way up.
 pub const RING_SLOTS: usize = 3;
 
 /// One device slot of the ring.
@@ -288,16 +254,6 @@ impl HostStack {
 }
 
 /// The frames of a whole stack, staged through pinned host memory.
-///
-/// Shared by every block of the stack, because its frames form one LIFO: the backbone
-/// forwards chunk-major (chunk c through every block, then chunk c+1) and unwinds in
-/// exactly the reverse order, so the frame a backward wants is always the last one
-/// pushed. That is what lets one host stack hold them all, and lets [`pop`](Self::pop)
-/// prefetch the frames below it without being told which block runs next.
-///
-/// The ring is a write-through cache of the host stack: every frame is copied up when its
-/// forward ends, and a slot that still holds a frame when its backward comes serves it
-/// without a copy back — which is the case for the last frames of a sweep.
 pub struct Offload {
     xfer: Arc<CudaStream>,
     slots: [Slot; RING_SLOTS],
@@ -352,8 +308,6 @@ impl Offload {
                 done: None,
             }
         });
-        // The allocation is stream-ordered on the compute stream, which the transfer
-        // stream knows nothing about; it must have happened before a copy touches it.
         gpu.stream.synchronize().expect("offload: slot alloc");
         slots
     }
@@ -370,8 +324,6 @@ impl Offload {
             self.grow_slots(gpu, largest);
         }
         if total > self.host.cap {
-            // Headroom: windows vary by well under a percent, and page-locking ~10 GB
-            // again for every one that sets a new maximum costs seconds.
             self.grow_host(gpu, total + total / 16);
         }
     }
@@ -416,8 +368,6 @@ impl Offload {
         self.sync();
         let top = self.host.top();
         if top == 0 {
-            // Nothing to carry over, so the old allocation goes first: holding both
-            // pins twice the stack at once, ~20 GB at the backbone's size.
             self.host.mem = None;
             self.host.ptr = std::ptr::null_mut();
             self.host.cap = 0;
@@ -527,8 +477,6 @@ impl Offload {
             gpu.stream.wait(ev).expect("offload: wait for fill");
         }
         self.open = Some(s);
-        // The frames below are the next backwards to run; start them on their way up
-        // while this one is read.
         for i in (j.saturating_sub(RING_SLOTS - 1)..j).rev() {
             if self.slots.iter().any(|sl| sl.holds == Some(i)) {
                 continue;
@@ -545,8 +493,6 @@ impl Offload {
 
     fn popped(&mut self, _gpu: &Gpu) {
         let s = self.open.take().expect("offload: popped without pop");
-        // A backward may write into its frame (the sLSTM reuses `g` for its deltas), so
-        // what the slot holds is no longer the frame.
         self.slots[s].holds = None;
         self.host.frames.pop();
     }

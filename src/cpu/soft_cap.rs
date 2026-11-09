@@ -1,7 +1,4 @@
 //! Batched logit soft-cap: `y = cap · tanh(x / cap)`, applied element-wise.
-//!
-//! Weightless. Bounds logits to (−cap, cap); backward is the exact derivative
-//! `1 − (y/cap)²`. Same math as `nn::soft_cap::SoftCapLayer`, on `[B, F]`.
 
 use crate::cpu::ops;
 use crate::tensor::Tensor;

@@ -1,37 +1,5 @@
 // Template expansion: instruction data for skills no public corpus covers
 // (your apps, your lamp, your tool names, your assistant's own identity).
-//
-// A `.syn` file is lists plus templates:
-//
-//   list app   = Firefox ; firefox | Spotify ; spotify
-//   list state = on ; true | off ; false
-//
-//   template
-//   instruction = {open|start} {app.0}
-//   response    = <tool>app.launch(name="{app.1}")</tool>
-//   category    = apps
-//
-// A list entry has `;`-separated fields: `{app.0}` is what a person says,
-// `{app.1}` what the tool call needs, so the surface form and the identifier
-// stay bound to the same entry. `{a|b|c}` is an inline paraphrase choice, drawn
-// per example — that is where the phrasing variety comes from.
-//
-// One example is: pick one entry per referenced list, resolve every inline
-// choice, render each field. `count` on the source decides how many are drawn;
-// with `count = 0` the full cartesian product is emitted.
-//
-// A template that uses `user =` / `assistant =` lines instead of
-// instruction/response is a **conversation**, and may have as many turns as it
-// likes — the lists bind once per example, so a later turn can refer back to
-// the same app the first one used. A `tool =` line is what the call returned:
-// it is prompt-side, so the reply after it is what the model is trained to
-// write.
-//
-//   template
-//   user      = {open|start} {app.0}
-//   assistant = <tool>app.launch(name="{app.1}")</tool>
-//   tool      = ok
-//   assistant = {app.0} is up.
 
 use std::collections::HashMap;
 
@@ -130,8 +98,6 @@ pub fn parse(text: &str, path: &str) -> Result<Synth> {
             "assistant" => t.turns.push((Role::Assistant, v)),
             "system" => t.turns.push((Role::System, v)),
             "tool" => t.turns.push((Role::Tool, v)),
-            // An assistant turn the model reads but is never trained to write:
-            // the mistake in an error-recovery conversation.
             "assistant_context" | "assistant_noloss" => {
                 t.turns.push((Role::AssistantContext, v))
             }
@@ -204,8 +170,6 @@ impl Synth {
         let mut seen = std::collections::HashSet::new();
         for t in &self.templates {
             let mut made = 0usize;
-            // Enough tries to fill even a template whose combinations barely
-            // exceed its quota, without spinning on an exhausted one.
             let mut tries = 0usize;
             while made < per && tries < per * 8 + 64 {
                 tries += 1;
@@ -215,11 +179,6 @@ impl Synth {
                     .map(|n| rng.pick(&self.lists[n]))
                     .collect();
                 let rec = self.render(t, &pick, rng, default_category);
-                // The whole rendered record is the key. Keying on the prompt
-                // alone throws away every variation a template puts in its
-                // answer, which for a template whose point IS the answer — the
-                // same question asked of a different tool result — collapses it
-                // to a handful of examples.
                 let key = match &rec {
                     Record::Sft {
                         instruction,
@@ -228,9 +187,6 @@ impl Synth {
                         ..
                     } => format!("{instruction}\u{1}{context}\u{1}{response}"),
                     Record::Doc { text } => text.clone(),
-                    // Every turn, not just the opener: templates that share an
-                    // opening line on purpose — small talk before a tool call —
-                    // are different examples from the second turn onwards.
                     Record::Chat { turns, .. } => {
                         turns.iter().map(|t| t.content.as_str()).collect::<Vec<_>>().join("\u{1}")
                     }
@@ -300,8 +256,6 @@ fn refs(s: &str) -> Vec<String> {
     for group in groups(s) {
         let choices = alternatives(&group);
         if choices.len() > 1 {
-            // A list referenced only from inside a choice still has to be bound,
-            // or `fill` will find no entry for it.
             for c in choices {
                 out.extend(refs(c));
             }
@@ -396,12 +350,8 @@ fn fill(s: &str, bind: &HashMap<&str, &Vec<String>>, rng: &mut Rng) -> String {
         };
         let inner = &rest[open + 1..close];
         rest = &rest[close + 1..];
-        // Not trimmed: a leading or trailing space inside a choice is how a
-        // template writes an optional word (`{|s}`, `{%| percent}`).
         let choices = alternatives(inner);
         if choices.len() > 1 {
-            // The chosen alternative may hold groups of its own — a list
-            // reference inside a paraphrase is the common case.
             let choice = *rng.pick(&choices);
             out.push_str(&fill(choice, bind, rng));
             continue;
@@ -411,8 +361,6 @@ fn fill(s: &str, bind: &HashMap<&str, &Vec<String>>, rng: &mut Rng) -> String {
             None => (inner.trim(), 0),
         };
         match bind.get(name) {
-            // A missing field falls back to field 0, so a one-field list can be
-            // referenced as `{room.1}` in a template shared with richer lists.
             Some(entry) => out.push_str(entry.get(field).unwrap_or(&entry[0])),
             None => {
                 out.push('{');

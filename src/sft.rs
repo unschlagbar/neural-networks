@@ -1,49 +1,4 @@
 // Supervised fine-tuning (SFT) dataset for instruction / Q-A post-training.
-//
-// Reads a JSONL file of `{instruction, context, response, category}` records
-// (the databricks-dolly-15k layout) and turns each into ONE training window for
-// the hierarchical model: a token sequence with chat markers, segmented into
-// words, plus a per-word **loss mask** so gradient flows only from the
-// assistant response.
-//
-// Prompt layout (context section omitted when the record has no context):
-//
-//   {instruction} <CONTEXT> {context} <SEP> {response} <END>
-//   └──────────── prompt (mask 0) ───────────┘└── response (mask 1) ──┘
-//
-// A record may instead carry a `messages` array (`{"role", "content"}`, the
-// OpenAI/LM-Studio shape), which is a conversation of any length:
-//
-//   {user1} <SEP> {asst1} <END> {user2} <SEP> {asst2} <END>
-//   └ mask 0 ────┘└ mask 1 ────┘└ mask 0 ────┘└ mask 1 ────┘
-//
-// Every assistant turn carries loss, every user turn does not — the same rule
-// as the single-turn case, applied once per turn. A `system` message takes the
-// <CONTEXT> slot of the first turn, so multi-turn data needs no new tokens and
-// no checkpoint surgery.
-//
-// A `tool` message is what a tool call returned. It sits on the prompt side
-// like a user turn — the model did not write it, it reads it — and the reply
-// after it carries loss:
-//
-//   {user} <SEP> <tool>app.launch(...)</tool> <END> <result>ok</result> <SEP> {asst} <END>
-//   └ mask 0 ───┘└ mask 1 ────────────────────────┘└ mask 0 ─────────┘└ mask 1 ┘
-//
-// `<tool>`, `</tool>`, `<result>`, `</result>`, `<think>` and `</think>` are
-// markup tokens: the data writes them as text and `to_tokens_markup` folds each
-// into one token, so a call boundary is a single word the model either emits or
-// does not, never a spelling it can get subtly wrong. What goes *between* them
-// is still plain text — the call syntax stays a convention of the data.
-//
-// The whole sequence is encoded and decoded as usual — the backbone must read
-// the prompt to condition on it — but only the words at or after `<SEP>` (the
-// response and its `<END>`) are counted in the loss. That is standard SFT
-// masking: the model learns to *produce* the response, not to reproduce the
-// prompt it was given.
-//
-// Words come from `crate::segment`, which already treats a special token (id
-// ≥ 256) as its own one-token word, so `<SEP>`, `<CONTEXT>` and `<END>` each
-// land on a clean word boundary and the mask is a per-word flag.
 
 use std::{
     fs::File,
@@ -123,11 +78,6 @@ pub struct Turn {
     /// turn is trained. This is `Role::AssistantContext` at sub-turn
     /// resolution, and it is what lets one answer hold a wrong tool call and
     /// its correction while only the correction is learned.
-    ///
-    /// Half-open, in bytes of the raw `content`. Order and overlap do not
-    /// matter (they are normalized when the turn is assembled), and a border
-    /// inside a word is rounded out to the word border by the segmentation —
-    /// words are the unit the mask is applied in.
     pub no_loss: Vec<(usize, usize)>,
     /// The take a user turn was spoken as (`<session>/<id>` in the SFT speech
     /// set). Where the take is not given to the loader the turn is read as
@@ -351,11 +301,6 @@ pub type HeardTokens<'a> = &'a dyn Fn(&str) -> Option<Vec<u16>>;
 /// Assemble the token sequence for a conversation, plus the token spans that
 /// carry loss (one per assistant turn, its trailing `<END>` included) and the
 /// token ranges of the user turns `heard` writes.
-///
-/// A leading `system` message is folded into the first user turn's <CONTEXT>
-/// slot. Anything before the first user turn, and any assistant turn with no
-/// user turn before it, is dropped: the model is trained to answer, so every
-/// loss span must have a prompt in front of it.
 fn build_conversation(
     tok: &Utf8Tokenizer,
     turns: &[Turn],
@@ -397,8 +342,6 @@ fn build_conversation(
                 open_prompt = true;
             }
             Role::Tool => {
-                // A result with no call in front of it is nothing the model can
-                // read; and it re-opens the prompt so the reply after it scores.
                 if content.is_empty() || open_prompt {
                     continue;
                 }
@@ -412,9 +355,6 @@ fn build_conversation(
                 if content.is_empty() || !open_prompt {
                     continue;
                 }
-                // Every piece is written; only the trained ones record a span.
-                // A context turn records none at all, so it is read by the
-                // backbone and never predicted.
                 let mut turn_spans = Vec::new();
                 for (piece, keep) in mask_pieces(&turn.content, &turn.no_loss) {
                     let start = tokens.len();
@@ -424,9 +364,6 @@ fn build_conversation(
                     }
                 }
                 tokens.push(END_TOKEN);
-                // `<END>` closes a turn the model is being trained to produce,
-                // so it joins the loss whenever any part of the turn does —
-                // even when the tail of the answer is masked out.
                 if !turn_spans.is_empty() {
                     turn_spans.push((tokens.len() - 1, tokens.len()));
                     spans.append(&mut turn_spans);
@@ -436,9 +373,6 @@ fn build_conversation(
         }
     }
 
-    // A prompt with no answer after it teaches nothing and would be decoded
-    // with no loss; drop the dangling tail. At inference that dangling prompt
-    // is the whole point, so `keep_open` keeps it.
     if open_prompt && !keep_open {
         let cut = spans.last().map(|&(_, e)| e).unwrap_or(0);
         tokens.truncate(cut);
@@ -475,7 +409,7 @@ pub fn build_example_heard(tok: &Utf8Tokenizer, turns: &[Turn], heard: HeardToke
 /// Format an inference prompt: `{instruction}[<CONTEXT>{context}]<SEP>`, with
 /// the trailing `<SEP>` that cues the model to start the response. This is the
 /// prompt side of [`build_tokens`] with no response — feed it to
-/// [`Hierarchical::sample_chat`](crate::hierarchical::Hierarchical::sample_chat).
+/// [`Hierarchical::sample_chat`](crate::infer::Hierarchical::sample_chat).
 pub fn format_prompt(tok: &Utf8Tokenizer, instruction: &str, context: &str) -> Vec<u16> {
     let mut tokens = tok.to_tokens_markup(instruction.trim());
     if !context.trim().is_empty() {
@@ -489,8 +423,7 @@ pub fn format_prompt(tok: &Utf8Tokenizer, instruction: &str, context: &str) -> V
 /// Format a conversation for inference: every completed exchange followed by
 /// the pending user turn and its `<SEP>`, which is what cues the model to
 /// answer. The multi-turn twin of [`format_prompt`] — feed it to
-/// [`Hierarchical::sample_chat`](crate::hierarchical::Hierarchical::sample_chat)
-/// and append the reply as an `Assistant` turn to continue.
+/// [`Hierarchical::sample_chat`](crate::infer::Hierarchical::sample_chat)
 pub fn format_chat_prompt(tok: &Utf8Tokenizer, turns: &[Turn]) -> Vec<u16> {
     build_conversation(tok, turns, true, &|_| None).0
 }
@@ -534,8 +467,6 @@ pub fn build_example(
     let (tokens, response_start) = build_tokens(tok, instruction, context, response);
     let (words, loss) = segment_with_mask(&tokens, response_start);
 
-    // A trainable window needs word 0 (encode-only prefix) plus at least one
-    // response word carrying loss.
     if words.len() < 2 || !loss.iter().any(|&b| b) {
         return None;
     }
@@ -581,8 +512,6 @@ pub fn load_jsonl_heard(
         if line.trim().is_empty() {
             continue;
         }
-        // A `messages` array is a conversation; anything else is a dolly
-        // record. Both end up as one window with the same per-word mask.
         let built = match parse_messages(&line) {
             Some(turns) => {
                 multi +=
@@ -635,8 +564,6 @@ fn parse_record(line: &str) -> Option<(String, String, String)> {
 /// colon. Dependency-free (no serde): the corpus is flat objects with string
 /// values, so a scan for the key plus a JSON-string decode is enough. Returns
 /// `None` if the key is missing or its value is not a string.
-/// Byte index just past `"key"` when it appears as an object *key* (followed
-/// by a colon), else `None`.
 fn key_position(line: &str, key: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let needle = format!("\"{key}\"");
@@ -656,9 +583,6 @@ fn key_position(line: &str, key: &str) -> Option<usize> {
 
 pub(crate) fn json_string_field(line: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
-    // Scan for the key as an object key: `"key"` followed (after whitespace) by
-    // a colon. A plain `find` could match the same text inside a value, so the
-    // colon check anchors it to a key position.
     let bytes = line.as_bytes();
     let mut from = 0;
     loop {
@@ -706,8 +630,6 @@ fn decode_json_string(bytes: &[u8], start: usize) -> Option<String> {
                     b'u' => {
                         let cp = decode_hex4(bytes, i + 1)?;
                         i += 4;
-                        // Surrogate pair: a high surrogate must be followed by
-                        // `\uXXXX` low surrogate to form one code point.
                         if (0xD800..=0xDBFF).contains(&cp) {
                             if bytes.get(i + 1) == Some(&b'\\') && bytes.get(i + 2) == Some(&b'u') {
                                 let lo = decode_hex4(bytes, i + 3)?;
@@ -925,8 +847,6 @@ mod tests {
         let pieces = mask_pieces(text, &[(9, 12), (5, 10), (100, 200)]);
         let joined: String = pieces.iter().map(|&(p, _)| p).collect();
         assert_eq!(joined, text.trim());
-        // The border at 5 falls inside 'ü' (bytes 4..6 of the trimmed text) and
-        // is pushed to its edge, so no piece splits a character.
         assert!(pieces.iter().all(|&(p, _)| !p.is_empty()));
         let masked: String = pieces
             .iter()

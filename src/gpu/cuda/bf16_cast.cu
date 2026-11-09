@@ -7,18 +7,6 @@
 
 // fp32 -> bf16 and back, for activations that are SAVED for backward but whose
 // stored precision does not need fp32's 24-bit mantissa (see `gpu::bf16`).
-//
-// Round-to-nearest-even, not truncation: `__float2bfloat16` is the RNE intrinsic.
-// Truncating instead would bias every stored value toward zero, and the sLSTM's
-// saved slabs feed a product chain that is summed over T — a systematic bias there
-// accumulates over the sequence, where symmetric rounding noise cancels.
-//
-// Four elements per thread through `float4`/`ushort4`. A scalar thread has only
-// 4 B loaded and 2 B stored in flight, so the launch needs very high occupancy to
-// keep enough bytes outstanding to saturate DRAM, and these launches are mostly
-// small (p50 ~2 us) — they never get there. The loop is grid-stride so the launch
-// stays correct either way: the host sizes the grid for the vector body, and a
-// misaligned buffer that falls back to the scalar path still covers all n.
 extern "C" __global__ void cast_f32_to_bf16(const float* src, __nv_bfloat16* dst, int n) {
     int stride = gridDim.x * blockDim.x;
     int i0 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -60,16 +48,6 @@ extern "C" __global__ void cast_bf16_to_f32(const __nv_bfloat16* src, float* dst
 }
 
 // Round an fp32 buffer to bf16 precision IN PLACE, staying fp32.
-//
-// The point is precision, not storage: it reproduces what a cuBLAS GEMM with
-// `Ctype = CUDA_R_16BF` and `beta = 1` does to an accumulator — read at bf16, add the
-// fp32 product, store back at bf16 — for a caller whose buffer has to remain fp32.
-// FlashRNN's `dR`/`db` are exactly that, and the sLSTM's gradients are windows into a
-// uniformly fp32 `ParamArena` that cannot hold a narrow one for a single layer. So the
-// question "does a bf16 gradient hurt?" is answered here, and the question "can we
-// have the memory back?" is answered by narrowing the whole arena, separately.
-//
-// No scratch and one launch, unlike a narrow-then-widen pair.
 extern "C" __global__ void quantize_bf16_inplace(float* p, int n) {
     int stride = gridDim.x * blockDim.x;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {

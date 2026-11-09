@@ -1,22 +1,5 @@
 // Minimal parquet reader — just enough to stream one BYTE_ARRAY column out of a
 // corpus file, one row group at a time.
-//
-// This is deliberately not a general parquet implementation. The training
-// corpora we consume (FineWeb-style dumps: a `text` column plus metadata) use a
-// narrow slice of the format, and supporting exactly that slice costs a few
-// hundred lines with no dependencies — where pulling in the `parquet` crate
-// would drag arrow + thrift + a large tree into a project that has almost none.
-//
-// What is supported:
-//   - flat (non-nested) schema, one or more requested columns, BYTE_ARRAY type
-//   - OPTIONAL or REQUIRED repetition (max definition level 0 or 1); nulls are
-//     skipped, not surfaced
-//   - UNCOMPRESSED and SNAPPY page compression
-//   - data page v1 and v2, PLAIN and dictionary (PLAIN_DICTIONARY / RLE_DICT)
-//     value encodings, RLE definition levels
-//
-// Anything outside that returns an `Err` naming what it hit, rather than
-// silently producing wrong text.
 
 use std::{
     fs::File,
@@ -26,10 +9,6 @@ use std::{
 pub type Result<T> = std::result::Result<T, String>;
 
 // ── Thrift compact protocol ────────────────────────────────────────────────
-//
-// Parquet metadata is thrift-compact-encoded. We only ever read structs whose
-// fields we either recognise or skip, so a reader that can decode the primitive
-// types and skip anything else is sufficient.
 
 const T_BOOL_TRUE: u8 = 1;
 const T_BOOL_FALSE: u8 = 2;
@@ -331,8 +310,6 @@ impl<'a> RleDecoder<'a> {
             return Ok(Some(v));
         }
         if self.bit_width == 0 {
-            // Width 0 means every value is 0; the stream carries no data, so
-            // the caller's count is what bounds it.
             return Ok(Some(0));
         }
         if self.pos >= self.buf.len() {
@@ -344,8 +321,6 @@ impl<'a> RleDecoder<'a> {
         self.run_pos = 0;
 
         if header & 1 == 0 {
-            // RLE run: `header >> 1` repeats of one little-endian value whose
-            // width is bit_width rounded up to whole bytes.
             let count = (header >> 1) as usize;
             let nbytes = (self.bit_width as usize).div_ceil(8);
             if self.pos + nbytes > self.buf.len() {
@@ -513,11 +488,6 @@ fn take_v1_section<'a>(body: &mut &'a [u8], what: &str) -> Result<&'a [u8]> {
 
 /// A leaf column of the schema tree: its dotted path, its type, and the two
 /// level ceilings that describe where it sits in the nesting.
-///
-/// `max_def` counts the ancestors (itself included) that may be absent, so a
-/// value is present only at `def == max_def`. `max_rep` counts the repeated
-/// ancestors, so a slot with `rep == 0` starts a new row and a higher `rep`
-/// continues a list inside it. A flat REQUIRED column has both at 0.
 struct Leaf {
     path: String,
     ty: Option<i64>,
@@ -567,8 +537,6 @@ fn schema_leaves(schema: &[SchemaElement]) -> Vec<Leaf> {
     }
 
     let mut out = Vec::new();
-    // Element 0 is the root: it names the message, not a column, so its own
-    // name is dropped from every path.
     if let Some(root) = schema.first() {
         let mut at = 1usize;
         for _ in 0..root.num_children {
@@ -623,10 +591,6 @@ fn parse_column_chunk(t: &mut Thrift, columns: &[&str]) -> Result<Option<(usize,
             while let Some((mfid, mty)) = t.field(&mut mid)? {
                 match mfid {
                     3 => {
-                        // path_in_schema: list<string>. A flat column is one
-                        // element; a leaf inside a list is its whole path
-                        // (`messages.list.element.role`), which the caller may
-                        // name either way.
                         let (n, _) = t.list_header()?;
                         let mut parts = Vec::with_capacity(n);
                         for _ in 0..n {
@@ -676,9 +640,6 @@ fn parse_footer(meta: &[u8], columns: &[&str]) -> Result<FileMeta> {
                     while let Some((gfid, gty)) = t.field(&mut gid)? {
                         if gfid == 1 && gty == T_LIST {
                             let (ncols, _) = t.list_header()?;
-                            // Slot by requested-column index, so a group's
-                            // chunks come back in the caller's order regardless
-                            // of how they are laid out in the file.
                             let mut hits: Vec<Option<ColumnChunk>> = vec![None; columns.len()];
                             for _ in 0..ncols {
                                 if let Some((i, c)) = parse_column_chunk(&mut t, columns)? {
@@ -698,11 +659,6 @@ fn parse_footer(meta: &[u8], columns: &[&str]) -> Result<FileMeta> {
         }
     }
 
-    // Locate each requested column among the schema's leaves. The schema is a
-    // pre-order tree, so a leaf carries the levels of everything above it: one
-    // definition level per optional-or-repeated ancestor, one repetition level
-    // per repeated ancestor. Those two numbers are what make a nested column
-    // decodable — see `Leaf`.
     let leaves = schema_leaves(&schema);
     let mut max_def_levels = Vec::with_capacity(columns.len());
     let mut max_rep_levels = Vec::with_capacity(columns.len());
@@ -824,9 +780,6 @@ fn parse_page_header(buf: &[u8]) -> Result<(PageHeader, usize)> {
 /// Decode a PLAIN-encoded BYTE_ARRAY block: a 4-byte little-endian length
 /// followed by that many bytes, repeated. Pushes offsets into `buf`.
 fn plain_byte_arrays(data: &[u8], limit: usize, out: &mut Vec<Vec<u8>>) -> Result<()> {
-    // `limit` counts the values of THIS page, while `out` accumulates the whole
-    // column chunk — a row group may hold several pages, and the second one
-    // must not be measured against the values the first already produced.
     let target = out.len() + limit;
     let mut pos = 0;
     while pos + 4 <= data.len() && out.len() < target {
@@ -852,9 +805,6 @@ pub type ListRows = Vec<Vec<Vec<Vec<u8>>>>;
 /// at a time. Row groups are the natural unit: each is independently encoded
 /// and, in the corpora we train on, is a few MB — small enough to hold, large
 /// enough that per-group overhead is irrelevant.
-///
-/// Reading several columns at once is what makes row-level filtering possible:
-/// a group's columns decode in lockstep, so index `i` of each is the same row.
 pub struct ParquetColumnReader {
     file: File,
     meta: FileMeta,
@@ -882,8 +832,6 @@ impl ParquetColumnReader {
             return Err(format!("{path:?} is too small to be a parquet file"));
         }
 
-        // Header and footer both carry the magic; the footer is
-        // `<metadata> <metadata_len u32> PAR1`.
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)
             .map_err(|e| format!("could not read {path:?}: {e}"))?;
@@ -943,11 +891,6 @@ impl ParquetColumnReader {
 
     /// Decode the next row group for every requested column, in the order they
     /// were passed to `open_columns`. Returns `None` at the end of the file.
-    ///
-    /// The columns are row-aligned only when none of them contains nulls (the
-    /// case in the corpora we read, and what row-level filtering relies on):
-    /// nulls are skipped rather than surfaced, so a null in one column would
-    /// shift it against the others.
     pub fn next_row_group_columns(&mut self) -> Result<Option<Vec<Vec<Vec<u8>>>>> {
         let Some(group) = self.meta.chunks.get(self.next_group).cloned() else {
             return Ok(None);
@@ -972,15 +915,6 @@ impl ParquetColumnReader {
 
     /// Decode a row group whose columns are the leaves of one repeated group —
     /// the shape every chat corpus uses (`messages: list<struct<role, content>>`).
-    ///
-    /// Returns one entry per row: a list of elements, each holding one value per
-    /// requested leaf, in the order the leaves were requested. A row whose list
-    /// is empty or null comes back as an empty `Vec`, so rows stay aligned with
-    /// the file even when a record has no messages.
-    ///
-    /// The reconstruction is the standard one: walk the slots of the first leaf,
-    /// start a new row wherever the repetition level is 0, and take a value only
-    /// where the definition level reaches the leaf's maximum.
     pub fn next_row_group_lists(&mut self) -> Result<Option<ListRows>> {
         let Some(group) = self.meta.chunks.get(self.next_group).cloned() else {
             return Ok(None);
@@ -1024,8 +958,6 @@ impl ParquetColumnReader {
             let Some(row) = rows.last_mut() else {
                 return Err("first slot has repetition level > 0".into());
             };
-            // Below its maximum definition level the element is absent: an empty
-            // or null list, which contributes no element to the row.
             if cols[0].defs[slot] < max_defs[0] {
                 continue;
             }
@@ -1058,8 +990,6 @@ impl ParquetColumnReader {
         max_rep_level: u8,
         group_index: usize,
     ) -> Result<Column> {
-        // One read for the whole chunk: pages are laid out contiguously from
-        // the dictionary page (or first data page) onward.
         let start = chunk.start() as u64;
         let len = chunk.total_compressed_size as usize;
         let mut raw = vec![0u8; len];
@@ -1074,8 +1004,6 @@ impl ParquetColumnReader {
             reps: Vec::new(),
             defs: Vec::new(),
         };
-        // Levels are only worth keeping for a nested column: for a flat one the
-        // slots and the values are the same thing.
         let nested = max_rep_level > 0;
         let mut pos = 0usize;
 
@@ -1107,9 +1035,6 @@ impl ParquetColumnReader {
                         .ok_or_else(|| "v1 data page without header".to_string())?;
                     let data = decompress(chunk.codec, page, ph.uncompressed_size as usize)?;
 
-                    // v1 puts the level sections inside the compressed payload,
-                    // each length-prefixed: repetition levels first, then
-                    // definition levels, then the values.
                     let mut body = &data[..];
                     if max_rep_level > 0 {
                         let section = take_v1_section(&mut body, "repetition")?;
@@ -1143,10 +1068,6 @@ impl ParquetColumnReader {
                     let (nv, nn, enc, dbl, rbl, compressed) = ph
                         .v2
                         .ok_or_else(|| "v2 data page without header".to_string())?;
-                    // v2 keeps the level sections uncompressed at the front of
-                    // the page, repetition before definition, and their byte
-                    // lengths in the header rather than inline; only the value
-                    // section is compressed.
                     let (dbl, rbl) = (dbl as usize, rbl as usize);
                     if rbl + dbl > page.len() {
                         return Err("v2 page: level section runs past page".into());
@@ -1234,8 +1155,6 @@ fn decode_values(
             if dictionary.is_empty() {
                 return Err("dictionary-encoded page with no dictionary page".into());
             }
-            // Dictionary indices: a leading byte holds the bit width, then an
-            // RLE/bit-packed stream of indices.
             let Some((&width, rest)) = body.split_first() else {
                 return Err("dictionary page body is empty".into());
             };
@@ -1340,8 +1259,6 @@ mod tests {
             ],
             "the root's own name must not appear in a path"
         );
-        // messages (optional) + list (repeated) + role (optional) = 3 levels
-        // that may be absent; only `list` repeats.
         assert_eq!((leaves[0].max_def, leaves[0].max_rep), (3, 1));
         assert_eq!((leaves[1].max_def, leaves[1].max_rep), (3, 1));
         // A flat optional column: present at def 1, never repeats.
@@ -1360,8 +1277,6 @@ mod tests {
 
     #[test]
     fn plain_page_limit_is_relative_to_what_is_already_decoded() {
-        // A row group with two PLAIN pages: the second decodes into an `out`
-        // that already holds the first page's values.
         let page = |vals: &[&str]| {
             let mut d = Vec::new();
             for s in vals {

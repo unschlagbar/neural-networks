@@ -1,21 +1,4 @@
 //! Hand-written single-precision GEMM.
-//!
-//! Three transpose forms cover a Linear layer's forward and backward:
-//!   - `NN`  C = A · B        forward           Y   = X · W
-//!   - `NT`  C = A · Bᵀ       input gradient    dX  = dY · Wᵀ
-//!   - `TN`  C = Aᵀ · B       weight gradient    dW  = Xᵀ · dY
-//!
-//! Each form is written with the loop order that keeps the innermost loop
-//! contiguous (stride-1) over the output, so the compiler auto-vectorizes it.
-//! Correctness first; cache tiling and explicit SIMD are a later pass — this is
-//! the module we will tune when we start the performance comparison.
-//!
-//! `beta = 0.0` overwrites C, `beta = 1.0` accumulates into C (used to sum
-//! gradients across a batch of windows without a separate add pass).
-//!
-//! A product of at least `PAR_MIN` multiply-adds runs on the rayon pool: split
-//! over C's rows, or, when there are too few rows to go round, over K into
-//! partial products that are summed afterwards.
 
 use rayon::prelude::*;
 
@@ -44,8 +27,6 @@ pub fn gemm_nn(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]
             .zip(a.par_chunks(rows * k))
             .for_each(|(cc, ac)| nn_serial(cc.len() / n, k, n, ac, b, cc, beta));
     } else if threads > 1 && m * k * n >= PAR_MIN && k >= 2 * threads {
-        // Few rows: each task takes a slab of K (contiguous rows of B) into its own
-        // partial C, so B is still read once and in order.
         let per = k.div_ceil(threads);
         let partial = (0..k.div_ceil(per))
             .into_par_iter()
@@ -101,9 +82,8 @@ pub fn gemm_tn(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]
 
 /// Number of C rows a micro-kernel updates together. Each B row loaded from
 /// memory is reused across `MR` output rows, cutting weight-matrix bandwidth by
-/// `MR×`. The contiguous inner `n` loop auto-vectorizes cleanly (AVX2 FMA); a
-/// pure-Rust register tile was tried and regressed — LLVM spilled the
-/// accumulator array to the stack instead of holding it in vector registers.
+/// `MR×`. The contiguous inner `n` loop auto-vectorizes (AVX2 FMA); an explicit
+/// register tile makes LLVM spill the accumulators.
 const MR: usize = 4;
 
 #[inline]
@@ -116,11 +96,6 @@ fn scale_beta(c: &mut [f32], beta: f32) {
 }
 
 /// Single-threaded `gemm_nn`.
-///
-/// M-blocked by `MR`: for each block of `MR` rows and each k, one row of B is
-/// loaded once and fused into all `MR` accumulator rows, so the weight row is
-/// reused `MR` times from L1 instead of being re-streamed per output row. The
-/// `MR` independent FMA chains give the vectorizer ILP.
 fn nn_serial(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32], beta: f32) {
     scale_beta(c, beta);
 
@@ -161,13 +136,7 @@ fn nn_serial(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32], 
 }
 
 /// Single-threaded `gemm_nt`.
-///
-/// C[m,n] = Σ_k A[m,k]·B[n,k]: both operands are contiguous over k, so the
-/// inner loop is a dot product.
 fn nt_serial(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32], beta: f32) {
-    // M-blocked by MR: each B row (length k) is loaded once and dotted against
-    // MR different A rows, so the weight row is reused MR times from cache
-    // instead of being re-streamed per output row.
     let mut i = 0;
     while i + MR <= m {
         let a0 = &a[i * k..i * k + k];
@@ -211,9 +180,6 @@ fn nt_serial(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32], 
 }
 
 /// Rows `i0..i0 + rows` of `gemm_tn`, written to `c` (those rows only).
-///
-/// C[m,n] = Σ_k A[k,m]·B[k,n]: loop k→m→n keeps the inner `n` loop contiguous
-/// over a row of B and of C, with A[k,m] held as a scalar.
 #[allow(clippy::too_many_arguments)]
 fn tn_rows(
     i0: usize,
@@ -228,9 +194,6 @@ fn tn_rows(
 ) {
     scale_beta(c, beta);
 
-    // M-blocked by MR (same reuse trick as gemm_nn): each B row is fused into
-    // MR accumulator rows. A[k,m] is column-strided here (stride M), but that's
-    // only MR scalar loads per k — the contiguous inner `n` loop dominates.
     let mut i = 0;
     while i + MR <= rows {
         let (r0, rest) = c[i * n..(i + MR) * n].split_at_mut(n);
@@ -389,8 +352,6 @@ mod tests {
 
     #[test]
     fn nn_full_register_tiles() {
-        // M = 19 (4·MR + tail), N = 43 (2·NR + tail): hits full MR×NR tiles plus
-        // both remainder-column and remainder-row paths.
         let (m, k, n) = (19, 11, 43);
         let a = Tensor::random(&[m, k], 1.0);
         let b = Tensor::random(&[k, n], 1.0);

@@ -1,11 +1,5 @@
 //! Device-resident RMSNorm, the GPU counterpart of
 //! [`cpu::rms_norm::RmsNorm`](crate::cpu::rms_norm::RmsNorm).
-//!
-//! Pure normalization (`y = γ ⊙ x / rms(x)`, row-wise) with a learned scale that
-//! trains on undecayed AdamW (norm scales are never weight-decayed). Wraps the
-//! grouped `rms_norm_forward`/`backward` ops with the single-group (plain) config
-//! `group == size`. Scale, grad, moments and the saved `inv_rms` all live on the
-//! device; `x̂` is never stored — backward rebuilds it from the forward output.
 
 use super::arena::{self, ParamKind, ParamSlot, TrainingCache};
 use super::ops::{self, GpuRmsForward};
@@ -28,12 +22,6 @@ pub struct RmsNorm {
     /// γ is a fixed scale rather than a learned one.
     frozen: bool,
     /// Saved `inv_rms` of a standalone [`forward`](Self::forward), reused across calls.
-    ///
-    /// The only thing the forward keeps. `x̂` is NOT stored: backward is handed the
-    /// forward output and rebuilds `x̂ = y/γ`, which is what Apex's `memory_efficient`
-    /// path does and Liger's equivalent from the input side. Storing it costs `[N, F]`
-    /// against this `[N]`. A norm inside a block saves into the block's frame instead —
-    /// see [`carve`](Self::carve).
     fwd: Option<GpuRmsForward>,
 }
 
@@ -79,9 +67,6 @@ impl RmsNorm {
 
     /// `y = γ ⊙ (x / rms(x))`, row-wise, into the caller's `out` `[B, F]`, saving
     /// `inv_rms` into `saved` and nothing else.
-    ///
-    /// `out` may alias `x` (the kernel reads each row before writing it), which
-    /// is what lets a caller normalize a buffer in place.
     pub fn forward_saved(
         &self,
         gpu: &Gpu,
@@ -96,12 +81,6 @@ impl RmsNorm {
     /// [`forward_saved`](Self::forward_saved) writing a slab, for a caller whose only
     /// readers of `y` take it narrow — the block's two pre-norms, whose output goes
     /// straight into a GEMM. `x` stays fp32: it is the residual stream.
-    ///
-    /// Pair it with [`backward_slab_saved`](Self::backward_slab_saved); mixing the two
-    /// widths across a forward/backward pair reads the wrong bits.
-    ///
-    /// With `add = Some((x2, z))` the norm's input is the residual sum `z = x + x2`,
-    /// which is written to `z` in the same pass.
     pub fn forward_slab_saved(
         &self,
         gpu: &Gpu,
@@ -163,10 +142,6 @@ impl RmsNorm {
 
     /// Given `dY` `[B, F]`, accumulate `dγ` and write `dX` `[B, F]` into `dx`, reading
     /// the `inv_rms` a standalone [`forward`](Self::forward) saved.
-    ///
-    /// `y` is this norm's own forward OUTPUT, which backward divides by γ to recover
-    /// `x̂`. Keeping the caller's `y` alive is the whole reason the forward can get away
-    /// with saving only `inv_rms`; every caller here holds it for another reason anyway.
     pub fn backward(
         &mut self,
         gpu: &Gpu,
@@ -287,9 +262,6 @@ impl RmsNorm {
 
     /// Device bytes held, split `(params, activations)`. Diagnostic — see
     /// [`Hierarchical::retained_report`](super::hierarchical::Hierarchical::retained_report).
-    ///
-    /// The params are four `[F]` vectors — negligible, and so is the activation side:
-    /// `inv_rms` is one float per normalization group, not per element.
     pub fn retained_bytes(&self) -> (usize, usize) {
         let params = [&self.gamma, &self.dgamma, &self.m, &self.v]
             .iter()
@@ -323,18 +295,12 @@ mod tests {
     /// The slab path must agree with the fp32 one to bf16's precision, and only to
     /// that: `y` is the sole tensor whose width changes, so the gap is one rounding
     /// of the forward output propagated through both readers of it.
-    ///
-    /// Worth pinning separately from the CPU parity tests because those run the fp32
-    /// entry points — a `_slab` kernel could be wrong in every element and they would
-    /// not notice.
     #[test]
     fn slab_path_matches_fp32_within_bf16() {
         let Some(gpu) = crate::gpu::test_gpu() else {
             return;
         };
         let tc = test_cache(&gpu);
-        // A block-norm shape (group == width) and a head-norm one (group << width),
-        // which take different launch geometries.
         for (rows, size, group) in [(64usize, 256usize, 256usize), (128, 128, 16)] {
             let g = Tensor::random(&[size], 0.4);
             let x = GTensor::from_host(&gpu, &Tensor::random(&[rows, size], 0.7));
@@ -355,8 +321,6 @@ mod tests {
             let mut dx_n = GTensor::uninit(&gpu, &[rows, size]);
             narrow.backward_slab_saved(&gpu, &dy, &y_n, &saved, None, &mut dx_n, &tc);
 
-            // bf16 keeps 8 mantissa bits, so a single rounding is ~4e-3 relative. The
-            // fp32 build makes the two paths the same kernel, hence the tighter bound.
             let tol = if gpu.kernels.slab_bf16 { 1e-2 } else { 1e-6 };
             for (name, a, b) in [
                 ("y", y_w.to_host(&gpu).data, {

@@ -1,19 +1,4 @@
 //! Gradient reproducibility across *different* window shapes, per stage.
-//!
-//!   cargo run --release --features cuda --example window_determinism [reps] [full]
-//!
-//! `train_determinism.rs` repeats one window. A window's shape decides how the
-//! encoder and decoder bucket their words (one group per length, split at the row
-//! cap) and how many chunks the backbone sweep runs, so a race that only fires at
-//! a particular group geometry is invisible there. Here several windows with
-//! deliberately different shapes are each hashed over `reps` fresh
-//! forward/backwards, the unstable tensors reported per stage, and then the whole
-//! sequence is trained twice and the loss traces compared.
-//!
-//! The geometry that matters is reached with `set_bb_chunk` / `set_group_cap`
-//! rather than with word count: a 96-word window under a 16-row cap splits its
-//! buckets exactly like a 4096-word one under the real cap, in a fraction of the
-//! time. Pass `full` for the production widths and window sizes instead.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -43,9 +28,6 @@ fn main() {
         CHAR_HIDDEN, OUT_HIDDEN,
         "decoder ties the encoder char table"
     );
-    // Encoder/decoder width and dqk are kept at the production values — those pick
-    // which mLSTM path a stage takes. The backbone is narrowed and shortened, so
-    // its sLSTM geometry (and with it the fused-time decision) is NOT production's.
     let cfg = ModelCfg {
         vocab: tok.vocab_size(),
         hc: CHAR_HIDDEN,
@@ -141,8 +123,6 @@ fn main() {
         })
         .collect();
 
-    // Packed documents, as the trainer feeds them: the backbone cells restart at each
-    // start inside the window, which is its own set of kernel branches to keep stable.
     let doc_starts = |words: usize| vec![0, words / 3, words / 2 + 1];
 
     let seed = std::env::temp_dir().join("window_determinism_seed.hier");
@@ -157,9 +137,6 @@ fn main() {
         m
     };
 
-    // One model for every rep. Grads accumulate, so a rep has to start from zero;
-    // a step at lr 0 zeroes them and leaves the weights alone, which reloading the
-    // checkpoint (~110 ms) only achieved the slow way. Checked, not assumed:
     let mut model = fresh(None, None);
     let clear = {
         let mut c = AdamCfg::new(0.0, 0.0);
@@ -230,8 +207,6 @@ fn main() {
         }
     }
 
-    // The windows in sequence, stepping between them: the training loop's own path,
-    // where a window also inherits the backbone state of the one before.
     let run = || -> Vec<f32> {
         let mut m = fresh(None, None);
         let mut out = Vec::new();

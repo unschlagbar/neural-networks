@@ -1,7 +1,5 @@
 //! What the character head hears on the recorded voice takes: transcript,
 //! greedy CTC decode and per-take CER, held-out sessions first.
-//!
-//!   cargo run --release --features cuda --example ae2_voice_ctc -- models/s4.ae2.G-460h [takes per group]
 
 use neural_networks::audio::ctc::{Ctc, CtcAlphabet, edit_distance};
 use neural_networks::audio::frontend::LogMel;

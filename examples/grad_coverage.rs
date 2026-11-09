@@ -1,38 +1,4 @@
 //! Does every word of a window reach the gradients, and does a window start clean?
-//!
-//!   cargo run --release --features cuda --example grad_coverage [segments] [full]
-//!
-//! Two independent failure modes, both invisible in a loss curve.
-//!
-//! **Coverage.** The window is swept phase by phase and stage by stage: encoder and
-//! decoder run one rectangle per length bucket, the backbone one chunk at a time.
-//! Every one of those loops reuses the same buffers, so a layer that *overwrites*
-//! its gradient instead of accumulating, or a saved input a later pass clobbers,
-//! silently drops whole spans of the sequence — the loss still falls, and the model
-//! only learns the words that landed in the surviving pass. The check is
-//! additivity: the window loss is a sum over decoder rows, so restricting it to a
-//! contiguous slice of the words (the SFT loss mask gates exactly those rows) must
-//! give gradients that sum back to the whole window's. Reported per shape:
-//!
-//!   * each segment's share of the total gradient norm — a discarded span
-//!     contributes 0 here, whatever the tolerance,
-//!   * `‖Σ segments − whole‖ / ‖whole‖` per tensor, against the run-to-run noise of
-//!     an identical repeat, which catches a partial drop the norms would average
-//!     away.
-//!
-//! Segment runs are rescaled before summing: the loss normalizes by the unmasked
-//! row count, so a segment covering a quarter of the rows returns gradients ~4x too
-//! large.
-//!
-//! **Leakage.** A cell carries recurrent state forward and a BPTT state gradient
-//! backward, and the backbone only resets the latter on the chunked path. So a
-//! window can inherit the previous window's recurrence: window B run after window A
-//! must give exactly what B gives on a fresh model. Every ordered pair of shapes is
-//! checked, which is what puts a chunked window in front of an unchunked one.
-//!
-//! Both stages of both cell kinds are exercised: the encoder and decoder alternate
-//! sLSTM/mLSTM every other block, the backbone is sLSTM every 8th, and residuals are
-//! reported per (stage, cell kind).
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -67,8 +33,6 @@ fn main() {
         hc: CHAR_HIDDEN,
         wh: if full { WORD_HIDDEN } else { 256 },
         enc_blocks: if full { 4 } else { 2 }, // alternates sLSTM/mLSTM
-        // 9, not 4: the backbone is sLSTM only every 8th block, so a shorter stack
-        // would run this whole probe against mLSTM cells alone.
         bb_blocks: if full { WORD_BLOCKS } else { 9 },
         dec_blocks: if full { 4 } else { 2 }, // alternates sLSTM/mLSTM
         heads: if full { 8 } else { 2 },
@@ -148,13 +112,9 @@ fn main() {
         .save(&gpu, seed)
         .expect("save seed");
     let fresh = || {
-        // The pool caches the previous model's blocks, and at production width
-        // that cache alone is enough to fail the next model's arena allocation.
         neural_networks::gpu::trim_pool(&gpu);
         Hierarchical::load(&gpu, seed, cfg.w_token).expect("load seed")
     };
-    // lr 0: zeroes the gradient accumulators without touching the weights, so every
-    // run below starts from zero against identical parameters.
     let clear = {
         let mut c = AdamCfg::new(0.0, 0.0);
         c.t = 1;
@@ -177,9 +137,6 @@ fn main() {
 
     let mut model = fresh();
 
-    // Cell kind per block, from its slot count: an sLSTM cell contributes 4 slots to
-    // its block, an mLSTM cell 15. Derived rather than hardcoded so a change to
-    // either cell's parameter list shows up as an unknown kind, not a wrong label.
     let kinds: BTreeMap<String, &'static str> = {
         let mut per_block: BTreeMap<String, usize> = BTreeMap::new();
         for (name, _) in model.grad_signature(&gpu) {
@@ -200,8 +157,6 @@ fn main() {
                     b,
                     match n {
                         12 => "sLSTM",
-                        // q/k/v/o are one projection and the two gate logits another,
-                        // so the cell holds three Linears, not seven.
                         15 => "mLSTM",
                         _ => "?",
                     },
@@ -247,27 +202,15 @@ fn main() {
         let whole = model.grad_values(&gpu);
         model.step(&gpu, &clear);
 
-        // The mask path itself is the control: an all-true mask must reproduce the
-        // plain path, or the comparison below measures the mask, not the sweep.
         model.forward_backward(&gpu, tokens, spans);
         let plain = model.grad_values(&gpu);
         model.step(&gpu, &clear);
 
-        // The noise floor: the same whole-window gradient a second time. Every
-        // residual below comes off a bf16 pipeline and only means something next to
-        // what an identical repeat already moves.
         model.forward_backward_masked(&gpu, tokens, spans, &vec![true; dw]);
         let again = model.grad_values(&gpu);
         model.step(&gpu, &clear);
 
-        // Contiguous segments of the decoded-word axis, each run's own normalizer
-        // undone before summing.
         let mut sum: Vec<Vec<f32>> = whole.iter().map(|(_, v)| vec![0.0; v.len()]).collect();
-        // Per tensor, the summed magnitude of the segments. Against `‖whole‖` this is
-        // how much the segments cancel each other — the factor by which any roundoff
-        // in a segment is amplified when the residual is measured relative to the
-        // whole. A tensor with heavy cancellation cannot be judged on the residual
-        // alone.
         let mut mag: Vec<f32> = vec![0.0; whole.len()];
         // (tensor, segment) pairs where the segment produced literally no gradient.
         let mut zeroed: Vec<Vec<(String, usize, usize)>> =
@@ -296,10 +239,6 @@ fn main() {
                     *d += s * scale;
                     t += (s * scale) * (s * scale);
                 }
-                // Exact, not a tolerance: with this segment the only scored rows, a
-                // tensor that ends at literal zero received nothing from these words.
-                // That is what a dropped span looks like — the pass that would have
-                // accumulated it was overwritten, so nothing was ever added.
                 if src.iter().all(|v| *v == 0.0) {
                     z.push(((*n).clone(), lo, hi));
                 }
@@ -333,8 +272,6 @@ fn main() {
             .collect();
         println!("{:<15}  segment share  {}", "", pct.join("  "));
 
-        // Worst residual per (stage, cell kind), each next to that tensor's own
-        // repeat noise: a real drop is orders above its noise, arithmetic is not.
         let mut per_kind: BTreeMap<String, (f32, f32, f32, &str)> = BTreeMap::new();
         for &(d, noise, cancel, n) in &resid {
             let e = per_kind.entry(kind_of(n)).or_insert((0.0, 0.0, 0.0, n));
@@ -343,16 +280,12 @@ fn main() {
             }
         }
         for (k, (d, noise, cancel, n)) in &per_kind {
-            // `per part` is the residual measured against what the segments actually
-            // carried rather than against what survived their cancellation.
             println!(
                 "{:<15}  {k:<12} worst {d:.2e}  per part {:.1e}  cancel {cancel:>6.1}x  noise {noise:.0e}  ({n})",
                 "",
                 d / cancel.max(1.0)
             );
         }
-        // The mask path against the plain path is one run against another of the same
-        // arithmetic, so this one IS exact: same kernels, same order, mask all-ones.
         let ctrl = whole
             .iter()
             .zip(&plain)
@@ -382,8 +315,6 @@ fn main() {
             }
             any_bad = true;
         }
-        // A dropped gradient is a whole missing term, not a rounding difference: flag
-        // only what stands well clear of the same tensor's repeat noise.
         if let Some(&(d, _, cancel, n)) = resid
             .iter()
             .find(|&&(d, _, cancel, _)| d / cancel.max(1.0) > 0.02)
@@ -404,9 +335,6 @@ fn main() {
         println!();
     }
 
-    // The coverage model, its pools and its arena are dead from here on. At
-    // production width they are gigabytes, and the sweep below holds two models at a
-    // time — without this the second load runs the device out of memory.
     drop(model);
     neural_networks::gpu::trim_pool(&gpu);
 
@@ -435,10 +363,6 @@ fn main() {
         })
         .collect();
 
-    // Bit-exact: the pipeline is deterministic, so window B after window A must
-    // reproduce B on a fresh model exactly. Anything at all carried across the window
-    // border — a cell's recurrent state, a BPTT state gradient the unchunked path
-    // never resets — moves some bit here.
     println!("  (a bit-exact comparison: '.' is identical, 'X' is not)");
     for wa in windows.iter() {
         let mut row = Vec::new();
@@ -460,8 +384,6 @@ fn main() {
                 })
                 .map(|((n, _), _)| n.as_str())
                 .collect();
-            // Forward state leaking shows in the loss too; a BPTT state gradient
-            // leaking does not touch the loss at all and only shows in the gradients.
             let loss_moved = loss.to_bits() != ref_loss.to_bits();
             if !bad.is_empty() || loss_moved {
                 println!(

@@ -1,7 +1,5 @@
 //! Writes one utterance through a few random augmentations as WAVs to listen
 //! to, and times the augmentation.
-//!
-//!   cargo run --release --example augment_listen -- <utterance.flac> <out dir> [noise dir] [other speakers' clips...]
 
 use std::time::Instant;
 

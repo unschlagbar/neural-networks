@@ -1,17 +1,4 @@
 //! xLSTM-style residual block, batched.
-//!
-//!   x ─► RMSNorm ─► cell ─► RMSNorm ─┬─► z ─► RMSNorm ─► SwiGLU ─┬─► y
-//!        (pre1)            (postcell) │        (pre2)             │
-//!        └──────── residual 1 ────────┘        └──── residual 2 ──┘
-//!
-//!   z = x + post_cell_norm(cell(pre_norm1(x)))
-//!   y = z + lin_down( SiLU(lin_gate·pre_norm2(z)) ⊙ (lin_value·pre_norm2(z)) )
-//!
-//! Same architecture as `nn::slstm_block` / `nn::mlstm_block`. The norms and the
-//! SwiGLU MLP are position-wise, so they run once on the flattened `[B·T, H]`
-//! view; only the recurrent `cell` sees the `[B, T, H]` sequence. This lets the
-//! block compose the already-FD-verified `Linear` / `RmsNorm` sub-layers (each
-//! called exactly once per block forward) around a generic cell.
 
 use crate::cpu::optim::AdamCfg;
 use crate::cpu::{Linear, MLstm, RmsNorm, SLstm};
@@ -149,8 +136,6 @@ impl<C: Cell> Block<C> {
 
         let x_flat = x.reshape(&[n, h]);
 
-        // Residual 1: z = x + post_cell_norm(cell(pre_norm1(x))).  The post-cell
-        // norm is skipped for cells that don't want it (mLSTM).
         let xn1 = self.pre_norm1.forward(&x_flat);
         let cell_out = self.cell.forward(&xn1.reshape(&[b, t, h]));
         let cell_flat = cell_out.reshape(&[n, h]);

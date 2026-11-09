@@ -76,11 +76,14 @@ build plus the tests named in the step. Tick a step off here when it is done.
   `ae2` text scale and `ae2s` use `infer::Hierarchical`. `models/*` `NNM1`
   originals are still on disk and no longer readable.
 
-- [ ] **6. Comment and doc pass.** File by file, per CLAUDE.md style: cut
+- [x] **6. Comment and doc pass.** File by file, per CLAUDE.md style: cut
   restating comments, history ("was X"), paragraphs where one line will do,
   German comments. Shrink CLAUDE.md to what is true after steps 1–5. Move
   measurement history out of doc comments (it lives in memory/commits).
   Check: no code change (`git diff --stat` shows only comment lines; build green).
+  Done: comment lines 11.6k → 5.1k (in-body `//` blocks of 2+ lines removed, doc
+  blocks cut to their first paragraph/sentence, measurement history dropped); a
+  comment-stripped token diff against HEAD is empty. CLAUDE.md 7.2k → 1.5k words.
 
 ## Examples
 

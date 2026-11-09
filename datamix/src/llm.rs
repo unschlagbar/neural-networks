@@ -1,11 +1,6 @@
 // Talking to a local OpenAI-compatible server (LM Studio, llama.cpp, Ollama's
 // compat endpoint). Two jobs: generating synthetic examples that templates
 // cannot phrase, and judging records against a prompt.
-//
-// Hand-rolled HTTP/1.1 over a TCP socket — the repo carries no HTTP client, and
-// what a local chat completion needs is one POST with a `Connection: close`, so
-// a real client would be a dependency for nothing. Only `http://` is supported:
-// this is a server on your own machine.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -52,8 +47,6 @@ impl Client {
         let body = self.request("GET", &format!("{}/models", self.base), None)?;
         let mut out = Vec::new();
         let mut rest = body.as_str();
-        // The listing is `{"data":[{"id":"...","object":"model"},...]}`; walk the
-        // `"id"` keys rather than parsing the array.
         while let Some(at) = rest.find("\"id\"") {
             rest = &rest[at + 4..];
             if let Some(colon) = rest.find(':')
@@ -96,9 +89,6 @@ impl Client {
         } else {
             temperature
         };
-        // The template is part of the key: a prefilled empty `<think>` is a
-        // different answer from the same model than a deliberated one, so the
-        // two must not share a cache entry.
         let key = hash(&format!(
             "{model}\u{1}{temperature}\u{1}{nonce}\u{1}{}\u{1}{system}\u{1}{user}",
             self.cfg.completion_template
@@ -110,17 +100,10 @@ impl Client {
             return Ok(hit);
         }
 
-        // Nothing beyond the cache: the caller wants a corpus out of what has
-        // already been generated, not a run that fills in the gaps.
         if self.cfg.cache_only {
             return Err("not in the cache (cache_only)".to_string());
         }
 
-        // Two endpoints, one contract. With a template the prompt is rendered
-        // here and `/v1/completions` takes it verbatim — the only way to
-        // prefill the assistant turn, which is how a reasoning model is told
-        // its thinking is already done. Without one the server templates the
-        // messages itself.
         let templated = !self.cfg.completion_template.is_empty();
         let (endpoint, reply_field, body) = if templated {
             let prompt = self
@@ -179,12 +162,8 @@ impl Client {
                     let content = json::field(&resp, reply_field).ok_or_else(|| {
                         format!("no message content in the reply: {}", head(&resp))
                     })?;
-                    // Reasoning models fence their thinking; the corpus wants
-                    // the answer only.
                     let content = strip_think(&content).trim().to_string();
                     self.calls += 1;
-                    // An empty completion is a failure, not an answer: caching
-                    // it would make every rerun reproduce the failure for free.
                     if let Some(dir) = &self.cache
                         && !content.is_empty()
                     {
@@ -204,9 +183,6 @@ impl Client {
     }
 
     fn request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String> {
-        // Every resolved address, not just the first: `localhost` resolves to
-        // ::1 before 127.0.0.1, and a server bound to IPv4 only would look
-        // unreachable.
         let addrs: Vec<_> = (self.host.as_str(), self.port)
             .to_socket_addrs()
             .map_err(|e| format!("{}:{}: {e}", self.host, self.port))?

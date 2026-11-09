@@ -2,63 +2,6 @@
 //! [`cpu::mlstm::MLstm`](crate::cpu::mlstm::MLstm) — in the **parallel /
 //! chunkwise** formulation, not the scalar per-head recurrence (the CPU's sub-1×
 //! path; see PLAN-gpu.md Phase C).
-//!
-//! The equivalence (derived in the plan): the CPU stores the *stabilized* state
-//! `C_t = C_t^true·exp(−m_t)`, and the running stabilizer unrolls to a row-max
-//! over the log-decay matrix `logD_{tj} = fc_t − fc_j + ĩ_j` (`fc` = cumulative
-//! log-forget). For the whole sequence as a single chunk (`C_prev=n_prev=0`,
-//! `m_prev=0`):
-//! ```text
-//!   S = Q·Kᵀ ;  m_t = max(max_{j≤t} logD_{tj}, fc_t)
-//!   D̄_{tj} = exp(logD_{tj} − m_t)  (j≤t else 0)
-//!   ỹ_t = ((D̄⊙S)·V)_t / ψ_t ,  ψ_t = max(|Σ_j (D̄⊙S)_{tj}|, exp(−m_t))
-//! ```
-//! then head-norm(ỹ) → ŷ, `y = o⊙ŷ`, `h = y·W_out + b_out`. Backward
-//! differentiates this graph with `m` held constant (the reference stabilizer
-//! approximation, same as the CPU / the sLSTM cell).
-//!
-//! The input projections and `W_out` are `gpu::Linear`; only the attention core is
-//! bespoke kernels. Those read q/k/v where the projections left them —
-//! position-major and concatenated — so the cell has no reorg pass at all, and every
-//! contraction in them runs on the tensor cores with bf16 operands, which is what
-//! the projections already produced.
-//!
-//! # Chunking (`config::MLSTM_CHUNK`)
-//!
-//! Taking the whole sequence as one chunk costs O(T²) — the `[BH, T, T]` matrices.
-//! Instead the sequence is cut into chunks of length `L`, each evaluated by the
-//! parallel form above over its own `[BH, L, L]` matrices, with the stabilized
-//! recurrent state carried across boundaries (`C_prev`, `n_prev`, `m_prev`):
-//! ```text
-//!   num_t += b_t·(C_prev·q_t) ,  qn_t += b_t·(q_t·n_prev)      b_t = exp(fc_t+m_prev−m_t)
-//!   C ← g·C_prev + (a⊙V)ᵀ·K  ,  n ← g·n_prev + Σ_j a_j k_j     a_j = D̄_{last,j}, g = b_last
-//! ```
-//! with `fc` the chunk-LOCAL cumulative log-forget. This is O(T·L) — linear in T.
-//!
-//! It is an exact refactoring, not an approximation: the chunk-local row-max
-//! `m_t = max(max_{j∈chunk, j≤t} logD_tj, fc_t + m_prev)` telescopes to the global
-//! row-max, so chunked and single-chunk agree to fp tolerance in both forward and
-//! backward (`mlstm_chunking_matches_single_chunk`). Backward sweeps chunks in
-//! reverse, carrying `dC`/`dn` — BPTT over chunks, parallel form within each.
-//!
-//! Each direction is four launches, in mirror-image shapes, and only one of them is
-//! serial in anything:
-//!
-//! | | forward | backward |
-//! |---|---|---|
-//! | per-timestep scalars | `mlstm_fw_gates` (gate scan, one block per `(b, h)`) | `mlstm_bw_dqn` (dψ, one warp per step) |
-//! | per-chunk state product | `mlstm_fw_dC` (every chunk's `ΔC`, all at once) | `mlstm_bw_dC` (every chunk's `ΔdC`) |
-//! | the chunk recurrence | `mlstm_state_scan` | the same kernel, reversed |
-//! | intra-chunk attention | `mlstm_fw_parallel` | `mlstm_bw_parallel` |
-//!
-//! The scan is the one place the chunk recurrence is actually walked, and it is
-//! elementwise, so it parallelises over the whole state either way. Nothing loops
-//! chunks inside a kernel: a chunk's own contribution to the state depends on
-//! nothing outside it, because `a` and `b` already carry the stabilizer.
-//!
-//! A sequence already shorter than `L` (the encoder/decoder, where T is a word
-//! length) takes the single-chunk path with no inter-chunk work at all — both scans
-//! are skipped outright.
 
 use std::sync::OnceLock;
 
@@ -108,18 +51,8 @@ fn chunk_len() -> usize {
 }
 
 /// What a forward saves for its backward, carved from a frame — see [`MLstm::carve`].
-///
-/// Far smaller than the op-at-a-time path's cache: the per-chunk `[BH, L, L]` decay
-/// matrices do not exist — backward rebuilds them in shared memory (see
-/// `ops::MlstmFused`).
 pub struct MlstmSaved {
-    // `q ‖ k ‖ v ‖ o` in bf16 storage, mirroring the reference's DTYPE tensors
-    // (matQ/matK/matV plus the o-gate pre-activation) concatenated as its fused
-    // `qkv_opreact` output. Holds the RAW `o`: `ogate_bwd` recomputes the sigmoid.
     xh: ops::SlabBuf,
-    // fp32: `ĩ ‖ f̃`. The reference loads vecI/vecB `.to(tl.float32)` — they are
-    // exponents feeding the stabilizer, where an absolute error becomes a
-    // multiplicative one. See `gpu::bf16`.
     gates: GTensor<f32>,
     fused: ops::MlstmFused,
     /// The head norm's output: read by `ogate_bwd`, what the norm's backward rebuilds
@@ -137,17 +70,6 @@ pub struct MLstm {
     /// Chunk length (0 = single-chunk). Defaults to [`chunk_len`].
     chunk: usize,
 
-    // Projections (in → ·) and the output projection (d → d). Bias, weight decay
-    // and AdamW all handled by `Linear`, matching the CPU cell's conventions.
-    //
-    // Two projections, not six: `q ‖ k ‖ v ‖ o` of width `H*(2*dqk + 2*dhv)` and
-    // the two gate logits of width `2*H` — the reference's fused weight mode
-    // (nx-ai/xlstm, `xlstm_large/model.py`: `qkv_opreact` + `ifgate_preact`). The
-    // kernels address each part where the GEMM left it, so nothing is split apart
-    // afterwards.
-    //
-    // The gate logits keep a projection of their own because they must stay fp32
-    // (see `forward`), while `q ‖ k ‖ v ‖ o` lands in a bf16 slab.
     pub(super) lin_qkvo: Linear,
     pub(super) lin_gates: Linear,
     pub(super) lin_out: Linear,
@@ -171,14 +93,6 @@ pub struct MLstm {
 /// arriving from the row before decay by `σ(-100) ≈ e^-100` — a restart, done inside
 /// the chunkwise kernels instead of by cutting the sequence there (`reset_fgate_value`
 /// in NX-AI's xlstm-jax, `blocks/mlstm/cell.py`).
-///
-/// Not their -25: theirs sits behind a ±15 soft cap on every gate logit, so the
-/// stabilizer `m` a document ends on is never far above the next row's `ĩ`. Ours are
-/// uncapped, and the old state survives as `e^(logit + m_prev − ĩ)`, which at -25 is
-/// visible once `m_prev − ĩ` nears 25. -100 cannot overflow either: every `expf` in the
-/// kernels takes a difference the stabilizer keeps non-positive. What it costs is the
-/// chunk-local log-forget cumsum, whose rows after the reset sit near -100 in fp32 —
-/// an absolute error of ~1e-5 in their decay exponents.
 pub const DOC_RESET_FGATE: f32 = -100.0;
 
 impl MLstm {
@@ -207,8 +121,6 @@ impl MLstm {
         gamma: &Tensor,
     ) -> Self {
         let dhv = d / heads;
-        // q·kᵀ wants k scaled by 1/√dqk. The factor is constant, so it is folded into
-        // wk/bk here and the runtime never spends a pass rescaling k or dk.
         let inv_sqrt_dqk = 1.0 / (dqk as f32).sqrt();
         let scaled =
             |t: &Tensor| Tensor::new(t.dims(), t.data.iter().map(|v| v * inv_sqrt_dqk).collect());
@@ -242,10 +154,6 @@ impl MLstm {
     }
 
     /// Column where `o` starts in the fused `q ‖ k ‖ v ‖ o` projection.
-    ///
-    /// The kernels derive the same offset from `(H, dqk, dhv)` themselves
-    /// (`MLSTM_OFF_O`); the o-gate pair takes it as an argument because those two are
-    /// plain elementwise kernels with no shape specialization to fold it into.
     fn o_off(&self) -> usize {
         2 * self.heads * self.dqk + self.d
     }
@@ -284,12 +192,6 @@ impl MLstm {
     }
 
     /// The chunk length the fused kernels run this sequence at.
-    ///
-    /// Chunk length is a blocking choice with no effect on the result
-    /// (`mlstm_chunking_matches_single_chunk` pins that), so a configured chunk is
-    /// clamped into what the kernels support rather than dispatched on: longer than
-    /// `FUSED_MAX_L` clamps down (the decay matrix must fit in shared memory), and
-    /// `chunk == 0` clamps UP to 1, a step-by-step recurrence.
     fn fused_chunk(&self, gpu: &Gpu, t: usize) -> usize {
         let l = self.chunk.min(ops::FUSED_MAX_L).min(t).max(1);
         debug_assert!(
@@ -354,18 +256,6 @@ impl MLstm {
     }
 
     /// Forward over `[B, T, in]` → `[B, T, d]`, saving into `sv`.
-    ///
-    /// Chunkwise: the sequence is cut into chunks of `chunk_len()`, each handled by
-    /// the parallel (attention) form over its own `[BH, L, L]` decay matrix, with
-    /// the recurrent state `(C, n, m)` carried across chunk boundaries. One chunk
-    /// covering the whole sequence reduces to the single-chunk form.
-    ///
-    /// `out` is the caller's `[B, T, d]` buffer, written in place.
-    ///
-    /// `x` must stay alive and unchanged until this call's backward, which takes it
-    /// back: the projections read it for their `dW`, and this cell keeps no copy of it.
-    /// In a [`Block`](super::block::Block) that is the block's own `norm1_out`, a slab
-    /// at the projections' width, so neither direction narrows it.
     pub fn forward_saved(
         &mut self,
         gpu: &Gpu,
@@ -386,34 +276,15 @@ impl MLstm {
         let rows = batch * t;
         let shape = self.shape(batch, t);
 
-        // The input as `[N, in]`, which is the shape both projections want. A view:
-        // every projection's `dW` reads it again in backward, but the caller hands it
-        // back there (`backward`'s `x`), so this cell keeps no copy of its own.
         let xv = x.view(gpu, &[rows, inp]);
 
-        // Two projections, both off the same narrowed `xf`. `q ‖ k ‖ v ‖ o` lands in
-        // one slab at the kernels' own width and stays exactly where the GEMM wrote
-        // it — the position-major, concatenated `[rows, H*(2*dqk+2*dhv)]` is what the
-        // fused kernels and `ogate_fwd` address. The gate logits keep a projection of
-        // their own so they can stay fp32: they are exponents feeding the stabilizer,
-        // where an absolute error becomes a multiplicative one, whereas `o` feeds a
-        // sigmoid, which is bounded and Lipschitz. At `[rows, 2*H]` they are a factor
-        // of `dqk` smaller than the slab, so narrowing them would buy nothing anyway.
-        //
-        // Both projections read the same narrowed `xf`: an fp32 input is narrowed
-        // once here, into a borrowed slot, rather than by each of them.
         let xf = xv.at_width(gpu, self.lin_qkvo.is_bf16(), &cache.temps);
         self.lin_qkvo.forward_slab_slab(gpu, &xf.x, &mut sv.xh);
         self.lin_gates.forward_slab_lhs(gpu, &xf.x, &mut sv.gates);
         drop(xf);
         // The frame keeps the forced logits, so backward's recompute sees the same gates.
         self.force_forget(gpu, &mut sv.gates, batch);
-        // k needs no rescale: 1/√dqk is folded into its columns of `lin_qkvo`. `o` is
-        // squashed later, fused into the product that consumes it.
 
-        // Carry the recurrent state in from the previous chunk when the surrounding
-        // sweep is chunked; `None` (the unchunked case) starts it at zero inside
-        // the kernel. The outgoing state is taken below, after the cache is built.
         let mut avec = cache
             .temps
             .get_small::<f32>(gpu, &[shape.bh(), sv.fused.nc, sv.fused.l]);
@@ -454,9 +325,6 @@ impl MLstm {
 
     /// Device bytes held, split `(params, activations)`. Diagnostic — see
     /// [`Hierarchical::retained_report`](super::hierarchical::Hierarchical::retained_report).
-    ///
-    /// Note the multiplier: this cell owns **three** [`Linear`]s, each with its own
-    /// bf16 GEMM staging, plus a head-wise [`RmsNorm`].
     pub fn retained_bytes(&self) -> (usize, usize) {
         let (mut params, mut act) = (0, 0);
         for l in [&self.lin_qkvo, &self.lin_gates, &self.lin_out] {
@@ -472,11 +340,6 @@ impl MLstm {
     }
 
     /// Continue the previous call's recurrence rather than starting from zero.
-    ///
-    /// For a chunked sweep: the state `C`/`n`/`m` crosses the chunk borders, which is
-    /// what makes the split reproduce the unchunked recurrence (see
-    /// `mlstm_chunked_carry_matches_whole`). Clear it — or call
-    /// [`reset_state`](Self::reset_state) — before the first chunk of a sweep.
     pub fn set_carry(&mut self, carry: bool) {
         self.carry = carry;
         if !carry {
@@ -534,10 +397,6 @@ impl MLstm {
     }
 
     /// Retained activation bytes split `(saved_cache, other)`.
-    ///
-    /// `saved_cache` is this cell's own frames. `other` is what the **three**
-    /// projections and the head norm hold internally — their bf16 GEMM staging — which
-    /// no `drop_saved_act` reaches.
     pub fn act_split(&self) -> (usize, usize) {
         let saved = self.frames.device_bytes();
         let (_, all) = self.retained_bytes();
@@ -552,10 +411,6 @@ impl MLstm {
             l.drop_saved_act(gpu);
         }
         self.headnorm.drop_saved_act();
-        // The bf16 staging scratch is process-wide and is NOT released here: this runs
-        // per block, mid-sweep, so freeing it would pull the buffer out from under the
-        // blocks still to come. `Hierarchical::drop_all_act` clears it once, at the
-        // point where the whole stack is done.
     }
 
     /// Backward over `[B, T, d]` → `dx` `[B, T, in]`, reading the frame the matching
@@ -590,11 +445,6 @@ impl MLstm {
 
     /// Backward over `[B, T, d]` → `dx` `[B, T, in]`, reading what
     /// [`forward_saved`](Self::forward_saved) wrote into `sv`. Accumulates all grads.
-    ///
-    /// Two kernels for the whole chunkwise core, with the projection/head-norm/o-gate
-    /// shell around it. Chunks are swept in reverse, carrying `dC`/`dn` (the grad wrt
-    /// the state a chunk hands to its successor) backwards the way forward carried
-    /// `C`/`n` forwards — BPTT over chunks, with the parallel form inside each.
     pub fn backward_saved(
         &mut self,
         gpu: &Gpu,
@@ -614,22 +464,13 @@ impl MLstm {
             n * inp
         );
 
-        // The whole shell is temporaries: each value below dies as soon as the next
-        // op has read it, so all of them come from the pool and go back.
-        // `dy` is `[B, T, d]` and `lin_out` wants `[N, d]` — the same elements, so a
-        // view rather than a copy into scratch of its own.
         let dy_flat = GTensor::view(gpu, &dy.buf, 0, &[n, d]);
-        // `lin_out`'s input is rebuilt rather than saved: one elementwise pass over two
-        // tensors the frame holds anyway, against `[N, d]` more to move per chunk.
         let mut hconcat = ops::SlabAt::temp(gpu, &cache.temps, &[n, d], self.hconcat_narrow(gpu));
         ops::ogate_fwd(gpu, &sv.xh, &sv.yhat, &mut hconcat.x, self.o_off());
         let mut d_hconcat = cache.temps.get::<f32>(gpu, &[n, d]);
         self.lin_out
             .backward_slab_x(gpu, &hconcat.x, &dy_flat, &mut d_hconcat, 0.0, cache);
         drop(hconcat);
-        // `dq‖dk‖dv‖do` is one buffer: `ogate_bwd` fills the `o` block here and
-        // `mlstm_fused_bw` the other three below, between them writing every column,
-        // so it comes in uninitialised and feeds `lin_qkvo`'s backward whole.
         let mut dxh = cache
             .temps
             .get::<f32>(gpu, &[n, self.lin_qkvo.output_size()]);
@@ -644,20 +485,12 @@ impl MLstm {
             self.o_off(),
         );
         drop(d_hconcat);
-        // No gather: the kernels read `d_ytil` through the same position-major strides
-        // they wrote `ytil` with, and the head norm's output is already in that layout.
         let mut d_ytil = cache.temps.get::<f32>(gpu, &[n, d]);
-        // `yhat` is the head norm's own output, kept for `ogate_bwd` — which is also
-        // what its backward rebuilds `x̂` from, so the norm stores no `[N, d]` of its own.
         self.headnorm
             .backward_saved(gpu, &d_yhat, &sv.yhat, &sv.headnorm, None, &mut d_ytil, cache);
         drop(d_yhat);
 
-        // `[N, 2·heads]` — a gate strip, not a rectangle, so it comes from the small
-        // array rather than spending a stage-sized slot on 64 KB.
         let mut dgates = cache.temps.get_small::<f32>(gpu, &[n, 2 * h]);
-        // Backward unwinds chunks right to left, so the carried BPTT state comes from
-        // the chunk to the RIGHT — `None` on the rightmost (and on any unchunked call).
         let dstate = ops::mlstm_fused_bw(
             gpu,
             &sv.fused,
@@ -684,24 +517,10 @@ impl MLstm {
         if self.carry {
             self.carry_dstate = Some(dstate);
         }
-        // A forced logit is a constant, not the projection's output: nothing flows back
-        // through it into `lin_gates`.
         for &r in &self.resets {
             ops::fill_f32(gpu, &mut dgates, r * 2 * h + h, h, 0.0);
         }
 
-        // No scatter and no split: the kernel wrote `dq`/`dk`/`dv` into the one
-        // `[N, H*(2*dqk+dhv)]` buffer through the same strides the projection wrote
-        // q/k/v with, so it feeds `lin_qkvo`'s backward whole. `dk` needs no 1/√dqk
-        // either — the factor lives in `lin_qkvo`'s k columns, so it is already in
-        // their scale.
-        //
-        // dx is the sum of the two projection backwards: the gates' GEMM accumulates
-        // onto the one `lin_qkvo` wrote. The accumulator is the caller's `dx` seen as
-        // `[N, in]`, so the sum lands where it is wanted.
-        //
-        // Both read the one `x` the caller kept from the forward, at the width they
-        // read it in forward.
         let mut acc = GTensor::view(gpu, &dx.buf, 0, &[n, inp]);
         let xv = x.view(gpu, &[n, inp]);
         let xf = xv.at_width(gpu, self.lin_qkvo.is_bf16(), &cache.temps);
@@ -829,10 +648,6 @@ mod tests {
 
     /// One temp cache per test, sized past every shape this module presents — the
     /// widest is `[b·t, heads·(2·dqk + 2·dhv)]` at `b·t = 400`, `dqk = dhv = 96`.
-    /// The chunk array is deliberately generous here: these tests drive `set_chunk`
-    /// down to 1, where the per-chunk state arrays hold `nc == t` states instead of the
-    /// `t/32` a real run sees. Production sizes it from the config — see
-    /// `Hierarchical::temp_chunk_elems`.
     fn test_cache(gpu: &Gpu) -> TrainingCache {
         TrainingCache::new(gpu, 1 << 20, 1 << 16, 1 << 24)
     }
@@ -848,11 +663,6 @@ mod tests {
     }
 
     /// Worst absolute difference measured against the tensor's own magnitude.
-    ///
-    /// Column block `[at, at + cols)` of a `[·, w]` host matrix.
-    ///
-    /// The cell holds q/k/v in one projection and ĩ/f̃ in another; the CPU cell it is
-    /// compared against keeps all six apart, so the parity checks cut a part back out.
     fn cols_of(m: &[f32], w: usize, at: usize, cols: usize) -> Vec<f32> {
         m.chunks(w)
             .flat_map(|r| r[at..at + cols].iter().copied())
@@ -861,9 +671,6 @@ mod tests {
 
     /// Lay separate `[B, T, ·]` q/k/v out the way the fused projection writes them —
     /// concatenated into `[B*T, H*(2*dqk + 2*dhv)]`, with `H = 1` for these tests.
-    ///
-    /// The trailing `o` block is zero-filled: nothing in the fused kernels reads it,
-    /// but it sets the row stride they address q/k/v through, so it has to be there.
     fn pack_qkv(
         gpu: &Gpu,
         q: &GTensor<f32>,
@@ -990,10 +797,6 @@ mod tests {
     /// including a length that leaves a SHORT final chunk (T=20, L=8 → 8+8+4), and
     /// L=1 (the fully recurrent extreme, where every intra-chunk matrix is 1×1 and
     /// all the work goes through the carried state).
-    ///
-    /// This is the tighter of the two mLSTM tests: it pins the inter-chunk state
-    /// carry and its BPTT, which `mlstm_matches_cpu` (T < L, single chunk) never
-    /// reaches.
     #[test]
     fn mlstm_chunking_matches_single_chunk() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -1003,12 +806,6 @@ mod tests {
         let (b, t, inp, d, heads, dqk) = (2, 20, 5, 8, 2, 4);
 
         let mut proto = CpuMLstm::new(inp, d, heads, dqk);
-        // Non-trivial gate weights so the decay/stabilizer path is exercised — with
-        // zero gates every chunk would decay identically and the test would pass
-        // vacuously.
-        // Seeded for the same reason as `mlstm_fused_chunking_matches_unit_chunk`: this compares
-        // two chunk blockings whose sums reassociate, so it is a tolerance test and
-        // must not redraw its data every run.
         proto.wi = Tensor::random_seeded(&[inp, heads], 0.3, 0xB1);
         proto.wf = Tensor::random_seeded(&[inp, heads], 0.3, 0xB2);
 
@@ -1034,35 +831,18 @@ mod tests {
             (y, dxo, wf, wout)
         };
 
-        // Both sides store q/k/v and ytil bf16, but a different chunking quantizes
-        // at different points, so the two do not cancel — the floor is bf16's, and
-        // Adam then amplifies it on near-zero-gradient weights (`lr·ĝ/(√v̂+ε)` is
-        // scale-invariant in the gradient). `GPU_NO_BF16=1` restores the fp32
-        // tolerances. Measured drift without this was ~3.5e-3 relative on `w_out`,
-        // intermittently over the old 1e-3 bound.
         let slab = if gpu.kernels.slab_bf16 { 8.0 } else { 1.0 };
         let (y0, dx0, wf0, wo0) = run(0); // single chunk
         for l in [1, 3, 8, 16, 32] {
             let (y, dxo, wf, wo) = run(l);
             assert_close(&y, &y0, 2e-4 * slab, &format!("y (chunk {l})"));
             assert_close(&dxo, &dx0, 2e-4 * slab, &format!("dx (chunk {l})"));
-            // Scale-relative: post-Adam weights are ~1e-2, so an absolute 2e-6 is a
-            // 1e-4 relative demand that chunk-boundary reassociation cannot meet.
             assert_close_rel(&wf, &wf0, 1e-3 * slab, &format!("wf (chunk {l})"));
             assert_close_rel(&wo, &wo0, 1e-3 * slab, &format!("w_out (chunk {l})"));
         }
     }
 
     /// Chunked (L = 32) vs step-by-step (L = 1), at a shape wide enough to matter.
-    ///
-    /// The chunk length is a blocking choice with no effect on the result, so the two
-    /// must agree — what is on trial is the inter-chunk state carry and the ragged
-    /// final chunk. The other tests run at toy dims (dqk = dhv = 4, T = 20), where a
-    /// fused block uses a few hundred bytes of shared memory and most of its threads
-    /// idle. This one runs dqk = dhv = 64 over a T that spans many chunks and ends on
-    /// a SHORT one (T = 200 = 6·32 + 8), which is what exercises the shared-memory
-    /// staging, the block-wide max/sum reductions, and the `len` masking. A bug in
-    /// any of those is invisible at the toy dims.
     #[test]
     fn mlstm_fused_chunking_matches_unit_chunk() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -1075,9 +855,6 @@ mod tests {
             "the last chunk must be short"
         );
 
-        // Seeded: this is a tolerance comparison between two float orderings, so
-        // unseeded data made it pass or fail by luck (~3 of 5 runs failed on a
-        // different element each time). See `Tensor::random_seeded`.
         let mut proto = CpuMLstm::new(inp, d, heads, dqk);
         proto.wi = Tensor::random_seeded(&[inp, heads], 0.3, 0xA1);
         proto.wf = Tensor::random_seeded(&[inp, heads], 0.3, 0xA2);
@@ -1085,8 +862,6 @@ mod tests {
         let x = GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, inp], 0.5, 0xA3));
         let g = GTensor::from_host(&gpu, &Tensor::random_seeded(&[b, t, d], 1.0, 0xA4));
 
-        // `chunk` here selects the path, not just the blocking: 0 is the only value
-        // the fused kernels decline, so it is the reference. See `fused_chunk`.
         let run = |chunk: usize| {
             let mut dev = MLstm::from_cpu(&gpu, &proto);
             dev.set_chunk(chunk);
@@ -1103,39 +878,18 @@ mod tests {
             (y, dx, wf, wout)
         };
 
-        // L = 1 degenerates the chunkwise form to a pure step-by-step recurrence (no
-        // intra-chunk parallel term at all); L = 32 is the real blocking. The state
-        // carry is the only thing that can make them differ.
         let (y0, dx0, wf0, wo0) = run(1);
         let (y1, dx1, wf1, wo1) = run(32);
 
-        // Both sides keep their saved q/k/v and ytil in bf16 (the reference's DTYPE
-        // tensors), so the floor is bf16's half-ulp (2^-8) rather than fp32
-        // reassociation, and both sides' dots are on the tensor cores. `GPU_NO_BF16=1`
-        // puts the slabs back on fp32 and the original tolerances apply.
         let slab = if gpu.kernels.slab_bf16 { 8.0 } else { 1.0 };
         assert_close(&y1, &y0, 2e-3 * slab, "y");
         assert_close(&dx1, &dx0, 2e-3 * slab, "dx");
-        // The weights come out of an Adam step, so they sit at ~1e-2 while the two
-        // paths' GEMMs reassociate at ~1e-3 relative. An ABSOLUTE 2e-5 on values of
-        // that size is really a 4e-4 relative demand, tighter than summation order
-        // guarantees — which is what made this test intermittent. Compare against
-        // the tensor's own scale.
-        // Adam divides by √v̂, which amplifies a small gradient difference on a
-        // near-zero-gradient weight, so the weight check needs more headroom than
-        // the activations above.
         assert_close_rel(&wf1, &wf0, 5e-3 * slab, "wf");
         assert_close_rel(&wo1, &wo0, 5e-3 * slab, "w_out");
     }
 
     /// The fused forward and backward against the CPU scalar recurrence at a shape
     /// with a SHORT final chunk (T = 200 = 6·32 + 8).
-    ///
-    /// What is on trial is the ragged tail: the mma fragment loaders read whole
-    /// 16x8x16 blocks, so every buffer is zero-filled past `len` and the pad rows must
-    /// contribute nothing. A wrong fragment index or a missed zero-fill garbles the
-    /// result outright rather than by 1e-3, so the tolerance is loose on purpose —
-    /// the operands are bf16, and the dots accumulate over 200 timesteps.
     #[test]
     fn mlstm_fused_ragged_chunk_matches_cpu() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -1170,19 +924,12 @@ mod tests {
 
     /// The fused kernels at a head width wide enough to TILE, against the CPU scalar
     /// recurrence.
-    ///
-    /// The other CPU checks run `dqk = 4`, where `MLSTM_KT`/`MLSTM_VT` exceed the head
-    /// dim and both slice loops are a single pass — so they exercise none of the
-    /// head-dim tiling. Here `dqk = dhv = 96` gives NKT = NVT = 3, and the CPU
-    /// recurrence is an independent implementation rather than a second GPU path.
     #[test]
     fn mlstm_fused_tiled_matches_cpu() {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
         let tc = test_cache(&gpu);
-        // T spans several fused chunks (FUSED_MAX_L = 32) so the state carry is
-        // covered too; dqk = dhv = 96 is the backbone's width.
         let (b, t, inp, d, heads, dqk) = (2, 70, 12, 768, 8, 96);
 
         let mut cpu = CpuMLstm::new(inp, d, heads, dqk);
@@ -1193,32 +940,12 @@ mod tests {
         let x = Tensor::random_seeded(&[b, t, inp], 0.5, 0xD3);
         let g = Tensor::random_seeded(&[b, t, d], 1.0, 0xD4);
 
-        // Relative, not absolute: at this width `y` lands around 2e-4, so an absolute
-        // 5e-3 would be ~20x the signal and pass on nearly any output.
-        //
-        // The bound is bf16's half-ulp (2^-8 ~ 3.9e-3) with room for the accumulated
-        // rounding on top: the fused path stores q/k/v and ytil narrow, so a tighter
-        // relative bound is measuring the storage format, not the kernel. Sitting at
-        // 5e-3 made this fail ~2 runs in 3 at 5.07e-3.
         let y_cpu = cpu.forward(&x);
         let xd = GTensor::from_host(&gpu, &x);
         let mut y_dev = GTensor::uninit(&gpu, &[b, t, d]);
         dev.forward(&gpu, &xd, &mut y_dev, &tc);
         assert_close_rel(&y_dev.to_host(&gpu).data, &y_cpu.data, 1e-2, "y");
 
-        // dx is looser than y: it carries the bf16 q/k/v narrowing and the TF32 mma
-        // rounding of every backward contraction, against an fp32 CPU recurrence.
-        // The injected-bug check that justifies this test lands at 2.2e-1, two orders
-        // above either bound.
-        // dx is looser than y: it carries the bf16 q/k/v narrowing and the TF32 mma
-        // rounding of every backward contraction, against an fp32 CPU recurrence.
-        // The injected-bug check that justifies this test lands at 2.2e-1, an order
-        // above either bound.
-        //
-        // Weights after an Adam step are deliberately NOT compared: the update is
-        // `lr·g/(√(g²)+ε)`, which normalizes away the gradient's magnitude and turns
-        // a last-bit difference into a full-size one — 3.1e-2 here. `dx` is the
-        // gradient check; a weight check on top of it only measures the optimizer.
         let dx_cpu = cpu.backward(&g);
         let dx_dev = dev.backward_alloc(&gpu, &xd, &GTensor::from_host(&gpu, &g), &tc);
         assert_close_rel(&dx_dev.to_host(&gpu).data, &dx_cpu.data, 1e-2, "dx");
@@ -1283,13 +1010,6 @@ mod tests {
 
     /// The fused forward, run in chunks with the state carried, must reproduce the
     /// single whole-sequence call.
-    ///
-    /// This is the load-bearing property of the chunked sweep, tested at the kernel
-    /// level so a failure points at the `CARRY` seeding in `mlstm_fw_gates` /
-    /// `mlstm_state_scan` rather than at anything layered above it. `m` is the stabilizer: seeding it wrong does not
-    /// crash and produces no NaN, it silently rescales every value in the chunk — so
-    /// comparing `ytil` (the kernel's output) across the split is the only thing that
-    /// actually catches it.
     #[test]
     fn mlstm_chunked_carry_matches_whole() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -1377,24 +1097,10 @@ mod tests {
         }
 
         assert_eq!(got.len(), want.len(), "chunked output length");
-        // bf16 `ytil` storage, so this is a storage-precision comparison, not an exact
-        // one. What would signal a broken carry is a whole chunk being off — a
-        // stabilizer error is multiplicative and hits every element after the border.
         assert_close(&got, &want, 3e-2, "chunked ytil vs whole");
     }
 
     /// The chunked **backward** must reproduce the whole-sequence one.
-    ///
-    /// `mlstm_chunked_carry_matches_whole` only compares the forward, and that gap hid
-    /// a real bug: `mlstm_bw_parallel` forced the last chunk's incoming state gradient
-    /// to zero (`is_last`), which is right for a whole sequence but wrong under CARRY,
-    /// where that chunk feeds the chunk to its right. The gradient stayed plausible and
-    /// the loss stayed right — only `dW` was off, and the error grew with the number of
-    /// chunk borders (measured 1.2% across one, 2.6% across two).
-    ///
-    /// A tolerance test: the two blockings sum the same terms in a different order.
-    /// `dx` is the observable, not `dW` — the projection gradients average the error
-    /// down to a factor of two, while `dx` separates the two states by ~700x.
     #[test]
     fn mlstm_chunked_backward_matches_whole() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -1402,8 +1108,6 @@ mod tests {
         };
         let tc = test_cache(&gpu);
         let (inp, d, heads, dqk, b, t) = (8usize, 16usize, 2usize, 8usize, 1usize, 12usize);
-        // Seeded: this compares two blockings whose sums reassociate, so it must not
-        // redraw its instance every run.
         let mut proto = CpuMLstm::new(inp, d, heads, dqk);
         proto.wi = Tensor::random_seeded(&[inp, heads], 0.3, 0xE1);
         proto.wf = Tensor::random_seeded(&[inp, heads], 0.3, 0xE2);
@@ -1423,10 +1127,6 @@ mod tests {
             GTensor::from_host(&gpu, &Tensor::new(&[b, len, w], o))
         };
 
-        // Reference: one call over the whole sequence.
-        // Internal chunk length 2, so each call has NC > 1. At the default (256) a
-        // 6-step call is a single internal chunk, `is_last` is true for it either way,
-        // and the CARRY path under test is never reached.
         let mut whole = MLstm::from_cpu(&gpu, &proto);
         let xd = GTensor::from_host(&gpu, &x);
         let mut y_whole = GTensor::uninit(&gpu, &[b, t, d]);
@@ -1437,8 +1137,6 @@ mod tests {
             .data
             .to_vec();
 
-        // Scale-aware: `dW` has near-zero entries where a pointwise relative error
-        // says nothing.
         let err = |got: &[f32]| -> f32 {
             let scale = want
                 .iter()
@@ -1457,8 +1155,6 @@ mod tests {
             let mut part = MLstm::from_cpu(&gpu, &proto);
             part.set_carry(true);
             part.reset_state(&gpu);
-            // Each chunk's input outlives its forward: backward reads it again for
-            // the projections' `dW`.
             let xs: Vec<GTensor<f32>> = parts
                 .iter()
                 .map(|&(c0, len)| cut(&x, c0, len, inp))
@@ -1479,8 +1175,6 @@ mod tests {
             }
             let got: Vec<f32> = pieces.concat();
             let e = err(&got);
-            // Measured on this instance: 1e-3 with the carry honoured, 0.69 without —
-            // the threshold sits between, far from both.
             assert!(
                 e < 1e-2,
                 "chunked backward dx differs by {e} over {} chunks",
@@ -1503,9 +1197,6 @@ mod tests {
 
     /// The same where the document before the reset drives the stabilizer far above
     /// the next row's input gate — static heads (`f̃` large, so `m` only ratchets up)
-    /// fed an input `ĩ` tens of units above the first row of the next document. The
-    /// forced logit must bury the old state whatever `m − ĩ` it left behind; at -25
-    /// this instance leaks half the output scale into the rows after the border.
     #[test]
     fn document_reset_survives_a_saturated_stabilizer() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -1604,18 +1295,11 @@ mod tests {
                 [&cpu[0].1, &cpu[1].1],
             ),
         ] {
-            // The document before the border: its forward never sees what follows,
-            // and its backward receives nothing from across the border — so it matches
-            // the prefix run on its own up to the projections' GEMM blocking.
             let e = err(whole, half[0], w, 0..r);
             assert!(
                 e < 1e-5,
                 "{what}: prefix rows moved by {e} with the next document attached"
             );
-            // The document after it, against the fp32 CPU cell run on it alone. The
-            // whole call blocks it differently from a call of its own, so it sits at
-            // the GPU's usual distance from fp32, not bit-equal to the GPU half — what
-            // the reset may not do is add to that distance.
             let suffix = |v: &Vec<f32>| v[r * w..].to_vec();
             let (e_whole, e_half) = (
                 err(&suffix(whole), reference[1], w, 0..t - r),

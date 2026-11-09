@@ -111,8 +111,6 @@ pub fn train_hierarchical(model_path: &str) {
             } else {
                 0
             };
-            // The resume offset is only meaningful against the window count it was
-            // measured with; `windows == 0` is a count that was never taken.
             let t0 = Instant::now();
             let total = data.count_windows();
             println!("  {total} windows (counting pass took {:.1?})", t0.elapsed());
@@ -142,8 +140,6 @@ pub fn train_hierarchical(model_path: &str) {
                     continue;
                 }
                 for batch in chunk.iter().skip(skip) {
-                    // Counts every window the iterator yields, so `done` stays
-                    // aligned with where `chunk.iter().skip(done)` resumes.
                     progress.done += 1;
                     let tokens: Vec<usize> = batch.tokens.iter().map(|&t| t as usize).collect();
                     let words = &batch.words;
@@ -166,8 +162,6 @@ pub fn train_hierarchical(model_path: &str) {
                     if let Some(lr) = state.step(loss) {
                         opt.lr = lr;
                         opt.t += 1;
-                        // The gradient is a sum over BATCH_SIZE windows; the clip and
-                        // the log are on the mean.
                         let batch = BATCH_SIZE as f32;
                         let norm = model.clip_grad_norm(GRAD_CLIP_NORM * batch);
                         state.log_metric("grad_norm", norm / batch);
@@ -220,8 +214,6 @@ pub fn train_hierarchical(model_path: &str) {
     }
 
     save_pretrain(&model, &mut state, &mut progress);
-    // The sidecar stays, saying the corpus is done: it records which shards these
-    // weights have seen, and deleting it is the user's call.
     println!(
         "Run complete — '{}' says the corpus is finished; delete it or point the \
          next run at another corpus.",
@@ -312,8 +304,6 @@ pub fn train_sft(model_path: &str) {
     state.set_defer_log_flush(true);
     let mut opt = AdamCfg::new(SFT_LR, crate::config::BACKBONE_WEIGHT_DECAY);
 
-    // The shuffle is seeded from the sidecar, so a resume replays the same
-    // permutation and skipping `done` examples skips the ones already trained on.
     let mut progress =
         sft_progress::resume_or_fresh(model_path, examples.len(), model.step_count, SFT_EPOCHS);
     // Warmup counts from where this fine-tune began, not from the checkpoint's step.
@@ -474,10 +464,8 @@ pub struct LrSchedule {
     pub decay_windows: usize,
     pub min_lr: f32,
     /// A second linear ramp from `rewarm_origin`, multiplied onto the curve above;
-    /// `rewarm_windows == 0` disables it. A resumed run needs it because its AdamW
-    /// moments restart at zero: the first steps are then sign-like, every parameter
-    /// moving by ~lr, and on `s5` one such step at the full rate took the held-out
-    /// loss from 1.24 to 2.13 (at 0.1x the rate it improved it).
+    /// `rewarm_windows == 0` disables it. A resumed run restarts its AdamW moments at
+    /// zero, so its first steps are sign-like and need a low rate.
     pub rewarm_origin: usize,
     pub rewarm_windows: usize,
 }
@@ -585,9 +573,6 @@ impl TrainingState {
     /// the mean NLL per decoder ROW, `rows` the count it was averaged over (chars
     /// plus one `[W]` per word), `bytes` the raw UTF-8 bytes those rows cover and
     /// `words` the scored words they belong to.
-    /// The `[W]` rows are part of the model's cost but not of the text, so the
-    /// total nats are charged against bytes only — that is what makes bpb
-    /// comparable to a byte-level model that never emits a word marker.
     pub fn log_bpb(&mut self, loss: f32, rows: usize, bytes: usize, words: usize) {
         if bytes == 0 || !loss.is_finite() {
             return;
@@ -629,8 +614,6 @@ impl TrainingState {
         let extra_header: String = extra_cols.iter().map(|c| format!(",{c}")).collect();
         let header = format!("step,batch,lr,loss,perplexity,ms_per_step,s_per_norm_seq{extra_header}");
         if !is_new {
-            // A resumed log written before a column existed: replace its header so the
-            // new rows line up. Older rows simply end before the new columns.
             if let Ok(text) = std::fs::read_to_string(&path)
                 && let Some((first, rest)) = text.split_once('\n')
                 && first != header
@@ -677,8 +660,6 @@ impl TrainingState {
         self.loss_steps += 1;
         self.steps_since_log += 1;
         if self.step.is_multiple_of(self.batch_size) {
-            // Schedule position is the number of windows seen since the run
-            // started, so the curve over the corpus is the same at any batch size.
             let sched = self.schedule;
             let windows = self.step.saturating_sub(sched.origin) as f32;
             self.warmup_lr = if sched.warmup_windows == 0 {

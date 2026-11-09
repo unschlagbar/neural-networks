@@ -1,8 +1,6 @@
 //! Checks that word embeddings mean the same to the CPU and GPU models: the CPU
 //! text encoder's e_w, fed to the GPU backbone as given embeddings, must score
 //! like the GPU model reading the text itself.
-//!
-//!   cargo run --release --features cuda --example ae2_interface -- s4.v2
 
 use std::range::Range;
 

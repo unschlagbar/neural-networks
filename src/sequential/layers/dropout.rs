@@ -1,17 +1,4 @@
 // Inverted dropout: during training each unit is kept with probability (1 − rate)
-// and scaled by 1/(1 − rate), so the expected value stays the same.
-// At inference time (`training == false`) the layer is a pure pass-through.
-//
-// Usage via SequentialBuilder:
-//
-//   SequentialBuilder::new(input_size)
-//       .lstm(256)
-//       .dropout(0.3)          // 30 % dropped during training
-//       .dense(vocab, Linear)
-//       .softmax()
-//       .build()
-//
-// Call `set_training(false)` before sampling / evaluation.
 
 use std::{any::Any, io};
 

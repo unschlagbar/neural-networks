@@ -1,11 +1,5 @@
 // The slice of TOML the mixture format uses, parsed by hand (the repo carries
 // no serde).
-//
-// Supported: table headers including dotted and quoted names, basic and literal
-// strings with their multi-line forms, integers, floats, booleans, and arrays
-// of those (arrays may span lines). Not supported, because the format has no
-// use for them: inline tables, arrays of tables, dates, dotted keys inside a
-// table. Each is refused by name rather than mis-parsed.
 
 use std::fmt;
 
@@ -336,8 +330,6 @@ impl<'a> Parser<'a> {
                             None => return self.err(format!("bad \\u escape: {hex:?}")),
                         }
                     }
-                    // A backslash at end of line eats the newline and the
-                    // indentation after it, so a long prompt can be wrapped.
                     b'\n' | b'\r' => {
                         while matches!(self.peek(), Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r'))
                         {
@@ -348,9 +340,6 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
-            // Consume a whole character: `bump` moves one byte, so a multi-byte
-            // character has to be stepped over in full or the next slice lands
-            // inside it.
             let ch = self.text[self.pos..]
                 .chars()
                 .next()

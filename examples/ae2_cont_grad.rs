@@ -1,8 +1,6 @@
 //! Where the next-word gradient lands on the audio embeddings: per row, for an
 //! utterance read alone and for the same utterance followed by the first words
 //! of the next one as text, plus the stem's gradient norm in each case.
-//!
-//!   cargo run --release --features cuda --example ae2_cont_grad -- s4 models/s4.ae2.E-ctc
 
 use std::range::Range;
 

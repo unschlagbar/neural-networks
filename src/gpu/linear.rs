@@ -1,14 +1,5 @@
 //! Device-resident `Linear` (`Y = X · W + b`), the GPU counterpart of
 //! [`cpu::linear::Linear`](crate::cpu::linear::Linear).
-//!
-//! Same weight layout (`W` is `[in, out]`, forward is `X · W`) and the same
-//! AdamW convention (weight decays, bias does not), so a GPU layer built from a
-//! CPU layer's `[w, b]` produces bit-comparable results — which the parity test
-//! checks against `cpu::Linear` for forward, backward and one optimizer step.
-//!
-//! The whole layer lives on the GPU: weights, gradient accumulators, AdamW
-//! moments and the saved forward input are all `GTensor<f32>`s, so a forward→backward→
-//! step cycle touches host memory only if the caller downloads a result.
 
 use super::arena::{self, ParamKind, ParamSlot, TrainingCache};
 use super::{GTensor, Gpu, ops};
@@ -31,11 +22,6 @@ pub struct Linear {
     output: usize,
     /// bf16 staging for this layer's three GEMMs (see `ops::GemmBf16`). Holds the
     /// narrowed operand copies across calls so the cast never allocates.
-    ///
-    /// This mirrors the reference's autocast boundary: its projections run under
-    /// `@custom_fwd(cast_inputs="bfloat16")`, i.e. fp32 master weights narrowed per
-    /// call, tensor-core matmul, fp32 accumulator. `w`/`b` above stay fp32 — the
-    /// optimizer steps them there and the checkpoint stores them there.
     gemm: ops::GemmBf16,
     /// Whether this layer's GEMMs go through the bf16 path. Pinned at construction
     /// so forward and backward cannot disagree, and `false` for a layer that must
@@ -74,10 +60,6 @@ impl Linear {
 
     /// Device bytes held, split `(params, activations)`. Diagnostic — see
     /// [`Hierarchical::retained_report`](super::hierarchical::Hierarchical::retained_report).
-    ///
-    /// `params` is weights + grads + AdamW moments, which are fixed by the config.
-    /// `activations` is the saved forward input `x` plus the bf16 GEMM staging, both
-    /// of which scale with the batch and are what a longer window grows.
     pub fn retained_bytes(&self) -> (usize, usize) {
         let params = [
             &self.w, &self.b, &self.dw, &self.db, &self.mw, &self.vw, &self.mb, &self.vb,
@@ -89,26 +71,12 @@ impl Linear {
     }
 
     /// Release the saved forward input and the bf16 staging of the *activations*.
-    ///
-    /// Neither is read outside a forward→backward pair, but both are kept across
-    /// calls (to keep the allocator and the cast off the hot path) and both reuse by
-    /// **capacity** — so in a stack with varying window sizes they settle at the
-    /// largest window ever seen.
-    ///
-    /// The cached bf16 **weight** deliberately survives: it is parameter-sized, so it
-    /// is not what a varying rectangle grows, and only an optimizer step can make it
-    /// stale. Dropping it here made the encoder and decoder re-narrow every weight in
-    /// the stack once per length group — half of all `cast_f32_to_bf16` traffic.
     pub fn drop_saved_act(&mut self, gpu: &Gpu) {
         self.x = GTensor::zeros(gpu, &[0, self.input]);
         self.gemm.clear_operands();
     }
 
     /// Force this layer's GEMMs back to fp32.
-    ///
-    /// For the few matmuls where the narrowed operands are not worth it: the logit
-    /// head, whose output feeds the softmax/cross-entropy directly, and any layer a
-    /// test needs bit-comparable against the CPU reference.
     pub fn set_fp32(&mut self) {
         self.bf16 = false;
     }
@@ -148,8 +116,6 @@ impl Linear {
             "Linear::forward — input width mismatch"
         );
         assert_eq!(y.dims(), [b, self.output], "Linear::forward — output shape");
-        // Reuse the saved-input buffer when the batch size is unchanged (steady
-        // state), else reallocate — avoids a per-call device allocation.
         if self.x.len() == b * self.input {
             self.x.reshape_to(&[b, self.input]);
             self.x.copy_from(gpu, x);
@@ -160,28 +126,11 @@ impl Linear {
     }
 
     /// The input [`forward`](Self::forward) saved, `[B, in]`.
-    ///
-    /// A layer feeding this one can read its own output back from here rather than
-    /// keeping a second copy — which is how the `RmsNorm` in front of a head recovers
-    /// the `y` its backward needs. Empty until the first `forward`, and stale after a
-    /// [`forward_shared`](Self::forward_shared), which saves nothing.
     pub fn saved_x(&self) -> &GTensor<f32> {
         &self.x
     }
 
     /// `Y = X · W + b` for a caller-owned input, saving **nothing**.
-    ///
-    /// [`forward`](Self::forward) deep-copies `x` into `self.x` so backward can form
-    /// `dW = Xᵀ·dY`. When several layers share one input — mLSTM hands the same `xf`
-    /// to all six projections — that is five identical `[N, in]` copies (21 MB per
-    /// cell at H=1024, 252 MB across the backbone). Here the caller keeps `x` alive
-    /// to its own backward instead and passes it to
-    /// [`backward_with_x`](Self::backward_with_x).
-    ///
-    /// The saved-input buffer is released, not merely bypassed: a layer that has ever
-    /// taken this path must not keep a stale `[N, in]` allocation resident. That frees
-    /// at most once per layer — after the first shared forward `self.x` is already
-    /// empty — so it is not an allocation on the steady-state path.
     pub fn forward_shared(&mut self, gpu: &Gpu, x: &GTensor<f32>, y: &mut GTensor<f32>) {
         assert_eq!(
             x.cols(),
@@ -267,8 +216,6 @@ impl Linear {
     /// [`forward`](Self::forward) and [`forward_shared`](Self::forward_shared) so the
     /// two cannot drift apart.
     fn forward_raw(&mut self, gpu: &Gpu, x: &GTensor<f32>, y: &mut GTensor<f32>) {
-        // Seed each output row with the bias (fills y entirely, so uninit is safe),
-        // then accumulate X·W on top (beta=1).
         ops::broadcast_row(gpu, y, &self.b);
         if self.bf16 {
             self.gemm.run_wb(gpu, ops::MmForm::Nn, x, &self.w, y, 1.0);
@@ -312,10 +259,6 @@ impl Linear {
 
     /// [`forward_shared`](Self::forward_shared) where `x` is a slab — already at the
     /// width the GEMM wants, so nothing is narrowed here at all.
-    ///
-    /// The fp32 variant falls through to the ordinary path; a bf16 slab into an
-    /// fp32-pinned layer is a build nobody constructs (`set_fp32` is only ever applied
-    /// to logit heads, which take no slab) and is rejected rather than silently widened.
     pub fn forward_slab_lhs(&mut self, gpu: &Gpu, x: &ops::SlabBuf, out: &mut GTensor<f32>) {
         match x {
             ops::SlabBuf::F32(t) => self.forward_shared(gpu, t, out),
@@ -360,10 +303,6 @@ impl Linear {
 
     /// [`forward_staged`](Self::forward_staged) writing a **bf16** output with the
     /// bias fused into the GEMM epilogue, for a consumer that reads bf16 anyway.
-    /// Saves the `broadcast_row` seed and the fp32 output's narrowing pass.
-    ///
-    /// Only valid on the bf16 path; an fp32-pinned layer has no bf16 GEMM to fuse
-    /// into and must go through [`forward_staged`](Self::forward_staged).
     pub fn forward_staged_bf16(
         &mut self,
         gpu: &Gpu,
@@ -389,9 +328,6 @@ impl Linear {
     /// [`forward_staged`](Self::forward_staged) into a slab, at whatever width the
     /// kernels were built for: a bf16 slab is written straight out of the GEMM
     /// epilogue, an fp32 one goes through the ordinary staged path.
-    ///
-    /// This is what lets a consumer that reads slabs ask for its projection without
-    /// knowing which width it got.
     pub fn forward_staged_slab(
         &mut self,
         gpu: &Gpu,
@@ -477,10 +413,6 @@ impl Linear {
     }
 
     /// `Y = X · W + b` into a freshly allocated `[B, out]`.
-    ///
-    /// The allocation-free [`forward`](Self::forward) is the one to use on a hot
-    /// path; this exists for call sites that still compose by value (mLSTM's
-    /// projection shell), where the output feeds straight into the next op.
     pub fn forward_alloc(&mut self, gpu: &Gpu, x: &GTensor<f32>) -> GTensor<f32> {
         let mut y = GTensor::uninit(gpu, &[x.rows(), self.output]);
         self.forward(gpu, x, &mut y);
@@ -516,9 +448,6 @@ impl Linear {
             dy.rows(),
             "Linear::backward — batch mismatch"
         );
-        // `self.x` and `self.dw` are disjoint fields, but the borrow checker cannot
-        // see that through a `&mut self` method call — so the shared body takes the
-        // three tensors it touches, not `self`.
         Self::grad_w(gpu, &mut self.gemm, self.bf16, &self.x, dy, &mut self.dw);
         ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
         self.grad_x(gpu, dy, dx, 0.0);
@@ -526,15 +455,6 @@ impl Linear {
 
     /// Backward for a caller-owned input: the companion to
     /// [`forward_shared`](Self::forward_shared).
-    ///
-    /// `x` must be the `[B, in]` this layer saw in forward — or, for a chunked
-    /// caller, a contiguous **row block** of it paired with the matching row block of
-    /// `dy`. Both weight terms contract over the row axis
-    /// (`dW = Xᵀ·dY`, `db = Σ_rows dY`) and both accumulate at `beta = 1`, so
-    /// summing over row blocks gives the identical result — splitting `N` is a
-    /// reassociation, not a change of math. `dX = dY·Wᵀ` writes at `beta = dx_beta`:
-    /// 0 is correct under row blocks because each block owns disjoint rows of `dx`,
-    /// and 1 adds this layer's `dX` to one another layer reading the same input wrote.
     pub fn backward_with_x(
         &mut self,
         gpu: &Gpu,
@@ -565,8 +485,6 @@ impl Linear {
             "Linear::backward — dx shape"
         );
         if self.bf16 {
-            // Both GEMMs read `dy`; narrowing it once for the pair drops a cast launch
-            // per Linear backward.
             self.gemm
                 .run_backward(gpu, x, dy, &self.w, &mut self.dw, dx, dx_beta);
             ops::add_col_sum(gpu, &mut self.db, dy, &cache.temps);
@@ -578,9 +496,6 @@ impl Linear {
     }
 
     /// `dW += Xᵀ · dY` (accumulating, `beta = 1`).
-    ///
-    /// Free-standing in the three tensors it touches rather than a `&mut self`
-    /// method, so a caller holding `self.x` borrowed can still reach `self.dw`.
     fn grad_w(
         gpu: &Gpu,
         gemm: &mut ops::GemmBf16,
@@ -614,9 +529,6 @@ impl Linear {
     }
 
     /// Every parameter with its gradient and AdamW moments.
-    ///
-    /// Hands out `&mut w`, so the cached bf16 weight is dropped here rather than at
-    /// the (untrackable) point the caller writes through it.
     pub fn param_slots(&mut self) -> Vec<ParamSlot<'_>> {
         self.gemm.invalidate_w();
         let w_kind = if self.decay {
@@ -702,13 +614,6 @@ mod tests {
     }
 
     /// Tolerance for a parameter compared AFTER an Adam step.
-    ///
-    /// Deliberately not `tol(gpu, 1e-5)`. Adam's update is `lr·ĝ/(√v̂+ε)`, which is
-    /// scale-invariant in the gradient: a weight whose gradient is near zero has its
-    /// bf16-sized difference divided by an equally small √v̂, so a ~1e-7 gradient
-    /// wobble lands as ~1e-4 on the weight. Scaling the activation tolerance by the
-    /// same factor is not enough — it leaves a bound that passes in isolation and
-    /// fails on maybe one run in five, which is worse than no check at all.
     fn step_tol(gpu: &Gpu) -> f32 {
         if ops::gemm_bf16_enabled(gpu) {
             2e-3
@@ -719,12 +624,6 @@ mod tests {
 
     /// `drop_saved_act` releases the narrowed *activations* and keeps the narrowed
     /// weight — and the weight it keeps must still follow the optimizer.
-    ///
-    /// The encoder and decoder call this at every length-group boundary, so a layer
-    /// there sees drop/forward/backward many times between two steps. Keeping the
-    /// weight is what makes that cheap; the danger it introduces is the mirror of
-    /// [`weight_cache_follows_optimizer_steps`](Self::weight_cache_follows_optimizer_steps):
-    /// a cache that now survives a boundary it used to be cleared at.
     #[test]
     fn drop_saved_act_keeps_the_weight_and_still_follows_a_step() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -773,12 +672,6 @@ mod tests {
     }
 
     /// The bf16 weight cache must be dropped by every optimizer step.
-    ///
-    /// `GemmBf16` narrows `w` once and reuses it across the layer's forward and its
-    /// `dX = dY·Wᵀ`; a step that forgot to invalidate would leave every later forward
-    /// reading the *initial* weight. That does not diverge or panic — the layer simply
-    /// stops learning — so a single-step test cannot see it. Two steps can: the second
-    /// forward must reflect the first step's update.
     #[test]
     fn weight_cache_follows_optimizer_steps() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -795,10 +688,6 @@ mod tests {
         let dy = GTensor::from_host(&gpu, &hdy);
         let cfg = AdamCfg::new(1e-2, 0.0);
 
-        // The observable is the forward recomputed from the *current* fp32 weight, not
-        // a drifting comparison against a CPU twin: what a stale cache breaks is
-        // exactly the link between `w` and what the GEMM reads. `y = x·W + b`, so
-        // subtracting the bias leaves a term that must track `W`.
         for t in 1..=3 {
             let before = gl.forward_alloc(&gpu, &x).to_host(&gpu).data;
             let w_before = gl.w.to_host(&gpu).data;
@@ -806,9 +695,6 @@ mod tests {
             let _ = gl.backward_alloc(&gpu, &dy, &tc);
             let mut c = cfg;
             c.t = t;
-            // The bias is frozen (above), so a step moves `w` alone: one that also
-            // moved `b` would shift the output whether or not the cached weight was
-            // refreshed, and the test would pass with the invalidation removed.
             gl.step(&gpu, &c);
 
             let w_after = gl.w.to_host(&gpu).data;
@@ -874,9 +760,6 @@ mod tests {
 
     /// The shared-input path must be numerically identical to the saving one, and
     /// must actually stop holding an `[N, in]` copy.
-    ///
-    /// This is what lets mLSTM keep one `xf` for all six projections instead of six
-    /// copies of it (252 MB across the backbone).
     #[test]
     fn forward_shared_matches_forward_and_saves_nothing() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -892,9 +775,6 @@ mod tests {
         let mut saving = Linear::from_parts(&gpu, &w, &b);
         let mut shared = Linear::from_parts(&gpu, &w, &b);
 
-        // Both paths issue the identical GEMM over the identical data — the only
-        // difference is whether `x` was copied first — so the GEMM outputs compare by
-        // exact equality, not a tolerance. `db` is the exception; see below.
         let eq = |got: &[f32], want: &[f32], what: &str| {
             assert_eq!(
                 got, want,
@@ -930,8 +810,6 @@ mod tests {
             "dw",
         );
 
-        // Exact, not a tolerance: `add_col_sum` folds in an order fixed by the shape,
-        // and both paths reduce the same `dy`.
         eq(
             &shared.db.to_host(&gpu).data,
             &saving.db.to_host(&gpu).data,
@@ -943,10 +821,6 @@ mod tests {
     /// backward: `dW = Xᵀ·dY` and `db = Σ_rows dY` both contract over the row axis and
     /// accumulate at `beta = 1`, so splitting `N` is a reassociation. `dX = dY·Wᵀ`
     /// writes at `beta = 0` but each block owns disjoint rows, so it stays correct.
-    ///
-    /// This is the property the chunked-offload path rests on. The batch is
-    /// deliberately **not** a multiple of the block size, to exercise a ragged last
-    /// block.
     #[test]
     fn backward_in_row_blocks_matches_whole_batch() {
         let Some(gpu) = super::super::test_gpu() else {
@@ -966,8 +840,6 @@ mod tests {
 
         let dx_whole = whole.backward_alloc_with_x(&gpu, &x, &dy, &tc);
 
-        // Row blocks are contiguous in a row-major [batch, ·] tensor, so a block is a
-        // plain host sub-slice — no gather needed.
         let mut dx_blocked = Vec::with_capacity(batch * input);
         for r0 in (0..batch).step_by(blk) {
             let rows = blk.min(batch - r0);

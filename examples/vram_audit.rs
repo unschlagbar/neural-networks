@@ -1,15 +1,4 @@
 //! Where the device memory actually goes, phase by phase.
-//!
-//! `mem_get_info` — what `GPU_MEM=1` prints — reports memory the *driver* has handed
-//! to the process, which includes every block the CUDA async allocator is caching for
-//! reuse. That number cannot distinguish "the model needs this" from "the allocator is
-//! sitting on it", and estimating from tensor shapes has repeatedly disagreed with it.
-//!
-//! So ask the allocator directly. `CU_MEMPOOL_ATTR_USED_MEM_CURRENT` is what is
-//! genuinely live; `RESERVED_MEM_CURRENT` is what the pool holds. The gap between them
-//! is cache, which is reclaimable under pressure and is *not* a reason to OOM.
-//!
-//! Run: cargo run --release --features cuda --example vram_audit [words]
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -34,8 +23,6 @@ fn main() {
 
     let gpu = Gpu::new().expect("gpu");
 
-    // The device's default async pool — what `cuMemAllocAsync` (and hence every
-    // `GTensor<f32>`) draws from.
     let pool = unsafe {
         let dev = cudarc::driver::result::device::get(0).expect("device");
         cudarc::driver::result::device::get_default_mem_pool(dev).expect("pool")
@@ -70,9 +57,6 @@ fn main() {
         vocab: tok.vocab_size(),
         hc: CHAR_HIDDEN,
         wh: WORD_HIDDEN,
-        // Must match `gpu::train::cfg_from_config` — that is what `hg` actually
-        // builds. A probe with fewer/narrower blocks measures a different model and
-        // will happily report a footprint that fits when the real one does not.
         enc_blocks: 4,
         bb_blocks: WORD_BLOCKS,
         dec_blocks: 4,
@@ -104,20 +88,10 @@ fn main() {
     row("after model init");
     let weights = used();
 
-    // Mixed word lengths, as a real corpus produces — but respecting the SAME token
-    // ceiling the loader enforces (`MAX_WINDOW_TOKENS`). Cycling 1..=MAX_WORD_BYTES
-    // averages 8.5 bytes/word, which for 2048 words is 17408 tokens: 2.1x more than
-    // training can ever hand the model, and the audit then reports a footprint no real
-    // window produces. `word_ends` averages 3-4 bytes/word on Rust source anyway.
     let budget = std::env::var("AUDIT_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(neural_networks::config::MAX_WINDOW_TOKENS);
-    // Word-length histogram. `word_ends` averages 3-4 bytes/word on real text, so a
-    // real window hits BOTH caps at once: 2048 words AND ~8192 tokens. Cycling
-    // 1..=MAX_WORD_BYTES averages 8.5 and runs out of token budget at ~967 words —
-    // half the word count, and the encoder/decoder cost scales with WORDS, not just
-    // tokens. `AUDIT_WLEN=n` pins every word to n bytes; the default mimics real text.
     let wlen_mode = std::env::var("AUDIT_WLEN")
         .ok()
         .and_then(|s| s.parse().ok());
@@ -125,14 +99,6 @@ fn main() {
     let mut spans: Vec<std::range::Range<usize>> = Vec::with_capacity(words);
     for w in 0..words {
         let s = tokens.len();
-        // Default: the distribution `word_ends` actually produces, measured off a real
-        // `hg` run — 14-16 distinct lengths per window spanning 1..=16, averaging ~5.
-        // The spread matters as much as the mean: the encoder and decoder run ONE
-        // RECTANGLE PER LENGTH BUCKET, so a window with 16 buckets allocates 16 sets of
-        // per-group buffers where a uniform window allocates one.
-        //
-        // Skewed short (most words are 2-6 bytes, a few run to 16) rather than uniform,
-        // which is what the measured histogram looks like.
         let want = wlen_mode.unwrap_or_else(|| {
             let r = (w * 2654435761) % 100;
             match r {
@@ -169,22 +135,12 @@ fn main() {
         );
     }
 
-    // Real training never repeats one shape: windows never cross a document border,
-    // so their word counts and length histograms vary constantly, and every `Buf`/
-    // `Pool` reuses by capacity. A fixed-shape probe therefore measures the steady
-    // state of ONE shape and misses the ratchet entirely — which is the failure mode
-    // that actually aborts a run. Sweep a spread of shapes and report the worst.
     if std::env::var("AUDIT_SWEEP").is_ok() {
         println!("\n--- varying window shapes (the real loader's behaviour) ---");
         let reps: usize = std::env::var("AUDIT_REPS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(40);
-        // Each iteration builds a FRESH window with its own word count and its own
-        // length histogram. Slicing one fixed window (the previous version of this
-        // sweep) reuses the same rectangles every time and so never exercises the
-        // ratchet: real training never sees the same shape twice, and it is the
-        // arrival of a shape no buffer yet fits that grows the footprint.
         let mut peak = used();
         let mut worst_at = (0usize, 0usize);
         for it in 0..reps {
@@ -199,8 +155,6 @@ fn main() {
             let mut sp: Vec<std::range::Range<usize>> = Vec::with_capacity(target);
             for w in 0..target {
                 let s = tk.len();
-                // Re-seeded per iteration, so the length histogram itself differs
-                // window to window — not just the word count.
                 let r = ((w + it * 7919) * 2654435761) % 100;
                 let want = match r {
                     0..=24 => 1 + (w % 3),
@@ -243,8 +197,6 @@ fn main() {
             worst_at.0, worst_at.1
         );
 
-        // Which owner grew? Compare against the same breakdown taken after the very
-        // first window: whatever is bigger here ratcheted, and by how much.
         let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
         println!("\n--- after the sweep, by owner (MB) ---");
         println!(
@@ -263,19 +215,12 @@ fn main() {
         }
     }
 
-    // What is still live once a whole step has finished? Nothing should be: every
-    // activation is dead, and the optimizer has consumed the gradients. Whatever
-    // remains is retained by a layer's own buffers, and THAT is what scales with the
-    // window and decides whether a longer sequence fits.
     println!("\n--- what survives a completed step ---");
     let after_step = used();
     println!("live after step        {after_step:8.0} MB");
     println!("  of which weights     {weights:8.0} MB");
     println!("  retained by layers   {:8.0} MB", after_step - weights);
 
-    // Walk the actual buffers. `release_stage` only reaches a block's own `Buf`s and
-    // pool, so anything it leaves behind is invisible to a release-and-diff — which
-    // is exactly the memory that went unaccounted for. This counts it directly.
     println!("\n--- retained bytes, by layer (capacity, not shape) ---");
     let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
     let report = model.retained_report();
@@ -292,9 +237,6 @@ fn main() {
         mb(tp + ta)
     );
 
-    // Which owner inside each stage holds it. Only `ffn` is reachable
-    // from drop_saved_act + trim_to; `norms`, `proj` and `cell_other` are held inside
-    // the sub-layers and survive both.
     println!("\n--- activations by owner (MB) ---");
     println!(
         "{:<10} {:>8} {:>8} {:>8} {:>10} {:>10}",
@@ -311,8 +253,6 @@ fn main() {
         );
     }
 
-    // Release one stage at a time, so the retained memory is attributed rather than
-    // estimated — every shape-based estimate so far has been off by ~10x.
     let mut prev = after_step;
     for stage in ["encoder", "backbone", "decoder"] {
         model.release_stage(stage);
@@ -336,8 +276,6 @@ fn main() {
         after_release - weights
     );
 
-    // Now the deep release, which also clears what lives inside the norms and
-    // projections. The gap between this and the line above is the answer.
     model.drop_all_act(&gpu);
     gpu.stream.synchronize().unwrap();
     let after_deep = used();
@@ -347,8 +285,6 @@ fn main() {
     );
     println!("  STILL retained       {:8.0} MB", after_deep - weights);
 
-    // Attribute the remainder: drop the whole model and see what the pool still holds.
-    // Anything left is either not owned by the model or leaked outright.
     drop(model);
     gpu.stream.synchronize().unwrap();
     println!(

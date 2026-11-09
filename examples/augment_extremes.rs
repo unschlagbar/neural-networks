@@ -1,7 +1,5 @@
 //! Writes one utterance through the edges of `AugmentCfg::speech` as WAVs to
 //! listen to: each knob alone at its harshest, then all of them at once.
-//!
-//!   cargo run --release --example augment_extremes -- <utterance> <out dir> <noise dir> [other speakers' clips...]
 
 use neural_networks::audio::augment::{Augment, AugmentCfg, NoiseBank};
 use neural_networks::audio::io::Clip;

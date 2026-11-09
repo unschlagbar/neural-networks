@@ -1,12 +1,4 @@
 // datamix — dataset mixing and filtering for the hierarchical model.
-//
-//   datamix build  <mix.toml>          stage, mix, write the corpus + report
-//   datamix check  <mix.toml>          same, but write nothing (filter/share stats)
-//   datamix sample <mix.toml> [-n 10]  print records drawn from the mixture
-//   datamix synth  <file.syn> [-n 10] preview a template file's expansion
-//   datamix verify <out.jsonl>       load it exactly as `hqg` does and report
-//   datamix edit   [out.jsonl]       hand-write SFT records in a browser UI
-//   datamix ping   [mix.toml]          check the local LM server and list its models
 
 mod config;
 mod editor;
@@ -64,8 +56,6 @@ fn run() -> config::Result<()> {
             }
             Ok(())
         }
-        // The point of verifying here is that it runs the *training* loader,
-        // not a second parser that might disagree with it.
         "verify" if !path.is_empty() => {
             println!("{}", verify_report(&path)?);
             Ok(())
@@ -166,8 +156,6 @@ pub fn verify_report(path: &str) -> config::Result<String> {
     let words: usize = examples.iter().map(|e| e.words.len()).sum();
     let resp: usize = examples.iter().map(|e| e.response_extent().1).sum();
     let longest = examples.iter().map(|e| e.tokens.len()).max().unwrap_or(0);
-    // Every <SEP> is one exchange, so the count says how much of the corpus is
-    // actually multi-turn.
     let sep = neural_networks::tokenizer_utf8::SEP_TOKEN;
     let exchanges: usize = examples
         .iter()

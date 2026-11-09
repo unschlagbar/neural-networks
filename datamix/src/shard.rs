@@ -1,10 +1,4 @@
 // Staging shards: filtered records parked on disk, one file per source.
-//
-// The mixer needs two things the input readers cannot give it — random access
-// (to shuffle) and the final token count of a source (to size its share) — and
-// neither may cost the corpus in RAM. So pass one streams every source through
-// the filters into a shard and records where each record landed; pass two
-// reads records back by index.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};

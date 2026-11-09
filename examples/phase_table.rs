@@ -1,14 +1,4 @@
 //! Where a hierarchical training step's time actually goes, split by component.
-//!
-//! Reports, separately for forward and backward, the share taken by the sLSTM
-//! cells, the mLSTM cells, the SwiGLU FFNs, and the per-block glue (norms, residual
-//! adds, buffer copies) — plus everything outside the blocks entirely (embedding,
-//! the encoder/decoder plumbing, loss, the optimizer step).
-//!
-//! Run with `GPU_PHASE=1`, which is what enables the per-phase accumulators. Note
-//! that phase timing synchronizes around every span, so the TOTAL here is longer
-//! than an uninstrumented step — read the percentages, not the absolute step time.
-//! The uninstrumented time is printed alongside for reference.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -44,9 +34,6 @@ fn main() {
     let mut model = Hierarchical::new(&gpu, cfg);
     let mut opt = AdamCfg::new(3e-4, 0.01);
 
-    // A real file when given one, else uniform 4-char words. The length spread decides
-    // how many rectangles the encoder and decoder run, and the synthetic window is one
-    // length — it cannot show anything that scales per group.
     let n_words = 1024;
     let mut tokens = Vec::new();
     let mut words: Vec<std::range::Range<usize>> = Vec::new();
@@ -159,8 +146,6 @@ fn main() {
         "{:<34} {total_ms:>10.1} {:>7.1}%",
         "TOTAL (instrumented)", 100.0
     );
-    // The sLSTM dominates, so break it down: is it the serial T-loop, the
-    // whole-sequence GEMMs, or the device-to-device staging copies?
     let sl_rows: [(&str, f64, f64); 3] = [
         (
             "  dtod staging copies",

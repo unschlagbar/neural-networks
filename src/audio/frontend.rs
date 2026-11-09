@@ -1,11 +1,5 @@
 //! The audio encoder's features at 100 Hz: 128 Slaney mel bins (as Whisper and
 //! librosa build them) plus the frame's absolute log energy.
-//!
-//! Framing is causal — frame `i` ends at sample `(i + 1) · AUDIO_HOP` — so a
-//! streaming caller and a whole-utterance call produce the same frames. Nothing
-//! is normalized per utterance or per frame: loudness and dynamics are part of
-//! what the encoder is meant to hear. The only normalization is
-//! [`FeatureStats`], fixed over a corpus.
 
 use super::mel::{MelFilterBank, log_total_energy};
 use super::spectrum::{Spectrogram, Window};

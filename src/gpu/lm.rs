@@ -1,21 +1,4 @@
-//! The real GPU language model (Phase D) — fully device-resident:
-//!
-//!   Embedding → Block×N (alternating sLSTM / mLSTM) → RMSNorm → Linear head
-//!   → SoftCap → fused softmax/CE
-//!
-//! This is the stack the flat toy (`gpu::flat`) stood in for: it has an actual
-//! recurrent core. Everything — the embedding table, every block (norms, SwiGLU
-//! projections, recurrent cell), the final norm and the logit head, plus all
-//! gradients and AdamW moments — lives in `GTensor<f32>`s, so a whole
-//! forward → loss → backward → step cycle crosses PCIe only for the token ids in
-//! and the scalar loss out.
-//!
-//! Optimizer convention (same as the rest of the project): the embedding table,
-//! the norm scales and the logit head train on **undecayed** Adam; the interior
-//! projections inside the blocks decay (handled by `gpu::Linear`).
-//!
-//! The blocks are held as `Vec<Box<dyn BlockLike>>` because `Block<SLstm>` and
-//! `Block<MLstm>` are different concrete types.
+//! A fully device-resident flat GPU language model: embedding, blocks, norm, head.
 
 use super::{GTensor, Gpu, linear::Linear, ops, rms_norm::RmsNorm};
 use crate::gpu::arena::TrainingCache;
@@ -68,11 +51,6 @@ impl Lm {
             blocks,
             norm: RmsNorm::from_parts(gpu, gamma),
             head: {
-                // The logit head stays fp32. Its output goes straight into the
-                // softmax/cross-entropy, where a bf16-sized perturbation of a logit
-                // is exponentiated — and the vocab-sized reduction that follows is
-                // exactly the place the reference keeps wide. It is also one GEMM
-                // per step against the backbone's many, so there is little to win.
                 let mut h = Linear::from_parts(gpu, head_w, head_b);
                 h.set_fp32();
                 h
@@ -124,8 +102,6 @@ impl Lm {
             .get_or_insert_with(|| TrainingCache::for_shape(gpu, n, h));
         let d_pre = ops::softcap_backward(gpu, dlogits, logits, self.cap);
         let d_normed = self.head.backward_alloc(gpu, &d_pre, cache);
-        // `head` saved its own input, which is `norm`'s output — what the norm's
-        // backward rebuilds `x̂` from.
         let d_flat = {
             let Self { head, norm, .. } = self;
             norm.backward_alloc(gpu, &d_normed, head.saved_x(), cache) // [N, H]
@@ -231,8 +207,6 @@ mod tests {
         let ids: Vec<usize> = (0..n).map(|i| (i * 5 + 1) % vocab).collect();
         let targets: Vec<usize> = (0..n).map(|i| (i * 3 + 2) % vocab).collect();
 
-        // Upload the GPU model NOW, from the pristine CPU weights — the CPU step
-        // below mutates them in place.
         let blocks: Vec<Box<dyn BlockLike>> = vec![
             Box::new(Block::<SLstm>::from_cpu(&gpu, &c_blk1)),
             Box::new(Block::<MLstm>::from_cpu(&gpu, &c_blk2)),
@@ -266,14 +240,6 @@ mod tests {
         // GPU: same init, one train step
         let gpu_loss = dev.train_step(&gpu, &ids, &targets, b, t, &cfg);
 
-        // The interior projections run bf16 operands / fp32 accumulate when enabled
-        // (the head itself is pinned fp32 — see `Lm::from_parts`), so both the loss
-        // and the stepped parameters land within bf16's precision of the CPU's.
-        //
-        // The parameter bound is the looser of the two because Adam's update is
-        // scale-invariant in the gradient: `lr·ĝ/(√v̂+ε)` divides a near-zero
-        // gradient by an equally small √v̂, turning a ~1e-7 difference into ~1e-4 on
-        // the weight. Same amplification the arch flag hits in `kernels.rs`.
         let bf = ops::gemm_bf16_enabled(&gpu);
         let ltol = if bf { 5e-3 } else { 1e-3 };
         let ptol = if bf { 2e-2 } else { 3e-3 };

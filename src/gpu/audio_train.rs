@@ -1,22 +1,4 @@
 //! Mode `ae2`: the audio encoder trained against a frozen text model (stage E2).
-//!
-//! The encoder learns word embeddings from which the pretrained `Hierarchical`
-//! predicts the next word as well as it does from the transcript's own, and a
-//! boundary head that finds the words. The text model is only read, never
-//! stepped. Data is LibriSpeech with MFA word alignments (`audio::librispeech`).
-//!
-//! Each utterance is one text-model window: optionally some of the chapter's
-//! transcript before it, its own words as audio embeddings, then the
-//! transcript that follows it, so the audio has to leave the backbone where
-//! the text can continue. The decoder's target mixes the transcript with the
-//! text model's own distribution reading the whole window as text
-//! (distillation, as in DiVA, arXiv 2410.02678).
-//!
-//! Logged: the student's next-word loss (nats per word, reading audio) against
-//! the teacher's (the same model reading the transcript) — the gap is what the
-//! audio path still loses — on the utterance's words and on the text after it,
-//! plus the boundary head's loss and F1 and the character head. The encoder is
-//! saved next to the text model as `<model>.ae2`, and a run resumes from it.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -115,13 +97,7 @@ fn run_audio_e2(model_path: &str, evaluate: Option<&str>) {
             return;
         }
     };
-    // Every window is read back by its own backward right away; parking the
-    // backbone's activations in host memory would only cost the copies.
     model.set_offload(&gpu, false);
-    // Its windows are an utterance and some text (packs of at most
-    // `PACK_WORDS` in training), never near the pretraining window the
-    // backbone's resident frames are sized for; an evaluation goes smaller
-    // still, to share the device with a training run.
     model.set_bb_chunk(Some(if evaluate.is_some() { 128 } else { PACK_WORDS }));
 
     let save_path = evaluate.map_or_else(|| format!("{model_path}.ae2"), str::to_string);
@@ -136,8 +112,6 @@ fn run_audio_e2(model_path: &str, evaluate: Option<&str>) {
         eprintln!("Could not load {save_path}.");
         return;
     }
-    // How many frames of a word the segment encoder reads changes no weight, so
-    // a training run takes it from the config rather than from the checkpoint.
     if let Some((enc, _)) = resumed.as_mut().filter(|_| evaluate.is_none()) {
         if enc.cfg.seg_max != AUDIO_SEG_MAX_FRAMES {
             println!("segment encoder reads {} frames per word, was {}", AUDIO_SEG_MAX_FRAMES, enc.cfg.seg_max);
@@ -218,8 +192,6 @@ fn run_audio_e2(model_path: &str, evaluate: Option<&str>) {
         if !voice_val.is_empty() {
             println!("  val voice | {}", trainer.validate(&corpus, &voice_val).summary());
         }
-        // The takes it trained on, scored the same way: against `val voice`,
-        // how much of the voice it learned and how much only the sentences.
         let voice_train: Vec<usize> = corpus.voice(false).iter().map(|p| p.index).collect();
         if evaluate.is_some() && !voice_train.is_empty() {
             println!("  voice trained | {}", trainer.validate(&corpus, &voice_train).summary());
@@ -274,11 +246,6 @@ fn run_audio_e2(model_path: &str, evaluate: Option<&str>) {
 /// `AUDIO_PRETRAIN_VOICE_P` of the windows are instead one of the pretraining
 /// documents the voice takes were read out of, with those takes heard where
 /// their sentences stand.
-/// With `AUDIO_PRETRAIN_DISTILL` the window first runs read, every word as
-/// text, and the heard run trains towards that reading's predictions.
-/// The audio encoder steps on its own after each window, with its character
-/// and boundary heads alongside. The backbone's carried state is stashed
-/// around the window, so the text stream runs exactly as it would without it.
 pub struct AudioPretrain {
     enc: AudioEncoder,
     ck: AudioCheckpoint,
@@ -488,8 +455,6 @@ impl AudioPretrain {
         let hc = c.out;
         let heard_items: Vec<&Prepared> = heard.iter().map(|&i| &self.corpus.items[i]).collect();
         let augment = self.corpus.augment.as_ref();
-        // One fresh encoder state for the whole window, carried through every
-        // utterance it hears.
         let batch = Batch::chained(heard_items, &self.corpus.stats, augment, c.stride);
         let out = self.enc.forward(
             gpu,
@@ -512,8 +477,6 @@ impl AudioPretrain {
             .to_host(gpu)
             .data;
 
-        // Rows of the window the backbone reads from the audio, and which
-        // encoder embedding each is.
         let dw = doc.words.len() - 1;
         let (rows, from): (Vec<usize>, Vec<usize>) =
             doc.heard.iter().copied().filter(|&(r, _)| r < dw).unzip();
@@ -525,8 +488,6 @@ impl AudioPretrain {
         let mut d = GTensor::zeros(gpu, &[rows.len(), hc]);
 
         let carried = model.stash_carried(gpu);
-        // The same tokens and words read: the teacher, and the loss hearing is
-        // measured against. Each run starts from zero state.
         if AUDIO_PRETRAIN_DISTILL > 0.0 {
             model.record_distill();
         }
@@ -743,8 +704,6 @@ impl SftAudio {
             println!("heard turns off: no aligned take in {SFT_SPEECH_DIRS:?}");
             return None;
         }
-        // A take's id is `<speaker dir>/<session>/<id>`; the corpus names it
-        // without the speaker dir.
         let by_id = corpus
             .items
             .iter()
@@ -809,8 +768,6 @@ impl SftAudio {
             self.reserve(gpu, heard.len());
         }
         let items: Vec<&Prepared> = heard.iter().map(|(id, _)| &self.corpus.items[self.by_id[id]]).collect();
-        // Each heard word's window index, in the order of the encoder's
-        // embedding rows (the turns' words one after another).
         let mut at = Vec::new();
         for (p, (_, r)) in items.iter().zip(heard) {
             let Some(w) = words.iter().position(|w| w.start == r.start) else {
@@ -935,8 +892,6 @@ impl Document {
     fn new(items: &[&Prepared], heard: &[usize]) -> Option<Self> {
         let mut raw: Vec<u16> = Vec::new();
         let (mut expected, mut heard_words, mut embed_row) = (0, Vec::new(), 0);
-        // Whether the written text so far ended a sentence: a heard utterance
-        // carries its full stop in its melody, not in the tokens.
         let mut ended = false;
         for (k, p) in items.iter().enumerate() {
             let is_heard = heard.contains(&k);
@@ -1061,8 +1016,6 @@ pub fn evaluate_alignment(model_path: &str) {
     for (name, part) in [("val", corpus.val()), ("train sample", sample)] {
         let mut scores: Vec<AlignScore> = variants.iter().map(|_| AlignScore::default()).collect();
         let mut forced = AlignScore::default();
-        // The same ends moved 1 and 2 frames earlier: the causal head emits a
-        // character only after it has heard it.
         let mut earlier = [AlignScore::default(), AlignScore::default()];
         let mut peak_scores: Vec<BoundaryScore> = peak_decoders
             .iter()
@@ -1175,10 +1128,6 @@ pub fn align_voice(path: &str) {
         };
         let (mut aligned, mut errors, mut chars) = (0, 0, 0);
         let t0 = Instant::now();
-        // Features in parallel a chunk at a time, then the chunk through the
-        // encoder in batches of similar length.
-        // Only takes with no alignment yet, unless `AE2V_ALL` asks for all of
-        // them: training aligns them again online anyway.
         let all = std::env::var_os("AE2V_ALL").is_some();
         let mut todo: Vec<&mut voice::Take> = takes.iter_mut().filter(|t| all || t.ends.is_none()).collect();
         println!("  {} to align", todo.len());
@@ -1326,8 +1275,6 @@ struct Prepared {
 impl Prepared {
     /// `None` when the transcript's words do not map one to one onto the spoken
     /// ones, or a word falls outside the audio.
-    /// `length` is the audio's `(samples, rate)`, read from its header when
-    /// not given.
     fn new(
         u: &Utterance,
         tok: &Utf8Tokenizer,
@@ -1460,8 +1407,6 @@ fn spelled(written: &[u16], spoken: &[&str]) -> Option<(Vec<u16>, Vec<u16>, Vec<
         if !raw.is_empty() {
             raw.push(b' ' as u16);
         }
-        // The splitter keeps a hyphen on the word before it ("heavy-" of
-        // "heavy-tailed"), which would split off as a word of its own here.
         let end = toks.iter().rposition(|&t| !(t as u8).is_ascii_whitespace() && t != b'-' as u16)? + 1;
         raw.extend_from_slice(&toks[..end]);
         spoken_at.push(i);
@@ -1614,8 +1559,6 @@ struct VoiceDoc {
 /// letters and digits alone: the prompt was normalized (plain quotes and
 /// dashes, one line) and the document was not.
 fn locate(doc: &str, text: &str) -> Option<Range<usize>> {
-    // Lower-cased letters and digits, and for each of their bytes the byte of
-    // `s` the character came from.
     let skeleton = |s: &str| {
         let (mut out, mut at) = (String::new(), Vec::new());
         for (i, c) in s.char_indices().filter(|(_, c)| c.is_alphanumeric()) {
@@ -1639,8 +1582,6 @@ fn locate(doc: &str, text: &str) -> Option<Range<usize>> {
 /// The text model's window around one utterance: `prefix` words of the
 /// chapter's transcript before it, its own `audio` words, which the backbone
 /// reads from the audio encoder, and `cont` words of transcript after it.
-/// The teacher reads the same window as written text: the utterance with its
-/// punctuation, so more words; `map[i]` is the teacher's word for word `i`.
 struct Window {
     tokens: Vec<usize>,
     words: Vec<Range<usize>>,
@@ -1659,8 +1600,6 @@ impl Window {
     fn new(prev: Option<&[usize]>, p: &Prepared, next: Option<&[usize]>, after: usize) -> Self {
         let as_u16 = |t: &[usize]| -> Vec<u16> { t.iter().map(|&c| c as u16).collect() };
         let blank = |c: &usize| (*c as u8).is_ascii_whitespace();
-        // Whitespace between the pieces is the window's own; a line break
-        // before the utterance ends what came before it like a full stop.
         let prev = prev.map(|t| {
             let end = t.iter().rposition(|c| !blank(c)).map_or(0, |i| i + 1);
             (&t[..end], t[end..].contains(&(b'\n' as usize)))
@@ -1671,8 +1610,6 @@ impl Window {
         let before = prev_words.len().min(AUDIO_CONTEXT_WORDS);
         let after = next_words.len().min(after);
         let (mut student, mut teacher): (Vec<u16>, Vec<u16>) = (Vec::new(), Vec::new());
-        // A transcript starts capitalized; inside the window it is running text
-        // unless the written text before it ended a sentence.
         let mut push = |s: &[usize], t: &[usize], broke: bool| {
             let inside = !teacher.is_empty();
             let ended = broke
@@ -1950,8 +1887,6 @@ impl Corpus {
             })
             .collect();
         let tokens = |t: &str| -> Vec<usize> { tok.to_tokens(t).iter().map(|&c| c as usize).collect() };
-        // Lengths come from the cache LibriSpeech's use, headers are read
-        // only for takes new to it, and each take is prepared in parallel.
         let mut lengths = AudioLengths::load();
         let utterances: Vec<Option<Utterance>> = takes.par_iter().map(|t| t.utterance()).collect();
         let known: Vec<Option<(usize, usize)>> = takes
@@ -2788,9 +2723,6 @@ impl E2Trainer {
             .filter(|e| !e.order.is_empty())
             .collect();
         let tts_n = if sets.is_empty() { 0 } else { (AUDIO_TAKE_SHARE * AUDIO_BATCH as f32).round() as usize };
-        // A set's share of the take slots grows with its size to the power
-        // `AUDIO_TAKE_SET_POWER`: a small set is not repeated many times over
-        // while a large one goes half unheard.
         let weights: Vec<f32> = sets.iter().map(|e| (e.order.len() as f32).powf(AUDIO_TAKE_SET_POWER)).collect();
         let total: f32 = weights.iter().sum();
         for ((w, e), dir) in weights.iter().zip(&sets).zip(AUDIO_TAKE_DIRS) {
@@ -2832,8 +2764,6 @@ impl E2Trainer {
         if !tts_val.is_empty() {
             println!("  val tts   | {}", self.validate(corpus, &tts_val).summary());
         }
-        // The next `LOAD_AHEAD` batches decode and featurize on the CPU while
-        // the GPU runs this one: one loader alone took longer than a step.
         std::thread::scope(|scope| {
             let mut ahead = std::collections::VecDeque::new();
             for _ in 0..LOAD_AHEAD {
@@ -2912,12 +2842,6 @@ impl E2Trainer {
     /// are cut for training), and where its boundary head puts the known
     /// number of words (how a take is cut live). What each way costs is what
     /// the segmentation costs.
-    /// The spoken words of `items` the character head gets wrong most often:
-    /// each greedy decode aligned word by word against what was said, every
-    /// said word that was replaced or dropped counted. What the user's
-    /// recording prompts should contain more of.
-    /// Every said word's count heard wrong and said also goes to `table` as
-    /// `word\twrong\tsaid` lines, the input of `scripts/error_prompts.py`.
     fn misheard_report(&mut self, corpus: &Corpus, items: &[usize], table: &str) {
         let c = self.enc.cfg;
         let ctc = Ctc {
@@ -3257,8 +3181,6 @@ impl E2Trainer {
                 let item = batch.items[b].to_mut();
                 (item.segments, item.times) = (segments, times);
             }
-            // Some words are pooled as the boundary head cuts them, as they
-            // will be live; its own targets stay the reference cut.
             let (pooled, n) = if train && batch.chain.is_empty() {
                 head_cut_segments(batch, boundary, t_out, c)
             } else {
@@ -3371,9 +3293,6 @@ impl E2Trainer {
                 (w, at - w.audio)
             })
             .collect();
-        // Takes read out of a document distill at `DISTILL_ALPHA`; windows with
-        // nothing after them (books, commands, speeches) at
-        // `DISTILL_ALPHA_PLAIN`, so their genre is nothing to learn.
         let mut heard = Vec::new();
         for (documents, alpha) in [(true, DISTILL_ALPHA), (false, DISTILL_ALPHA_PLAIN)] {
             let class: Vec<(&Window, usize)> = placed.iter().copied().filter(|(w, _)| (w.cont > 0) == documents).collect();
@@ -3425,8 +3344,6 @@ impl E2Trainer {
                 Some(m) => mask.extend(m),
                 None => mask.extend(std::iter::repeat_n(true, w.decoded())),
             }
-            // The window's last word predicts its `<END>`, the `<END>` the next
-            // window's first word: neither is scored.
             mask.extend([false, false]);
             for j in 0..w.audio {
                 let r = w.words[w.prefix + j];
@@ -3484,8 +3401,6 @@ impl E2Trainer {
             }
         }
         if EMBED_ALIGN_WEIGHT > 0.0 {
-            // γ/2 · Σ‖a − t‖² / Σ‖t‖² against the text encoder's embedding of
-            // each heard word.
             let energy = heard
                 .iter()
                 .map(|&(at, _, _)| text[at * hc..(at + 1) * hc].iter().map(|x| x * x).sum::<f32>())
@@ -3541,9 +3456,6 @@ impl E2Trainer {
                 next.teachers.push(t_next);
                 after.teachers.push(t_after);
             }
-            // The control: each audio word handed the embedding from half an
-            // utterance away. Close to the real loss means the embeddings say
-            // little about which word was spoken.
             let rotated: Vec<f32> = (0..n)
                 .flat_map(|i| {
                     let j = (i + n / 2) % n;

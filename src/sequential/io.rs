@@ -1,15 +1,4 @@
 //! The `Sequential` file format: an `NNM1` container holding one stack blob.
-//!
-//! ```text
-//! container  MAGIC u32 "NNM1" | VERSION u8 | KIND u8 (0 = flat)
-//!            N_SECTIONS u32 | per section: name <string>, stack blob
-//! stack blob STACK_MAGIC u32 "NNFW" | STACK_VERSION u8 | N_LAYERS u32
-//!            per layer: tag u8, input u32, output u32
-//!            per layer, same order: layer.save(w), weights only
-//! ```
-//!
-//! Kind 1 (the old hierarchical model) is refused: that model is stored as a v2
-//! checkpoint (`src/checkpoint.rs`).
 
 use std::{
     fs::File,

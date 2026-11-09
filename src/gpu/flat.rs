@@ -1,18 +1,4 @@
-//! A small fully-GPU-resident training stack, composing every ported kernel:
-//!
-//!   Embedding → Linear → RMSNorm → Linear(head) → SoftCap → softmax/CE
-//!
-//! This is *not* the real language model yet — it has no recurrent core (the
-//! sLSTM/mLSTM block is the next port). Its purpose is to prove the ported ops
-//! and the `Linear` layer **compose** into a correct forward → loss → backward →
-//! optimizer-step cycle end to end on the device: buffer threading, transpose
-//! forms, gradient-accumulation order and the multi-layer optimizer convention
-//! all exercised at once. The parity test checks loss and every updated
-//! parameter against the identical stack built from `cpu` CPU layers.
-//!
-//! Optimizer convention (same as the rest of the project): the interior `Linear`
-//! decays its weight; the embedding table, the RMSNorm scale and the logit head
-//! train on undecayed Adam.
+//! A small fully GPU-resident training stack, checking that the ported ops compose.
 
 use super::ops::{self, GpuRmsForward};
 use super::{GTensor, Gpu, linear::Linear};
@@ -119,8 +105,6 @@ impl Flat {
         });
         let d_pre = ops::softcap_backward(gpu, dlogits, logits, self.cap);
         let d_rmsout = self.head.backward_alloc(gpu, &d_pre, cache);
-        // `head` saved its own input, which is the norm's output — what the norm's
-        // backward rebuilds `x̂` from, so nothing else has to keep it.
         let d_h = ops::rms_norm_backward(
             gpu,
             &d_rmsout,
@@ -255,10 +239,6 @@ mod tests {
         );
         let gpu_loss = dev.train_step(&gpu, &ids, &targets, &cfg);
 
-        // The interior projections run bf16 operands / fp32 accumulate when that is
-        // enabled, so the loss lands within bf16's precision of the CPU's, not
-        // fp32's. The logit head itself stays fp32 (see `Flat::from_parts`), so this
-        // is the projections' contribution only.
         let loss_tol = if ops::gemm_bf16_enabled(&gpu) {
             5e-3
         } else {
@@ -268,15 +248,6 @@ mod tests {
             (cpu_loss - gpu_loss).abs() < loss_tol,
             "loss: cpu {cpu_loss} vs gpu {gpu_loss} (tolerance {loss_tol:.0e})"
         );
-        // Updated parameters must match after the step.
-        //
-        // Adam's update is `lr·ĝ/(√v̂+ε)`, which is scale-INVARIANT in the gradient:
-        // a weight whose gradient is near zero has its tiny bf16-sized difference
-        // divided by an equally tiny √v̂, so a 1e-7 gradient wobble becomes ~1e-4 on
-        // the weight. (The same amplification is documented for the arch flag in
-        // `kernels.rs`.) `table` and `gamma` are unaffected — the embedding gather
-        // and the norm never go through a bf16 GEMM — but they share the helper, so
-        // the widening is applied uniformly and the tight bound is kept for fp32.
         let ptol = if ops::gemm_bf16_enabled(&gpu) {
             2e-3
         } else {

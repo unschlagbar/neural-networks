@@ -1,14 +1,4 @@
 //! Batched RMSNorm — pure normalization (no residual, no inner layer).
-//!
-//! Unlike the old `nn::rms_norm::RMSNorm`, which bakes in a pre-norm residual
-//! and an inner layer, this is just the normalization op:
-//!
-//!   rms   = sqrt( mean(xᵢ²) + ε )
-//!   x̂ᵢ   = xᵢ / rms
-//!   yᵢ   = γᵢ · x̂ᵢ
-//!
-//! applied independently to each row (feature vector) of a `[B, F]` tensor.
-//! Residual connections are the block's responsibility, kept explicit.
 
 use crate::cpu::ops;
 use crate::cpu::optim::{AdamCfg, AdamState};
@@ -59,9 +49,6 @@ impl RmsNorm {
     }
 
     /// Given `dY` `[B, F]`, accumulate `dγ` and return `dX` `[B, F]`.
-    ///
-    /// Per row:  S   = Σⱼ γⱼ · dYⱼ · x̂ⱼ
-    ///           dXᵢ = inv_rms · ( γᵢ·dYᵢ − x̂ᵢ · S / F )
     pub fn backward(&mut self, dy: &Tensor) -> Tensor {
         assert_eq!(dy.cols(), self.size, "RmsNorm::backward — width mismatch");
         ops::rms_norm_backward(

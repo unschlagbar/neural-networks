@@ -1,8 +1,4 @@
 //! Fused softmax + cross-entropy over a batch of logit rows.
-//!
-//! Batched analogue of the old flat model's `Softmax` output: the forward
-//! softmax and the cross-entropy gradient are fused, so backward returns the
-//! standard `p - onehot` directly (no separate softmax Jacobian pass).
 
 use crate::tensor::Tensor;
 
@@ -25,10 +21,6 @@ pub fn softmax_rows(logits: &Tensor) -> Tensor {
 }
 
 /// Mean cross-entropy loss and its gradient w.r.t. the logits.
-///
-/// `logits` is `[B, C]`, `targets` holds `B` class indices. Returns
-/// `(mean_loss, dlogits)` where `dlogits = (softmax − onehot) / B` — already
-/// averaged over the batch, ready to feed straight into `Linear::backward`.
 pub fn softmax_cross_entropy(logits: &Tensor, targets: &[usize]) -> (f32, Tensor) {
     let (b, c) = (logits.rows(), logits.cols());
     assert_eq!(

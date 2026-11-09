@@ -29,8 +29,6 @@ pub fn render(mix: &Mix, st: &BuildStats) -> String {
         human(st.budget),
         unit_name(st.unit)
     ));
-    // What limited the size. With an explicit budget this is the only place it
-    // is said: the corpus is simply smaller than asked for.
     let short: Vec<_> = st.sources.iter().filter(|s| s.is_short()).collect();
     if short.is_empty() {
         s.push_str("- every source filled its share\n\n");

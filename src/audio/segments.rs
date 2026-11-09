@@ -1,9 +1,5 @@
 //! Host-side layout of the audio encoder: which feature rows the stem stacks,
 //! which encoder frames form a word segment, and the boundary head's targets.
-//!
-//! Units: a *feature frame* is one [`LogMel`](super::frontend::LogMel) row
-//! (10 ms); an *encoder frame* is one stem output (`stride` feature frames,
-//! 40 ms). Segments and boundaries are in encoder frames.
 
 use crate::config::{AUDIO_HOP, AUDIO_SR, AUDIO_STRIDE};
 
@@ -85,8 +81,6 @@ impl WordSegments {
     /// previous one's last frame moves on to the next — and words starting past
     /// the end are dropped.
     pub fn from_word_times(words: &[(f32, f32)], n_frames: usize) -> Self {
-        // A time exactly on a frame border must not round into the neighbour
-        // through the division's last bit.
         const EPS: f32 = 1e-3;
         let mut out: Vec<Segment> = Vec::with_capacity(words.len());
         for &(s, e) in words {
@@ -147,15 +141,6 @@ impl WordSegments {
 
 /// The encoder-frame rows the segment encoder runs over, for a batch whose
 /// utterance `b` holds encoder frames `b · t_out ..`.
-///
-/// Each segment reads its own frames and nothing after them. The boundary head
-/// may look ahead to decide *where* a word ended, since that decision never
-/// reaches the text model; the embedding does, and anything past the word's
-/// end would hand it the next word. Each segment is one row of a
-/// `[segments, steps]` batch: its last `max_frames` frames, then with `word`
-/// one `[W]` step, the cells' cue that the word is complete, where its
-/// embedding is read. Rows are padded to `steps` after that, where nothing
-/// reads them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SegmentRows {
     /// Frame row of every step, `[segments, steps]` row-major; `[W]` and the
@@ -207,12 +192,6 @@ impl SegmentRows {
 }
 
 /// Targets for the boundary head, `[n_frames, delay + 1]` row-major.
-///
-/// Column `d` at frame `t` asks "did a word end at frame `t − d`?", so the head
-/// can commit early when the evidence is clear (a pause) and wait up to `delay`
-/// frames when it is not. A frame within `tolerance` of a labelled end gets a
-/// soft target that falls off linearly. `weights` is 0 where `t − d` precedes
-/// the utterance.
 pub struct BoundaryTargets {
     pub targets: Vec<f32>,
     pub weights: Vec<f32>,

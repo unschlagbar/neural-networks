@@ -76,12 +76,6 @@ pub fn unit_name(unit: WeightUnit) -> &'static str {
 }
 
 /// Where this build's staging shards live. Deleted when the build finishes.
-///
-/// One directory per process, because two builds can legitimately be running at
-/// once: a long rewrite filling the cache, and a `cache_only` build assembling
-/// a corpus out of what it has finished so far. A shared path would have them
-/// writing each other's shards, and the shards are named by source — which the
-/// two mixtures share.
 fn stage_dir() -> String {
     format!("target/datamix-stage-{}", std::process::id())
 }
@@ -98,11 +92,6 @@ pub fn build(mix: &Mix, opts: &Options) -> Result<BuildStats> {
     let mut rng = Rng::new(mix.output.seed);
     let mut readers = Vec::new();
     let mut stats = Vec::new();
-    // Constructed even when nothing uses it: it opens no socket until the first
-    // completion, so a mixture with no `llm` source and no `judge` never talks
-    // to the server.
-    // A `RefCell` because both halves of staging reach for it: the generator
-    // (making records) and the judge (vetting them) run inside one another.
     let llm = RefCell::new(Client::new(&mix.llm)?);
     let gate = match mix.output.kind {
         OutKind::Prompts => Some(Gate {
@@ -130,16 +119,11 @@ pub fn build(mix: &Mix, opts: &Options) -> Result<BuildStats> {
         stats.push(SourceStats { unit, ..st });
     }
 
-    // Which staged records may be drawn. Every one, except that a prompt pool
-    // drops a sentence an earlier source already has or a training corpus
-    // already holds.
     let mut usable: Vec<Vec<usize>> = readers.iter().map(|r| (0..r.len()).collect()).collect();
     if gate.is_some() {
         usable = unique_prompts(mix, &mut readers, &mut stats)?;
     }
 
-    // Shares are relative weights; a source with nothing left after filtering
-    // drops out and its weight is redistributed over the rest.
     let total_w: f32 = mix
         .sources
         .iter()
@@ -158,9 +142,6 @@ pub fn build(mix: &Mix, opts: &Options) -> Result<BuildStats> {
         };
     }
 
-    // With no explicit budget, take the largest corpus in which every source
-    // stays inside its own `epochs` — i.e. the binding source is the one whose
-    // available data runs out first at its share.
     let asked = match unit {
         WeightUnit::Tokens => mix.output.tokens,
         WeightUnit::Records => mix.output.records,
@@ -179,9 +160,6 @@ pub fn build(mix: &Mix, opts: &Options) -> Result<BuildStats> {
             .unwrap_or(0)
     };
 
-    // The binding source — the one that runs out first at its share — sets the
-    // size of the whole corpus, so name it: a 500 MB mixture collapsing to a
-    // few thousand tokens is otherwise a silent surprise.
     if asked == 0
         && let Some((src, st)) = mix
             .sources
@@ -220,8 +198,6 @@ pub fn build(mix: &Mix, opts: &Options) -> Result<BuildStats> {
         let mut i = 0usize;
         while drawn < target && !order.is_empty() {
             if i == order.len() {
-                // Next epoch over this source: reshuffle so the repeat is not
-                // the same sequence again.
                 rng.shuffle(&mut order);
                 i = 0;
             }
@@ -243,9 +219,6 @@ pub fn build(mix: &Mix, opts: &Options) -> Result<BuildStats> {
         };
     }
 
-    // Say which sources ran out. With an explicit `tokens` budget nothing else
-    // reports it: the corpus is simply smaller than asked for, and the reason is
-    // one source's `epochs` cap.
     let short: Vec<&SourceStats> = stats.iter().filter(|s| s.is_short()).collect();
     if !short.is_empty() {
         let missing: usize = short.iter().map(|s| s.wanted - s.emitted_units()).sum();
@@ -315,15 +288,6 @@ pub fn build(mix: &Mix, opts: &Options) -> Result<BuildStats> {
 }
 
 /// Rewrite a batch of records through the model, `[llm] workers` in flight.
-/// Order is preserved and a record whose rewrite could not be read back comes
-/// home as `None` — the caller drops it rather than keeping an original the
-/// mixture has asked not to contain.
-///
-/// Each worker gets its own `Client` because a request needs `&mut self` for
-/// its counters; they share only the cache directory, and cache files are
-/// named by content hash, so two workers writing the same answer write the
-/// same bytes to the same path.
-/// Does this record fall under the source's rewrite?
 fn wants_transform(f: &Filters, rec: &Record) -> bool {
     if f.transform.is_empty() {
         return false;
@@ -352,8 +316,6 @@ fn accept(
         *st.rejects.entry(reason).or_insert(0) += 1;
         return true;
     }
-    // The judge runs last, on what survived the cheap gates. It is one round
-    // trip per record, so records queue here and go up a batch at a time.
     if !src.filters.judge.is_empty() {
         judging.push(rec);
         if judging.len() >= judge_batch_size(llm) {
@@ -376,8 +338,6 @@ fn keep(rec: Record, st: &mut SourceStats, shard: &mut Shard, err: &mut Option<S
 }
 
 fn judge_batch_size(llm: &RefCell<Client>) -> usize {
-    // Four deep per worker: enough that no slot waits on the slowest record,
-    // small enough that a source's progress line still moves.
     llm.borrow().cfg.workers.max(1) * 4
 }
 
@@ -393,9 +353,6 @@ fn flush_judged(
     if judging.is_empty() {
         return true;
     }
-    // Under `cache_only` nothing opens a socket, so a judge error is never a
-    // transport failure — it is a record whose verdict has not been paid for.
-    // That is a drop, the same as any other unfinished work, not a dead build.
     let unpaid = llm.borrow().cfg.cache_only;
     let verdicts = judge_batch(&mut llm.borrow_mut(), &src.filters, judging);
     let recs = std::mem::take(judging);
@@ -466,8 +423,6 @@ fn verified(
         return Ok(rewritten);
     }
     let Record::Chat { turns, .. } = &rewritten else {
-        // A dolly record carries its code the same way; verify it through the
-        // turns it stands for.
         let json = rewritten.to_messages_json().ok_or(Reject::Rewritten)?;
         let turns = neural_networks::sft::parse_messages(&json).ok_or(Reject::Rewritten)?;
         let src = crate::verify::rust_blocks(&turns);
@@ -483,8 +438,6 @@ fn verified(
     if f.verify_repair.is_empty() {
         return Err(Reject::Uncompilable);
     }
-    // The nonce keeps the repair from colliding with the rewrite's own cache
-    // entry for the same record.
     let payload = format!(
         "{}\n\nrustc says:\n{errors}",
         rewritten.to_messages_json().ok_or(Reject::Rewritten)?
@@ -510,11 +463,6 @@ fn transform_batch(
     recs: &[Record],
 ) -> Vec<std::result::Result<Record, Reject>> {
     let workers = client.cfg.workers.max(1);
-    // A queue, not a static split. Records cost wildly different amounts — one
-    // whose code compiles first time is a single call, one that needs a repair
-    // is two calls and four rustc runs — so handing each worker a fixed slice
-    // leaves most of them waiting on the slowest, and the server idle with
-    // them. Measured mid-run that way: GPU utilization dipping to 22%.
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out: std::sync::Mutex<Vec<std::result::Result<Record, Reject>>> =
         std::sync::Mutex::new(vec![Err(Reject::Rewritten); recs.len()]);
@@ -524,8 +472,6 @@ fn transform_batch(
                 let mut c = client.clone();
                 let next = &next;
                 let out = &out;
-                // Each worker compiles in its own directory: rustc writes fixed
-                // names there and two workers sharing one would race.
                 let scratch = std::env::temp_dir()
                     .join(format!("datamix-verify-{}-{w}", std::process::id()));
                 scope.spawn(move || {
@@ -536,10 +482,6 @@ fn transform_batch(
                         let Some(payload) = rec.to_messages_json() else {
                             continue;
                         };
-                        // nonce 0: the same record must always land on the same
-                        // cache entry. That identity is the whole persistence
-                        // story — a rebuild re-reads the corpus, hashes the same
-                        // text and never reaches the server.
                         let Ok(reply) = c.chat_as(
                             &f.transform,
                             &payload,
@@ -660,10 +602,6 @@ fn stage(
         let st = &mut st;
         let shard = &mut shard;
         let err = &mut err;
-        // A rewrite is worth batching: the server answers `workers` requests at
-        // once, and a record at a time would leave all but one slot idle.
-        // Eight deep per worker: the queue only helps if there is work in it
-        // when a worker finishes early.
         let batch = if src.filters.transform.is_empty() {
             0
         } else {
@@ -673,8 +611,6 @@ fn stage(
         let mut judging: Vec<Record> = Vec::new();
         let skipped = source::read(src, seed, llm, &mut |mut rec| {
             st.read += 1;
-            // A prompt pool keeps sentences, not records: each one goes through
-            // the gates on its own, as a document of one sentence.
             if let Some(gate) = gate {
                 for (index, sentence) in prompts::sentences(&rec).into_iter().enumerate() {
                     if let Err(reason) = gate.check(&sentence) {
@@ -692,24 +628,14 @@ fn stage(
                 }
                 return true;
             }
-            // Before anything else: the record's own text decides its rewrite
-            // cache key, so the system turn has to be settled first or the
-            // same record hashes two ways.
             if fold_system || !system_strip.is_empty() {
                 rec.fold_system(&system_strip, fold_system);
             }
-            // Trimming runs before the gates: it decides whether the record is
-            // over the token cap at all — and before the rewrite, so no turn
-            // is translated only to be dropped.
             if trim && !rec.trim_to_fit(max_tokens, max_words) {
                 *st.rejects.entry(Reject::TooLong).or_insert(0) += 1;
                 return true;
             }
-            // The gates judge the record the corpus will actually hold, so the
-            // rewrite comes first — but only for the records it applies to.
             if batch == 0 || !wants_transform(&src.filters, &rec) {
-                // `transform_only` makes the rewrite the corpus: a record the
-                // gate never sent is not a record this mixture is collecting.
                 if src.filters.transform_only && !src.filters.transform.is_empty() {
                     *st.rejects.entry(Reject::NotTransformed).or_insert(0) += 1;
                     return true;
@@ -757,8 +683,6 @@ fn judge_payload(cfg: &Filters, rec: &Record) -> (String, String) {
             .collect::<Vec<_>>()
             .join("\n\n"),
     };
-    // Long documents are judged on their head: a local model's context is the
-    // binding constraint, and the first few KB decide quality in practice.
     let head: String = body.chars().take(6000).collect();
     let system = format!(
         "{}\n\nAnswer with the verdict FIRST — yes or no — then, after a dash, \
@@ -778,10 +702,7 @@ fn judged_keep(cfg: &Filters, reply: &str) -> bool {
         .starts_with(&cfg.judge_expect.to_lowercase())
 }
 
-/// Judge a batch, `[llm] workers` in flight. Judging is one short round trip per
-/// record and it was the only part of a build still made one at a time:
-/// measured at 36% of the wall clock on `mixes/tools.toml`, with seven of the
-/// server's eight slots idle throughout.
+/// Judge a batch, `[llm] workers` in flight.
 fn judge_batch(client: &mut Client, cfg: &Filters, recs: &[Record]) -> Vec<Result<bool>> {
     let workers = client.cfg.workers.max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -793,11 +714,6 @@ fn judge_batch(client: &mut Client, cfg: &Filters, recs: &[Record]) -> Vec<Resul
                 let mut c = client.clone();
                 c.calls = 0;
                 c.cached = 0;
-                // A verdict plus one clause. Measured over 5,407 cached judge
-                // replies: p90 is 25 tokens, but p99 is 434 and one reached the
-                // inherited 4096-token cap — a judge that starts rambling holds
-                // a server slot for minutes and decides nothing after its first
-                // word. The cap costs nothing and removes that whole tail.
                 c.cfg.max_tokens = c.cfg.max_tokens.min(96);
                 let (next, out) = (&next, &out);
                 scope.spawn(move || {
@@ -924,8 +840,6 @@ pub fn render(rec: &Record, kind: OutKind) -> Option<String> {
             let messages = turns
                 .iter()
                 .map(|t| {
-                    // The mask is written only when there is one, so an
-                    // unmasked corpus reads exactly as it did before.
                     let mask = if t.no_loss.is_empty() {
                         String::new()
                     } else {
@@ -951,8 +865,6 @@ pub fn render(rec: &Record, kind: OutKind) -> Option<String> {
             ))
         }
         (OutKind::Text, Record::Doc { text }) => Some(format!("{text}<|endoftext|>")),
-        // An instruction pair still makes a usable pretraining document; the
-        // chat markers are dropped because they are token ids, not text.
         (OutKind::Text, rec) => Some(format!("{}<|endoftext|>", rec.train_text())),
         (OutKind::Prompts, rec) => Some(format!("{}\n", rec.train_text())),
         (OutKind::None, _) => None,

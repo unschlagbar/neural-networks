@@ -1,15 +1,4 @@
 //! LibriSpeech utterances with word-level forced alignments.
-//!
-//! Audio: `<root>/LibriSpeech/<split>/<speaker>/<chapter>/<id>.flac` (openslr 12).
-//! Alignments: `<root>/alignments/<split>/<speaker>/<chapter>/<id>.TextGrid`, the
-//! Montreal Forced Aligner output of zenodo record 2619474, whose `words` tier
-//! holds every word with its start and end time and pauses as empty intervals.
-//! Written text: `<root>/pc/<split>.json`, LibriSpeech-PC (openslr 145), the
-//! transcripts with punctuation and capitalization restored, where it exists.
-//! All of it for a split is kept in one file, `<root>/index/<split>.tsv`, made
-//! on the first load: reading one file is a second where hundreds of thousands
-//! of small ones on a hard disk are minutes. Delete it after changing the
-//! alignments or the written transcripts.
 
 use std::collections::HashMap;
 use std::fs;

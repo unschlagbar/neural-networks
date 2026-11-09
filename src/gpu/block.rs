@@ -1,12 +1,5 @@
 //! Device-resident xLSTM-style residual block, the GPU counterpart of
 //! [`cpu::block::Block`](crate::cpu::block::Block).
-//!
-//!   z = x + cell(pre_norm1(x))
-//!   y = z + lin_down( SiLU(lin_gate·pre_norm2(z)) ⊙ (lin_value·pre_norm2(z)) )
-//!
-//! The cell owns its own post-norm, so its output enters the residual normalized.
-//! Everything but the cell is position-wise and runs on an `[N, H]` view of the
-//! `[B, T, H]` sequence (`N = B·T`), which is metadata-only — the storage is shared.
 
 use super::{
     GTensor, Gpu,
@@ -112,10 +105,6 @@ pub mod phase {
 }
 
 /// Rows of one `[1, T, ·]` call at which a packed document begins.
-///
-/// A cell restarts its recurrence at each of them: the row sees nothing of the rows
-/// before it, and in backward no gradient crosses it towards them. Set for the call
-/// about to run, forward and backward alike (see [`Cell::set_resets`]).
 #[derive(Clone, Default)]
 pub struct Resets {
     /// Ascending, local to the call. Never 0 of a sweep's first call: a sequence that
@@ -133,11 +122,6 @@ impl Resets {
 }
 
 /// A recurrent cell operating on `[B, T, H]` device sequences (H in == H out).
-///
-/// The cell saves nothing of its own: what its backward needs is carved from the
-/// surrounding block's frame ([`carve`](Self::carve)) and handed to both directions.
-/// A cell's carried forward state, moved out so another sequence can run on
-/// the same weights and moved back to continue the first.
 pub enum CarriedState {
     None,
     Mlstm(Option<ops::MlstmState>),
@@ -462,8 +446,6 @@ impl<C: Cell> BlockLike for Block<C> {
         self.cell.set_carry(carry)
     }
     fn reset_state(&mut self, gpu: &Gpu) {
-        // A sweep that forwarded chunks and never unwound them would otherwise leave
-        // its frames to accumulate across steps.
         self.frames.reset();
         self.cell.reset_state(gpu)
     }
@@ -517,22 +499,6 @@ pub struct Block<C: Cell> {
 }
 
 /// What a block's forward saves for its backward, carved from one frame.
-///
-/// Named after the forward, which computes them in this order:
-///
-/// ```text
-///   norm1_out = pre_norm1(x)               the cell's input
-///   cell_out  = cell(norm1_out)            already post-normed; kept if the cell asks
-///   z         = x + cell_out               residual 1  (not kept)
-///   norm2_out = pre_norm2(z)               both FFN projections' input
-///   gate_pre  = lin_gate(norm2_out)        value = lin_value(norm2_out)
-///   mixed     = SiLU(gate_pre) ⊙ value     lin_down's input
-///   out       = z + lin_down(mixed)        residual 2
-/// ```
-///
-/// Everything else (`z`, every `d_*`) comes from [`temp`](super::temp) instead, and
-/// `SiLU(gate_pre)` is recomputed by the backward rather than saved. `ffn` is `None`
-/// under [`recompute_ffn`](Block::recompute_ffn).
 struct BlockSaved<S> {
     norm1_out: ops::SlabBuf,        // [B, T, H], at the width the cell's GEMMs read
     cell_out: Option<GTensor<f32>>, // [B, T, H], only when `C::NEEDS_Y`
@@ -607,12 +573,6 @@ impl<C: Cell> Block<C> {
 
     /// Keep this block's frames in the shared `off` instead of on the device, or back
     /// on the device with `None`.
-    ///
-    /// **Only legal where the whole stack forwards before any of it unwinds**, and
-    /// only for a stack whose blocks all push to the same `off` in sweep order — the
-    /// frames form one LIFO across the stack. See [`Offload`](super::offload::Offload).
-    /// The frame layout depends on it, so set it before measuring a frame and never
-    /// between a forward and its backward.
     pub fn set_offload(&mut self, off: Option<SharedOffload>) {
         self.recompute_ffn = off.is_some();
         self.frames = match off {
@@ -700,8 +660,6 @@ impl<C: Cell> Block<C> {
     /// Release every activation
     pub fn drop_all_act(&mut self, gpu: &Gpu) {
         self.drop_saved_act();
-        // The pool is NOT emptied (see `MLstm::drop_all_act`): dropping scratch per
-        // group puts the allocator on the hot path. `trim_to` sizes it per window.
         self.pre_norm1.drop_saved_act();
         self.pre_norm2.drop_saved_act();
         for l in [&mut self.lin_gate, &mut self.lin_value, &mut self.lin_down] {
@@ -784,12 +742,8 @@ impl<C: Cell> Block<C> {
         let mut f = self.frames.push(gpu, bytes, self.carry);
         let mut sv = self.carve(gpu, &mut f, b, t);
 
-        // The input as [N, H]. A view, not a pooled copy: the storage stays the
-        // caller's, so it must not outlive `input` nor go back to the pool.
         let x_flat = GTensor::view(gpu, &input.buf, 0, &[n, h]);
 
-        // Residual 1: z = input + cell(pre_norm1(input)). Both intermediates are saved:
-        // each is a norm's output, which is all that norm's backward needs.
         self.pre_norm1
             .forward_slab_saved(gpu, input, None, &mut sv.norm1_out, &mut sv.norm1);
         let mut cell_tmp = (!C::NEEDS_Y).then(|| cache.temps.get::<f32>(gpu, &[b, t, h]));
@@ -804,13 +758,9 @@ impl<C: Cell> Block<C> {
                 .forward_saved(gpu, &sv.norm1_out, cell_out, &mut sv.cell, cache)
         });
 
-        // Downstream is position-wise [N, H]. The residual sum `z` comes out of
-        // pre_norm2's own pass over it.
         let cell_flat = GTensor::view(gpu, &cell_out.buf, 0, &[n, h]);
         let mut z = cache.temps.get::<f32>(gpu, &[n, h]);
 
-        // Residual 2: out = z + SwiGLU(pre_norm2(z)). `norm2_out` is kept once here
-        // because `lin_gate` and `lin_value` share it.
         self.pre_norm2.forward_slab_saved(
             gpu,
             &x_flat,
@@ -826,8 +776,6 @@ impl<C: Cell> Block<C> {
         let (gate_pre, value, mixed) = ffn_parts(&mut sv.ffn, &mut scratch);
         phase::timed(gpu, phase::Bucket::FfnFwd, || {
             self.ffn_up(gpu, &sv.norm2_out, gate_pre, value, mixed);
-            // `out = z + down(mixed)`: the residual rides in `lin_down`'s bias seed, so
-            // there is no separate add and no buffer for `down`'s output.
             out.reshape_to(&[n, h]);
             self.lin_down.forward_slab_lhs_resid(gpu, mixed, &z, out);
         });
@@ -866,8 +814,6 @@ impl<C: Cell> Block<C> {
         let mut f = self.frames.pop(gpu);
         let mut sv = self.carve(gpu, &mut f, b, t);
 
-        // The incoming delta as [N, H], the counterpart of `x_flat`: read by
-        // lin_down's backward and again by the d_z residual, never written.
         let dy_flat = GTensor::view(gpu, &dy.buf, 0, &[n, h]);
 
         // Residual 2.
@@ -887,15 +833,10 @@ impl<C: Cell> Block<C> {
         }
         self.lin_down
             .backward_slab_x(gpu, mixed, &dy_flat, &mut d_mixed, 0.0, cache);
-        // The deltas are written at the width `norm2_out` has: their only readers are
-        // the two projections' GEMMs and bias sums, which take them narrow.
         let mut d_gate = ops::SlabAt::temp(gpu, &cache.temps, &[n, u], self.narrow);
         let mut d_value = ops::SlabAt::temp(gpu, &cache.temps, &[n, u], self.narrow);
         ops::swiglu_backward_into_slab(gpu, &d_mixed, value, gate_pre, &mut d_gate.x, &mut d_value.x);
         drop((d_mixed, scratch));
-        // Forward wrote `norm2_out` at the width both GEMMs want, so neither narrows here.
-        // Both projections read `norm2_out`, so the value one accumulates its `dx` onto
-        // the gate one's.
         let mut d_norm2_out = cache.temps.get::<f32>(gpu, &[n, h]);
         self.lin_gate
             .backward_slab_xy(gpu, &sv.norm2_out, &d_gate.x, &mut d_norm2_out, 0.0, cache);
@@ -907,9 +848,6 @@ impl<C: Cell> Block<C> {
         }
         drop((d_gate, d_value));
 
-        // z feeds pre_norm2 and the y = z + down residual, so the norm's dx and the
-        // incoming dy sum into d_z, inside the norm's backward.
-        // `norm2_out` is pre_norm2's own output — see `RmsNorm::backward`.
         let mut d_z = cache.temps.get::<f32>(gpu, &[n, h]);
         self.pre_norm2.backward_slab_saved(
             gpu,
@@ -922,8 +860,6 @@ impl<C: Cell> Block<C> {
         );
         drop(d_norm2_out);
 
-        // Residual 1. Neither cell writes its `dy`, so d_z goes in as a `[B, T, H]`
-        // view — the dx residual below still needs it as `[N, H]`.
         let d_cell_out = GTensor::view(gpu, &d_z.buf, 0, &[b, t, h]);
         let mut d_cell_in = cache.temps.get::<f32>(gpu, &[b, t, h]);
         let (_cf, cb) = self.cell.phase_buckets();
@@ -1038,8 +974,8 @@ mod tests {
     }
 
     /// Tolerance against the all-fp32 CPU reference, 0 on the fp32 path. Three bf16
-    /// sources chain here, so it is a small multiple of one quantization: the worst
-    /// element over ten runs was 0.0110. Growth with T is pinned in `gpu::slstm`.
+    /// sources chain here, so it is a small multiple of one quantization. Growth with
+    /// T is pinned in `gpu::slstm`.
     fn rel(gpu: &Gpu) -> f32 {
         if ops::gemm_bf16_enabled(gpu) || gpu.kernels.slab_bf16 {
             2e-2
@@ -1119,8 +1055,6 @@ mod tests {
         let (b, t, h, u, heads, dqk) = (2, 5, 8, 12, 2, 4); // dhv = 4
 
         let mut cpu = CpuMLstmBlock::new_mlstm(h, u, heads, dqk);
-        // Non-trivial gate weights so the decay/stabilizer path is exercised
-        // (cpu::MLstm::new zero-inits wi/wf).
         cpu.cell.wi = Tensor::random(&[h, heads], 0.3);
         cpu.cell.wf = Tensor::random(&[h, heads], 0.3);
         let mut dev = Block::<MLstm>::from_cpu(&gpu, &cpu);
@@ -1173,8 +1107,6 @@ mod tests {
         let tc = test_cache(&gpu);
         let (b, t, h, u) = (2, 5, 8, 12);
 
-        // `run` builds an identical block from identical CPU weights, so the only
-        // difference between the two calls is where the activations lived.
         fn run<C: Cell, F: Fn() -> Block<C>>(
             gpu: &Gpu,
             tc: &TrainingCache,
@@ -1189,8 +1121,6 @@ mod tests {
             }
             let y = dev.forward_alloc(gpu, &GTensor::from_host(gpu, x), tc);
             let dx = dev.backward_alloc(gpu, &GTensor::from_host(gpu, g), tc);
-            // Gradients of the three FFN projections are the ones the offloaded frame
-            // feeds, so they are the sharpest probe.
             let dw_down = dev.lin_down.dw.to_host(gpu).data;
             let dw_gate = dev.lin_gate.dw.to_host(gpu).data;
             (y.to_host(gpu).data, dx.to_host(gpu).data, dw_down, dw_gate)

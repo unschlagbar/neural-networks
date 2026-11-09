@@ -1,16 +1,4 @@
 // Causal depthwise conv1d with Swish activation, as used in the xLSTM paper.
-//
-// Applied per-timestep. Each channel has its own kernel (depthwise — no cross-channel mixing).
-// A causal ring buffer keeps the last `kernel_size` inputs; only past and present tokens contribute.
-//
-// Forward: z[c] = bias[c] + Σ_{k=0}^{K-1} w[c,k] · x[t-k,c]
-//          y[c] = z[c] · σ(z[c])           (Swish)
-//
-// Backward (BPTT for the delayed gradients):
-//   d_pre[c] = δ[c] · σ(z)·(1 + z·(1−σ(z)))
-//   dx[t, c] = d_pre[c]·w[c,0] + bptt[0,c]
-//   bptt[k,c] ← bptt[k+1,c]_old + d_pre[c]·w[c,k+1]   for k = 0..K-2
-// (forward-k order is safe in-place: we always read slot k+1 before we overwrite slot k)
 
 use std::{any::Any, io};
 
@@ -180,9 +168,6 @@ impl CausalConv1dLayer {
             cache.dx[ch] = self.d_pre[ch] * w[ch * k] + bptt;
         }
 
-        // Shift BPTT buffer one step earlier.
-        // dx_bptt[ki, c] ← dx_bptt[ki+1, c]_old + d_pre[c] · w[c, ki+1]
-        // Forward ki order is safe: slot ki+1 is read before slot ki is overwritten.
         if k > 1 {
             for ki in 0..k - 1 {
                 for ch in 0..c {

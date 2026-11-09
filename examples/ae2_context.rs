@@ -1,8 +1,6 @@
 //! How much the text model gains from context on LibriSpeech transcripts: each
 //! held-out utterance alone versus the utterances of its chapter run as one
 //! window, scored per word.
-//!
-//!   cargo run --release --features cuda --example ae2_context -- s4
 
 use std::range::Range;
 

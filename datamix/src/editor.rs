@@ -1,10 +1,6 @@
 // A hand-editing UI for SFT data: a loopback HTTP server that serves one page
 // and reads/writes the JSONL that page edits. The corpus it produces is a
 // plain `kind = "jsonl"` source, so a hand-written file mixes in like any other.
-//
-// The page holds the whole file as text and does its own JSON escaping through
-// `JSON.stringify`, so nothing here parses records — this side only moves bytes
-// and runs the training loader over what was saved.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};

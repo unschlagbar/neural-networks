@@ -1,12 +1,5 @@
 //! Cuts an utterance where the boundary head of an `.ae2` checkpoint puts word
 //! ends and writes every piece as its own WAV, to hear what the head calls a word.
-//!
-//!   cargo run --release --features cuda --example ae2_split -- <ckpt.ae2> <dev-clean id | wav/flac> <out dir>
-//!
-//! Writes `NN_<start>-<end>.wav` per word, `gaps.wav` with every word
-//! separated by silence, and `segments.txt`. A dev-clean id also labels each
-//! piece with the MFA words whose middle falls inside it, so a piece holding
-//! two words or half of one shows up in the listing.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;

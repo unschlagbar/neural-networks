@@ -1,13 +1,5 @@
 // Dump what a parquet corpus looks like to the trainer: row/group counts, the
 // first few documents, and a streaming pass reporting throughput.
-//
-//   cargo run --release --example parquet_demo -- <file.parquet> [column] [--all]
-//   cargo run --release --example parquet_demo -- <file.parquet> --chat [--all]
-//
-// `--all` streams the whole file (a full decode of every row group) instead of
-// stopping after the first few — use it to check a new corpus end to end.
-// `--chat` reads a `messages: list<struct<role, content>>` column instead of a
-// flat one, and prints the conversations turn by turn.
 
 use std::{env, time::Instant};
 

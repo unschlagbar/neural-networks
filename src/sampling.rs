@@ -25,8 +25,6 @@ impl Utf8Printer {
             return false;
         }
         if (token as usize) >= BYTE_TOKENS {
-            // Markup (`<tool>`, `<think>`, …) is part of the reply and is
-            // spelled out; the structural markers are model-internal.
             if tokenizer.is_markup(token) {
                 print!("{}", tokenizer.display(token));
                 stdout().flush().unwrap();
@@ -41,8 +39,6 @@ impl Utf8Printer {
                 stdout().flush().unwrap();
                 self.pending.clear();
             }
-            // Incomplete character: keep collecting. Anything else is a byte the
-            // model made up that can never complete — drop it.
             Err(e) if e.error_len().is_none() => {}
             Err(_) => self.pending.clear(),
         }
@@ -68,9 +64,6 @@ pub fn sample_chat(model_path: &str) {
         }
     };
 
-    // The conversation so far. Each generated reply is appended as an
-    // `Assistant` turn, so the next prompt carries the whole history — the same
-    // layout the multi-turn training data has.
     let mut turns: Vec<Turn> = Vec::new();
 
     loop {
@@ -87,8 +80,6 @@ pub fn sample_chat(model_path: &str) {
             continue;
         }
 
-        // Context is asked for once, at the start of a conversation: it takes
-        // the <CONTEXT> slot of the first turn and conditions every reply after.
         if turns.is_empty() {
             print!("Context (optional, blank for none): ");
             stdout().flush().unwrap();
@@ -101,10 +92,6 @@ pub fn sample_chat(model_path: &str) {
 
         turns.push(Turn::new(Role::User, input.to_string()));
 
-        // One user turn can take several rounds: a reply that is a tool call is
-        // not the answer, it is a request for a result. `app.launch` failing into
-        // `app.list` and back is three rounds, so the cap is what stops a model
-        // that has learned to call and never conclude.
         for _ in 0..MAX_TOOL_ROUNDS {
             let prompt = crate::sft::format_chat_prompt(&tokenizer, &turns);
             print!(">>> ");
@@ -120,8 +107,6 @@ pub fn sample_chat(model_path: &str) {
             );
             println!();
             let called_tool = reply.contains(&TOOL_OPEN_TOKEN);
-            // Markup is kept in the turn text so re-encoding the history
-            // reproduces the exact tokens the model just wrote.
             turns.push(Turn::new(Role::Assistant, tokenizer.to_text_markup(&reply)));
             if !called_tool {
                 break;

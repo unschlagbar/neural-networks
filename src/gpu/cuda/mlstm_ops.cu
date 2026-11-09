@@ -3,18 +3,6 @@
 // the reference the fused TFLA kernels in mlstm_fused.cu are checked against.
 
 // Block-wide sum of `v`, returned on thread 0 (garbage on the others).
-// Assumes at most 32 warps per block.
-//
-// `parts` is padded to a full warp with the reduction's identity. Blocks here are
-// as narrow as 32 threads, so the final warp-0 shuffle has lanes beyond `nwarps`;
-// with `0xffffffff` they participate, and reading an unwritten `parts` slot folds
-// whatever the previous block left in that shared memory into the result. That is
-// silent, nondeterministic gradient corruption, not a crash.
-//
-// Every thread runs to the end — no early return — so the caller may reduce twice.
-// The trailing __syncthreads() is what makes a second call safe: it keeps a fast
-// warp from overwriting `parts` while a slow one is still reading the previous
-// round out of it.
 __device__ __forceinline__ float block_reduce_sum(float v) {
     __shared__ float parts[32];
     if (threadIdx.x < 32) parts[threadIdx.x] = 0.0f;
@@ -89,11 +77,6 @@ __device__ __forceinline__ float block_scan_inclusive(float v, float* carry) {
 }
 
 // `cumsum_logsig` with one BLOCK per row instead of one thread.
-//
-// The thread-per-row form has adjacent lanes reading `f[g*T + t]` a full row apart,
-// so every warp touches 32 cache lines per iteration and the launch is one block
-// wide (grid=1 at BH=1024) — one SM of 84, walking T serially. A block per row makes
-// the row contiguous across lanes and turns the serial walk into a shuffle scan.
 extern "C" __global__ void cumsum_logsig_block(const float* f, float* fc, int T, int BH) {
     int g = blockIdx.x;
     if (g >= BH) return;
@@ -122,8 +105,6 @@ extern "C" __global__ void revcumsum_dlogsig_block(const float* dfc, const float
     float* outr = df + (long)g * T;
     float running = 0.0f;
     for (int base = 0; base < T; base += blockDim.x) {
-        // Tile [T-1-base-blockDim+1 .. T-1-base], walked so threadIdx.x 0 is the
-        // highest index — a forward scan over the reversed row.
         int t = T - 1 - base - (int)threadIdx.x;
         float v = (t >= 0) ? dr[t] : 0.0f;
         float carry;
@@ -141,19 +122,6 @@ extern "C" __global__ void mul(float* out, const float* a, const float* b, int n
 }
 
 // o-gate activation and its product with yhat in one pass.
-//
-// `o` is a column block of the fused q‖k‖v‖o projection output (`stride` apart per
-// row, starting at `off`), so this walks the `[rows, d]` logical shape and never
-// touches the rest of the tensor. `yhat` and `hconcat` are dense `[rows, d]`.
-//
-// The raw pre-activation is left in place rather than overwritten with σ(o):
-// `ogate_bwd` recomputes the sigmoid from it. Storing it back would cost a
-// full-width write here and a second rounding through the slab's width, and the
-// sigmoid is cheaper than either.
-//
-// One grid row per row of the `[rows, d]` shape, so the row index is `blockIdx.y`
-// and never a division: `d` is a runtime value, and `i / d` per element cost more
-// than the sigmoid.
 extern "C" __global__ void ogate_fwd(const slab_t* o, const float* yhat, float* hconcat,
                                      int d, int stride, int off) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -175,9 +143,6 @@ extern "C" __global__ void ogate_fwd_slab(const slab_t* o, const float* yhat, sl
 }
 
 // mLSTM chunking (inter-chunk state carry; see gpu/mlstm.rs)
-// A chunk is a contiguous T-range [c0, c0+L) of a [BH, T, W] head-major tensor.
-// Within a group g the range is contiguous (g*T*W + c0*W, length L*W), so both
-// directions are plain index math.
 
 // Extract a chunk: out[BH,L,W] = x[BH, c0..c0+L, W].
 extern "C" __global__ void slice_t(const float* x, float* out, int T, int L, int c0,
@@ -191,19 +156,6 @@ extern "C" __global__ void slice_t(const float* x, float* out, int T, int L, int
 }
 
 // Several `slice_t` calls sharing T, L and c0, fused into one launch.
-//
-// The chunked sweep slices q/k/v (and on the backward side five gradient tensors)
-// out of the same time range back to back: identical geometry, different buffers
-// and row widths. As separate launches they are ~2.3 us each and the step issues
-// thousands of them, so the launch dominates the copy. One grid covers all of them
-// by giving each tensor a contiguous span of the flat index space.
-//
-// The descriptor is passed **by value** as a kernel argument, not through a device
-// array: a pointer array would need its own H2D copy (plus the event to order it)
-// per call, which costs more than the launches being saved.
-//
-// `off[i]` is the running sum of each tensor's element count, so `off[N]` is the
-// grand total; a short linear scan maps a flat index back to its tensor.
 #define SLICE_BATCH_MAX 8
 struct SliceBatch {
     const float* src[SLICE_BATCH_MAX];
@@ -306,8 +258,6 @@ extern "C" __global__ void mlstm_chunk_ab_bwd(const float* db, const float* da,
 
 // hierarchical model
 // Copy rows of `src` into arbitrary rows of `dst`: dst[row_ids[i], :] = src[i, :].
-// The inverse (gathering those rows back out) is just `embedding_gather` with the
-// same row ids, so the hierarchical model needs no separate gather kernel.
 extern "C" __global__ void scatter_rows(float* dst, const float* src, const unsigned* row_ids,
                                         int dim, int rows) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -330,8 +280,6 @@ extern "C" __global__ void route_rows(float* dst, const float* src, const unsign
 
 // The rectangle side of a readout is affine: groups hold one word length, so word i's
 // slot `offset` is row `i * stride + offset`. Only the window side needs a table.
-//
-// pack: rectangle -> window. dst[ids[i], :] = src[i * stride + offset, :]
 extern "C" __global__ void pack_rows(float* dst, const float* src, const unsigned* ids,
                                      int stride, int offset, int dim, int rows) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -379,11 +327,6 @@ extern "C" __global__ void masked_softmax_ce(const float* logits, const unsigned
 }
 
 // `masked_softmax_ce` with one BLOCK per row.
-//
-// The thread-per-row form walks the C-wide row four times (max, sum, then the
-// gradient) with adjacent lanes a full row apart, and at R=1024 fits in two blocks —
-// two SMs of 84, 341 us a launch. A block per row makes the row contiguous across
-// lanes and turns each pass into a block reduction.
 extern "C" __global__ void masked_softmax_ce_block(const float* logits, const unsigned* targets,
                                                     const unsigned* mask, float* dlogits,
                                                     float* row_loss, int C, float inv, int R) {
@@ -425,11 +368,6 @@ extern "C" __global__ void masked_softmax_ce_block(const float* logits, const un
 }
 
 // `mlstm_chunk_ab_bwd` with the last-row reduction spread across a block.
-//
-// The elementwise part is unchanged, but in the thread-per-row form the single
-// thread holding `t == L-1` walks the whole row serially while every other thread in
-// the launch waits on it. Here one block owns a row `g`: the elementwise terms are
-// strided across lanes and the row sum is a block reduction.
 extern "C" __global__ void mlstm_chunk_ab_bwd_block(const float* db, const float* da,
                                                      const float* b, const float* a,
                                                      float* dfc, float* dig, int L, int BH) {
@@ -451,11 +389,6 @@ extern "C" __global__ void mlstm_chunk_ab_bwd_block(const float* db, const float
 
 // mLSTM parallel-form backward
 // o-gate backward: hconcat = σ(o_pre) ⊙ yhat.
-//   d_yhat = d_hconcat ⊙ σ ;  do_pre = d_hconcat ⊙ yhat ⊙ σ(1-σ).
-//
-// `o` and `do_pre` are the same column block of the fused projection and of its
-// gradient, so both take `stride`/`off`; `d_yhat` is dense `[rows, d]`. The sigmoid
-// is recomputed here rather than read back from forward — see `ogate_fwd`.
 extern "C" __global__ void ogate_bwd(const float* d_hconcat, const slab_t* o, const float* yhat,
                                      float* do_pre, float* d_yhat,
                                      int d, int stride, int off) {
@@ -470,9 +403,6 @@ extern "C" __global__ void ogate_bwd(const float* d_hconcat, const slab_t* o, co
 
 // Reduce P into the cumulative-log-forget and input-gate grads (m held const):
 //   dfc[g,r] = Σ_{j≤r} P[g,r,j] − Σ_{t≥r} P[g,t,r]      (fc_t: +D̄, fc_j: −D̄)
-//   dig[g,r] = Σ_{t≥r} P[g,t,r]                          (ig_j: +D̄)
-// One BLOCK per (g,r) over BH·T: both sums walk a full T, and a thread per (g,r)
-// would give each lane its own sector on the row sum.
 extern "C" __global__ void mlstm_dfc_dig(const float* P, float* dfc, float* dig, int T, int BHT) {
     int idx = blockIdx.x;
     if (idx >= BHT) return;

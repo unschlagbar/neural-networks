@@ -1,16 +1,4 @@
 //! Checkpoint format v2.
-//!
-//! A header ([`Header`]: the [`ModelCfg`] widths, the [`Layout`] — every block's
-//! kind as a tag plus arguments — the step count and the [`Seen`] counters), then every parameter tensor in the model's `param_slots` order, each
-//! as `rank u32, dims u64 × rank, data f32 × len`. Everything is little-endian.
-//!
-//! The tensors are stored in the GPU model's layouts (fused projections, the
-//! sLSTM's gate-concatenated weights), so a reader maps them by position. Nothing
-//! is named: the config and layout fix the layer sequence, and the per-tensor shape
-//! is checked against it on load.
-//!
-//! Reading and writing stream one tensor at a time, so the host never holds more
-//! than the largest tensor.
 
 use std::{
     fs::File,
@@ -550,8 +538,6 @@ pub fn compact(n: u64) -> String {
     ];
     // Largest unit first, so 999_999 rounds into "1m" rather than "1000k".
     for (scale, suffix) in UNITS {
-        // Round at this unit's precision before comparing, so a value just under
-        // the boundary (999_999) is caught by the unit it rounds *into*.
         let v = n as f64 / scale as f64;
         if v < 0.9995 {
             continue;

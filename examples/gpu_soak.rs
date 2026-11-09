@@ -2,19 +2,6 @@
 //! exactly as `train_hierarchical_gpu` does — same dataset, same forward_backward,
 //! same optimizer cadence — but on a fresh model and writing no checkpoint, so it
 //! can be run against a live training setup without touching `models/`.
-//!
-//!   cargo run --release --features cuda --example gpu_soak -- <corpus> [windows]
-//!
-//! It exists to exercise what only real data produces. Packing fixes the word count,
-//! but the token span and the word-length histogram behind it still move window to
-//! window, so every layer's per-call buffers are refit — and sometimes reallocated —
-//! window after window, and the backbone's cells restart wherever the documents in the
-//! window happen to start. A buffer that outlives a shape it was sized for surfaces
-//! asynchronously, and possibly much later, as a sticky
-//! CUBLAS_STATUS_EXECUTION_FAILED.
-//!
-//! Prints the distribution of window shapes it actually exercised, so a clean run
-//! is evidence about the shapes it saw rather than a bare "it didn't crash".
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -56,8 +43,6 @@ fn main() {
         w_token,
         cap: LOGIT_SOFTCAP,
     };
-    // `SOAK_MODEL=<path>` starts from a checkpoint (read, never written) instead of a
-    // fresh model; `SOAK_SKIP=<n>` starts at the file's n-th window, as a resume does.
     let mut model = match std::env::var("SOAK_MODEL") {
         Ok(p) => Hierarchical::load(&gpu, &p, w_token).expect("load SOAK_MODEL"),
         Err(_) => Hierarchical::new(&gpu, cfg),
@@ -80,18 +65,11 @@ fn main() {
     println!("soaking {limit} windows from '{path}' ...");
     let t0 = Instant::now();
     let mut seen = 0usize;
-    // How many windows fell in each backbone-unroll band. The short ones are the
-    // interesting ones: below 32 the sLSTM drops off its time-fused path onto the
-    // per-step loop.
     let (mut tiny, mut short, mut full) = (0usize, 0usize, 0usize);
     let mut loss_sum = 0.0;
-    // Throughput is measured after one full batch: the first windows pay for every
-    // pool and arena the run will ever allocate.
     let warmup = BATCH_SIZE;
     let (mut hot, mut hot_tokens) = (None, 0usize);
 
-    // Stateful exactly as the trainer runs it: a window continues the previous one's
-    // backbone state when the dataset says so.
     let stateful = CARRY_WINDOW_STATE && std::env::var("SOAK_STATELESS").is_err();
     model.set_stateful(stateful);
 

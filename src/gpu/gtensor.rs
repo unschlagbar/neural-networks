@@ -1,16 +1,5 @@
 //! A device-resident tensor: the shape metadata of a host [`Tensor`] plus a [`GBuf`]
 //! — an allocation in GPU memory, or a window into one.
-//!
-//! [`GTensor`] is generic in the element width. `GTensor<f32>` is what every
-//! kernel and GEMM computes in; `GTensor<u16>` holds bf16, whose bits Rust has no
-//! native type for (see [`bf16`](super::bf16)).
-//!
-//! This is the "resident device buffer" of the bring-up plan. Rather than bolt
-//! a `CudaSlice` onto the host `Tensor` (which derives `Clone`/`PartialEq` and
-//! is used everywhere, incl. serialization), `GTensor` is a parallel type: data
-//! stays on the GPU across a chain of ops and only crosses the PCIe bus at the
-//! explicit `from_host` / `to_host` boundaries. Layers hold `GTensor<f32>` on the
-//! GPU path exactly where they hold `Tensor` on the CPU path.
 
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
@@ -27,8 +16,6 @@ use crate::tensor::{MAX_RANK, Tensor};
 /// Records the device address of every `uninit` allocation, so a run can be checked
 /// for pointer stability across steps — i.e. how much of the allocator traffic the
 /// per-layer buffer reuse is actually catching.
-///
-/// Diagnostic only, off unless `GPU_PTR_PROBE=1`; `dump` prints per-step overlap.
 pub mod ptr_probe {
     use super::{CudaSlice, Gpu};
     use std::sync::Mutex;
@@ -78,14 +65,6 @@ pub mod ptr_probe {
 }
 
 /// A device allocation, or a non-owning window into a larger one.
-///
-/// Every parameter lives in one contiguous [`ParamArena`](super::arena::ParamArena)
-/// and each layer holds a window into it, so a tensor's storage is not always its
-/// own. A window is a real `CudaSlice` at an offset inside the arena — freeing it
-/// would hand the driver an interior pointer, so `owned` decides what drop does.
-///
-/// Derefs to `CudaSlice<T>` and carries the cudarc traits, so a window is passed
-/// to kernels, cuBLAS and the copy helpers exactly like an allocation.
 pub struct GBuf<T> {
     slice: ManuallyDrop<CudaSlice<T>>,
     owned: bool,
@@ -100,14 +79,6 @@ impl<T> GBuf<T> {
     }
 
     /// A window of `len` elements at element offset `off` in `base`.
-    ///
-    /// The caller must keep `base` alive for as long as the window: the arena owns
-    /// the storage and outlives every layer that views it.
-    ///
-    /// Windows of one allocation are independent handles, so they carry no ordering
-    /// between them. That is exactly the contract `Gpu::new` already takes on with
-    /// `disable_event_tracking` — one stream, program order — and re-enabling cudarc's
-    /// event tracking would not extend to them.
     fn window(gpu: &Gpu, base: &CudaSlice<T>, off: usize, len: usize) -> Self {
         assert!(
             off + len <= base.len(),
@@ -127,14 +98,6 @@ impl<T> GBuf<T> {
     }
 
     /// A window of `len` elements of `T` starting at device address `at`.
-    ///
-    /// The width-agnostic form of [`window`](Self::window): the caller supplies the
-    /// address rather than a typed base, so one allocation can be viewed at a width
-    /// it was not allocated at. [`super::temp::TempCache`] hands out its f32 slots as
-    /// bf16 through this.
-    ///
-    /// The caller guarantees `at..at + len * size_of::<T>()` lies inside a live
-    /// allocation that outlives the window.
     fn window_at(gpu: &Gpu, at: u64, len: usize) -> Self {
         // SAFETY: the caller's guarantee above; `Drop` below never frees a window.
         let slice = unsafe { gpu.stream.upgrade_device_ptr::<T>(at, len) };
@@ -216,13 +179,6 @@ unsafe impl<'a, 'b: 'a, T> PushKernelArg<&'b mut GBuf<T>> for LaunchArgs<'a> {
 }
 
 /// A dense, row-major, contiguous tensor of `T` resident in device memory.
-/// Shape layout mirrors [`Tensor`]: only `shape[..rank]` are meaningful.
-///
-/// The element type is a parameter because the two widths the model stores differ
-/// only in it: `f32` is what everything computes in, `u16` is the bf16 storage slab.
-/// Shape handling, pooling, arena windows and reshaping are identical for both, so
-/// they are written once here; what genuinely differs — host round-trips, the cast
-/// kernels — lives in the per-width impls.
 pub struct GTensor<T> {
     pub shape: [usize; MAX_RANK],
     pub rank: usize,
@@ -249,10 +205,6 @@ impl GTensor<f32> {
     }
 
     /// Download back to a host tensor (blocking D2H copy on the stream).
-    ///
-    /// Copies the elements the SHAPE covers, which for a pooled buffer may be
-    /// fewer than are allocated — the host tensor must match `dims()`, not the
-    /// capacity behind it.
     pub fn to_host(&self, gpu: &Gpu) -> Tensor {
         let n = self.len();
         let data = gpu
@@ -302,9 +254,6 @@ impl<T: DeviceRepr + ValidAsZeroBits> GTensor<T> {
     }
 
     /// A tensor of shape `dims` viewing `base` from element offset `off`.
-    ///
-    /// Owns nothing: the storage stays the arena's, and this tensor's device address
-    /// is fixed for as long as the arena lives. See [`super::arena`].
     pub fn view(gpu: &Gpu, base: &CudaSlice<T>, off: usize, dims: &[usize]) -> Self {
         assert!(
             dims.len() <= MAX_RANK,
@@ -342,8 +291,6 @@ impl<T: DeviceRepr + ValidAsZeroBits> GTensor<T> {
     /// Zero this tensor's buffer in place (memset), reusing the existing device
     /// allocation — used to clear gradient accumulators between optimizer steps
     /// without freeing/reallocating.
-    /// Zeroes the elements the SHAPE covers; a pooled buffer's slack beyond that
-    /// is left alone, since nothing may read it anyway.
     pub fn zero_(&mut self, gpu: &Gpu) {
         let n = self.len();
         gpu.stream
@@ -355,8 +302,6 @@ impl<T: DeviceRepr + ValidAsZeroBits> GTensor<T> {
     /// contents. Used to save a layer's forward input for its backward without a
     /// round-trip through host memory.
     pub fn dup(&self, gpu: &Gpu) -> Self {
-        // Clone only what the shape covers: duplicating a pooled buffer's slack
-        // would copy — and retain — memory the result never uses.
         let buf = gpu
             .stream
             .clone_dtod(&self.buf.slice(..self.len()))
@@ -369,13 +314,6 @@ impl<T: DeviceRepr + ValidAsZeroBits> GTensor<T> {
     }
 
     /// Device-to-device copy of `src`'s elements into this tensor.
-    ///
-    /// Both sides are sliced to `src`'s element count first. A pooled buffer can
-    /// be larger than the shape it is presented at (see [`shrink_to`]), and
-    /// `memcpy_dtod` requires both lengths to agree — copying the raw `buf`s would
-    /// fail, or move slack that means nothing, the moment either side is pooled.
-    ///
-    /// [`shrink_to`]: Self::shrink_to
     pub fn copy_from(&mut self, gpu: &Gpu, src: &Self) {
         let n = src.len();
         assert!(
@@ -408,11 +346,6 @@ impl<T: DeviceRepr + ValidAsZeroBits> GTensor<T> {
 
     /// Reinterpret this tensor's shape **in place**, keeping the same device
     /// buffer (metadata-only, no copy).
-    ///
-    /// [`reshaped`](Self::reshaped) consumes `self`, which a layer-owned buffer
-    /// borrowed as `&mut GTensor<f32>` cannot give up. This is the in-place form, used
-    /// where an owned buffer must be seen as `[B,T,H]` by one op and `[N,H]` by
-    /// the next. Panics if the element count would change.
     pub fn reshape_to(&mut self, dims: &[usize]) {
         assert!(
             dims.len() <= MAX_RANK,
@@ -427,12 +360,6 @@ impl<T: DeviceRepr + ValidAsZeroBits> GTensor<T> {
     }
 
     /// Present this tensor at `dims`, which must fit **within** its allocation.
-    ///
-    /// [`reshape_to`](Self::reshape_to) insists the element count match exactly.
-    /// This is the looser form for a pooled buffer that may be larger than the
-    /// request: the shape metadata describes the used prefix, while the underlying
-    /// `CudaSlice` keeps its full capacity, so returning it to the pool restores
-    /// the whole buffer. The trailing elements are untouched and must not be read.
     pub fn shrink_to(&mut self, dims: &[usize]) {
         assert!(
             dims.len() <= MAX_RANK,
@@ -456,11 +383,6 @@ impl<T: DeviceRepr + ValidAsZeroBits> GTensor<T> {
     }
 
     /// Number of elements the current **shape** describes.
-    ///
-    /// Not the allocation size: a buffer handed out by a `Pool` may be larger than
-    /// the shape it was asked for (see [`shrink_to`](Self::shrink_to)). Every op
-    /// sizes its launch from this, so it must track the shape — reporting capacity
-    /// here would run kernels over the untouched tail.
     #[inline]
     pub fn len(&self) -> usize {
         self.shape[..self.rank].iter().product()
@@ -496,9 +418,6 @@ impl<T: DeviceRepr + ValidAsZeroBits> GTensor<T> {
     /// This tensor as `[N, F]` — the last axis kept, every leading axis folded into
     /// `N`. For position-wise ops (RMSNorm), which act on the last axis and do not
     /// care whether the caller is holding `[B, T, H]` or the flat `[N, H]`.
-    ///
-    /// Metadata only, and borrowing: unlike [`reshaped`](Self::reshaped) it does not
-    /// consume the tensor, so a `&GTensor<f32>` argument can be viewed this way.
     #[inline]
     pub fn as_2d(&self) -> (usize, usize) {
         assert!(self.rank >= 1, "as_2d(): rank 0");

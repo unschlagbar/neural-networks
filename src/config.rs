@@ -1,4 +1,4 @@
-// Sequenz-Len
+// Sequence length
 
 pub const SEQ_LEN: usize = 512;
 pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
@@ -8,11 +8,8 @@ pub const MAX_SEQ_LEN: usize = SEQ_LEN + 128;
 pub const WORDS_PER_SEQ: usize = 1024 * 4; // K — words per window / backbone unroll length
 pub const MIN_WORDS_PER_SEQ: usize = 8; // keep a trailing window only if >= this
 
-// Documents are packed, so a window is K words whatever the documents in it are long
-// — which makes a window a fixed amount of data and every word equally weighted in the
-// loss. On `pretrain_v2` that is 4094 words per window against 1046 before, so a
-// window (and a `BATCH_SIZE` step, and everything the schedule below counts in
-// windows) covers 3.9x the corpus it used to.
+// Documents are packed, so a window is K words whatever the documents in it are long:
+// a fixed amount of data, every word equally weighted in the loss.
 
 // Defines what a word is, so it lives with the splitter.
 pub use wordseg::MAX_WORD_BYTES;
@@ -21,7 +18,7 @@ pub use wordseg::MAX_WORD_BYTES;
 /// Caches size to the actual longest window, so raising this is free.
 pub const MAX_WINDOW_TOKENS: usize = WORDS_PER_SEQ * 7;
 
-// Training-Schedule
+// Training schedule
 
 pub const LR: f32 = 1e-4;
 pub const MIN_LR: f32 = 1e-5;
@@ -29,16 +26,15 @@ pub const MIN_LR: f32 = 1e-5;
 // BATCH_SIZE does not reshape the curve over the corpus.
 pub const WARMUP_WINDOWS: usize = 1_200;
 pub const DECAY_WINDOWS: usize = 1_500_000;
-// Windows accumulated per optimizer step. Muon (Frobenius normalization) and
-// aux-Adam (second moment) are scale-invariant, so summed grads need no rescale.
+// Windows accumulated per optimizer step. AdamW is scale-invariant (up to eps),
+// so summed grads need no rescale.
 pub const BATCH_SIZE: usize = 12;
 // Windows over which a resumed GPU pretraining run ramps its rate up again from 0.
 // Checkpoints carry no AdamW moments; see `LrSchedule::rewarm_windows`.
 pub const RESUME_WARMUP_WINDOWS: usize = 960;
 // Global L2 norm the GPU pretrainer clips each step's mean (per-window) gradient to.
 // `f32::INFINITY` only measures it; the `grad_norm` log column is the unclipped norm.
-// s5 at 49k windows measured ~1.1 at batch 48 and ~1.4 at 16 (`grad_norm_probe`), so
-// 3.0 only catches outliers; the conventional 1.0 would clip nearly every step.
+// The typical norm is ~1-1.5, so this only catches outliers.
 pub const GRAD_CLIP_NORM: f32 = 5.0;
 pub const EPOCHS: usize = 1;
 
@@ -57,8 +53,7 @@ pub const DECODER_WEIGHT_DECAY: f32 = 0.01;
 // small for a narrower stack. μP's prescription for a hidden weight is
 // `lr ∝ 1/fan_in`, which puts the `CHAR_HIDDEN`-wide encoder and decoder at
 // `WORD_HIDDEN / CHAR_HIDDEN` times the backbone's rate. `1.0` is one rate for
-// the whole model, which is what every checkpoint before these existed trained
-// under.
+// the whole model.
 pub const ENCODER_LR_SCALE: f32 = 2.0;
 pub const DECODER_LR_SCALE: f32 = 2.0;
 
@@ -71,7 +66,7 @@ pub const TOP_P: f32 = 0.98;
 /// to get exactly right, not prose to vary.
 pub const TOOL_TEMPERATURE: f32 = 0.1;
 
-// Modell-Dimensions
+// Model dimensions
 
 pub const CHAR_HIDDEN: usize = 256;
 pub const OUT_HIDDEN: usize = 256;
@@ -106,20 +101,9 @@ pub const CARRY_WINDOW_STATE: bool = true;
 pub const BACKBONE_CHUNK: usize = 512 * 2;
 
 /// Largest encoder/decoder group in rows (`words × tmax`), `0` = uncapped.
-/// A group holds every word of one length and pooled buffers never shrink, so
-/// one unusual window would raise the run's memory floor forever. Splitting is
-/// pure batching — the groups were already independent rectangles. Sized so the
-/// rectangle still fills the device.
 pub const GROUP_MAX_ROWS: usize = 2048;
 
 /// GPU mLSTM chunk length `L` for the chunkwise formulation (`0` = L = 1).
-/// The single-chunk form materializes `[heads, T, T]`, quadratic exactly where
-/// the backbone lives; chunking carries `(C, n, m)` across chunks for O(T·L).
-/// It is an exact refactoring, not an approximation — the chunk-local stabilizer
-/// telescopes to the global row-max (`mlstm_chunking_matches_single_chunk`).
-/// 256 measured fastest at the backbone shape (T=2048: 18.9 vs 63.5 ms/iter, and
-/// linear in T); below ~64 launch-bound, above ~512 the [L, L] matrices dominate.
-/// `MLSTM_CHUNK` overrides; the fused kernels clamp L at `ops::FUSED_MAX_L`.
 pub const MLSTM_CHUNK: usize = 256;
 
 /// Read the word embedding `e_w` at an appended `[W]` step, where the state
@@ -176,8 +160,7 @@ pub const SFT_MAX_TOKENS: usize = MAX_WINDOW_TOKENS;
 
 pub const AUDIO_SR: usize = 16_000;
 /// Analysis window and hop in samples: 25 ms every 10 ms, so features run at
-/// 100 Hz. Without the overlap (20 ms edge to edge) the Hann taper hides short
-/// sounds at window borders: run C in `docs/ae2-runs.md` lost on every metric.
+/// 100 Hz. Without the overlap the Hann taper hides short sounds at window borders.
 pub const AUDIO_WIN: usize = 400;
 pub const AUDIO_HOP: usize = 160;
 /// FFT length; the window is zero-padded up to it.
@@ -247,20 +230,15 @@ pub const AUDIO_CONTEXT_WORDS: usize = 24;
 pub const AUDIO_PREFIX_P: f32 = 0.0;
 /// Words after the audio a training window scores, for takes read out of a
 /// document (voice, TTS); a LibriSpeech utterance is followed by its book and
-/// scores none. The loss is a mean over every scored word: at CTC weight 0.1,
-/// 24 of them outweighed the utterance's own words and cost the encoder its
-/// word identity, boundaries and characters (run F).
+/// scores none. The loss is a mean over every scored word, so too many of them
+/// outweigh the utterance's own words.
 pub const AUDIO_TRAIN_AFTER_WORDS: usize = 16;
 /// Weight of the text model's own distribution (reading the transcript) in the
 /// decoder's target for the audio window; 0 trains on the transcript alone.
-/// The transcript has no punctuation, so after an utterance the audio already
-/// beats that teacher: distilling there pulls the student towards it.
 pub const DISTILL_ALPHA: f32 = 0.5;
 /// The same for windows with no document text after the audio (LibriSpeech,
 /// SLURP, VoxPopuli): 1 trains towards the reading alone, so audio that
-/// beats it (a book's genre, a parliament's phrasing) is not rewarded. Run N
-/// at 1 everywhere heard better than M at 0.5 but continued worse after the
-/// audio on every document set.
+/// beats it (a book's genre, a parliament's phrasing) is not rewarded.
 pub const DISTILL_ALPHA_PLAIN: f32 = 1.0;
 /// Weight `β` of the backbone-context distillation in `ae2`: after the audio
 /// the backbone's per-word context should be the one reading the transcript
@@ -297,8 +275,8 @@ pub const AUDIO_VOICE_VAL_SESSIONS: &[&str] = &["2026-10-17_1534"];
 pub const AUDIO_VOICE_LAST: usize = usize::MAX;
 /// How often each training voice take is heard over a run of
 /// `AUDIO_E2_STEPS`: a batch carries one take, in place of a LibriSpeech
-/// utterance, with the chance that spreads them evenly. At 56 (run G) the
-/// encoder learned the takes' sentences and not the voice.
+/// utterance, with the chance that spreads them evenly. Too many and the
+/// encoder learns the takes' sentences instead of the voice.
 pub const AUDIO_VOICE_EPOCHS: f32 = 8.0;
 /// The documents the voice prompts were read out of: the text around a take.
 pub const AUDIO_VOICE_DOCS: &str = "data/voice/prompts_docs.jsonl";
@@ -320,9 +298,8 @@ pub const AUDIO_TAKE_DIRS: &[&str] = &[
     "../../training_data/common_voice",
     "../../training_data/heysquad_human",
 ];
-/// Peak learning rate. A run from scratch took 3e-4; a run continuing a
-/// finished encoder at 3e-4 first lost 3-4 points of CER to its parent (O
-/// from N), so continuations use 1e-4.
+/// Peak learning rate: 3e-4 from scratch; continuing a finished encoder at
+/// 3e-4 first loses CER to its parent.
 pub const AUDIO_LR: f32 = 1e-4;
 pub const AUDIO_WARMUP_STEPS: usize = 100;
 pub const AUDIO_VAL_EVERY: usize = 200;
@@ -359,9 +336,8 @@ pub const AUDIO_REALIGN_MAX_CER: f32 = 0.35;
 pub const AUDIO_ALIGN_ONLINE: bool = false;
 /// Chance that a training utterance's words are pooled as the encoder's own
 /// boundary head cuts them (given the word count, as the evaluation's
-/// "boundary head" line does) rather than at the reference ends. Live the
-/// head decides; trained on reference cuts only, the embeddings lost 0.37 on
-/// the heard words and word match fell from 97% to 86% under its cut (O).
+/// "boundary head" line does) rather than at the reference ends: live, the
+/// head decides, and embeddings trained on reference cuts only degrade under it.
 pub const AUDIO_HEAD_CUT_P: f32 = 0.5;
 /// Share of an `ae2` batch drawn from `AUDIO_TAKE_DIRS`.
 pub const AUDIO_TAKE_SHARE: f32 = 0.625;

@@ -1,17 +1,4 @@
 //! Capture-range control for Nsight Systems.
-//!
-//! `nsys profile --capture-range=cudaProfilerApi` records only what happens
-//! between `cuProfilerStart` and `cuProfilerStop`, so a report holds a
-//! steady-state training window instead of NVRTC compilation, the first
-//! allocations and the pool warmup that dominate the start of a run.
-//!
-//! Off unless `GPU_NSYS` is set:
-//!
-//! ```text
-//! GPU_NSYS=1 GPU_NSYS_SKIP=10 GPU_NSYS_WINDOWS=1 \
-//!   nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
-//!                -o step ./target/release/neural-networks <<< hg
-//! ```
 
 use crate::gpu::Gpu;
 

@@ -1,17 +1,4 @@
 //! NVRTC-compiled CUDA kernels for the backend op seam.
-//!
-//! The device source lives in `src/gpu/cuda/*.cu` — real `.cu` files so an editor
-//! or clangd can lint and highlight them — and is stitched back into ONE string by
-//! [`SRC`] at Rust compile time. It is compiled once at [`Kernels::load`] and
-//! cached on the [`Gpu`](super::Gpu). Each `extern "C"` kernel is the device
-//! counterpart of a function in `src/cpu/ops.rs` / `loss.rs` / `optim.rs`, and is
-//! launched by a thin wrapper in `src/gpu/ops.rs` that owns the grid/block config
-//! and is parity-checked against the CPU reference.
-//!
-//! Conventions: tensors are the same row-major contiguous `f32` as on the host;
-//! embedding ids and CE targets are uploaded as `unsigned int`; reductions that
-//! accumulate into shared outputs (`embedding_scatter_add`, RMSNorm `dgamma`)
-//! use `atomicAdd`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,17 +7,6 @@ use cudarc::driver::{CudaContext, CudaFunction};
 use cudarc::nvrtc::{CompileOptions, compile_ptx, compile_ptx_with_opts};
 
 /// The whole device source, as one translation unit.
-///
-/// The pieces are separate files purely for tooling — NVRTC still sees a single
-/// concatenated string, and it has to: `prelude.cu`'s `slab_t` typedef is at file
-/// scope and every kernel that touches an sLSTM slab must be compiled against the
-/// same width, and the `#ifdef` fences (`SLAB_BF16`, `BF16_CAST`, `COOP_KERNELS`,
-/// `MMA_TF32`, `SLSTM_H`/`SLSTM_B`) select *across* the pieces. So the order below
-/// is load-bearing: `prelude.cu` first, and each file must stay self-contained
-/// enough that its `#ifdef`/`#endif` pairs balance within itself.
-///
-/// `include_str!` also means `cargo` reruns on any `.cu` edit, and a missing file
-/// is a Rust compile error rather than an NVRTC error at first GPU touch.
 const SRC: &str = concat!(
     include_str!("cuda/prelude.cu"),
     include_str!("cuda/common.cu"),
@@ -131,21 +107,10 @@ const MMA_NAMES: &[&str] = &[
 
 /// Cooperative-launch kernels; need `<cooperative_groups.h>`, so they share the
 /// bf16 module's include-path requirement.
-///
-/// Both exist ONLY in shape-specialized builds — each keeps per-unit data in a
-/// register array whose size needs H at compile time — so these are reached through
-/// [`Kernels::specialized`], never through [`Kernels::get`]. The startup module is
-/// compiled at [`COOP_CANARY`] and its functions are thrown away: what it establishes
-/// is that the cooperative include path resolves AND that both kernels still compile,
-/// neither of which a module built without the shape defines would notice.
 const COOP_NAMES: &[&str] = &["slstm_fused_time", "slstm_fused_time_bwd", "slstm_batched_fwd", "slstm_batched_bwd"];
 
 /// The throwaway shape [`COOP_NAMES`] is compiled at to prove it still builds. Small
 /// enough to compile fast, and legal for both kernels' geometry contracts.
-///
-/// `SLSTM_RS` is deliberately half of the forward's padded row count, not all of it:
-/// the partial-`Wh`-stage tail loop is `#if`-ed out at `RS == HP`, so a canary that
-/// stages everything would not compile the branch the wide widths take.
 const COOP_CANARY: &[(&str, usize)] = &[
     ("SLSTM_H", 512),
     ("SLSTM_B", 1),
@@ -162,10 +127,6 @@ const COOP_CANARY: &[(&str, usize)] = &[
 /// fp32 <-> bf16 casts. Need `<cuda_bf16.h>` only — a strictly smaller include
 /// requirement than [`COOP_NAMES`], hence their own module: a machine that cannot
 /// build the cooperative kernels can still store activations in bf16.
-/// Whether the sLSTM's stabilizer group is stored narrow (`SLSTM_BF16_STATE=1`).
-///
-/// Opt-in, and read once: a forward and its backward must agree on the layout of what
-/// was saved, so this cannot change within a process.
 fn state_bf16_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("SLSTM_BF16_STATE").as_deref() == Ok("1"))
@@ -174,12 +135,6 @@ fn state_bf16_enabled() -> bool {
 const BF16_NAMES: &[&str] = &["cast_f32_to_bf16", "cast_bf16_to_f32", "quantize_bf16_inplace"];
 
 /// Directory holding `cuda_bf16.h`, or `None` if it cannot be found.
-///
-/// `dynamic-loading` means the crate never links a fixed CUDA install, so there is
-/// no build-time constant to fall back on; NVRTC still needs a real `-I` to read
-/// the bf16 intrinsics. `CUDA_INCLUDE_DIR` overrides, otherwise the usual install
-/// locations are probed. Missing headers are not an error — the bf16 path is
-/// simply unavailable and callers fall back to fp32.
 fn cuda_include_dir() -> Option<String> {
     if let Ok(d) = std::env::var("CUDA_INCLUDE_DIR")
         && std::path::Path::new(&d).join("cuda_bf16.h").is_file()
@@ -208,12 +163,6 @@ fn cuda_include_dir() -> Option<String> {
 }
 
 /// Extra `-I` directories needed alongside [`cuda_include_dir`].
-///
-/// `<cooperative_groups.h>` includes `<cuda/std/type_traits>` from libcu++, which
-/// CUDA 13 ships in a `cccl/` subtree that is *not* on NVRTC's default search
-/// path — without this the cooperative kernels fail to compile with "cannot open
-/// source file". Probed next to the main include dir and in the system location
-/// the distro packages use.
 fn extra_include_dirs(main: &str) -> Vec<String> {
     let mut out = Vec::new();
     for cand in [
@@ -243,17 +192,10 @@ pub struct Kernels {
     pub has_bf16: bool,
     /// Whether the kernels were built with `-DSLAB_BF16`, i.e. whether the sLSTM's
     /// saved `zt`/`ot`/`h_prev` slabs are bf16 in global memory.
-    ///
-    /// **This is the authority the Rust side must allocate against**: the kernels
-    /// index those buffers at a compile-time width, so a `GTensor<u16>` where the kernel
-    /// expects `float` (or the reverse) is a silent out-of-bounds walk, not a type
-    /// error. Every slab allocation reads this flag rather than the env var.
     pub slab_bf16: bool,
     /// Whether the kernels were built with `-DSTATE_BF16`, i.e. whether the sLSTM's
     /// **stabilizer-carrying** saved tensors (`c`, `n`, `i_prime`, `f_prime`) are
     /// narrow. Opt-IN via `SLSTM_BF16_STATE=1`, unlike [`slab_bf16`](Self::slab_bf16)
-    /// which is on by default — this group is the one `gpu::bf16` argues must stay
-    /// fp32, and the switch exists to measure that.
     pub state_bf16: bool,
     /// Include flags the optional modules were compiled with, kept so the
     /// shape-specialized variants can reuse them. `None` if the headers were absent.
@@ -262,23 +204,8 @@ pub struct Kernels {
     arch: (i32, i32),
     /// Shape-specialized cooperative kernels, keyed by name and the `-D` shape they
     /// were built at.
-    ///
-    /// The FlashRNN model (`flashrnn.py` emits `-DFLASHRNN_HIDDEN_SIZE=...`
-    /// `-DFLASHRNN_BATCH_SIZE=...` and rebuilds the module): with the shape known at
-    /// compile time the reductions get static trip counts, the per-unit slices become
-    /// register arrays and the batch indexing folds away. A miss costs one NVRTC
-    /// compile (a few hundred ms); the backbone runs one fixed shape, so it is paid
-    /// once at startup and hit forever after.
-    ///
-    /// `Mutex` because `Kernels` lives behind an `Arc` and this fills in lazily.
     specialized: std::sync::Mutex<HashMap<SpecKey, Option<CudaFunction>>>,
     /// Shape-specialized fused mLSTM kernels, keyed by `(name, L, dqk, dhv, H)`.
-    ///
-    /// The reference (`nx-ai/mlstm_kernels`) passes every one of these as a Triton
-    /// `tl.constexpr`, so the tile arithmetic folds at compile time; here they arrive
-    /// as runtime `int`s and each shared-memory index costs a multiply. With them
-    /// fixed, `LP`/`KP`/`VP` become literals, the tile loops get static trip counts,
-    /// and the pad branches resolve away.
     mlstm_spec: std::sync::Mutex<HashMap<MlstmSpecKey, Option<CudaFunction>>>,
 }
 
@@ -308,42 +235,16 @@ pub type MlstmSpecKey = (&'static str, MlstmSpec);
 impl Kernels {
     /// Compile [`SRC`] with NVRTC and load every kernel in [`NAMES`], plus — on a
     /// device that has tensor cores — the [`MMA_NAMES`] kernels.
-    ///
-    /// [`SRC`] is compiled **twice**, and deliberately so. `mma.sync` does not exist
-    /// at NVRTC's default target arch, so the tensor-core kernels need
-    /// `--gpu-architecture` pointed at the real device. But that flag is not free of
-    /// consequences for the kernels around them: at a newer arch ptxas contracts
-    /// FMAs differently, which shifts every scalar kernel's rounding in the last
-    /// bits. That is harmless in itself — but `mlstm_fused_matches_legacy` compares
-    /// weights after ONE Adam step, where the update is `lr·g/(√(g²)+ε)` and so
-    /// amplifies a 1e-7 gradient wobble on a near-zero-gradient weight into ~1e-4.
-    /// The test is right to be tight; the arch flag simply has no business changing
-    /// the numerics of kernels that did not ask for it.
-    ///
-    /// So: module `base` is compiled exactly as before (default arch, no define) and
-    /// every pre-existing kernel is taken from it, bit-for-bit unchanged. Module
-    /// `mma` is compiled for the device arch with `MMA_TF32` defined, and *only* the
-    /// two tensor-core kernels are taken from it. The second compile costs a few
-    /// hundred ms once, at startup.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<Self, String> {
         let (major, minor) = ctx
             .compute_capability()
             .map_err(|e| format!("compute capability query failed: {e:?}"))?;
-        // The mLSTM core is tensor-core only: every contraction in the parallel pair
-        // is an `mma.sync`, which needs sm_80. There is no scalar twin to fall back
-        // to, so this is a hard requirement rather than a dispatch.
         if major < 8 {
             return Err(format!(
                 "GPU training needs tensor cores (sm_80 or later); this device is sm_{major}{minor}"
             ));
         }
 
-        // Slab storage dtype has to be decided BEFORE the base module is compiled:
-        // `slab_t` appears in the signature of `slstm_cell_step` and friends, which
-        // live in this module, and every module that touches the same slab buffers
-        // must agree on their width. bf16 needs `<cuda_bf16.h>`, so it is only
-        // attempted when the header was found and the user has not opted out; the
-        // compile is still allowed to fail, in which case we fall back to fp32 below.
         let inc = cuda_include_dir();
         let want_bf16 = super::bf16::enabled() && inc.is_some();
         let base_opts = |bf16: bool| -> CompileOptions {
@@ -363,8 +264,6 @@ impl Kernels {
             }
         };
 
-        // Try bf16 first, fall back to fp32 if NVRTC cannot build it. `slab_bf16`
-        // records what actually got compiled — the Rust side allocates to match.
         let mut slab_bf16 = want_bf16;
         let base = match want_bf16
             .then(|| compile_ptx_with_opts(SRC, base_opts(true)))
@@ -396,9 +295,6 @@ impl Kernels {
                 format!("--gpu-architecture=compute_{major}{minor}"),
                 "-DMMA_TF32=1".to_string(),
             ];
-            // Same slab dtype as the base module: these kernels do not touch the
-            // sLSTM slabs, but `slab_t` is at file scope and the two must agree so
-            // that a future kernel moved between modules cannot silently disagree.
             if slab_bf16 {
                 let inc = inc.as_deref().expect("slab_bf16 implies an include dir");
                 options.push("-DSLAB_BF16=1".to_string());
@@ -428,10 +324,6 @@ impl Kernels {
             }
         }
 
-        // Two optional modules, compiled SEPARATELY so one cannot disable the other:
-        // the bf16 kernels need only <cuda_bf16.h>, while the cooperative ones drag
-        // in libcu++ through <cooperative_groups.h> and so have a strictly larger
-        // include requirement. Either may be absent; neither is fatal.
         let mut has_coop = false;
         let mut has_bf16 = false;
         let mut coop_includes: Option<Vec<String>> = None;
@@ -453,8 +345,6 @@ impl Kernels {
                     format!("-I{inc}"),
                 ];
                 options.extend(shape.iter().map(|(k, v)| format!("-D{k}={v}")));
-                // The cooperative sLSTM kernels write the same slabs as the base
-                // module's eager ones, so they MUST be built at the same width.
                 if slab_bf16 {
                     options.push("-DSLAB_BF16=1".to_string());
                     if state_bf16_enabled() {
@@ -511,13 +401,6 @@ impl Kernels {
 
     /// A fused mLSTM kernel with `(L, dqk, dhv, H)` baked in as compile-time
     /// constants, or `None` to fall back to the generic one.
-    ///
-    /// Mirrors [`Kernels::specialized`]: one NVRTC compile per distinct shape, cached
-    /// (failures included). The backbone runs a single shape, so this is paid once at
-    /// startup. `MLSTM_NO_SPECIALIZE=1` forces the generic path for an A/B.
-    ///
-    /// Every specialized build is compiled for the device arch, which the `mma.sync`
-    /// in the parallel pair needs anyway.
     pub fn mlstm_specialized(
         &self,
         ctx: &Arc<CudaContext>,
@@ -594,9 +477,6 @@ impl Kernels {
     /// one. Compiles on first request for a shape and caches the result — including
     /// a cached *failure*, so a shape that cannot be specialized is not retried on
     /// every call.
-    ///
-    /// Mirrors FlashRNN's parametric build: same source, recompiled with the shape
-    /// as `-D` constants. Sequence length is not among them, there or here.
     pub fn specialized(
         &self,
         ctx: &Arc<CudaContext>,
@@ -618,8 +498,6 @@ impl Kernels {
             "-DCOOP_KERNELS=1".to_string(),
         ];
         options.extend(shape.iter().map(|(k, v)| format!("-D{k}={v}")));
-        // Must match the slab width the rest of the backend was built at, or this
-        // specialized kernel would read the saved slabs at the wrong stride.
         if self.slab_bf16 {
             options.push("-DSLAB_BF16=1".to_string());
             if self.state_bf16 {

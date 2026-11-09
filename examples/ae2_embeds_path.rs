@@ -1,8 +1,6 @@
 //! Is continuing from given word embeddings the same as continuing from text?
 //! Samples s4 (CPU) from a prompt as text and from the text encoder's own
 //! embeddings of the same words fed through `sample_from_embeddings`.
-//!
-//!   cargo run --release --example ae2_embeds_path -- models/s4.v2 "prompt text"
 
 use neural_networks::config::{TEMPERATURE, TOP_P};
 use neural_networks::infer::Hierarchical;

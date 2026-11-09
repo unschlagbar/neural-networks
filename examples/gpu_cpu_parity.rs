@@ -1,11 +1,4 @@
 //! Composition parity: the GPU model vs the CPU one (`cpu::hierarchical`).
-//!
-//! The layers are each checked against CPU, but the hierarchical composition —
-//! encode -> backbone -> decode, the [W] slot, the injected context, the tied
-//! table, the v2 layouts both read — only here, on a real checkpoint: the mean
-//! decode loss of one window from each, without and with a document border.
-//!
-//!   cargo run --release --features cuda --example gpu_cpu_parity [model.v2] [file] [bytes]
 
 #[cfg(not(feature = "cuda"))]
 fn main() {

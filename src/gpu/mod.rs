@@ -1,16 +1,4 @@
 //! CUDA backend (feature `cuda`).
-//!
-//! This module is the device side of the Backend/ops seam described in
-//! `PLAN-gpu.md`. Bring-up order:
-//!   1. Prove the toolchain: a lazy `CudaContext`, an NVRTC-compiled kernel, and
-//!      a round-trip smoke test (this file). <-- we are here.
-//!   2. Give `Tensor` an optional resident device buffer + up/download.
-//!   3. Port the ops-seam kernels one at a time, each checked against the CPU
-//!      implementation / finite-difference tests.
-//!
-//! Nothing here is wired into the layers yet; enabling the feature only adds the
-//! context + smoke test so we can confirm `cudarc`, NVRTC and the driver all work
-//! on the laptop before porting real kernels.
 
 use std::sync::Arc;
 
@@ -52,15 +40,6 @@ pub use temp::{Temp, TempCache};
 
 /// Whether host waits park the thread instead of spinning. On unless
 /// `GPU_SPIN_SYNC` is set, which restores the driver's default busy-wait.
-///
-/// Costs nothing measurable: 679 vs 675 ms/step over three `step_time` runs each,
-/// inside run-to-run noise. It also recovers less than one might hope — 100% -> 95%
-/// of a core — because the submitting thread is not mostly *waiting*: at 4096 words
-/// a step's launches put 40% of its CPU in `libcuda` and 28% in libc marshalling
-/// launch arguments. Only the residual sync time is spin, and that is the 5%.
-///
-/// Read through a `OnceLock` so the context flag and the event-creation flags,
-/// which are set at different times, cannot disagree.
 pub fn blocking_sync() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GPU_SPIN_SYNC").is_err())
@@ -69,8 +48,6 @@ pub fn blocking_sync() -> bool {
 /// Flags for an event the host will wait on with `synchronize`. The context's
 /// scheduling policy does not reach `cuEventSynchronize` — an event spins unless it
 /// was *created* with `CU_EVENT_BLOCKING_SYNC` — so host-waited events need this.
-/// Events only ordered device-side (`stream.wait`) never block a thread and can
-/// keep the cheaper default.
 pub fn host_wait_event_flags() -> Option<cudarc::driver::sys::CUevent_flags> {
     blocking_sync().then_some(cudarc::driver::sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC)
 }
@@ -110,13 +87,6 @@ pub struct Gpu {
 
 impl Gpu {
     /// Initialise CUDA device 0. Returns an error string (rather than panicking)
-    /// so callers can fall back to the CPU path when no GPU is present.
-    ///
-    /// The work goes on an explicitly created stream, not `default_stream()`:
-    /// cudarc's default stream is the *legacy* NULL stream, which implicitly
-    /// synchronizes against every other stream on the context. Everything is
-    /// submitted to this one stream in issue order, so ordering semantics are
-    /// those of program order.
     pub fn new() -> Result<Self, String> {
         let context = CudaContext::new(0).map_err(|e| format!("CUDA init failed: {e:?}"))?;
         // Leaving the default stream also puts cudarc into "multi stream mode", where
@@ -133,11 +103,6 @@ impl Gpu {
         // is a single stream, so program order *is* the synchronization. Must happen
         // before any allocation — the flag only affects slices created after it.
         unsafe { context.disable_event_tracking() };
-        // `cuDevicePrimaryCtxRetain` leaves the scheduling policy at CU_CTX_SCHED_AUTO,
-        // which with one active context on a many-core host resolves to a busy-wait: a
-        // host core sits at 100% spinning inside every `synchronize()`. BLOCKING_SYNC
-        // parks the thread on an interrupt instead, trading a few microseconds of wake
-        // latency per sync for an idle core.
         if blocking_sync() {
             context
                 .set_blocking_synchronize()
@@ -184,42 +149,6 @@ impl Gpu {
 }
 
 /// Let cuBLAS run our f32 GEMMs on the tensor cores in TF32.
-///
-/// A plain `sgemm` in the default math mode uses the FP32 CUDA cores and nothing
-/// else — on Ampere and later that leaves the tensor cores, i.e. most of the
-/// machine's matmul throughput, idle. `CUBLAS_TF32_TENSOR_OP_MATH` keeps the
-/// interface fp32 (our buffers, the accumulator and the result stay fp32) and only
-/// rounds the *multiplicand mantissas* to TF32's 10 bits before they enter the
-/// tensor core. Dynamic range is fp32's — TF32 keeps all 8 exponent bits — so no
-/// value here can overflow or flush that would not have in fp32; the products just
-/// carry ~10 mantissa bits instead of 24, which is why this is a knob and not a
-/// silent default.
-///
-/// That is a real precision cut, and the reason it is safe for us is that the
-/// error lands where we already tolerate it: gradients and activations, summed in
-/// fp32 over long K, whose per-step noise is orders of magnitude above 2^-11
-/// relative. What must *not* go through it is the stabilizer's own arithmetic
-/// (`m`, `exp(-m)`) — but that lives in the fused kernels, not in cuBLAS, so it is
-/// untouched by this.
-///
-/// **Opt-in** (`GPU_TF32=1`), unlike the tensor cores in the mLSTM kernels, which
-/// are on by default. The reason is what each one buys: the fused kernels' dots are
-/// where the model's own arithmetic lives, and the reference (`mlstm_kernels`) puts
-/// them on the tensor cores too. cuBLAS's math mode, by contrast, reaches *every*
-/// GEMM in the backend — including the ones the parity tests use as an exact-fp32
-/// oracle — so it is a switch rather than a default.
-///
-/// What it buys has grown as the rest of the step got faster: GEMMs are now 43% of
-/// kernel time, and enabling this cuts GEMM time 191.1 -> 161.9 ms and whole-step
-/// kernel time 447.9 -> 416.0 ms (~7%), against the ~4% measured when the step was
-/// still dominated by the backbone's sLSTM.
-///
-/// The cost is that six parity tests fail with it on — the three `gemm_*_matches_cpu`
-/// oracles plus `slstm_fused_time_matches_per_step` and the two hierarchical grouping
-/// tests. The error is ~1.3e-3 relative (TF32's ~10-bit mantissa) against their 1e-3
-/// tolerance, i.e. the kernels are right and the tolerance is simply tighter than TF32
-/// can meet. Turning this on by default therefore means retuning those tolerances and
-/// giving up the exact-fp32 oracle, which is a numerics decision, not a perf one.
 fn set_tf32(blas: &CudaBlas) -> Result<(), String> {
     let mode = if std::env::var("GPU_TF32").as_deref() == Ok("1") {
         cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH
@@ -254,18 +183,8 @@ impl std::ops::Deref for TestGpu {
 #[cfg(test)]
 /// Shared test helper: a `Gpu` if the machine has one, else `None` (so GPU tests
 /// self-skip on the dev box with no Nvidia card).
-///
-/// Holds a process-wide lock for the caller's lifetime, so **only one GPU test runs
-/// at a time**. `cargo test` runs tests on parallel threads, which would otherwise
-/// have them contend for the same context: the cooperative launches need the whole
-/// grid co-resident, and the larger shapes want most of the card's memory, so
-/// concurrent tests both slow each other down and can fail to launch. Serializing
-/// here keeps `cargo test --features cuda` honest without a `--test-threads=1`
-/// incantation that a future runner would forget.
 fn test_gpu() -> Option<TestGpu> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // A panicking test poisons the lock; the guarded data is `()`, so there is no
-    // broken invariant to protect and the next test may proceed.
     let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     match Gpu::new() {
         Ok(gpu) => Some(TestGpu { gpu, _lock: lock }),
@@ -277,14 +196,6 @@ fn test_gpu() -> Option<TestGpu> {
 }
 
 /// Device memory currently **allocated** from the async pool, in MB.
-///
-/// Distinct from `mem_get_info`, which reports everything the driver has handed the
-/// process — including blocks the allocator is merely caching for reuse. That cached
-/// portion is reclaimable and is *not* a reason to OOM, so a memory report built on
-/// `mem_get_info` alone cannot tell "the model grew" from "the allocator is holding
-/// cache". This is the number that decides whether the next allocation succeeds.
-///
-/// `None` if the pool attribute cannot be read.
 pub fn pool_used_mb() -> Option<f64> {
     use cudarc::driver::sys;
     let pool = unsafe {
@@ -304,14 +215,6 @@ pub fn pool_used_mb() -> Option<f64> {
 }
 
 /// Hand every cached-but-unused block in the async pool back to the driver.
-///
-/// The pool keeps freed blocks reserved for reuse, which is what makes it fast and
-/// what makes `mem_get_info` useless for capacity questions. That cache is normally
-/// harmless — but a process that drops one whole model and builds another (a probe
-/// sweeping window shapes, not the training loop) is asking for memory the pool is
-/// still sitting on, and the second allocation fails while the first model's cache
-/// is idle. Costs a synchronize: freeing is stream-ordered, so blocks only become
-/// trimmable once the queued frees have actually run.
 pub fn trim_pool(gpu: &Gpu) {
     gpu.stream.synchronize().expect("sync before trim");
     unsafe {
@@ -333,8 +236,6 @@ mod tests {
 
     /// End-to-end toolchain check: compile a trivial vector-add kernel with
     /// NVRTC, upload two host vectors, launch, download, and verify the result.
-    /// If this passes, `cudarc` + NVRTC + the driver are all working and we can
-    /// start porting the real ops kernels.
     #[test]
     fn vector_add_roundtrip() {
         let Some(gpu) = test_gpu() else { return };

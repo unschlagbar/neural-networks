@@ -1,26 +1,4 @@
 // Resume state for SFT fine-tuning runs.
-//
-// A checkpoint stores weights and a step count, so stopping a run never loses
-// what was learned — but on restart the trainer would begin again at epoch 1,
-// example 0, re-training examples it has already seen and restarting the epoch
-// budget. This module stores the missing piece: WHERE in the SFT set the run
-// was, written as a small sidecar file next to the checkpoint.
-//
-// Sidecar layout (`<model_path>.sftprog`, plain text, one `key value` per line):
-//
-//   version 1
-//   seed <u64>        shuffle seed — the per-epoch order is seeded, so resuming
-//                     reproduces the exact permutation the run was walking
-//   epoch <usize>     1-based epoch the run was in
-//   done <usize>      examples completed WITHIN that epoch
-//   step <usize>      trainer step count, cross-checked against the checkpoint
-//   origin <usize>    step the run started at — the LR warmup counts from here,
-//                     so resuming continues the ramp instead of restarting it
-//   examples <usize>  size of the SFT set when the run started
-//
-// The file is written together with every checkpoint save, so the pair stays
-// consistent: the sidecar never describes a position past the saved weights.
-// A missing or unreadable sidecar simply means "start from the beginning".
 
 use std::{
     fs,
@@ -115,9 +93,6 @@ pub fn load(model_path: &str) -> Option<SftProgress> {
         epoch: epoch?,
         done: done?,
         step: step?,
-        // Sidecars written before the warmup schedule existed carry no origin;
-        // treating the recorded step as the start leaves the rest of the run at
-        // full LR, which is what those runs were already doing.
         origin: origin.unwrap_or(step?),
         examples: examples?,
     })

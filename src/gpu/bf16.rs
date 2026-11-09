@@ -1,140 +1,10 @@
 //! bf16 **storage** for saved activations.
-//!
-//! Training memory on this model is dominated not by weights but by the tensors a
-//! forward pass saves for its backward. At the backbone's shape (`T` = a window's
-//! word count, `H` = `WORD_HIDDEN`) one sLSTM holds nine `[B, T, H]` slabs plus a
-//! `[B, T, 4H]` gate buffer, and there are `WORD_BLOCKS` of them. Those slabs are
-//! written once, read once, and never enter a reduction in their stored form —
-//! which makes their *storage* precision a free parameter, independent of the
-//! precision the math runs at.
-//!
-//! A `GTensor<u16>` is such a slab held as bf16: same shape, half the bytes. Kernels
-//! that read one convert to fp32 on load and compute in fp32 exactly as before, so
-//! the arithmetic is unchanged and only the round-trip through global memory is
-//! narrowed.
-//!
-//! # Why bf16 and not fp16
-//!
-//! bf16 keeps fp32's 8 exponent bits and drops the mantissa to 7 stored bits
-//! (fp16 does the reverse: 5 exponent bits, 10 of mantissa). Nothing stored here
-//! can overflow
-//! or flush to zero that would not have in fp32 — the dynamic range is identical —
-//! so no loss scaling is needed. What is lost is precision: ~3 decimal digits
-//! instead of ~7. That is the trade, and it is the same one every mixed-precision
-//! framework makes for activations.
-//!
-//! # What must NOT be stored here
-//!
-//! The rule is taken from the reference implementation (NX-AI `mlstm_kernels`,
-//! the Triton kernels behind the xLSTM paper), which is explicit about its dtype
-//! split: `matQ`/`matK`/`matV`/`matC` and the output `matH` are loaded and stored
-//! at the kernel's `DTYPE` (bf16 under autocast), while **every** accumulator is
-//! `tl.zeros(..., dtype=tl.float32)` and — the part that matters here — the gate
-//! vectors and the stabilizer are pinned to fp32:
-//!
-//! ```text
-//! vecB_val        = tl.load(...).to(tl.float32)      # cumulative log-forget
-//! vecI_val        = tl.load(...).to(tl.float32)      # input-gate logit
-//! scaMinter_km1   = tl.load(...).to(tl.float32)      # inter-chunk stabilizer
-//! vecM_combine    = tl.maximum(vecB + scaMinter, vecM_intra)
-//! tl.store(vecMout_ptr, vecM_combine_val.to(tl.float32))
-//! tl.store(vecNout_ptr, vecH_denom_val.to(tl.float32))
-//! ```
-//!
-//! and its inter-chunk recurrent state is accumulated *and stored* in fp32
-//! (`matC_k_val = tl.zeros(..., dtype=tl.float32)`, stored `.to(tl.float32)`)
-//! even though the same `matC` is *read back* as bf16 by the parallel kernels.
-//!
-//! The reason is structural, not conservatism. The stabilizer `m` is an exponent:
-//! every value it guards is formed as `exp(x - m)`, so an absolute error `eps` in
-//! `m` multiplies the result by `exp(eps)`. bf16's mantissa near a typical `m` of
-//! order 10 quantizes to steps of ~0.06, i.e. a ~6% multiplicative error injected
-//! into the very quantity whose job is to keep the recurrence bounded. `c` and `n`
-//! carry the matching `exp(-m)` factor and cancel it in the ratio `c/n`, so they
-//! must be stored at the same precision as each other and as `m`.
-//!
-//! Concretely, in this codebase that means:
-//!
-//! | fp32 (pinned)                                   | bf16 (storage)                       |
-//! |-------------------------------------------------|--------------------------------------|
-//! | sLSTM `c`, `n`, `c_entry`, `n_entry`, `i'`, `f'` | sLSTM `zt`, `ot`, `h_prev`, `x_saved` |
-//! | mLSTM `mst`, `msv`, `psiv`, `qnv`, `cst`, `nst` | mLSTM `qh`, `kh`, `vh`, `o`, `yhat`, `ytil` |
-//! | gate logits `igh`, `fgh`, all cumulative sums   | the sLSTM gate buffer `g`            |
-//! | every weight, gradient and optimizer moment     |                                      |
-//!
-//! `i_prime`/`f_prime` sit on the fp32 side too: they are `exp(i - m)` and
-//! `exp(fm - m)`, i.e. the stabilizer's own outputs, and the backward multiplies a
-//! chain of `f_prime` together across timesteps.
-//!
-//! ## Measured, 2026-08-25: the compounding does not happen
-//!
-//! The paragraph above predicts error growing with `T`. It does not, at our shapes.
-//! `SLSTM_BF16_STATE=1` narrows exactly this group (`Kernels::state_bf16`), and
-//! `examples/slstm_state_prec.rs` compares the two arms element for element:
-//!
-//! * `y` is **bit-identical**. The live carry (`c_state`/`n_state`/`m_state`, and the
-//!   fused kernel's registers) stays fp32; only the copies saved *for backward* narrow,
-//!   so the forward recurrence never reads a rounded value. This is the structural
-//!   difference from FlashRNN, which narrows the live state too.
-//! * gradients move by **~0.25% RMS relative** — one bf16 rounding, not `T` of them —
-//!   and the figure is the same at `T = 512` (backbone) and `T = 8` (encoder). An
-//!   error in `c`/`n` is *relative*, and backward's use of them is linear, so it does
-//!   not accumulate the way the `exp(eps)` argument suggests.
-//!
-//! What it buys is small: -12 MB device, -47 MB host pinned at 2048 words, and no
-//! step-time change. So the group stays fp32 by DEFAULT because the win does not pay
-//! for a 0.25% gradient perturbation — not because narrowing is unsafe. The `m`
-//! argument at the top of this section still stands on its own terms; what the
-//! measurement refutes is extending it to `c`, `n`, `i'` and `f'`.
-//!
-//! # The other half: bf16 GEMMs
-//!
-//! Storage is only one of the two places the reference uses bf16. The other is the
-//! matmuls themselves: its projections run under
-//! `@custom_fwd(cast_inputs=autocast_kernel_dtype)` with `autocast_kernel_dtype =
-//! "bfloat16"`, so the operands entering cuBLAS are bf16 while the accumulator
-//! stays fp32. [`ops::matmul_bf16_into`](super::ops::matmul_bf16_into) is that
-//! path here — `cublasGemmEx` with `CUDA_R_16BF` operands and
-//! `CUBLAS_COMPUTE_32F` — and [`ops::GemmBf16`](super::ops::GemmBf16) owns the
-//! per-layer staging that narrows an fp32 master weight per call.
-//!
-//! Measured on an RTX 5080 at 4096³: **10.9 → 92.8 TFLOP/s**, an 8.5x speedup on
-//! the GEMM in isolation. End-to-end it is worth ~4% of a training step, because
-//! the backbone is ~89% of the step and is bound by the sLSTM's serial recurrence
-//! and the fused mLSTM kernels rather than by cuBLAS.
-//!
-//! Logit heads are excluded and stay fp32: their output is exponentiated by the
-//! softmax/cross-entropy, so a bf16 wobble on a logit becomes a multiplicative
-//! error on a probability, and there is one such GEMM per step against the
-//! backbone's many.
-//!
-//! # Enabling
-//!
-//! On by default; `GPU_NO_BF16=1` forces fp32 everywhere — storage *and* GEMMs —
-//! which is the A/B baseline and the escape hatch. Also silently unavailable, and
-//! therefore fp32, when `<cuda_bf16.h>` was not found at startup (see
-//! `Kernels::has_bf16`).
-//!
-//! # What this did NOT buy
-//!
-//! VRAM, which is what prompted the work. At the production config the largest
-//! window that fits is 2048 words either way. The saved recurrent tensors are
-//! simply not where the memory is: only 4 of 16 backbone blocks are sLSTMs
-//! (`hierarchical.rs` builds one when `i % 4 == 0`), the backbone runs B = 1, and
-//! the dominant consumers are the per-block `Act` pool and the SwiGLU activations
-//! at `[N, U]`, both of which are fp32 temporaries rather than slabs. Note also
-//! that `mem_get_info` reports the CUDA async pool's *reserved* size, which does
-//! not shrink when blocks are freed — measure capacity (the largest window that
-//! fits) rather than reported usage.
 
 use cudarc::driver::PushKernelArg;
 
 use super::{GTensor, Gpu};
 
 /// Whether saved activations are stored as bf16. On unless `GPU_NO_BF16` is set.
-///
-/// Read through a `OnceLock`: the answer must not change within a process, since a
-/// forward and its backward have to agree on the layout of what was saved.
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GPU_NO_BF16").is_err())
@@ -189,15 +59,6 @@ impl GTensor<u16> {
 
 /// A saved activation slab, held as bf16 when that is available and fp32 when it
 /// is not.
-///
-/// This is what a layer stores instead of a bare `GTensor<f32>`. The two variants are
-/// deliberately not a runtime choice per call: [`Slab::new`] picks once from
-/// [`active`], and forward and backward then agree by construction.
-///
-/// Reading is always through [`get`](Self::get), which hands back an fp32 view —
-/// either the tensor itself (fp32 variant, zero cost) or a widened copy into a
-/// caller-provided scratch buffer (bf16 variant). Consumers therefore need no
-/// knowledge of which is in play.
 pub enum Slab {
     F32(GTensor<f32>),
     Bf16(GTensor<u16>),
@@ -272,10 +133,6 @@ impl Slab {
     }
 
     /// An fp32 view of this slab.
-    ///
-    /// `scratch` is only touched for the bf16 variant, where it receives the widened
-    /// copy; the fp32 variant ignores it and returns the slab directly, so the
-    /// no-bf16 path costs exactly what it did before this module existed.
     pub fn get<'a>(&'a self, gpu: &Gpu, scratch: &'a mut GTensor<f32>) -> &'a GTensor<f32> {
         match self {
             Slab::F32(t) => t,
@@ -320,8 +177,6 @@ mod tests {
             worst = f32::max(worst, rel);
             signed += a - g;
         }
-        // bf16 stores 7 explicit mantissa bits (+1 implicit), so round-to-nearest
-        // has a half-ulp bound of 2^-8 = 3.91e-3 relative.
         assert!(
             worst < 3.91e-3,
             "bf16 round-trip relative error {worst} too large"

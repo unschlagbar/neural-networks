@@ -1,7 +1,4 @@
 //! The CPU modelling stack, batched, built on `crate::tensor`.
-//!
-//! Everything here operates on `[B, F]` / `[B, T, F]` tensors. No autograd: each
-//! layer keeps a forward cache and hand-writes its backward.
 
 pub mod block;
 pub mod embedding;
@@ -34,15 +31,11 @@ mod train_smoke {
 
     /// End-to-end batched training smoke test: a single Linear + softmax must
     /// learn a linearly separable 3-class mapping, driving the loss down.
-    /// Exercises forward, fused CE backward, grad accumulation and the SGD step
-    /// all together on `[B, F]` tensors.
     #[test]
     fn linear_softmax_learns_toy_task() {
         let (batch, features, classes) = (30, 2, 3);
         let mut lin = Linear::new(features, classes);
 
-        // Fixed batch: class from the value of a+b — a cheap, deterministic,
-        // linearly separable 3-band target.
         let mut xs = Vec::with_capacity(batch * features);
         let mut ys = Vec::with_capacity(batch);
         for i in 0..batch {
@@ -100,8 +93,6 @@ mod train_e2e {
         let mut block = SLstmBlock::new_slstm(hidden, up);
         let mut head = Linear::new(hidden, vocab);
 
-        // Learnable next-token task: token[i+1] = (token[i] + 1) % vocab.
-        // Each of the B sequences starts at a different value.
         let mut ids = Vec::with_capacity(n);
         let mut targets = Vec::with_capacity(n);
         for seq in 0..b {

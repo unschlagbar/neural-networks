@@ -1,24 +1,7 @@
 // Byte-level tokenizer: token ids 0..256 are raw UTF-8 bytes, ids 256.. are
 // special tokens. Vocab is exactly 256 + SPECIAL_TOKENS.len().
-//
-// No charset file and no HashMap — encoding is `str::as_bytes` and decoding is
-// `String::from_utf8_lossy`, so text in any language round-trips losslessly.
-// Special tokens live *above* the byte range instead of stealing byte values,
-// so no valid input can ever collide with them.
 
 /// Special tokens, in id order. Their ids are `256 + index`.
-///
-/// The first two (`<W>`, `<END>`) are the pretraining specials and their ids
-/// are load-bearing — `<W>` (256) is the encoder/decoder end-of-word marker and
-/// `<END>` (257) the end-of-text stop. The rest are post-training (SFT) chat
-/// markers, appended *after* them so an existing byte/`<W>`/`<END>` id never
-/// shifts. A pretrained checkpoint has a smaller vocab than this list implies;
-/// `crate::grow_vocab` widens its tables to make room for the new rows.
-///
-/// From `MARKUP_START` on the specials are *markup*: unlike the structural
-/// markers above them they also occur verbatim in the training data, so
-/// `to_tokens_markup` folds each literal occurrence into its token and
-/// `to_text_markup` writes it back out unchanged.
 pub const SPECIAL_TOKENS: &[&str] = &[
     "<W>",
     "<END>",

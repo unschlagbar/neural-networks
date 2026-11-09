@@ -3,7 +3,6 @@
 //! both; `frontend` and `segments` are the speech encoder's features and layout,
 //! whose device side is `gpu::audio`; `librispeech` reads its first corpus and
 //! `voice` the takes recorded on the harness VOICE page.
-//! All of it runs without a GPU.
 
 pub mod augment;
 pub mod ctc;

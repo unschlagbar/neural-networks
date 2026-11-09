@@ -1,28 +1,4 @@
 // slstm.rs ── sLSTM from xLSTM (Beck et al. 2024, arXiv:2405.04517)
-//
-// Single-head scalar-memory sLSTM with:
-//   • exponential input gate      i_t = exp(ĩ_t)
-//   • sigmoid forget gate         f_t = σ(f̃_t)           (log-space internally)
-//   • normalizer state            n_t = f'_t·n_{t-1} + i'_t
-//   • stabilizer state            m_t = max(log f_t + m_{t-1}, ĩ_t)
-//   • stabilized gates            i'_t = exp(ĩ_t − m_t),  f'_t = exp(log f_t + m_{t-1} − m_t)
-//   • scalar cell                 c_t = f'_t·c_{t-1} + i'_t·z_t
-//   • normalized hidden           h_t = o_t · c_t / n_t
-//
-// No clamp on n_t (the reference has none, and it would be wrong to add one here):
-// c_t and n_t are both STABILIZED, i.e. they carry a factor exp(−m_t), which cancels
-// exactly in the ratio c_t/n_t. That is what makes the stabilizer invisible to the
-// model. Clamping the stabilized n_t at 1 — as this code used to — leaves the floor
-// at exp(m_t) in unstabilized terms, so m_t leaks into the output. On the first step
-// of a sequence n is 0, and m is then set to ĩ (not max(log f + m_prev, ĩ)) so that
-// i' is exactly 1 and c/n cannot be 0/0.
-//
-// Gradient treatment of the stabilizer follows the paper / reference impl:
-// m_t is treated as a constant w.r.t. backprop (like the max in softmax). This is
-// exact for the c/n ratio, since the exp(−m_t) factors cancel.
-//
-// Code style mirrors lstm.rs: concat-trick xh=[x, h_{t-1}], one matrix per gate,
-// gradient accumulators inside the layer, scratch buffers pre-allocated.
 
 use iron_oxide::collections::Matrix;
 use rand::random_range;
@@ -101,8 +77,6 @@ pub struct SLSTMLayerGrads {
     pub bi: GradVec,
     pub bf: GradVec,
     pub bo: GradVec,
-    //pub h_init_grad: GradVec,
-    //pub c_init_grad: GradVec,
 }
 
 impl SLSTMLayerGrads {
@@ -116,8 +90,6 @@ impl SLSTMLayerGrads {
             bi: GradVec::zeros(h),
             bf: GradVec::zeros(h),
             bo: GradVec::zeros(h),
-            // h_init_grad: GradVec::zeros(h),
-            // c_init_grad: GradVec::zeros(h),
         }
     }
 }
@@ -153,11 +125,6 @@ pub struct SLSTMLayer {
 
     pub grads: SLSTMLayerGrads,
 
-    // ── Deferred weight-gradient accumulation ─────────────────────────────
-    // backward() stashes (xh, per-gate deltas) per step and folds them into
-    // the grad matrices in blocks of GRAD_BLOCK, so each grad matrix is
-    // streamed once per block instead of read-modified-written every step.
-    // The delta rows double as the backward scratch for the current step.
     pend_len: usize,
     pend_xh: Box<[f32]>, // GRAD_BLOCK × (input+hidden)
     pend_dz: Box<[f32]>, // GRAD_BLOCK × hidden
@@ -184,8 +151,6 @@ impl SLSTMLayer {
 
             bz: vec![0.0; hidden_size].into(),
             bi: vec![0.0; hidden_size].into(),
-            // Forget-gate bias init to a positive value (Jozefowicz et al. 2015;
-            // xLSTM paper keeps this convention to avoid very small f_t at start).
             bf: (0..hidden_size).map(|_| random_range(3.0..6.0)).collect(),
             bo: vec![0.0; hidden_size].into(),
 
@@ -276,17 +241,11 @@ impl SLSTMLayer {
         matvec_acc(&self.wf, &cache.xh, &mut cache.ft_pre);
         matvec_acc(&self.wo, &cache.xh, &mut cache.ot_pre);
 
-        // Activations, stabilizer, gates, cell, normalizer, hidden — one pass;
-        // the transcendentals keep this loop scalar, so extra passes over the
-        // h-sized buffers would only add load/store traffic.
         for j in 0..h {
             let zt = cache.zt_pre[j].tanh();
             let ot = stable_sigmoid(cache.ot_pre[j]);
             let log_f = log_sigmoid(cache.ft_pre[j]);
 
-            // Stabilizer  m_t = max(log f_t + m_{t-1},  ĩ_t), except on the first
-            // step of a sequence (n == 0), where m = ĩ so that i' is exactly 1 and
-            // n starts at 1 — otherwise i' can underflow to 0 and h = c/n is 0/0.
             let fm = log_f + cache.m_prev[j];
             let np = cache.n_prev[j];
             let first = np == 0.0;
@@ -296,10 +255,6 @@ impl SLSTMLayer {
                 fm.max(cache.it_pre[j])
             };
 
-            // Stabilized exponential gates. On the first step the carry is empty
-            // (n_prev = c_prev = 0), so f' only ever multiplies zeros; forcing it
-            // to 0 avoids exp(fm − ĩ) overflowing to inf for a strongly negative
-            // ĩ, which would turn inf·0 into NaN.
             let i_prime = (cache.it_pre[j] - m).exp();
             let f_prime = if first { 0.0 } else { (fm - m).exp() };
 
@@ -325,20 +280,11 @@ impl SLSTMLayer {
         self.m.copy_from_slice(&cache.m);
     }
 
-    // Incoming `delta` = dL/dh_t (already combined with dh_bptt from t+1 by Sequential).
-    //
-    // Writes:
-    //   weight/bias gradients into self.grads
-    //   dL/dx into cache.dconcat[..input_size]   (exposed via input_grad())
-    //   dL/dh_{t-1} into self.dh_bptt            (read by bptt_hidden_grad())
-    //   dc_bptt, dn_bptt updated for next iter   (layer-internal BPTT channels)
 
     pub fn backward(&mut self, delta: &mut [f32], cache: &mut SLSTMCache) {
         let h = self.hidden_size;
         let r = self.input_size + h;
 
-        // This step's gate deltas are written straight into the pending block
-        // (they double as the scratch the dconcat sweep reads below).
         let slot = self.pend_len;
         self.pend_xh[slot * r..(slot + 1) * r].copy_from_slice(&cache.xh);
         let dz = &mut self.pend_dz[slot * h..(slot + 1) * h];
@@ -346,10 +292,6 @@ impl SLSTMLayer {
         let df = &mut self.pend_df[slot * h..(slot + 1) * h];
         let dob = &mut self.pend_do[slot * h..(slot + 1) * h];
 
-        // ── 1–3. Elementwise chain in one pass: output gate, δh split into
-        // δc/δn paths (+BPTT from future), gate pre-activation grads, BPTT
-        // channels for t-1. Scalar anyway (branch + transcendental), so one
-        // pass over the h-sized buffers beats three.
         for j in 0..h {
             let d = delta[j] + self.dh_bptt[j];
             delta[j] = d;
@@ -359,9 +301,6 @@ impl SLSTMLayer {
             //   h = o · (c / n)   →   do/dõ = δh · c/n · o·(1-o)
             dob[j] = d * (cache.c[j] / n) * ot * (1.0 - ot);
 
-            //   c = f'·c_prev + i'·z
-            //   n = f'·n_prev + i'
-            // No clamp on n, so ∂h/∂n = −o·c/n² unconditionally (no branch).
             let dc = d * ot / n + self.dc_bptt[j];
             let dn = d * ot * (-cache.c[j]) / (n * n) + self.dn_bptt[j];
 
@@ -375,9 +314,6 @@ impl SLSTMLayer {
             // i' = exp(ĩ − m)   →   dĩ = di' · i'     (m treated as constant — see header)
             di[j] = di_prime * cache.i_prime[j];
 
-            // f' = exp(log_f + m_prev − m)
-            //   d(log_f)/df̃ = 1 − σ(f̃)
-            //   → df̃ = df' · f' · (1 − σ(f̃))
             let sigm_f = stable_sigmoid(cache.ft_pre[j]);
             df[j] = df_prime * cache.f_prime[j] * (1.0 - sigm_f);
 
@@ -397,9 +333,6 @@ impl SLSTMLayer {
             }
         }
 
-        // ── 5. dL/d(xh): four lane-accumulated dots per weight row, one sweep
-        // over W (read-only — the weight-grad outer products are deferred to
-        // flush_grads, so gW is not read-modified-written here every step).
         {
             let wz = self.wz.as_slice();
             let wi = self.wi.as_slice();
@@ -412,8 +345,6 @@ impl SLSTMLayer {
 
             for i in 0..r {
                 let off = i * h;
-                // Exact-length row slices — elides the bounds checks a flat
-                // `[off + j]` index would keep.
                 cache.dconcat[i] = dot(&wz[off..off + h], dz)
                     + dot(&wi[off..off + h], di)
                     + dot(&wf[off..off + h], df)
@@ -537,8 +468,6 @@ impl NnLayer for SLSTMLayer {
         self.grads.bf.apply_to(&mut self.bf, lr);
         self.grads.bo.apply_to(&mut self.bo, lr);
 
-        // self.grads.c_init_grad.apply_to(&mut self.c_init, lr);
-        // self.grads.h_init_grad.apply_to(&mut self.h_init, lr);
     }
 
     fn clear_grads(&mut self) {
@@ -552,15 +481,11 @@ impl NnLayer for SLSTMLayer {
         self.grads.bi.clear();
         self.grads.bf.clear();
         self.grads.bo.clear();
-        // self.grads.h_init_grad.clear();
-        //self.grads.c_init_grad.clear();
     }
 
     fn reset_state(&mut self) {
         self.h.fill(0.0);
         self.c.fill(0.0);
-        //self.h.copy_from_slice(&self.h_init);
-        //self.c.copy_from_slice(&self.c_init);
         self.n.fill(0.0);
         self.m.fill(0.0);
     }
@@ -575,8 +500,6 @@ impl NnLayer for SLSTMLayer {
     fn accumulate_init_grad(&mut self) {
         // Window seam — fold any partial pending block into the grad matrices.
         self.flush_grads();
-        // add_vec_in_place(&mut self.grads.h_init_grad.vec(), &self.dh_bptt);
-        // add_vec_in_place(&mut self.grads.c_init_grad.vec(), &self.dc_bptt);
     }
 
 }

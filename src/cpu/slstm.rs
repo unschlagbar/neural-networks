@@ -1,17 +1,4 @@
 //! Batched sLSTM cell (xLSTM, Beck et al. 2024), sequential over time.
-//!
-//! Direct port of `nn::slstm::SLSTMLayer`'s equations, but batched: the state
-//! `(h, c, n, m)` is `[B, H]` and every gate pre-activation is a `[B, rows] ·
-//! [rows, H]` GEMM instead of `B` separate matrix-vector products. Time is a
-//! serial loop (irreducible for sLSTM); the batch is the parallel axis.
-//!
-//! One `forward` consumes a whole `[B, T, in]` sequence and returns `[B, T, H]`,
-//! starting from zero state (independent sequences of equal length T). A step
-//! listed in [`set_resets`](SLstm::set_resets) starts from zero state too, and
-//! nothing flows back across it.
-//!
-//! Stabilizer `m_t` is treated as constant in backward (same approximation as
-//! the reference and the old code): exact for |n_t| > 1, standard elsewhere.
 
 use crate::cpu::optim::{AdamCfg, AdamState, ensure_states};
 use crate::tensor::{Tensor, gemm};
@@ -92,8 +79,6 @@ pub struct SLstm {
     pub input_size: usize,
     pub hidden_size: usize,
 
-    // Gate weights, each [rows, H] with rows = input+hidden. Same layout as the
-    // old code (concat-trick, one matrix per gate).
     pub wz: Tensor,
     pub wi: Tensor,
     pub wf: Tensor,
@@ -133,8 +118,6 @@ pub struct SLstm {
     dh_bptt: Tensor,
     dc_bptt: Tensor,
     dn_bptt: Tensor,
-    // Transposed gate weights [H, rows], rebuilt once per backward so dxh uses
-    // the fast gemm_nn instead of the reduction-form gemm_nt.
     wtz: Tensor,
     wti: Tensor,
     wtf: Tensor,
@@ -243,8 +226,6 @@ impl SLstm {
 
         let mut out = Tensor::zeros(&[b, t, h]);
 
-        // Disjoint field borrows so the per-step loop can hold several buffers
-        // mutably at once without going through `self` methods.
         let Self {
             steps,
             wz,
@@ -283,8 +264,6 @@ impl SLstm {
                 row[inp..].copy_from_slice(&h_state.data[bi_ * h..(bi_ + 1) * h]);
             }
 
-            // Gate pre-activations: [B, rows] · [rows, H] -> [B, H], + bias.
-            // z/i/o go to transient scratch; f is stored (needed in backward).
             gemm::gemm_nn(b, rows, h, &st.xh.data, &wz.data, &mut zt_pre.data, 0.0);
             gemm::gemm_nn(b, rows, h, &st.xh.data, &wi.data, &mut it_pre.data, 0.0);
             gemm::gemm_nn(b, rows, h, &st.xh.data, &wf.data, &mut st.ft_pre.data, 0.0);
@@ -305,10 +284,6 @@ impl SLstm {
                 let log_f = log_sigmoid(st.ft_pre.data[k]);
                 let fm = log_f + m_state.data[k];
                 let np = st.n_prev.data[k];
-                // n == 0 is the first step of a sequence: take m = ĩ so that i' is
-                // exactly 1 and n starts at 1. With m = max(fm, ĩ) instead, i' can
-                // underflow to 0 and leave h = c/n as 0/0. The reference guards the
-                // same case, and state resets per word here, so it is hit constantly.
                 let m = if np == 0.0 {
                     it_pre.data[k]
                 } else {
@@ -330,8 +305,6 @@ impl SLstm {
                 c_state.data[k] = c;
                 n_state.data[k] = n;
                 m_state.data[k] = m;
-                // h = o·c/n, no clamp: c and n both carry exp(−m), so it cancels in
-                // the ratio and the stabilizer stays invisible to the model.
                 let hh = o * c / n;
                 h_state.data[k] = hh;
 
@@ -373,8 +346,6 @@ impl SLstm {
         self.dc_bptt.zero_();
         self.dn_bptt.zero_();
 
-        // Transpose the gate weights [rows,H] -> [H,rows] once; reused across all
-        // T steps so dxh can use the fast gemm_nn instead of gemm_nt.
         self.wtz.fit(&[h, rows]);
         self.wti.fit(&[h, rows]);
         self.wtf.fit(&[h, rows]);
@@ -539,8 +510,6 @@ mod tests {
     /// cells (see the hierarchical FD tests). The loose tolerance still catches
     /// routing/plumbing bugs, which miss by far more. `perturb` moves the chosen
     /// parameter (or input) by a step along `u`; `loss` re-runs the forward.
-    /// Bundles everything the perturb/loss closures need, so both take one
-    /// `&mut Ctx` and never alias-borrow the cell.
     struct Ctx {
         cell: SLstm,
         x: Tensor, // perturbed for the dx check, fixed otherwise

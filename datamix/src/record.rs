@@ -99,14 +99,6 @@ impl Record {
 
     /// Cut `strip` out of the system turn, then optionally fold what remains
     /// into the first user turn and drop the system turn.
-    ///
-    /// The corpus's system turns are a small set of repeated strings — twelve
-    /// of them cover a third of the records — and a constant that large is a
-    /// prop: the model learns to answer with it there and is off its
-    /// distribution the moment it is not. But most of those strings end in the
-    /// only instruction the record has, so the turn cannot simply be deleted.
-    /// Stripping the framing and folding the remainder removes the constant
-    /// and keeps the task.
     pub fn fold_system(&mut self, strip: &[String], fold: bool) {
         let clean = |s: &str| {
             let mut out = s.to_string();
@@ -141,8 +133,6 @@ impl Record {
                 if text.is_empty() {
                     return;
                 }
-                // Onto the first user turn, which is where the instruction
-                // reaches the model at inference.
                 if let Some(u) = turns.iter().position(|t| t.role == Role::User) {
                     let merged = format!("{text}\n\n{}", turns[u].content);
                     turns[u] = Turn::new(Role::User, merged);
@@ -155,11 +145,6 @@ impl Record {
     /// exchanges. Returns false when even the first exchange is too long, in
     /// which case the record cannot be trimmed into shape and the caller should
     /// drop it.
-    ///
-    /// A prefix of a conversation is a conversation: the model still sees a
-    /// prompt followed by the answer it should give. Discarding the whole
-    /// record instead throws away the early turns for the sake of the late
-    /// ones — on SmolTalk that is most of the corpus.
     pub fn trim_to_fit(&mut self, max_tokens: usize, max_words: usize) -> bool {
         if self.tokens() <= max_tokens && self.words() <= max_words {
             return true;
@@ -171,8 +156,6 @@ impl Record {
             let Record::Chat { turns, .. } = self else {
                 unreachable!()
             };
-            // A trailing user turn has no answer, so it goes on its own; other-
-            // wise drop the assistant turn and the user turn that prompted it.
             if turns.last().map(|t| t.role) == Some(Role::User) {
                 turns.pop();
             } else {
@@ -311,8 +294,6 @@ impl Record {
     /// conversation or has lost a turn — a rewrite that drops the answer is a
     /// failure, not a shorter record.
     pub fn from_messages_json(&self, reply: &str) -> Option<Record> {
-        // The reply may be fenced or prefaced; `parse_messages` anchors on the
-        // `messages` key, so the surrounding text does not matter.
         let turns = sft::parse_messages(reply)?;
         if turns.len() != self.to_messages_json().map(count_turns)?? {
             return None;
@@ -343,9 +324,6 @@ impl Record {
                 turns: old,
                 category,
             } => {
-                // Roles are the record's structure, not the model's to change:
-                // an answer relabelled as a question would silently move the
-                // loss mask onto the prompt.
                 if old.iter().zip(&turns).any(|(a, b)| a.role != b.role) {
                     return None;
                 }
@@ -548,8 +526,6 @@ mod transform_tests {
 
     #[test]
     fn a_relabelled_turn_is_refused() {
-        // Roles are the record's structure, not the model's to change: an answer
-        // relabelled as a question would move the SFT loss mask onto the prompt.
         let rec = chat(&[(Role::User, "q"), (Role::Assistant, "a")]);
         let swapped = r#"{"messages":[{"role":"assistant","content":"q"},
             {"role":"user","content":"a"}]}"#;

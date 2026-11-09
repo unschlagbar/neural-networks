@@ -1,7 +1,4 @@
 //! Parameter count of the hierarchical model, per stack.
-//!
-//! Counts `params_mut` — the learnable tensors a checkpoint stores — so the total
-//! is directly comparable to the size of a saved `models/` file.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {

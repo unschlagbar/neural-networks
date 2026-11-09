@@ -1,22 +1,4 @@
 //! Host-side word grouping and id rectangles for the encoder and decoder stages.
-//!
-//! Both stages run one word per batch row, and a batch is a dense `[words, tmax]`
-//! rectangle — so an ungrouped window pads every row out to its longest word (~4.5x
-//! wasted rows on Rust source, in both FLOPs and VRAM). Grouping by byte length
-//! removes that: the groups run strictly one after another, each is its own
-//! rectangle, and their gradients accumulate, so cutting a window into groups changes
-//! no arithmetic.
-//!
-//! Groups are **exact-length**, so a rectangle carries no padding at all and `tmax` is
-//! the group's word length plus its closing `[W]` step. Measured over a 4096-word
-//! window of Rust source: 16 groups, 0% padding, against 5 groups and ~20% padding
-//! when lengths were bucketed by `next_power_of_two`.
-//!
-//! Everything here is index bookkeeping fed to the gather/scatter/CE kernels, plus
-//! [`GroupIds`], which gets one group's lists onto the device in a single transfer.
-//! Ids are built as `u32` (what the kernels take) so uploading them needs no narrowing
-//! copy, and every buffer is allocated once at its window-worst-case size — a training
-//! run rebuilds these per window forever, so nothing may allocate on the hot path.
 
 use std::range::Range;
 
@@ -110,10 +92,6 @@ impl Grouping {
         );
         self.groups.clear();
 
-        // Counting sort by exact length: count at `len + 1`, prefix-sum, then place.
-        // Ascending length is also the group order, which fixes the order the
-        // per-group losses are summed and the grads are scattered.
-        // Words per length, prefix-summed into `order` offsets.
         let mut starts = [0u32; MAX_TMAX + 1];
         for &l in lens {
             starts[l + 1] += 1;
@@ -134,10 +112,6 @@ impl Grouping {
             if words == 0 {
                 continue;
             }
-            // `tmax` is fixed by the length, so a row cap converts to a word count.
-            // Splitting into equal pieces rather than `per_piece` plus a remainder
-            // keeps every rectangle wide — a 1-word tail launch is nearly pure
-            // overhead and the pool sizes to the largest piece either way.
             let tmax = len as u32 + 1;
             let per_piece = match max_rows {
                 0 => words,
@@ -190,9 +164,6 @@ impl EncGroup<'_> {
 }
 
 /// Every encoder rectangle of one window.
-///
-/// Built once per window rather than once per direction: the encoder backward
-/// re-forwards each group (activation checkpointing) and needs byte-identical ids.
 pub struct EncoderGroups {
     grouping: Grouping,
     lens: Vec<usize>,
@@ -264,10 +235,6 @@ impl EncoderGroups {
 }
 
 /// A `[words, tmax]` decoder rectangle and the six id lists addressing it.
-///
-/// A masked (prompt) word is still fed forward so its state and the tied-table char
-/// grads are produced, but its slots get CE mask 0 — no loss, no logit gradient from
-/// a prompt token.
 pub struct DecGroup<'a> {
     /// Window word index per row.
     pub words: &'a [u32],
@@ -347,9 +314,6 @@ impl DecoderGroups {
             .extend((0..dw).map(|w| words[w + 1].end - words[w + 1].start));
         self.grouping.build(&self.lens, max_rows);
 
-        // Every group scales by the WINDOW's valid-row count, so the summed loss and
-        // grads match what one big rectangle would have produced. Under SFT masking
-        // only the response words' rows count.
         self.valid_rows = (0..dw)
             .filter(|&w| word_on(w))
             .map(|w| self.lens[w] + 1)
@@ -429,35 +393,6 @@ impl DecoderGroups {
 const SLOTS: usize = 2;
 
 /// One group's id lists, uploaded to the device in a single async transfer.
-///
-/// A group's bookkeeping — which row is a `[W]` step, which slot is a char, the CE
-/// targets and mask — is a handful of small `u32` lists. Sending each with its own
-/// [`super::ops::upload_ids_u32`] costs a device allocation and a *blocking* H2D
-/// apiece (`memcpy_htod` from a pageable host slice is synchronous, so the compute
-/// stream stalls on every one). The decoder issues six lists per group and the encoder
-/// three, both again in backward: ~30 stalls per window for ~100 KB of data.
-///
-/// [`upload`](Self::upload) instead packs the lists back to back into one pinned host
-/// buffer and issues one async copy, which overlaps the compute already queued.
-/// [`list`](Self::list) hands back a device view per list, indexed by position in the
-/// call. It borrows `&self`, so the borrow checker keeps a view from outliving the
-/// next upload.
-///
-/// Every buffer is allocated once at [`MAX_GROUP_IDS`], the most any group of any
-/// window can need, so no upload allocates or page-locks.
-///
-/// # Reuse hazard
-///
-/// The copy is async and reads the *pinned* buffer, while the refill at the top of
-/// `upload` is a plain CPU write — so a single buffer is overwritten by the next group
-/// while the previous group's copy, and the kernels reading its views, are still
-/// outstanding. The ids silently become another group's: training diverged (loss
-/// 2.6 -> 69) with no error anywhere.
-///
-/// Rotating slots alone does **not** fix that, which is the trap: it buys `SLOTS - 1`
-/// iterations of slack, and the CPU runs arbitrarily far ahead of the device inside a
-/// loop over groups, so it laps the rotation. What makes it safe is `copied` — the CPU
-/// blocks on a slot's previous copy before refilling it.
 pub struct GroupIds {
     host: [PinnedHostSlice<u32>; SLOTS],
     dev: [CudaSlice<u32>; SLOTS],
@@ -510,8 +445,6 @@ impl GroupIds {
 
         self.cur = (self.cur + 1) % SLOTS;
         let slot = self.cur;
-        // A device-side `stream.wait` would not do: the racing write below is the
-        // CPU's, and the CPU is what has to be held back.
         if let Some(ev) = &self.copied[slot] {
             ev.synchronize().expect("GroupIds: wait for prior H2D");
         }
@@ -546,23 +479,11 @@ mod tests {
     use crate::tensor::Tensor;
 
     /// Consecutive uploads must not corrupt each other's ids.
-    ///
-    /// The uploads are async, so a group whose slot is refilled too early has its ids
-    /// replaced by a later group's — no error, just wrong gathers.
-    ///
-    /// **This test does not reproduce that failure.** Single-slotting `GroupIds`
-    /// diverges real training deterministically (char loss 2.6 -> 69 within ~10 steps)
-    /// while this test still passes, at every group count and contention level tried;
-    /// the reuse window evidently needs the real workload's queue depth. It guards the
-    /// packing and offset arithmetic, which it does cover — the slot rotation is pinned
-    /// only by that training run, so treat a green suite here as insufficient evidence.
     #[test]
     fn uploads_do_not_clobber_each_other() {
         let Some(gpu) = crate::gpu::test_gpu() else {
             return;
         };
-        // A table whose row `i` is all `i`, so a gathered row names the id that
-        // fetched it and a stale id is obvious.
         let rows = 64;
         let table = GTensor::from_host(
             &gpu,
@@ -583,17 +504,12 @@ mod tests {
             })
             .collect();
 
-        // Something slow between the upload and the gather, so the copy for group
-        // `g+1` is issued while group `g`'s gather is still queued — the interleaving
-        // real training produces and a bare upload/gather pair does not.
         let busy = GTensor::zeros(&gpu, &[512, 512]);
         let mut sink = GTensor::uninit(&gpu, &[512, 512]);
 
         for list in &groups {
             ids.upload(&gpu, &[list]);
             ops::matmul_nn_into(&gpu, &busy, &busy, &mut sink, 0.0);
-            // Gather, keeping the result on the device — no sync here, so an unsound
-            // reuse has every chance to show.
             got.push(ops::embedding_gather_u32(
                 &gpu,
                 &table,
@@ -687,8 +603,6 @@ mod tests {
     #[test]
     fn cap_splits_evenly() {
         let mut grouping = Grouping::new();
-        // 9 words of length 3 (tmax 4), cap 16 rows -> 4 words per piece -> 3 pieces
-        // of 3, not 4 + 4 + 1.
         grouping.build(&[3; 9], 16);
         let sizes: Vec<u32> = grouping.groups.iter().map(|g| g.words).collect();
         assert_eq!(sizes, vec![3, 3, 3]);

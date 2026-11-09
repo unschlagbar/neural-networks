@@ -1,20 +1,4 @@
 // Mixture configuration: the file that decides what goes into a corpus.
-//
-// The format is TOML, parsed by `toml.rs` (the repo carries no serde), so any
-// editor's TOML support gives syntax checking as you type and the schema next
-// door (`mixture.schema.json`, named by the `#:schema` line at the top of each
-// mixture) gives key completion and unknown-key warnings. Four table kinds:
-//
-//   [output]          where the corpus goes and how big it is
-//   [filter]          quality defaults, inherited by every source
-//   [llm]             the local OpenAI-compatible server, for `kind = "llm"`
-//                     sources and for `judge` filters
-//   [source.NAME]     one input, its weight, and its filter overrides
-//
-// Every key is validated: an unknown one is an error naming the line, because
-// a silently ignored filter is a corpus you cannot trust. So is a value of the
-// wrong type — the schema catches those in the editor, this catches them in
-// the file the editor never opened.
 use std::collections::HashMap;
 use std::fmt;
 
@@ -119,14 +103,6 @@ pub struct Filters {
     /// instead of dropping it. Only affects `chat`-shaped records.
     pub trim_turns: bool,
     /// Rewrite every record through the local model before it is filtered.
-    /// This is the system prompt; the record goes up as `{"messages": [...]}`
-    /// and the reply must come back in the same shape. Empty = no rewriting
-    /// (and no server needed).
-    ///
-    /// The rewrite is keyed on the record's own text, so it is cached like any
-    /// other completion: a corpus rewritten once stays rewritten across every
-    /// later `build` for free, and only records the sources have never yielded
-    /// before reach the server.
     pub transform: String,
     /// Rewrite only records whose text contains one of these. Empty = all of
     /// them. The gate is what keeps a whole-corpus rewrite affordable: on
@@ -148,22 +124,12 @@ pub struct Filters {
     pub system_strip: Vec<String>,
     /// After stripping, move whatever is left of the system turn to the front
     /// of the first user turn and drop the system turn itself.
-    ///
-    /// Deleting the turn outright is not an option: in 23k records the system
-    /// turn is not framing but the *only* instruction ("Rewrite the input text
-    /// to make it more professional"), the user turn being the raw material.
-    /// Folding removes the constant while keeping the record answerable, and
-    /// puts the instruction where a user would actually type it.
     pub system_fold: bool,
     /// Compile the code a record carries and drop what does not build.
-    /// `"rust"` extracts its ```rust blocks and runs them through `rustc`;
-    /// empty disables the check. Runs on rewritten records only — it is the
-    /// gate on what the rewrite produced.
     pub verify: String,
     /// Prompt for one repair pass: the record and `rustc`'s own errors go up,
     /// the corrected record comes back. Empty drops a failing record instead of
-    /// trying to fix it. One pass is worth having and two are not — measured
-    /// 63% -> 79% on the first attempt and nothing on the second.
+    /// trying to fix it. A second pass adds nothing.
     pub verify_repair: String,
 }
 
@@ -266,9 +232,6 @@ pub struct Source {
     pub select_column: String,
     pub select_values: Vec<String>,
     /// `chat`: further row conditions on flat columns, all of which must hold.
-    /// Written `"column=a|b"` (keep rows holding one of the values) or
-    /// `"column!=a|b"` (drop them) — magpie's `category` and `quality` sit
-    /// side by side, and one select cannot cut on both.
     pub row_where: Vec<RowCond>,
     /// `synth`/`llm`: how many examples to generate (`synth`: 0 = every
     /// combination).
@@ -335,39 +298,17 @@ pub struct Llm {
     pub timeout: usize,
     pub retries: usize,
     /// Directory of cached replies. Empty disables caching.
-    ///
-    /// Deliberately outside `target/`: what accumulates here is not a build
-    /// artifact but the corpus itself. The Python->Rust rewrite of SmolTalk is
-    /// ~56 h of local generation, and it exists nowhere else — a `cargo clean`
-    /// under the old default took it with it, and so did deleting a build.
-    /// From `data/` it survives both, and any mixture can reproduce its corpus
-    /// from it with `cache_only = true` in minutes.
     pub cache: String,
     pub api_key: String,
     /// Chat template written out, which switches every call to
     /// `/v1/completions`. `{system}` and `{user}` are substituted. Empty = use
     /// `/v1/chat/completions` and let the server apply its own template.
-    ///
-    /// The reason to take the template over is the thinking budget. A reasoning
-    /// model spends most of a completion deliberating, which a mechanical
-    /// rewrite does not need — but no OpenAI-compatible field turns it off
-    /// (`chat_template_kwargs`, `/no_think` and `reasoning.enabled` are all
-    /// ignored by LM Studio). Prefilling an empty `<think></think>` in the
-    /// template does turn it off, because the model reads its own thinking as
-    /// already finished. Measured on Python→Rust rewrites of this corpus:
-    /// 4.3 s against 43.6 s per record, and no reply truncated mid-answer.
     pub completion_template: String,
     /// Where a completion ends — the template's turn terminator, e.g.
     /// `<|im_end|>`. Only used on the `/v1/completions` path.
     pub completion_stop: Vec<String>,
     /// Answer only out of the cache and never open a socket: a cache miss is
     /// an error, which drops the record rather than generating it.
-    ///
-    /// What it is for is assembling a corpus from a long rewrite that is still
-    /// running. The build is then minutes instead of days, and what it holds is
-    /// exactly what has been translated so far — a record whose rewrite has not
-    /// come back yet is left out, which is the safe direction: the whole point
-    /// of the rewrite is that the untranslated form must not reach the corpus.
     pub cache_only: bool,
     /// Requests in flight. Match the server's parallel slot count (LM Studio
     /// prints it as PARALLEL in `lms ps`); past that the extra requests only
@@ -458,8 +399,6 @@ pub fn parse(text: &str, path: &str) -> Result<Mix> {
     for kv in &sources {
         parsed.push(source_from(kv, &defaults, path)?);
     }
-    // Key validation first: a typo is a more useful error than the downstream
-    // symptom it causes.
     out_kv.reject_unknown(path)?;
     def_kv.reject_unknown(path)?;
     llm_kv.reject_unknown(path)?;
@@ -946,13 +885,6 @@ count = 5
     /// newlines and indentation.
     #[test]
     fn the_shipped_mixtures_parse() {
-        // `joined` marks the mixtures whose prompts are written as one flowing
-        // paragraph wrapped with trailing backslashes. For those, a double
-        // space or a second line means the join failed and the model is being
-        // sent the source file's indentation. `mixes/tools.toml` is written the
-        // other way on purpose — its prompts are multi-paragraph specifications
-        // with a column-aligned table of the tool surface in them — so those
-        // checks would be asserting the opposite of what the file wants.
         for (name, text, joined) in [
             ("pretrain.toml", include_str!("../../mixes/pretrain.toml"), true),
             (

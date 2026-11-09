@@ -1,11 +1,4 @@
 //! Same window, same weights, N times — the loss must be bit-identical.
-//!
-//! Catches shared-memory and warp-shuffle races that unit tests miss: a stale
-//! `__shared__` slot read by a partial final warp is usually zero in a small
-//! isolated launch and only turns non-zero once many blocks have cycled through
-//! an SM. That makes it a whole-model, many-block property, not a kernel one.
-//!
-//! Run: cargo run --release --features cuda --example determinism [words] [reps]
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -65,8 +58,6 @@ fn main() {
     }
     println!("window: {} words, {} tokens", spans.len(), tokens.len());
 
-    // One model, never stepped: every repetition sees identical weights, so any
-    // spread in the loss is the forward/backward itself being nondeterministic.
     let mut model = Hierarchical::new(&gpu, cfg);
 
     let mut losses = Vec::with_capacity(reps);

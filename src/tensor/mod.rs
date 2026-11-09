@@ -1,15 +1,4 @@
 //! Clean-room tensor system for the batched NN experiment (`cpu`).
-//!
-//! Design goals, in order:
-//!   1. A single row-major, contiguous `f32` tensor type carrying its own shape.
-//!   2. Batched math: the leading dimension is the batch axis, so a per-timestep
-//!      matrix-vector product in the old `nn` code becomes a matrix-matrix
-//!      product here (arithmetic intensity ~1 -> ~B).
-//!   3. No autograd. Layers implement forward/backward by hand, exactly like the
-//!      old system, but on `[B, F]` tensors instead of `&[f32]` vectors.
-//!
-//! This is deliberately kept independent from `iron_oxide::Matrix` and the old
-//! `nn` module so the two systems can be benchmarked head to head.
 
 pub mod gemm;
 
@@ -21,12 +10,6 @@ use rand::random_range;
 pub const MAX_RANK: usize = 4;
 
 /// A dense, row-major, contiguous tensor of `f32`.
-///
-/// The shape is a fixed-size stack array (no heap allocation for the shape,
-/// which matters given how many short-lived tensors the batched paths create);
-/// only the first `rank` entries are meaningful, the rest are zero. The NN paths
-/// use `[B, F]` (a batch of feature vectors) and `[B, T, F]` (a batch of
-/// sequences) almost exclusively.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Tensor {
     /// Dimension sizes; only `shape[..rank]` are valid, trailing slots are 0.
@@ -88,16 +71,8 @@ impl Tensor {
 
     /// Uniform `[-scale, scale)` from a fixed `seed` — the reproducible twin of
     /// [`Self::random`].
-    ///
-    /// Parity tests (GPU vs CPU, fused vs op-at-a-time) compare two paths whose
-    /// float reassociation differs, so they run against a tolerance. With unseeded
-    /// data every run draws a different sample of that error distribution and the
-    /// test passes or fails by luck; with a seed a run that passes keeps passing,
-    /// and a failure means the math changed rather than the dice.
     pub fn random_seeded(dims: &[usize], scale: f32, seed: u64) -> Self {
         let n: usize = dims.iter().product();
-        // SplitMix64: cheap, dependency-free, and good enough to decorrelate the
-        // per-element draws that these tests feed to a GEMM.
         let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let data = (0..n)
             .map(|_| {
@@ -119,7 +94,6 @@ impl Tensor {
     }
 
     /// Xavier/Glorot-uniform init for a `[fan_in, fan_out]` weight matrix.
-    /// Matches the old `LinearLayer::new` scale so both systems start comparably.
     pub fn xavier(fan_in: usize, fan_out: usize) -> Self {
         let scale = (6.0 / (fan_in as f32 + fan_out as f32)).sqrt();
         Self::random(&[fan_in, fan_out], scale)

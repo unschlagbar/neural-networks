@@ -1,14 +1,4 @@
 //! Peak activation VRAM of one hierarchical training step, at the real config.
-//!
-//! The number that matters for the offload plan: device memory held *between*
-//! forward and backward, which is what scales linearly in T and caps sequence
-//! length. Measured as (free before forward) − (free after forward, before
-//! backward), so it excludes weights, optimizer moments and the pooled scratch that
-//! backward returns.
-//!
-//! Re-run after each offload step to check the predicted saving actually landed.
-//!
-//! Run: cargo run --release --features cuda --example offload_vram [words]
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -63,13 +53,6 @@ fn main() {
     let after_init = free_mb();
     println!("after model init: {after_init:.0} MB free");
 
-    // A window of `words` words with **mixed** lengths, 1..=MAX_WORD_BYTES.
-    //
-    // Deliberately not a fixed 4 bytes: `segment::word_ends` yields a spread, and the
-    // encoder/decoder bucket words by length into `[words, tmax]` rectangles whose
-    // sizes then set the high-water mark of every `Buf` and `Pool` behind them. A
-    // uniform window exercises exactly one rectangle shape and badly under-reports
-    // what a real corpus makes resident.
     let mut tokens = Vec::with_capacity(words * 4);
     let mut spans: Vec<std::range::Range<usize>> = Vec::with_capacity(words);
     for w in 0..words {
@@ -82,8 +65,6 @@ fn main() {
         spans.push((s..tokens.len()).into());
     }
 
-    // Warm up: first step allocates the caches and grows the pools, so its delta is
-    // not the steady-state figure.
     for _ in 0..2 {
         model.forward_backward(&gpu, &tokens, &spans);
         opt.t += 1;
@@ -91,10 +72,6 @@ fn main() {
     }
     gpu.stream.synchronize().unwrap();
 
-    // NOTE: the CUDA allocator caches freed blocks, so `mem_get_info` reports the
-    // process high-water mark, not live usage — a forward/backward delta reads as
-    // zero once the pools are warm. The meaningful figure is therefore the
-    // high-water mark itself, compared across builds or across `words`.
     let loss = model.forward_backward(&gpu, &tokens, &spans);
     gpu.stream.synchronize().unwrap();
     model.step(&gpu, &opt);
@@ -110,9 +87,6 @@ fn main() {
         held * 1024.0 / words as f64
     );
 
-    // Step time, so a memory win that costs throughput shows up here rather than in
-    // a training run days later. Offload's transfers are meant to hide behind
-    // compute; if they do not, this is where it surfaces.
     const REPS: usize = 5;
     let t0 = std::time::Instant::now();
     for _ in 0..REPS {

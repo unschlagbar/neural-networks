@@ -1,12 +1,5 @@
 //! One backbone mLSTM block and one backbone sLSTM block at the production chunk
 //! shape, forward and backward — a small-footprint target for `ncu`.
-//!
-//!   ncu --set full -k regex:... target/release/examples/ncu_blocks [reps]
-//!
-//! A whole model under `ncu` is hopeless: kernel replay saves and restores what a
-//! kernel may write, and in a 12 GB process every pass of every profiled kernel pays
-//! for that. These two blocks run every kernel a backbone chunk runs, at the same
-//! shapes, in a few hundred MB.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {

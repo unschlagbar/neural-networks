@@ -1,8 +1,4 @@
 // Cooperative-launch sLSTM: the whole time loop in one grid-synchronising kernel.
-// Behind COOP_KERNELS; drags in libcu++ via <cooperative_groups.h>, so it has the
-// largest include requirement of any module. Both kernels exist only in their
-// shape-specialised builds — SLSTM_H / SLSTM_B / SLSTM_RS for the forward, plus
-// SLSTM_NJ / SLSTM_TH for the backward (see Kernels::specialized).
 
 #ifdef COOP_KERNELS
 #include <cooperative_groups.h>
@@ -18,39 +14,7 @@ union bf16x8 {
 // Time-fused sLSTM forward: the ENTIRE T-loop in ONE launch (FlashRNN's
 // `cuda_fused` idea, arXiv 2412.07752). At B=1 the per-step path is a GEMV plus a
 // pointwise kernel, i.e. two launches whose combined ~6.6us is almost all launch
-// latency and Wh re-reads -- the math itself is trivial. Fusing time removes both:
-//
-//   * Wh is loaded ONCE into shared memory, before the loop, instead of streaming
-//     from HBM at every timestep. Each block owns a contiguous slice of Wh's 4H
-//     output columns (`units_per_block`), so the whole matrix lives on-chip across
-//     the grid and no block needs more than its slice.
-//   * the two per-step launches become one `grid.sync()` (measured ~0.9us here,
-//     against ~6.6us for the launch pair).
-//
-// Cross-block consistency is the reason this must be a *cooperative* launch: block
-// k computes gate columns for the whole batch but needs the FULL h_t vector from
-// the previous step, which other blocks produced. `grid.sync()` after the state
-// update is what makes h_t visible everywhere before step t+1 reads it.
-//
-// Precision follows FlashRNN's split: bf16 is the STORAGE dtype for everything the
-// loop re-reads (the staged `Wh` slice, the `h` mirror), fp32 is the ARITHMETIC
-// dtype — every accumulator and the whole stabilizer group stay wide. A conversion
-// costs a couple of ALU ops because both sides are already in registers or shared
-// memory; the earlier standalone bf16 path lost only because it converted through a
-// separate kernel over HBM.
-//
-// SPECIALIZATION (FlashRNN's `-DFLASHRNN_HIDDEN_SIZE=... -DFLASHRNN_BATCH_SIZE=...`
-// in `flashrnn.py`): H and B are compile-time constants here, which is what lets the
-// reduction below hold its slice of `h` in a REGISTER ARRAY. There is deliberately no
-// generic build of this kernel — a runtime H would put that array in local memory and
-// give back the whole win — so `ops::slstm_fused_time` declines when the specialized
-// build is unavailable and the caller takes the per-step loop.
-//
-// Sequence length is NOT specialized, exactly as upstream: `steps` is a runtime
-// argument to their `Run()` too. T is the outer loop's bound, walked once with a data
-// dependency between iterations, so there is nothing to unroll or size by it — and
-// here windows never cross a document border, so T varies per window and specializing
-// on it would mean an NVRTC compile per window length.
+// latency and Wh re-reads; fusing time removes both.
 #if defined(SLSTM_H) && defined(SLSTM_B) && defined(SLSTM_RS)
 
 #define FUSED_H SLSTM_H
@@ -69,16 +33,6 @@ union bf16x8 {
 // Rows of its Wh columns a block keeps in SHARED memory; the remaining FUSED_TAIL
 // rows sit in a bf16 GLOBAL scratch in the same column-major layout and are re-read
 // once per timestep.
-//
-// Staging the whole matrix is what this kernel is for, and it holds while `8*H*H`
-// bytes fit the device's aggregate shared memory — 8.0 MB at H=1024 against 8.2 MB
-// on an 84-SM, 100 KB/SM part, which the per-block opt-in limit then rounds out of
-// reach: at 84 blocks a block owns ceil(H/84) units and needs 104 KB of the 99 KB it
-// may opt into. A partial stage keeps the fused path (~4x per timestep over the
-// per-step loop) instead of losing it to a 5% overshoot. The tail is re-read T times
-// off a working set of a couple of MB, so it comes out of L2, not HBM.
-//
-// FUSED_RS == FUSED_HP is the ordinary case and compiles the tail away entirely.
 #define FUSED_RS SLSTM_RS
 #define FUSED_TAIL (FUSED_HP - FUSED_RS)
 #define FUSED_SPASSES (FUSED_RS / FUSED_RPP)
@@ -109,28 +63,15 @@ extern "C" __global__ void slstm_fused_time(
     extern __shared__ __align__(16) float smem[];
     cg::grid_group grid = cg::this_grid();
 
-    // Each block owns a contiguous range of HIDDEN UNITS [j0, j0+nj), and for each
-    // it owns all four gate columns j, H+j, 2H+j, 3H+j. That pairing is what lets
-    // the pointwise phase below read gate values this same block just wrote, so only
-    // ONE grid.sync() per step is needed (for h_t) instead of two.
     const int H4 = 4 * FUSED_H;
     const int j0 = blockIdx.x * units_per_block;
     const int nj = min(units_per_block, FUSED_H - j0);
     const int ncol = 4 * nj;                       // Wh columns staged by this block
 
-    // Shared: this block's Wh columns, then the fp32 gate scratch the recurrence
-    // consumes. The gate scratch stays wide — it is an accumulator.
     __nv_bfloat16* wsh = (__nv_bfloat16*)smem;
     float* gacc = (float*)(wsh + (long long)ncol * FUSED_RS);
-    // The tail of every Wh column, indexed by the GLOBAL column so blocks never
-    // overlap. Unused, and never read, when FUSED_TAIL is zero.
     __nv_bfloat16* wtl = (__nv_bfloat16*)wtail;
 
-    // Stage the Wh slice, once for all T, TRANSPOSED: wsh[c * RS + r], i.e. column-
-    // major so one column is contiguous and a lane's 8 rows are one 128-bit access.
-    // Local column c in [0, 4*nj) maps to gate g = c / nj and unit j = j0 + c % nj,
-    // i.e. global Wh column g * H + j. The traversal is row-major so the strided
-    // global read still coalesces across `c`.
     const __nv_bfloat16 bzero = __float2bfloat16(0.0f);
     for (int i = threadIdx.x; i < FUSED_HP * ncol; i += blockDim.x) {
         int r = i / ncol, c = i - r * ncol;
@@ -148,21 +89,11 @@ extern "C" __global__ void slstm_fused_time(
 #endif
     }
 
-    // The bf16 mirror of h the reduction reads: TWO [B, HP] planes packed into the
-    // caller's fp32 [B, HP] buffer (two bf16 to a float). Two, because a block writes
-    // its own units of step t while another may still be reading step t-1 — a
-    // cross-block write-after-read that would otherwise cost a second barrier per
-    // step. Writing into the other plane removes the hazard itself.
     __nv_bfloat16* hb_cur = (__nv_bfloat16*)hmir;
     __nv_bfloat16* hb_nxt = hb_cur + (long long)FUSED_B * FUSED_HP;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < FUSED_B * FUSED_HP;
          i += blockDim.x * gridDim.x) {
         int b = i / FUSED_HP, r = i - b * FUSED_HP;
-        // Both planes' row padding must be a real zero: it multiplies Wh padding that
-        // is also zero, and an uninitialised NaN there would poison the sum. `carry`
-        // off means this call starts a sequence, so h_{-1} is zero by definition and
-        // `h_state` holds whatever the previous call left — the host no longer zeroes
-        // it, this does.
         hb_cur[i] = (carry && r < FUSED_H) ? __float2bfloat16(h_state[b * FUSED_H + r]) : bzero;
         hb_nxt[i] = bzero;
     }
@@ -172,11 +103,6 @@ extern "C" __global__ void slstm_fused_time(
     const int lane = threadIdx.x & 31;
     const int warps = blockDim.x >> 5;
 
-    // Pointwise ownership is FIXED for the whole loop: thread `p` owns exactly one
-    // (batch row, hidden unit), which `geometry` guarantees by keeping the block at
-    // least `B * units_per_block` wide. That is what lets the recurrent state and the
-    // four biases live in REGISTERS — they touch global memory once at each end of
-    // the loop instead of four loads and four stores per timestep.
     const int pw = threadIdx.x;
     const bool owner = pw < FUSED_B * nj;
     const int b_pw = owner ? pw / nj : 0;
@@ -185,8 +111,6 @@ extern "C" __global__ void slstm_fused_time(
     const int k_pw = b_pw * FUSED_H + j_pw;
     float c_reg = 0.0f, n_reg = 0.0f, m_reg = 0.0f, h_reg = 0.0f;
     float bz = 0.0f, bi = 0.0f, bf = 0.0f, bo = 0.0f;
-    // Same as the mirror above: without a carry the sequence starts from zero, so
-    // there is nothing to read and nothing for the host to have zeroed.
     if (owner && carry) {
         c_reg = c_state[k_pw];
         n_reg = n_state[k_pw];
@@ -201,9 +125,6 @@ extern "C" __global__ void slstm_fused_time(
     }
 
     for (int t = 0; t < T; ++t) {
-        // This step's input half, issued BEFORE the reduction: it depends on `t`
-        // alone, so its global latency lands under the reduction instead of in front
-        // of the pointwise phase, where only the owning threads are awake to hide it.
         long long go = ((long long)b_pw * T + t) * H4 + j_pw;
         long long s = ((long long)b_pw * T + t) * FUSED_H + j_pw;
         float gz = 0.0f, gi = 0.0f, gf = 0.0f, go4 = 0.0f;
@@ -214,15 +135,6 @@ extern "C" __global__ void slstm_fused_time(
             go4 = g[go + 3 * FUSED_H];
         }
 
-        // --- recurrent half: gacc[b, col] = sum_r h[b, r] * Wh[r, col] ---
-        // ONE WARP PER COLUMN, lanes striding the H reduction. A thread per column
-        // instead would leave almost every lane idle at the shape that matters (B=1,
-        // ~40 columns per block) and then walk all H rows serially in each.
-        //
-        // `h` is pulled into REGISTERS once per batch row and reused by every column
-        // the warp takes. Every warp needs the whole h vector, so re-reading it per
-        // column made h roughly as much shared traffic as Wh itself — and Wh is the
-        // operand that cannot be reused at all.
         for (int b = 0; b < FUSED_B; ++b) {
             float hr[FUSED_HSLICE];
             fused_load_slice(hr, hb_cur + (long long)b * FUSED_HP, lane);
@@ -241,8 +153,6 @@ extern "C" __global__ void slstm_fused_time(
                     }
                 }
 #if FUSED_TPASSES > 0
-                // Same access shape against the global tail: 128 bits per lane, one
-                // column contiguous. Read T times off a working set that stays in L2.
                 const int gidx_t = c / nj;
                 const __nv_bfloat16* wtc =
                     wtl + (long long)(gidx_t * FUSED_H + j0 + (c - gidx_t * nj)) * FUSED_TAIL
@@ -262,26 +172,16 @@ extern "C" __global__ void slstm_fused_time(
 #endif
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
-                // Block-local staging: the pointwise phase below consumes these
-                // WITHOUT a grid-wide sync, because this block owns every gate column
-                // of every unit it is about to update.
                 if (lane == 0) gacc[b * ncol + c] = acc;
             }
         }
         __syncthreads(); // gacc written before this block reads it
 
-        // --- pointwise recurrence ---
-        // Identical math to slstm_step_fused; see it for the stabilizer notes.
         if (owner) {
-            // A document starts at this row: the step runs exactly as a sequence's
-            // first, from zero state and with no recurrent half (the zero mirror of a
-            // fresh start reduces to +0 as well).
             const bool rs = reset != nullptr && reset[t] != 0;
             if (rs) {
                 c_reg = 0.0f; n_reg = 0.0f; m_reg = 0.0f; h_reg = 0.0f;
             }
-            // Gate pre-activation = input half + recurrent half (this block's gacc)
-            // + bias. gacc is laid out [b][gate][unit].
             const float* ga = gacc + (long long)b_pw * ncol + jl_pw;
             float z_pre = gz + (rs ? 0.0f : ga[0]) + bz;
             float i_pre = gi + (rs ? 0.0f : ga[nj]) + bi;
@@ -300,8 +200,6 @@ extern "C" __global__ void slstm_fused_time(
             float c = fp * c_reg + ip * z;
             float n = fp * n_reg + ip;
 
-            // Only the sweep's first predecessor is stored: for t > 0 backward reads
-            // c_out/n_out one timestep back. See `slstm_step_fused`.
             if (t == 0) {
                 state_st(c_entry, (long long)b_pw * FUSED_H + j_pw, c_reg);
                 state_st(n_entry, (long long)b_pw * FUSED_H + j_pw, n_reg);
@@ -332,45 +230,6 @@ extern "C" __global__ void slstm_fused_time(
 
 // Time-fused sLSTM BACKWARD: the whole reverse T-loop in ONE cooperative launch,
 // the mirror of slstm_fused_time.
-//
-// A block owns a contiguous range of hidden units [j0, j0 + NJ). Everything else
-// follows from that range:
-//
-//   * the POINTWISE update of those units is entirely block-local. Thread `p` owns
-//     (batch row b, unit u) for the whole loop, so `dc`/`dn` live in registers and
-//     reach global memory once at each end instead of twice per timestep, and the
-//     `dh` a step consumes is produced by this same block's contraction — it never
-//     leaves shared memory.
-//   * the CONTRACTION dh[j] = sum_c dgates[c] * Wh[j, c] runs over EVERY gate delta
-//     in the grid. That is the one cross-block dependency, and the only reason for a
-//     grid.sync() at all — one per timestep. `g` is the channel: the pointwise phase
-//     writes this step's deltas there for the post-loop dWx/dWh/db GEMMs anyway, and
-//     `g[:, t, :]` is exactly the [B, 4H] vector the contraction wants. No separate
-//     grid-visible scratch, and no write-after-read hazard to rotate buffers around,
-//     because a timestep only ever touches its own slice of it.
-//
-// The contraction is ONE WARP PER (batch row, owned unit), with that unit's whole
-// `Wh` row held across the warp's lanes in REGISTERS — bf16 storage (FlashRNN's
-// `DTYPE_R`, arXiv 2412.07752), fp32 accumulation (their `ACC_DTYPE`), the conversion
-// a register op. Two things follow, and both are the point:
-//
-//   * a row is read once per LAUNCH instead of once per timestep, so `Wh` never
-//     reaches shared memory or HBM inside the loop;
-//   * the reduction is a single shuffle tree whose result lands complete in lane 0 —
-//     no cross-warp fold, and nothing for the pointwise phase to sum. The obvious
-//     alternative, spreading every unit over every thread so each gate delta is read
-//     once, costs `threads * NJ` shuffle steps per timestep against this one's
-//     `threads`; measured at the backbone's shape that reduction alone was a third of
-//     the kernel.
-//
-// SPECIALIZATION: H, B, the units per block and the block width are all compile-time
-// constants (SLSTM_H / SLSTM_B / SLSTM_NJ / SLSTM_TH), which is what lets the `Wh`
-// slice be a register ARRAY — a runtime bound would put it in local memory and give
-// back the whole win. There is deliberately no generic build;
-// `ops::slstm_fused_time_bwd` declines when the specialized one is unavailable and
-// the caller takes the per-step loop. T stays a runtime argument, as it is upstream:
-// it is the outer loop's bound, with a data dependency between iterations, so there
-// is nothing to unroll by it.
 #if defined(SLSTM_H) && defined(SLSTM_B) && defined(SLSTM_NJ) && defined(SLSTM_TH)
 
 #define BW_H4 (4 * SLSTM_H)
@@ -392,10 +251,6 @@ extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
         const int* __restrict__ reset) {
     cg::grid_group grid = cg::this_grid();
 
-    // The block's whole dh vector: written by the contraction's lane 0, read by the
-    // owning thread at the top of the next timestep. Seeded with the gradient arriving
-    // from the chunk to the right (zero for an unchunked sweep), so a timestep reads
-    // dh from exactly one place and the first one needs no special case.
     __shared__ float dh_sh[BW_OWNERS];
 
     const int tid = threadIdx.x;
@@ -403,14 +258,9 @@ extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
     const int warp = tid >> 5;
     const int j0 = blockIdx.x * SLSTM_NJ;
 
-    // Contraction ownership: warp `warp` reduces unit `u_w` for batch rows
-    // `b0_w, b0_w + BW_WPU, ...`.
     const int u_w = warp / BW_WPU;
     const int b0_w = warp - u_w * BW_WPU;
 
-    // Pointwise ownership, fixed for the whole loop. The last block's range runs past
-    // H when NJ does not divide it; those threads sit out and their Wh row below is
-    // zero, so nothing they touch contributes.
     const int b_pw = tid / SLSTM_NJ;
     const int j_pw = j0 + (tid - b_pw * SLSTM_NJ);
     const int k_pw = b_pw * SLSTM_H + j_pw;
@@ -418,9 +268,6 @@ extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
 
     if (owner) dh_sh[tid] = dh_recur[k_pw];
 
-    // This warp's Wh row, spread over its lanes four columns at a time. Columns past
-    // 4H and rows past H are exact zeros, so the reduction has a static trip count and
-    // no tail branch.
     __nv_bfloat162 wr[BW_PASSES][BW_VEC / 2];
     #pragma unroll
     for (int p = 0; p < BW_PASSES; ++p) {
@@ -439,10 +286,6 @@ extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
         dn_reg = dn_recur[k_pw];
     }
 
-    // Everything the pointwise phase reads at a timestep depends on `t` alone, so the
-    // NEXT step's loads are issued before the grid.sync() and land under it and the
-    // contraction. At B = 1 only a handful of lanes are awake in that phase, which is
-    // far too few to hide an HBM round trip any other way.
     float f_dy = 0.0f, f_fpre = 0.0f, f_o = 0.0f, f_c = 0.0f, f_n = 0.0f;
     float f_cp = 0.0f, f_np = 0.0f, f_z = 0.0f, f_i = 0.0f, f_f = 0.0f;
     auto fetch = [&](int t) {
@@ -470,11 +313,7 @@ extern "C" __global__ __launch_bounds__(SLSTM_TH) void slstm_fused_time_bwd(
     __syncthreads(); // dh seeded before the first timestep reads it
 
     for (int t = T - 1; t >= 0; --t) {
-        // Nothing crosses a reset row towards t - 1: its forward read no state and no
-        // recurrent h, so the carried gradients stop here.
         const bool rs = reset != nullptr && reset[t] != 0;
-        // --- pointwise: one thread per (batch row, owned unit) ---
-        // Identical math to slstm_step_fused_bwd; see it for the derivation.
         if (owner) {
             const float d_h = f_dy + dh_sh[tid];
             const float d_o_pre = d_h * (f_c / f_n) * f_o * (1.0f - f_o);

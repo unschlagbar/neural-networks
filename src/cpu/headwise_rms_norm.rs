@@ -1,12 +1,5 @@
 //! Batched head-wise RMSNorm: RMS normalization applied independently to each
 //! head-slice of a `[B, d]` row.
-//!
-//! For each row split into `H` heads of size `dhv = d/H`:
-//!   rms_h = sqrt(mean(x_h²) + ε),  out_h = γ_h ⊙ x_h / rms_h
-//!
-//! `γ` is a learnable per-element scale (`d` elements, init 1). Same math as
-//! `nn::headwise_rms_norm::HeadwiseRMSNorm`, batched over the leading axis and
-//! grouped over heads. (This is `RmsNorm` with an inner per-head group loop.)
 
 use crate::cpu::ops;
 use crate::tensor::Tensor;

@@ -19,12 +19,6 @@ pub fn add_vec_in_place(x: &mut [f32], y: &[f32]) {
 }
 
 /// Dot product with 8 independent accumulator lanes.
-///
-/// A plain `s += a[j] * b[j]` loop is a serial dependency chain that LLVM may
-/// not vectorize (f32 addition is not associative), leaving the loop scalar.
-/// The lane accumulators reassociate the sum explicitly, so the chunk loop
-/// compiles to packed FMA. The result differs from the serial sum only in the
-/// last ulps.
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -37,8 +31,6 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     }
     for (x8, y8) in ca.0.iter().zip(cb.0) {
         for l in 0..8 {
-            // mul_add compiles to a packed FMA under target-cpu=native;
-            // rustc never contracts `a * b + c` on its own.
             acc[l] = x8[l].mul_add(y8[l], acc[l]);
         }
     }
@@ -81,7 +73,6 @@ pub fn matvec_into(w: &Matrix, x: &[f32], out: &mut [f32]) {
 /// before being folded into the grad matrices. Amortizes the grad-matrix
 /// read-modify-write traffic 1/GRAD_BLOCK; any leftover partial block is
 /// flushed at the window-end hooks (accumulate_init_grad / reset_bptt_state)
-/// and defensively before grads are read (apply_grads).
 pub const GRAD_BLOCK: usize = 16;
 
 /// gw += Σ_b xh_b ⊗ d_b over the n pending steps. One gate at a time: the

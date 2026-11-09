@@ -1,48 +1,5 @@
 // Batch-parallel time-fused sLSTM: the whole T-loop in ONE cooperative launch, with
 // the recurrent product `h·Wh` on the bf16 MMA unit.
-//
-// `slstm_fused_time` (slstm_coop.cu) already fuses time, but it contracts with scalar
-// `fmaf` + a warp shuffle, so its cost is LINEAR in the batch: at B=8 it measured 8.9x
-// its B=1 time. That is fine for the backbone (B=1, where the recurrent op is a
-// mat-VEC and tensor cores have nothing to fill) and useless for the encoder and
-// decoder, which call the cell with B = 120..2048 rows of one word each. Those took
-// the per-step path instead — two launches per timestep, ~149 timesteps per layer per
-// window — and sat at 21% GPU occupancy waiting on the driver.
-//
-// This kernel is the other corner: same fusion, but `h·Wh` is
-// `mma.sync.aligned.m16n8k16` over bf16 operands (see mma.cu), so the batch fills the
-// tiles instead of multiplying the work.
-//
-// OWNERSHIP. A block owns SB_NJ hidden units and SB_BR batch rows:
-//
-//   blockIdx.x -> unit range [j0, j0 + SB_NJ), and with it all four gate columns
-//                 j, H+j, 2H+j, 3H+j of every unit in it. That pairing keeps the
-//                 POINTWISE phase block-local, so one grid.sync() per timestep (for
-//                 the new `h`) is the only cross-block traffic.
-//   blockIdx.y -> row range [rowbase, rowbase + SB_BR). Batch rows are completely
-//                 independent — each carries its own h/c/n/m — so this axis needs no
-//                 communication at all; it exists to spread the grid over the device
-//                 and to bound the per-thread state.
-//
-// The two together are what let the state live in REGISTERS across the whole loop:
-// thread `p` owns (row m*16 + p/SB_NJ, unit j0 + p%SB_NJ) for m = 0..SB_RPT, i.e.
-// SB_RPT fixed (row, unit) pairs, and touches global memory once at each end of the
-// loop instead of four loads and four stores per timestep.
-//
-// MMA TILING. Warp `w` owns gate columns [8w, 8w+8) and holds their whole `Wh` slice
-// in REGISTERS as B-fragments — SB_KT k-tiles x 2 registers, read once per LAUNCH
-// rather than once per timestep. `h` is the A operand, staged in shared memory so all
-// warps of the block read one copy; the M axis is the batch, walked SB_RPT tiles of 16
-// rows at a time with the accumulator written straight into `gacc` and consumed by the
-// pointwise phase before the next tile overwrites it. Only 4 accumulator registers are
-// live at once, which is what leaves room for the `Wh` fragments.
-//
-// SPECIALIZATION, as in `slstm_fused_time`: H, the units per block and the rows per
-// thread are compile-time constants, because both register arrays are sized by them.
-// The block width follows from SB_NJ (one warp per 8 gate columns), and T stays a
-// runtime argument — it is the outer loop's bound with a data dependency between
-// iterations, so there is nothing to unroll by it, and the encoder's T varies per word
-// length.
 #if defined(SLSTM_MMA) && defined(SLSTM_H) && defined(SB_NJ) && defined(SB_RPT)
 #include <cooperative_groups.h>
 namespace cg_b = cooperative_groups;
@@ -77,28 +34,9 @@ extern "C" __global__ __launch_bounds__(SB_TH) void slstm_batched_fwd(
     const int j0 = blockIdx.x * SB_NJ;
     const int rowbase = row0 + (int)blockIdx.y * SB_BR;
 
-    // This warp's `Wh` columns, as MMA B-fragments over the whole reduction axis, read
-    // ONCE per launch. The fragment layout wants element (k0 + c [+8] + {0,1}, n0 + g)
-    // of the block's [H, NCOL] slice, and local column `lc` is gate `lc / SB_NJ` of
-    // unit `j0 + lc % SB_NJ` — i.e. global `Wh` column `gate * H + unit`.
-    //
-    // Read through shared memory rather than straight into the fragments: a fragment
-    // walks a COLUMN of `Wh`, whose global stride is 4H floats, so gathering it
-    // directly is one 4-byte transaction per element. Staged a k-tile at a time the
-    // same data arrives as `SB_NJ`-float runs, which coalesce, and the transpose
-    // happens in shared memory where a strided read costs nothing.
     unsigned whb[SB_KT][2];
     const int gq = lane >> 2, cq = (lane & 3) << 1;
     if (!(T == 1 && !carry)) { // a single step from a zero state never reads Wh
-        // Read through shared memory, SB_WSR rows of the slice at a time. Directly into
-        // the fragments would be one 4-byte transaction per element — a fragment walks a
-        // COLUMN of `Wh`, whose global stride is 4H floats — while a row of the slice is
-        // four runs of SB_NJ contiguous floats, which coalesce; the transpose then
-        // happens in shared memory, where a strided read costs nothing.
-        //
-        // In passes rather than all at once because this area is dead the moment the
-        // fragments are built, and sizing the block's whole shared allocation by it
-        // would cost occupancy for the entire T-loop.
         bf16s_t* wst = (bf16s_t*)sb_smem;      // [SB_WSR, SB_NCOL], dead once loaded
         #pragma unroll
         for (int p = 0; p < SB_WPASS; ++p) {
@@ -143,27 +81,12 @@ extern "C" __global__ __launch_bounds__(SB_TH) void slstm_batched_fwd(
         }
     }
 
-    // The bf16 mirror of `h`: TWO [B, H] planes packed into the caller's fp32 [B, H]
-    // scratch, ping-ponged. Two, because a block writes its units of step t while
-    // another may still be reading step t-1 — a cross-block write-after-read that
-    // would otherwise need a second grid.sync() per step.
-    //
-    // Neither plane is initialised. The "next" plane is fully overwritten every step
-    // (the unit axis is partitioned exactly, and rows past B are never read), and step
-    // 0 does not read the "current" one at all — h_{-1} comes from `h_state`, or is
-    // zero when this call starts a sequence.
     bf16s_t* hb_cur = (bf16s_t*)hmir;
     bf16s_t* hb_nxt = hb_cur + (long long)B * SB_H;
 
     for (int t = 0; t < T; ++t) {
-        // This block's rows of h_{t-1}, one copy for all its warps. Rows past B are
-        // zero-filled: they multiply into their own output rows only, which nothing
-        // reads, but a NaN there would still be a NaN in the tile.
         const bool zero_h = t == 0 && !carry;
         if (!zero_h) {
-            // Eight bf16 per access, the widest either global or shared supports. Both
-            // strides are multiples of 8 elements (`SB_LD` is `BF16_LD`, the mirror's is
-            // H), so every one of these is 16-byte aligned.
             #pragma unroll 1
             for (int i = threadIdx.x; i < SB_BR * (SB_H / 8); i += SB_TH) {
                 const int lr = i / (SB_H / 8), r = i - lr * (SB_H / 8);
@@ -173,8 +96,6 @@ extern "C" __global__ __launch_bounds__(SB_TH) void slstm_batched_fwd(
                     if (t > 0) {
                         v = ((const int4*)hb_cur)[(long long)b * (SB_H / 8) + r];
                     } else {
-                        // Step 0 of a carried sweep: h_{-1} is still fp32 in `h_state`,
-                        // narrowed here instead of through a mirror pass of its own.
                         const float4* hp = (const float4*)(h_state + (long long)b * SB_H) + 2 * r;
                         const float4 lo = hp[0], hi = hp[1];
                         v.x = bf16_pair(to_bf16(lo.x), to_bf16(lo.y));
@@ -187,10 +108,6 @@ extern "C" __global__ __launch_bounds__(SB_TH) void slstm_batched_fwd(
             }
         }
 
-        // This step's input half, issued BEFORE the barrier and the contraction: it
-        // depends on `t` alone, so its global latency lands under them instead of in
-        // front of the pointwise phase, which is a chain of dependent loads with only
-        // this block's warps awake to hide it.
         float gz[SB_RPT], gin[SB_RPT], gfo[SB_RPT], gou[SB_RPT];
         #pragma unroll
         for (int m = 0; m < SB_RPT; ++m) {
@@ -208,12 +125,6 @@ extern "C" __global__ __launch_bounds__(SB_TH) void slstm_batched_fwd(
 
         #pragma unroll
         for (int m = 0; m < SB_RPT; ++m) {
-            // gacc[b, col] = sum_r h[b, r] * Wh[r, col], one M-tile of 16 rows. At the
-            // start of an uncarried sweep h_{-1} is zero and so is the whole product —
-            // the same case the per-step loop skips its t=0 GEMM for.
-            // Two accumulators over the even and odd k-tiles: `mma` accumulates in
-            // place, so a single one makes the whole k-loop a dependency chain of its
-            // own latency.
             float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             if (!zero_h) {
                 float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -234,8 +145,6 @@ extern "C" __global__ __launch_bounds__(SB_TH) void slstm_batched_fwd(
             }
             __syncthreads(); // gacc written before the pointwise phase reads it
 
-            // Pointwise recurrence. Identical math to slstm_step_fused; see it for the
-            // stabilizer notes.
             const int b = rowbase + m * 16 + row_l;
             if (b < B) {
                 const long long go = ((long long)b * T + t) * SB_H4 + j_pw;
@@ -258,8 +167,6 @@ extern "C" __global__ __launch_bounds__(SB_TH) void slstm_batched_fwd(
                 const float cc = fp * c_reg[m] + ip * z;
                 const float nn = fp * n_reg[m] + ip;
 
-                // Only the sweep's first predecessor is stored: for t > 0 backward
-                // reads c_out/n_out one timestep back.
                 if (t == 0) {
                     state_st(c_entry, (long long)b * SB_H + j_pw, c_reg[m]);
                     state_st(n_entry, (long long)b * SB_H + j_pw, n_reg[m]);
@@ -278,10 +185,6 @@ extern "C" __global__ __launch_bounds__(SB_TH) void slstm_batched_fwd(
                 hb_nxt[(long long)b * SB_H + j_pw] = to_bf16(h_reg[m]);
                 out[s] = h_reg[m];
             }
-            // gacc consumed before the next M-tile overwrites it. At one tile there is
-            // no next: the grid.sync() below is a block barrier too, and the tile load
-            // that follows it has one of its own, so the write at t+1 is already
-            // ordered after this read.
             if (SB_RPT > 1) {
                 __syncthreads();
             }
@@ -312,31 +215,6 @@ extern "C" __global__ __launch_bounds__(SB_TH) void slstm_batched_fwd(
 
 // Batch-parallel time-fused sLSTM BACKWARD: the whole reverse T-loop in ONE
 // cooperative launch, the mirror of `slstm_batched_fwd`.
-//
-// Same ownership — blockIdx.x picks SB_NJ hidden units, blockIdx.y a range of batch
-// rows — and the same reason for it: the POINTWISE update of those units is entirely
-// block-local, so `dc`/`dn` live in registers for the whole loop, while the
-// CONTRACTION `dh[b,j] = sum_c dg[b,c] * Wh[j,c]` runs over every gate delta in the
-// grid and is the one cross-block dependency, hence one grid.sync() per timestep.
-//
-// The contraction is the transposed shape of the forward's: the reduction axis is 4H
-// rather than H, and the output is H rather than 4H. Two things follow.
-//
-//   * `Wh` is FOUR times bigger along the reduction, so a warp cannot hold its units'
-//     whole slice in registers (8 units x 4H would be H/2 = 128 registers at H=256).
-//     The warps therefore split the reduction SBB_WK ways as well as the unit axis,
-//     which brings a warp's slice back to H/8 registers, and their partial sums are
-//     folded through shared memory once per timestep.
-//   * `dg` — the A operand — is the big one now ([B, 4H] against the forward's
-//     [B, H]), so it is staged in shared memory a k-chunk at a time and read once per
-//     block instead of once per warp. The chunk count is SB_RPT and the chunk width
-//     4H/SB_RPT, which keeps the tile the same size at every `rpt`.
-//
-// `dg` reaches the contraction through a bf16 mirror rather than through `g` itself:
-// `g` must keep the deltas at fp32 for the post-loop dWx/dWh/db GEMMs, and feeding the
-// mma unit from it would double the operand traffic and convert 4H values per row per
-// timestep on the way in. The mirror is ping-ponged for the same reason the forward's
-// `h` mirror is — a block writing step t-1 must not overtake one still reading step t.
 #ifdef SB_WSC
 
 #define SBB_H4     (4 * SB_H)
@@ -378,16 +256,8 @@ extern "C" __global__ __launch_bounds__(SBB_TH, SB_RPT == 1 ? 2 : 1) void slstm_
     const int rowbase = row0 + (int)blockIdx.y * SBB_BR;
     const int gq = lane >> 2, cq = (lane & 3) << 1;
 
-    // This warp's slice of `Whᵀ` as MMA B-fragments: B[k=c][n=j] is `wh[j*4H + c]`,
-    // i.e. the block's units are whole ROWS of `Wh`. Staged through shared memory (a
-    // row is contiguous, so the read coalesces) and then transposed into fragments.
     unsigned whb[SBB_KTOT][2];
     {
-        // SB_WSC reduction columns at a time, for the same reason the forward stages
-        // in passes: the area is dead once the fragments are built. A warp's k-tiles
-        // depend on `wk`, so which pass holds one is a runtime test — but it is
-        // warp-uniform, and the fragment it writes is still a compile-time index into
-        // the register array.
         bf16s_t* wst = (bf16s_t*)sb_smem; // [SB_NJ, SB_WSC], dead once loaded
         #pragma unroll
         for (int p = 0; p < SBB_WPASS; ++p) {
@@ -425,8 +295,6 @@ extern "C" __global__ __launch_bounds__(SBB_TH, SB_RPT == 1 ? 2 : 1) void slstm_
     for (int m = 0; m < SB_RPT; ++m) {
         const int b = rowbase + m * 16 + row_l;
         dc_reg[m] = dn_reg[m] = 0.0f;
-        // Seeded with what the chunk to the right carried back (zero for an unchunked
-        // sweep), so a timestep reads `dh` from exactly one place.
         dh_sh[m * 16 * SB_NJ + threadIdx.x] = 0.0f;
         if (b < B) {
             const long long k = (long long)b * SB_H + j_pw;
@@ -488,9 +356,6 @@ extern "C" __global__ __launch_bounds__(SBB_TH, SB_RPT == 1 ? 2 : 1) void slstm_
         }
         grid.sync(); // this step's gate deltas visible in the mirror across the grid
 
-        // Contraction: dh[b, j] = sum_c dg[b, c] * Wh[j, c], a chunk of `c` at a time.
-        // Fully unrolled: `whb` is a register array, and a chunk index the compiler
-        // cannot resolve would put it in local memory.
         float acc[SB_RPT][4] = {};
         #pragma unroll
         for (int ch = 0; ch < SB_RPT; ++ch) {
@@ -514,8 +379,6 @@ extern "C" __global__ __launch_bounds__(SBB_TH, SB_RPT == 1 ? 2 : 1) void slstm_
                 }
             }
         }
-        // Fold the SBB_WK partial reductions. One thread per (row, unit) out, which is
-        // exactly the pointwise map, so the next timestep reads `dh` where it expects.
         __syncthreads();
         #pragma unroll
         for (int m = 0; m < SB_RPT; ++m) {

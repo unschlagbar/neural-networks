@@ -130,15 +130,8 @@ impl SiluDenseLayer {
         }
     }
 
-    /// Backward.
-    ///
-    /// `delta` (dL/d output) wird in-place mit silu'(z) multipliziert:
+    /// `delta` (dL/d output) is multiplied in place by silu'(z):
     ///     silu'(z) = σ(z) · (1 + z · (1 − σ(z)))
-    ///
-    /// Then:
-    ///     grads.W += x · deltaᵀ
-    ///     grads.b += delta
-    ///     cache.dx = Wᵀ · delta
     pub fn backward(&mut self, delta: &mut [f32], cache: &mut SiluDenseCache) {
         for (d, &z) in delta.iter_mut().zip(cache.pre_activation.iter()) {
             let s = sigmoid(z);

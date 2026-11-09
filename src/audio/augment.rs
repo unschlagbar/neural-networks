@@ -2,9 +2,6 @@
 //! microphone coloration and distance. Rooms and coloration follow the wake
 //! word's augmentation in `smart-light`; convolution runs through the FFT, since
 //! a speech utterance is seconds long.
-//!
-//! Nothing here normalizes loudness: the level a word arrives at is part of how
-//! it was said.
 
 use std::f32::consts::{LN_10, PI};
 use std::path::Path;

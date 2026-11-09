@@ -1,7 +1,5 @@
 //! Window shape of a corpus after packing: how full the windows are, how many
 //! documents share one, and how much of the corpus the border masks drop.
-//!
-//! `cargo run --release --example win_carry_stats -- <shard> [chunks]`
 
 use neural_networks::{
     batches::ChunkedWordDataSet,
@@ -25,9 +23,6 @@ fn main() {
 
     let (mut n, mut cont, mut words, mut toks, mut borders) = (0usize, 0usize, 0usize, 0usize, 0);
     let mut short = 0usize;
-    // Tokens per window: the shape the caches are sized to, and the only axis packing
-    // does *not* make constant — a window is K words, and a word is 1 to
-    // `MAX_WORD_BYTES` tokens.
     let mut tok_per_win: Vec<usize> = Vec::new();
     // Document pieces per window — a window inside one long document holds one.
     let mut docs_hist = [0usize; 10];
@@ -42,8 +37,6 @@ fn main() {
             toks += b.tokens.len();
             tok_per_win.push(b.tokens.len());
             short += usize::from(k < WORDS_PER_SEQ);
-            // Word 0 is not a border inside the window — it is where the state starts —
-            // and the trailing offset is the document after this window.
             let cuts = b.doc_starts.iter().filter(|&&d| d > 0 && d < k).count();
             borders += cuts;
             docs_hist[(cuts + 1).min(9)] += 1;

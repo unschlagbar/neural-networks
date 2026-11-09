@@ -1,50 +1,9 @@
 //! Layer-owned device buffers: allocate once, reuse forever.
-//!
-//! Every GPU layer used to return its output as a freshly allocated `GTensor<f32>`,
-//! so a training step allocated and freed hundreds of device buffers — one per
-//! op, per layer, per window. cudarc routes those through `cuMemAllocAsync` on a
-//! memory pool, so each one is cheap in isolation, but they are not free: they
-//! cost host time on the critical path (the backbone is launch-bound, see
-//! `gpu::slstm::fwd_loop`), they make device memory-in-use drift upward across
-//! windows as the pool retains freed blocks, and — the part that has actually
-//! caused bugs — they mean a buffer's device address changes from call to call.
-//!
-//! A [`Buf`] is a slot a layer owns for the whole of its life. [`Buf::get`] hands
-//! back the existing allocation whenever the requested shape matches, and only
-//! reallocates when it does not. In steady state (the same shapes recurring, as
-//! in a training loop) it never allocates at all.
-//!
-//! # Why reuse matters
-//!
-//! A step issues thousands of ops, and a layer that returns a fresh tensor per call
-//! puts an allocate/free pair on the hot path for each of them. `gpu::slstm` grew a
-//! private `take_uninit` for its own buffers first; `Buf` is that mechanism,
-//! generalized so every layer gets it.
-//!
-//! # Contract
-//!
-//! [`Buf::get`] returns **uninitialised** memory when it reallocates and **stale**
-//! memory (the previous call's contents) when it reuses. Callers must fully
-//! overwrite it before reading — which is what an op that writes its whole output
-//! does anyway. Use [`Buf::get_zeroed`] when the buffer is accumulated into rather
-//! than overwritten.
 
 use super::{GTensor, Gpu, ops};
 
 /// How much larger than the request a retained allocation may be before it is
 /// dropped and replaced with a right-sized one.
-///
-/// Reuse-if-it-fits alone makes every slot ratchet to the largest window ever seen:
-/// real windows vary (`MIN_WORDS_PER_SEQ`..`WORDS_PER_SEQ`, and one encoder/decoder
-/// rectangle per word-length bucket), so a single unusually large window permanently
-/// inflates every buffer behind it. Measured on the real `hg` path at
-/// `WORDS_PER_SEQ = 2048`: device memory sat flat for many windows, then one larger
-/// window walked it from 14.2 GB to 16.5 GB and aborted.
-///
-/// 4x is deliberately loose. The point is to cap the ratchet, not to chase an exact
-/// fit — reallocating whenever a window is merely a bit smaller would put the
-/// allocator back on the hot path, which is what `Buf` exists to avoid. At 4x a slot
-/// still absorbs the ordinary window-to-window spread without a single free.
 const RETAIN_SLACK: usize = 4;
 
 /// Whether an existing `capacity` should be kept for a request of `want` elements.
@@ -55,26 +14,8 @@ pub(super) fn fits(capacity: usize, want: usize) -> bool {
 
 /// Round an allocation up to a **size class**, so near-identical shapes share one
 /// buffer instead of each pinning its own.
-///
-/// `RETAIN_SLACK` alone bounds how oversized any single reuse may be, but it does not
-/// bound *how many distinct sizes* the free list accumulates — and that is the leak
-/// that actually aborts a run. Real windows vary continuously (word count, and one
-/// encoder/decoder rectangle per length bucket: 14-16 buckets per window measured on
-/// the real `hg` path), so essentially every window asks for a handful of sizes no
-/// previous window used. Each is individually within slack of something, so `trim`
-/// keeps it, and the free list grows without bound: measured over 40 varying windows
-/// it went 60 distinct sizes / 182 buffers -> 238 / 542, and device memory climbed
-/// 7571 MB -> 10307 MB in lockstep. Real training showed the same shape, 12.9 -> 16.4
-/// GB, and then OOMed.
-///
-/// Quantizing collapses that. `1/16`-granular classes (mantissa rounded up within
-/// each power of two) waste at most 6.25% per buffer and reduce the reachable size
-/// count to ~16 per octave — a constant, independent of how many distinct shapes the
-/// corpus produces.
 #[inline]
 pub(super) fn size_class(n: usize) -> usize {
-    // Small allocations are left exact: the waste would be proportionally large and
-    // there are few enough distinct small sizes for them not to be the problem.
     const MIN_CLASS: usize = 1024;
     if n <= MIN_CLASS {
         return n;
@@ -87,10 +28,6 @@ pub(super) fn size_class(n: usize) -> usize {
 
 /// A device buffer owned by a layer across calls, resized only when the shape
 /// it is asked for changes.
-///
-/// Starts empty; the first [`get`](Self::get) allocates. Holding this rather than
-/// returning fresh tensors keeps the allocator off the hot path and, as a side
-/// effect, a layer's output address stable across calls.
 #[derive(Default)]
 pub struct Buf {
     slot: Option<GTensor<f32>>,
@@ -104,37 +41,16 @@ impl Buf {
 
     /// Device bytes this slot is holding. Diagnostic — see
     /// [`Hierarchical::retained_report`](crate::gpu::hierarchical::Hierarchical::retained_report).
-    ///
-    /// Counts **capacity**, not the shape the buffer was last used at: reuse here is
-    /// by capacity, so the allocation is what occupies memory.
     pub fn retained_bytes(&self) -> usize {
         self.slot.as_ref().map_or(0, |t| t.capacity() * 4)
     }
 
     /// The buffer, shaped `dims` — reusing the existing allocation when it
     /// already has that shape, else allocating a fresh (uninitialised) one.
-    ///
-    /// The contents are **not** cleared: on reuse they are the previous call's
-    /// data, on reallocation they are uninitialised. The caller must write every
-    /// element it later reads. For an accumulator, use
-    /// [`get_zeroed`](Self::get_zeroed).
-    /// Reuse is by **element count**, not by exact shape: a buffer already holding
-    /// the right number of elements is reshaped in place (metadata only) rather
-    /// than reallocated. That is what lets one owned buffer serve both the
-    /// `[B, T, H]` and `[N, H]` views of the same activations without a copy.
     pub fn get(&mut self, gpu: &Gpu, dims: &[usize]) -> &mut GTensor<f32> {
         let n: usize = dims.iter().product();
         match &mut self.slot {
-            // Reuse whenever the allocation is big enough, presenting it at the
-            // asked-for shape. Requiring an exact match would reallocate on every
-            // shape change, which for a varying window size is every call.
-            //
-            // But only while it is not *wildly* too big — see `RETAIN_SLACK`. A slot
-            // that keeps every allocation it has ever been big enough for ratchets to
-            // the largest window in the corpus and stays there.
             Some(t) if fits(t.capacity(), n) => t.shrink_to(dims),
-            // Allocate at the size class so the next window's slightly-different shape
-            // reuses this allocation instead of replacing it. See `size_class`.
             _ => {
                 let mut t = GTensor::uninit(gpu, &[size_class(n)]);
                 t.shrink_to(dims);
@@ -169,8 +85,6 @@ impl Buf {
     pub fn copy_of(&mut self, gpu: &Gpu, src: &GTensor<f32>) -> &mut GTensor<f32> {
         let n = src.len();
         let dst = self.get(gpu, src.dims());
-        // Slice both sides to the shape: either may be a pooled buffer with slack
-        // beyond it, and `memcpy_dtod` requires the two lengths to agree.
         gpu.stream
             .memcpy_dtod(&src.buf.slice(..n), &mut dst.buf.slice_mut(..n))
             .expect("Buf::copy_of");
@@ -189,11 +103,6 @@ impl Buf {
     }
 
     /// Move the tensor out of this slot, leaving it empty.
-    ///
-    /// For a caller that needs to *own* the buffer for a while — typically because it
-    /// must be borrowed alongside other fields of the same struct, which a borrow of
-    /// the whole slot would prevent. Pair with [`put`](Self::put) to give it back and
-    /// keep the allocation for the next call.
     pub fn take(&mut self) -> Option<GTensor<f32>> {
         self.slot.take()
     }
@@ -212,12 +121,6 @@ impl Buf {
 
 /// A [`Buf`] whose tensor is stored at the slab width — bf16 where the kernels were
 /// built for it, fp32 otherwise.
-///
-/// Same contract as `Buf` (persist across calls, reuse by capacity, allocate at a size
-/// class), for a value whose every reader takes it narrow. `norm2_out` in a `Block` is the
-/// case that motivated it: its norm writes it, two GEMMs and that norm's own backward
-/// read it, and all four are happy with bf16 — so materializing it fp32 only to narrow
-/// it again was a full extra pass over the tensor per reader.
 #[derive(Default)]
 pub struct SlabSlot {
     slot: Option<ops::SlabBuf>,
@@ -295,9 +198,6 @@ mod tests {
 
         // A different shape must reallocate (the old buffer is the wrong size)...
         addr(&mut buf, &[4, 9]);
-        // ...and coming back to the original shape is a fresh allocation too: the
-        // slot only ever holds one buffer. What matters is that a STEADY shape is
-        // stable, which is the case a training loop actually hits.
         let p4 = addr(&mut buf, &[4, 8]);
         let p5 = addr(&mut buf, &[4, 8]);
         assert_eq!(p4, p5, "shape is steady again, so the address must be too");

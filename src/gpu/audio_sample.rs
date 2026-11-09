@@ -2,14 +2,6 @@
 //! encoder of `<model>.ae2`, its word embeddings step the text model's backbone
 //! in place of the text encoder's, and the model writes on from there. The text
 //! model samples on the CPU, so this runs beside a training job.
-//!
-//! A LibriSpeech id runs three ways — MFA's word boundaries, boundaries aligned
-//! to the transcript, the boundary head alone — next to the text model reading
-//! the transcript itself. Any other WAV/FLAC runs on the boundary head, or
-//! aligned to a transcript given after `|`.
-//!
-//! [`AudioEncoder::hear`] and the calls after it are the same path for any
-//! other front end, e.g. a live microphone.
 
 use std::io::{Write, stdin, stdout};
 use std::path::PathBuf;

@@ -21,13 +21,6 @@ pub trait DynCache: Send + Sync {
 }
 
 /// Unified trait for all layer types.
-///
-/// Caches are type-erased (`dyn DynCache`) but each layer impl downcasts to its
-/// own concrete type, so there is no runtime overhead beyond one virtual dispatch.
-///
-/// Gradient accumulators live *inside* the layer (not in `Sequential`), which:
-///   • halves the number of parallel `Vec`s in `Sequential`,
-///   • keeps related data (weights + their grads) physically adjacent in memory.
 pub trait Dyn: 'static {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
@@ -49,11 +42,6 @@ pub trait NnLayer: Dyn + Send + Sync {
     }
 
     /// Backward for one timestep.
-    ///
-    /// `delta` (dL/d output) is modified in-place and the caller should discard it
-    /// afterwards — use `cache.input_grad()` for the gradient flowing to the layer below.
-    ///
-    /// For LSTM layers `bptt_hidden_grad()` is updated as a side-effect.
     fn backward(&mut self, delta: &mut [f32], cache: &mut dyn DynCache);
 
     fn layer_tag(&self) -> u8;

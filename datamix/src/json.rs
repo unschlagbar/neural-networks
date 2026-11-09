@@ -47,8 +47,6 @@ pub fn decode(rest: &str) -> Option<String> {
                 'u' => {
                     let hex: String = (0..4).filter_map(|_| it.next()).collect();
                     let cp = u32::from_str_radix(&hex, 16).ok()?;
-                    // A surrogate half on its own is not a char; the pair form
-                    // does not appear in the responses we read.
                     out.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
                 }
                 other => out.push(other),

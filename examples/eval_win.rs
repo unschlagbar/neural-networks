@@ -1,10 +1,5 @@
 //! Forward-only evaluation against a full training window, at config.rs shapes:
 //! what `hvg` (`Hierarchical::eval_loss`) saves over a training step.
-//!
-//!   cargo run --release --features cuda --example eval_win [words] [iters]
-//!
-//! The two are interleaved rather than run in blocks — the SM clock drifts far
-//! enough over a run to swamp the effect if they are not.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {

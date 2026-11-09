@@ -1,10 +1,4 @@
 //! CPU inference for the hierarchical model, loaded from a v2 checkpoint.
-//!
-//! Weights only, no gradients or optimizer state, kept in the checkpoint's own
-//! (GPU) layouts: the mLSTM's fused `q‖k‖v‖o` and `i‖f` projections with 1/√dqk
-//! already folded into `k`, the sLSTM's gate-concatenated `wx`/`whr`/`bcat`.
-//! Everything runs one step at a time: the backbone carries its state across
-//! words, the encoder and the decoder restart per word.
 
 use std::io;
 
@@ -79,8 +73,6 @@ fn matmul(x: &[f32], rows: usize, w: &[f32], k: usize, n: usize, y: &mut [f32]) 
     if k * n < PAR_MIN {
         gemm_nn(rows, k, n, x, w, y, 0.0);
     } else if rows == 1 {
-        // Each task streams a contiguous slab of W's rows into a partial sum:
-        // the product is bandwidth-bound and this reads W strictly in order.
         let per = k.div_ceil(rayon::current_num_threads()).max(SLAB_MIN);
         let partial = x
             .par_chunks(per)
@@ -681,7 +673,6 @@ impl Hierarchical {
     /// Generate one reply from what the backbone has read, until `<END>`. The
     /// reply's words are encoded as the model closes them with `[W]`, and the
     /// closing `<END>` too, so the state afterwards has read the whole exchange.
-    /// Between `<tool>` and `</tool>` it samples at `tool_temperature`.
     pub fn continue_chat(
         &mut self,
         max_len: usize,

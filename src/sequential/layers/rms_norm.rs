@@ -1,26 +1,4 @@
 // norm.rs — RMSNorm-Wrapper with pre-norm residual connection
-//
-// Architecture (per timestep):
-//
-//   x ──┬── RMSNorm ──► gamma·x̂ ──► inner layer ──► y ──┬──► output
-//       └──────────────────────────────────────────────┘  (residual: y + x)
-//
-// Why RMSNorm instead of LayerNorm:
-//   • No mean subtraction  → one fewer pass over the vector
-//   • No beta parameter    → fewer parameters, slightly less overfitting risk
-//   • Empirically matches LayerNorm quality on LM tasks (Zhang & Sennrich 2019)
-//
-// Residual constraint: inner.input_size() == inner.output_size() (asserted in new()).
-// The residual stabilises deep recurrent stacks and provides a free gradient highway.
-//
-// Save format (tag 8):
-//   gamma        [f32 × norm_size]   (length-prefixed via write_f32_slice)
-//   inner_tag    u8
-//   inner_input  u32
-//   inner_output u32
-//   inner data   <layer-specific>
-//
-// NOTE: beta is gone — old checkpoints using LayerNorm (with beta) are incompatible.
 
 use std::{any::Any, io};
 
@@ -79,9 +57,6 @@ impl RMSNorm {
         }
     }
 
-    //   rms    = sqrt( mean(x²) + ε )
-    //   x̂[i]  = x[i] / rms
-    //   out[i] = gamma[i] · x̂[i]
 
     #[inline]
     fn rms_norm(
@@ -122,10 +97,6 @@ impl RMSNorm {
     }
 
     /// Forward mit konkretem Cache — kein dyn-Overhead.
-    ///
-    ///   rms    = sqrt( mean(x²) + ε )
-    ///   x̂[i]  = x[i] / rms
-    ///   out[i] = gamma[i] · x̂[i]   → cache.output
     pub fn forward_into(&mut self, input: &[f32], cache: &mut RMSNormCache) {
         cache.input.copy_from_slice(input);
         Self::rms_norm(
@@ -139,13 +110,6 @@ impl RMSNorm {
     }
 
     /// Backward mit konkretem Cache.
-    ///
-    /// `delta` = dL/d(output). Schreibt dL/d(input) nach `cache.dx`.
-    /// Akkumuliert `grads_gamma` wie gewohnt.
-    ///
-    /// Jacobian (RMSNorm ohne Bias):
-    ///   S          = Σⱼ gamma[j] · delta[j] · x̂[j]
-    ///   dx[i]      = inv_rms · ( gamma[i]·delta[i] − x̂[i]·S/n )
     pub fn backward_into(&mut self, delta: &[f32], cache: &mut RMSNormCache) {
         let n = self.norm_size;
         let irms = cache.inv_rms;

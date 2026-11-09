@@ -2,28 +2,6 @@
 // unit. Compiled whenever some consumer asks for them (MMA_TF32 for the fused
 // mLSTM, SLSTM_MMA for the batched sLSTM); `mma.sync` does not exist at NVRTC's
 // default target, so a build that wants neither must not see this at all.
-//
-// Every contraction in the reference (nx-ai/mlstm_kernels) is a `tl.dot` on DTYPE =
-// bf16 tensors. Below is that same `dot`, written out as the PTX Triton would emit:
-// `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`, where a whole WARP
-// cooperates to compute D(16x8) += A(16x16)·B(16x8) with bf16 operands and a full
-// fp32 accumulator.
-//
-// bf16 rather than the TF32 unit (m16n8k8) these kernels used to contract on: q, k,
-// v and ỹ are bf16 in memory already, so rounding them to TF32 is a no-op that costs
-// a `cvt` per element and half the contraction depth, and every fp32 intermediate
-// either feeds a dot whose other operand is bf16 anyway or is a gradient, where the
-// mantissa the accumulator keeps is what matters. Halving the operand width also
-// halves the staging tiles, which is what buys the occupancy back.
-//
-// A warp's 32 lanes each hold a fixed slice of every fragment. With
-//   g = lane / 4   (the "group")      c = lane % 4   (the index within it)
-// the layouts the instruction requires are:
-//   A (16x16, row): register i holds the PAIR (g[+8], 2c[+8]) and its k+1 neighbour
-//   B (16x8, col):  b0 = (2c, g)   b1 = (2c+8, g)          [(row=k, col=n)]
-//   D (16x8):       d0=(g, 2c)  d1=(g, 2c+1)  d2=(g+8, 2c)  d3=(g+8, 2c+1)
-// The `ldb_*` helpers below are just those tables, applied to a shared-memory tile.
-// Nothing here is allowed to diverge inside a warp — `mma.sync` is warp-wide.
 #if MMA_TF32 || defined(SLSTM_MMA)
 
 typedef unsigned short bf16s_t;
@@ -102,11 +80,6 @@ __device__ __forceinline__ void ldb_b_kn(unsigned* b, const bf16s_t* s, int ld, 
 // `ldb_a_mk`: `ldmatrix` gathers the four 8x8 sub-matrices an A fragment is made of and
 // distributes them across the warp in exactly the layout `mma.sync` wants, so a lane
 // supplies one row address instead of issuing four loads and assembling the pairs.
-//
-// The four sub-matrices are (rows 0-7, k 0-7), (rows 8-15, k 0-7), (rows 0-7, k 8-15),
-// (rows 8-15, k 8-15) — matrix `lane / 8`, its row `lane % 8`. Every address must be
-// 16-byte aligned, which `BF16_LD` gives (its stride is a multiple of 8 elements) as
-// long as `k0` is too.
 __device__ __forceinline__ void ldm_a_mk(unsigned* a, const bf16s_t* s, int ld, int m0, int k0) {
     const int lane = threadIdx.x & 31;
     const int row = m0 + (lane & 7) + ((lane >> 3) & 1) * 8;

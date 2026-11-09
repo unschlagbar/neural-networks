@@ -1,21 +1,5 @@
 //! The hierarchical (HAT-style) model on the CPU, read from and written to v2
 //! checkpoints (`crate::checkpoint`).
-//!
-//! Three stages over a window of words, phase by phase:
-//!   1. encoder  — per word, the tied char table and the encoder blocks over its
-//!                 chars plus a closing `[W]`; `e_w` is the output at `[W]`.
-//!   2. backbone — `Linear → blocks → Linear` over the `e_w` as one sequence; its
-//!                 output for word w is the context that decodes word w+1.
-//!   3. decoder  — per word, step 0 is that context and step k the tied embedding
-//!                 of char k−1; `blocks → RMSNorm → head → SoftCap` predicts the
-//!                 chars plus `[W]`.
-//!
-//! The encoder and decoder run per group of equal-length words, so nothing is
-//! padded, and at most `GROUP_MAX_ROWS` rows at once: the decoder goes forward and
-//! straight back per group, and the encoder runs again in backward instead of
-//! keeping every group's activations. The masking is `gpu::Hierarchical`'s: an
-//! SFT per-word loss mask, and at a document border the backbone restarts and the
-//! two words there carry no loss.
 
 use std::{io, mem, range::Range};
 
@@ -224,8 +208,6 @@ impl Hierarchical {
 
         let mut mask = word_loss.map_or_else(|| vec![true; dw], <[bool]>::to_vec);
         assert_eq!(mask.len(), dw, "one loss flag per decoded word");
-        // Word w decodes word w+1: at a document starting at word d, `mask[d-1]`
-        // is the document's first word and `mask[d-2]` the `<END>` before it.
         for &d in &doc_starts {
             for i in [d.checked_sub(1), d.checked_sub(2)].into_iter().flatten() {
                 if i < dw {

@@ -63,9 +63,6 @@ pub struct LinearLayer {
     /// Gradient accumulators — cleared per batch, applied in `sgd_step`.
     pub grads: LinearGrads,
 
-    // Deferred weight-gradient accumulation (see slstm.rs): backward stashes
-    // (input, delta) per step; blocks are folded into `grads.weights` every
-    // GRAD_BLOCK steps and before any read of the grads.
     pend_len: usize,
     pend_x: Box<[f32]>, // GRAD_BLOCK × input
     pend_d: Box<[f32]>, // GRAD_BLOCK × output
@@ -122,26 +119,15 @@ impl LinearLayer {
     }
 
     /// Backward.
-    ///
-    /// `delta` (dL/d output) is modified in-place:
-    ///   - Non-softmax: element-wise multiplied by the activation derivative.
-    ///   - Softmax output layer: caller passes the fused cross-entropy gradient ŷ−y.
-    ///
-    /// `cache.dx` ← dL/d(input) = Wᵀ · delta.
     pub fn backward(&mut self, delta: &mut [f32], cache: &mut LinearCache) {
         add_vec_in_place(self.grads.biases.vec(), delta);
 
-        // Defer the weight-grad outer product: stash (input, delta) and fold
-        // blocks in flush_grads, so gW is streamed once per block instead of
-        // read-modified-written every step.
         let (r, c) = (self.weights.rows(), self.weights.cols());
         let slot = self.pend_len;
         self.pend_x[slot * r..(slot + 1) * r].copy_from_slice(&cache.input);
         self.pend_d[slot * c..(slot + 1) * c].copy_from_slice(delta);
         self.pend_len += 1;
 
-        // Lane-accumulated dot per weight row — a serial `*dx +=` chain
-        // would keep this loop scalar (f32 adds don't reassociate).
         for (i, dx) in cache.dx.iter_mut().enumerate() {
             *dx = dot(delta, &self.weights[i]);
         }
@@ -222,9 +208,6 @@ impl NnLayer for LinearLayer {
         self.grads.biases.apply_to(&mut self.biases, lr);
     }
 
-    // Window seams — fold any partial pending block so callers (drivers,
-    // tests, diagnostics) that read `grads` after a backward window see the
-    // materialized values.
     fn accumulate_init_grad(&mut self) {
         self.flush_grads();
     }
