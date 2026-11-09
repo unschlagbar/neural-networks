@@ -1,4 +1,4 @@
-// mLSTM parallel/chunkwise core (nn2/mlstm.rs), op-at-a-time: head gather/scatter,
+// mLSTM parallel/chunkwise core (cpu/mlstm.rs), op-at-a-time: head gather/scatter,
 // the gate scans, the chunk A/B terms and their backward twins. One launch per op —
 // the reference the fused TFLA kernels in mlstm_fused.cu are checked against.
 

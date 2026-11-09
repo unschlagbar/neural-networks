@@ -447,7 +447,7 @@ __device__ __forceinline__ float clip_grad(float g, float clip) {
 // is measured against.
 //
 // `clip` bounds every gradient element to [-clip, clip] before it enters the moments,
-// matching `nn2::optim`; a non-finite `clip` disables it.
+// matching `cpu::optim`; a non-finite `clip` disables it.
 extern "C" __global__ void adamw(float* param, const float* grad, float* m, float* v,
                                  float lr, float b1, float b2, float eps, float wd,
                                  float bc1, float bc2, float clip, int n) {
@@ -659,7 +659,7 @@ extern "C" __global__ void adamw_arena_q8(float* param, const float* grad,
 
 // sLSTM cell (recurrent core)
 // Numerically-stable sigmoid / log-sigmoid, matching the CPU helpers in
-// nn2/slstm.rs (branch on the sign to avoid overflow of exp).
+// cpu/slstm.rs (branch on the sign to avoid overflow of exp).
 __device__ __forceinline__ float stable_sigmoid(float x) {
     if (x >= 0.0f) { return 1.0f / (1.0f + expf(-x)); }
     float e = expf(x);
@@ -702,7 +702,7 @@ extern "C" __global__ void split_dxh(const float* dxh, float* dx, float* dh_bptt
     }
 }
 
-// Elementwise sLSTM recurrence over B*H (nn2/slstm.rs lines 241-271). Reads the
+// Elementwise sLSTM recurrence over B*H (cpu/slstm.rs lines 241-271). Reads the
 // four gate pre-activations and the running (c,n,m) state; writes the advanced
 // (c,n,m,h) state, the per-step saved tensors for backward, and out[:,t,:].
 // c_state/n_state are read (previous) then overwritten; the previous values are
@@ -746,7 +746,7 @@ extern "C" __global__ void slstm_cell_step(
     out[(b * T + t) * H + j] = hh;
 }
 
-// Backward of slstm_cell_step (nn2/slstm.rs lines 321-353). Produces the four
+// Backward of slstm_cell_step (cpu/slstm.rs lines 321-353). Produces the four
 // gate deltas (dz,di,df,dob) and carries the BPTT channels dc_bptt/dn_bptt back
 // one step (read = incoming from the later step, write = outgoing to the earlier
 // step). dh_bptt (incoming) is read here; it is rewritten by split_dxh afterward.

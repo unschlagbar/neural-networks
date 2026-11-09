@@ -33,7 +33,6 @@ pub mod kernels;
 pub mod linear;
 pub mod lm;
 pub mod mlstm;
-pub mod nn_convert;
 pub mod offload;
 pub mod ops;
 pub mod profile;
@@ -43,20 +42,6 @@ pub mod temp;
 pub mod train;
 pub mod word_groups;
 
-/// Hand freed heap back to the OS. A checkpoint round-trips the model through the
-/// CPU layers in allocations glibc keeps after they are freed, so without this a
-/// save leaves gigabytes resident (and later in swap) for the rest of the run.
-pub(crate) fn trim_heap() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
-        unsafe extern "C" {
-            fn malloc_trim(pad: usize) -> i32;
-        }
-        // SAFETY: glibc's malloc_trim has no preconditions.
-        unsafe { malloc_trim(0) };
-    }
-}
-
 pub use arena::{ParamArena, ParamKind, ParamSlot};
 pub use bf16::Slab;
 pub use buf::{Buf, SlabSlot};
@@ -64,32 +49,6 @@ pub use gtensor::GTensor;
 use kernels::Kernels;
 pub use offload::{Frame, FrameStack};
 pub use temp::{Temp, TempCache};
-
-use iron_oxide::collections::Matrix;
-
-/// Download a 2-D device tensor into an `iron_oxide` `Matrix` (row-major), used
-/// when exporting device weights into the CPU `nn` layer format for `HIER`.
-pub(crate) fn dt_matrix(gpu: &Gpu, t: &GTensor<f32>) -> Matrix {
-    let h = t.to_host(gpu);
-    let (rows, cols) = (h.dims()[0], h.dims()[1]);
-    Matrix::from_vec(h.data, rows, cols)
-}
-
-/// Download a 1-D device tensor into a boxed slice.
-pub(crate) fn dt_vec(gpu: &Gpu, t: &GTensor<f32>) -> Box<[f32]> {
-    t.to_host(gpu).data.into_boxed_slice()
-}
-
-/// Host `Matrix` → `Tensor` (2-D, row-major), for uploading `nn` weights back to
-/// the device when importing a `HIER` checkpoint.
-pub(crate) fn tensor_from_matrix(m: &Matrix) -> crate::tensor::Tensor {
-    crate::tensor::Tensor::new(&[m.rows(), m.cols()], m.as_slice().to_vec())
-}
-
-/// Host slice → 1-D `Tensor`.
-pub(crate) fn tensor_from_slice(s: &[f32]) -> crate::tensor::Tensor {
-    crate::tensor::Tensor::new(&[s.len()], s.to_vec())
-}
 
 /// Whether host waits park the thread instead of spinning. On unless
 /// `GPU_SPIN_SYNC` is set, which restores the driver's default busy-wait.

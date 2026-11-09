@@ -48,9 +48,8 @@ use crate::config::{
     AUDIO_BLOCKS, AUDIO_DQK, AUDIO_FEATS, AUDIO_HEADS, AUDIO_HIDDEN, AUDIO_SEG_MAX_FRAMES, AUDIO_SEG_MAX_ROWS,
     AUDIO_SEG_STACK, AUDIO_STACK, AUDIO_STRIDE, BOUNDARY_DELAY, CTC_PER_FRAME, up_of,
 };
-use crate::loading::{read_f32_vec, read_u32, read_u64};
-use crate::nn2::optim::AdamCfg;
-use crate::saving::{write_f32_slice, write_u32, write_u64};
+use crate::bytes::{read_f32_vec, read_u32, read_u64, write_f32_slice, write_u32, write_u64};
+use crate::cpu::optim::AdamCfg;
 use crate::tensor::Tensor;
 
 #[derive(Clone, Copy, Debug, PartialEq)]

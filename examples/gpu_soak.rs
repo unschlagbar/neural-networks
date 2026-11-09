@@ -29,7 +29,7 @@ fn main() {
     use neural_networks::config::*;
     use neural_networks::gpu::Gpu;
     use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
-    use neural_networks::nn2::optim::AdamCfg;
+    use neural_networks::cpu::optim::AdamCfg;
     use neural_networks::tokenizer_utf8::Utf8Tokenizer;
 
     let path = std::env::args()
@@ -66,7 +66,7 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let mut opt = AdamCfg::new(LR, neural_networks::optimizers::WEIGHT_DECAY);
+    let mut opt = AdamCfg::new(LR, neural_networks::config::BACKBONE_WEIGHT_DECAY);
 
     let mut data = ChunkedWordDataSet::open(
         tok,

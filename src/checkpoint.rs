@@ -42,6 +42,26 @@ pub struct ModelCfg {
     pub cap: f32,
 }
 
+impl ModelCfg {
+    /// The model `config.rs` describes, for a new run.
+    pub fn configured(vocab: usize, w_token: usize) -> Self {
+        use crate::config::{CHAR_HIDDEN, LOGIT_SOFTCAP, WORD_BLOCKS, WORD_HIDDEN};
+        let heads = 8;
+        Self {
+            vocab,
+            hc: CHAR_HIDDEN,
+            wh: WORD_HIDDEN,
+            enc_blocks: 4,
+            bb_blocks: WORD_BLOCKS,
+            dec_blocks: 4,
+            heads,
+            dqk: WORD_HIDDEN / heads,
+            w_token,
+            cap: LOGIT_SOFTCAP,
+        }
+    }
+}
+
 /// mLSTM heads in the encoder and decoder; their `dqk` is `hc / CHAR_HEADS`.
 pub const CHAR_HEADS: usize = 16;
 
@@ -383,6 +403,22 @@ impl Reader {
             )));
         }
         Ok(())
+    }
+
+    /// The next tensor's shape, its data skipped.
+    pub fn skip(&mut self) -> io::Result<Vec<usize>> {
+        if self.left == 0 {
+            return Err(invalid("no tensors left".into()));
+        }
+        self.left -= 1;
+        let rank = get_u32(&mut self.r)? as usize;
+        if rank > crate::tensor::MAX_RANK {
+            return Err(invalid(format!("tensor rank {rank}")));
+        }
+        let dims = (0..rank).map(|_| get_usize(&mut self.r)).collect::<io::Result<Vec<_>>>()?;
+        let bytes = dims.iter().product::<usize>() * 4;
+        self.r.seek_relative(bytes as i64)?;
+        Ok(dims)
     }
 
     pub fn next_tensor(&mut self) -> io::Result<Tensor> {

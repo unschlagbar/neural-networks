@@ -1,4 +1,4 @@
-//! Clean-room tensor system for the batched NN experiment (`nn2`).
+//! Clean-room tensor system for the batched NN experiment (`cpu`).
 //!
 //! Design goals, in order:
 //!   1. A single row-major, contiguous `f32` tensor type carrying its own shape.
@@ -27,7 +27,7 @@ pub const MAX_RANK: usize = 4;
 /// only the first `rank` entries are meaningful, the rest are zero. The NN paths
 /// use `[B, F]` (a batch of feature vectors) and `[B, T, F]` (a batch of
 /// sequences) almost exclusively.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Tensor {
     /// Dimension sizes; only `shape[..rank]` are valid, trailing slots are 0.
     pub shape: [usize; MAX_RANK],

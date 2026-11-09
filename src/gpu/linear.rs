@@ -1,10 +1,10 @@
 //! Device-resident `Linear` (`Y = X · W + b`), the GPU counterpart of
-//! [`nn2::linear::Linear`](crate::nn2::linear::Linear).
+//! [`cpu::linear::Linear`](crate::cpu::linear::Linear).
 //!
 //! Same weight layout (`W` is `[in, out]`, forward is `X · W`) and the same
 //! AdamW convention (weight decays, bias does not), so a GPU layer built from a
 //! CPU layer's `[w, b]` produces bit-comparable results — which the parity test
-//! checks against `nn2::Linear` for forward, backward and one optimizer step.
+//! checks against `cpu::Linear` for forward, backward and one optimizer step.
 //!
 //! The whole layer lives on the GPU: weights, gradient accumulators, AdamW
 //! moments and the saved forward input are all `GTensor<f32>`s, so a forward→backward→
@@ -12,7 +12,7 @@
 
 use super::arena::{self, ParamKind, ParamSlot, TrainingCache};
 use super::{GTensor, Gpu, ops};
-use crate::nn2::optim::AdamCfg;
+use crate::cpu::optim::AdamCfg;
 use crate::tensor::Tensor;
 
 pub struct Linear {
@@ -119,8 +119,7 @@ impl Linear {
         self.decay = false;
     }
 
-    /// Never step `b`, leaving it at its zero init. Makes this layer equivalent to
-    /// `nn::LinearNBLayer`, so it exports to a no-bias head faithfully.
+    /// Never step `b`, leaving it at its zero init: a bias-free head.
     pub fn freeze_bias(&mut self) {
         self.bias_frozen = true;
     }
@@ -607,10 +606,10 @@ impl Linear {
         }
     }
 
-    /// Freshly-initialised layer, matching `nn2::Linear::new`'s init exactly
+    /// Freshly-initialised layer, matching `cpu::Linear::new`'s init exactly
     /// (built on the host, then uploaded).
     pub fn new_rand(gpu: &Gpu, input: usize, output: usize) -> Self {
-        let cpu = crate::nn2::Linear::new(input, output);
+        let cpu = crate::cpu::Linear::new(input, output);
         Self::from_parts(gpu, &cpu.w, &cpu.b)
     }
 
@@ -679,8 +678,8 @@ mod tests {
         TrainingCache::new(gpu, 1 << 20, 1 << 16, 1 << 20)
     }
     use super::*;
-    use crate::nn2::linear::Linear as CpuLinear;
-    use crate::nn2::optim::AdamCfg;
+    use crate::cpu::linear::Linear as CpuLinear;
+    use crate::cpu::optim::AdamCfg;
 
     fn assert_close(got: &[f32], want: &[f32], tol: f32) {
         assert_eq!(got.len(), want.len());
@@ -834,7 +833,7 @@ mod tests {
         }
     }
 
-    /// GPU Linear must match the CPU `nn2::Linear` for a full
+    /// GPU Linear must match the CPU `cpu::Linear` for a full
     /// forward → backward → AdamW-step cycle, starting from identical weights.
     #[test]
     fn linear_matches_cpu_layer() {

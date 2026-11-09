@@ -23,7 +23,7 @@ use crate::audio::io::Clip;
 use crate::audio::librispeech::LibriSpeech;
 use crate::audio::segments::{CountAligner, DurationPrior, PeakDecoder, WordSegments};
 use crate::config::{AUDIO_DATA, AUDIO_FEATS, AUDIO_SPLITS, AUDIO_SR, TEMPERATURE, TOP_P};
-use crate::hierarchical::Hierarchical;
+use crate::infer::Hierarchical;
 use crate::sampling::Utf8Printer;
 use crate::segment::word_ends;
 use crate::tokenizer_utf8::Utf8Tokenizer;
@@ -165,7 +165,7 @@ pub fn sample_audio(model_path: &str) {
         }
     };
     let tok = Utf8Tokenizer::new();
-    let mut model = match Hierarchical::load(model_path, tok) {
+    let mut model = match Hierarchical::load(model_path) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Could not load the text model '{model_path}': {e}");

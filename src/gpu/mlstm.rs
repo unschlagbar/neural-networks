@@ -1,5 +1,5 @@
 //! Device-resident multi-head mLSTM cell, GPU counterpart of
-//! [`nn2::mlstm::MLstm`](crate::nn2::mlstm::MLstm) — in the **parallel /
+//! [`cpu::mlstm::MLstm`](crate::cpu::mlstm::MLstm) — in the **parallel /
 //! chunkwise** formulation, not the scalar per-head recurrence (the CPU's sub-1×
 //! path; see PLAN-gpu.md Phase C).
 //!
@@ -64,13 +64,36 @@ use std::sync::OnceLock;
 
 use super::arena::{self, ParamSlot};
 use super::block::{Cell, Resets};
-use super::nn_convert::concat_cols;
 use super::offload::{Frame, ResidentFrames};
 use super::ops::{GpuRmsForward, SlabBuf};
 use super::{GTensor, Gpu, linear::Linear, ops, rms_norm::RmsNorm};
 use crate::gpu::arena::TrainingCache;
-use crate::nn2::optim::AdamCfg;
+use crate::cpu::optim::AdamCfg;
 use crate::tensor::Tensor;
+
+/// Lay `[rows, ·]` weight (or `[·]` bias) tensors side by side into the one matrix
+/// a fused projection holds.
+fn concat_cols(parts: &[&Tensor]) -> Tensor {
+    let rows = if parts[0].dims().len() == 1 {
+        1
+    } else {
+        parts[0].dims()[0]
+    };
+    let cols: Vec<usize> = parts.iter().map(|p| p.data.len() / rows).collect();
+    let total: usize = cols.iter().sum();
+    let mut data = Vec::with_capacity(rows * total);
+    for r in 0..rows {
+        for (p, c) in parts.iter().zip(&cols) {
+            data.extend_from_slice(&p.data[r * c..(r + 1) * c]);
+        }
+    }
+    let dims: &[usize] = if parts[0].dims().len() == 1 {
+        &[total]
+    } else {
+        &[rows, total]
+    };
+    Tensor::new(dims, data)
+}
 
 /// Chunk length: `config::MLSTM_CHUNK`, overridable with `MLSTM_CHUNK=<L>` for A/B
 /// runs. Resolved once — the env read must not sit in forward.
@@ -111,7 +134,6 @@ pub struct MLstm {
     pub heads: usize,
     pub dqk: usize,
     pub dhv: usize,
-    pub(super) inv_sqrt_dqk: f32,
     /// Chunk length (0 = single-chunk). Defaults to [`chunk_len`].
     chunk: usize,
 
@@ -186,8 +208,7 @@ impl MLstm {
     ) -> Self {
         let dhv = d / heads;
         // q·kᵀ wants k scaled by 1/√dqk. The factor is constant, so it is folded into
-        // wk/bk here and unfolded in `to_nn_cell`: the checkpoint keeps the unscaled
-        // weights, while the runtime never spends a pass rescaling k or dk.
+        // wk/bk here and the runtime never spends a pass rescaling k or dk.
         let inv_sqrt_dqk = 1.0 / (dqk as f32).sqrt();
         let scaled =
             |t: &Tensor| Tensor::new(t.dims(), t.data.iter().map(|v| v * inv_sqrt_dqk).collect());
@@ -198,7 +219,6 @@ impl MLstm {
             heads,
             dqk,
             dhv,
-            inv_sqrt_dqk,
             chunk: chunk_len(),
             lin_qkvo: Linear::from_parts(
                 gpu,
@@ -216,9 +236,9 @@ impl MLstm {
         }
     }
 
-    /// Freshly-initialised cell, matching `nn2::MLstm::new`'s init exactly.
+    /// Freshly-initialised cell, matching `cpu::MLstm::new`'s init exactly.
     pub fn new_rand(gpu: &Gpu, input_size: usize, d: usize, heads: usize, dqk: usize) -> Self {
-        Self::from_cpu(gpu, &crate::nn2::MLstm::new(input_size, d, heads, dqk))
+        Self::from_cpu(gpu, &crate::cpu::MLstm::new(input_size, d, heads, dqk))
     }
 
     /// Column where `o` starts in the fused `q ‖ k ‖ v ‖ o` projection.
@@ -231,7 +251,7 @@ impl MLstm {
     }
 
     /// Upload a CPU cell (weights are copied; grads/moments start at zero).
-    pub fn from_cpu(gpu: &Gpu, c: &crate::nn2::MLstm) -> Self {
+    pub fn from_cpu(gpu: &Gpu, c: &crate::cpu::MLstm) -> Self {
         Self::from_parts(
             gpu,
             c.input_size,
@@ -817,8 +837,8 @@ mod tests {
         TrainingCache::new(gpu, 1 << 20, 1 << 16, 1 << 24)
     }
     use super::*;
-    use crate::nn2::mlstm::MLstm as CpuMLstm;
-    use crate::nn2::optim::AdamCfg;
+    use crate::cpu::mlstm::MLstm as CpuMLstm;
+    use crate::cpu::optim::AdamCfg;
 
     fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
         assert_eq!(got.len(), want.len(), "{what}: length mismatch");
@@ -899,40 +919,8 @@ mod tests {
         );
     }
 
-    /// The checkpoint round-trip must put every weight back byte for byte.
-    ///
-    /// `q ‖ k ‖ v` and `ĩ ‖ f̃` live as one matrix each at runtime while the
-    /// checkpoint format keeps all six apart, so `to_nn_cell` cuts them up and
-    /// `from_nn_cell` stitches them back. A wrong offset there corrupts a saved model
-    /// silently — the shapes still fit, the loss still falls, and only the parts sit
-    /// in each other's columns. Exact equality is the right bar: the split, the
-    /// concatenation and the 1/√dqk fold/unfold are all lossless.
-    ///
-    /// Head dims are deliberately unequal (`dqk != dhv`) so a check that only ever
-    /// sees square parts cannot pass by accident.
-    #[test]
-    fn nn_cell_round_trip_preserves_the_fused_projections() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        let (inp, d, heads, dqk) = (12usize, 24usize, 4usize, 5usize);
-        let before = MLstm::new_rand(&gpu, inp, d, heads, dqk);
-        let after = MLstm::from_nn_cell(&gpu, &before.to_nn_cell(&gpu));
-        for (name, a, b) in [
-            ("qkvo w", &before.lin_qkvo.w, &after.lin_qkvo.w),
-            ("qkvo b", &before.lin_qkvo.b, &after.lin_qkvo.b),
-            ("gates w", &before.lin_gates.w, &after.lin_gates.w),
-            ("gates b", &before.lin_gates.b, &after.lin_gates.b),
-            ("out w", &before.lin_out.w, &after.lin_out.w),
-        ] {
-            let (a, b) = (a.to_host(&gpu), b.to_host(&gpu));
-            assert_eq!(a.dims(), b.dims(), "{name}: shape changed");
-            assert_eq!(a.data, b.data, "{name}: round trip is not the identity");
-        }
-    }
-
     /// Single-chunk parallel forward+backward+step must match the CPU scalar
-    /// recurrence (`nn2::MLstm`) from identical weights. The CPU backward is
+    /// recurrence (`cpu::MLstm`) from identical weights. The CPU backward is
     /// itself FD-verified, so a GPU-vs-CPU grad match is the (tighter) check.
     #[test]
     fn mlstm_matches_cpu() {

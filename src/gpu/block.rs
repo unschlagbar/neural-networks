@@ -1,5 +1,5 @@
 //! Device-resident xLSTM-style residual block, the GPU counterpart of
-//! [`nn2::block::Block`](crate::nn2::block::Block).
+//! [`cpu::block::Block`](crate::cpu::block::Block).
 //!
 //!   z = x + cell(pre_norm1(x))
 //!   y = z + lin_down( SiLU(lin_gate·pre_norm2(z)) ⊙ (lin_value·pre_norm2(z)) )
@@ -20,8 +20,7 @@ use super::{
 };
 use crate::{
     gpu::arena::TrainingCache,
-    nn::linear::LinearLayer,
-    nn2::{self, optim::AdamCfg},
+    cpu::{self, optim::AdamCfg},
     tensor::Tensor,
 };
 
@@ -749,7 +748,7 @@ impl<C: Cell> Block<C> {
 
     /// Assemble around a cell, with the surrounding norms/projections from a CPU block
     /// (the caller uploads the cell). Shared by the `from_cpu` constructors.
-    fn from_cpu_parts<D: nn2::block::Cell>(gpu: &Gpu, cpu: &nn2::Block<D>, cell: C) -> Self {
+    fn from_cpu_parts<D: cpu::block::Cell>(gpu: &Gpu, cpu: &cpu::Block<D>, cell: C) -> Self {
         Self::assemble(
             gpu,
             cpu.hidden,
@@ -979,63 +978,19 @@ impl<C: Cell> Block<C> {
     }
 }
 
-/// Upload an `nn::LinearLayer` to the device.
-fn lin_from_nn(gpu: &Gpu, l: &LinearLayer) -> Linear {
-    use super::{tensor_from_matrix as m, tensor_from_slice as v};
-    Linear::from_parts(gpu, &m(&l.weights), &v(&l.biases))
-}
-
 impl Block<SLstm> {
     /// Upload a whole CPU sLSTM block (norms, SwiGLU projections and the cell).
-    pub fn from_cpu(gpu: &Gpu, cpu: &crate::nn2::SLstmBlock) -> Self {
-        // `nn2` still keeps the post-cell norm on the block; the GPU cell owns it.
+    pub fn from_cpu(gpu: &Gpu, cpu: &crate::cpu::SLstmBlock) -> Self {
+        // The CPU block keeps the post-cell norm; the GPU cell owns it.
         let post = cpu.post_cell_norm.as_ref().map(|n| &n.gamma);
         Self::from_cpu_parts(gpu, cpu, SLstm::from_cpu(gpu, &cpu.cell, post))
-    }
-
-    /// Import an `nn::SLSTMBlock` (from a `HIER` checkpoint) onto the device.
-    pub fn from_nn_block(gpu: &Gpu, cpu: &crate::nn::slstm_block::SLSTMBlock) -> Self {
-        use super::tensor_from_slice as v;
-        Self::assemble(
-            gpu,
-            cpu.hidden_size,
-            cpu.up_size,
-            RmsNorm::from_parts(gpu, &v(&cpu.pre_norm1.gamma)),
-            // The checkpoint keeps the post-cell norm on the block; the GPU cell owns
-            // it, so its γ is handed down here.
-            SLstm::from_nn_cell(gpu, &cpu.cell, Some(&v(&cpu.post_cell_norm.gamma))),
-            RmsNorm::from_parts(gpu, &v(&cpu.pre_norm2.gamma)),
-            [
-                lin_from_nn(gpu, &cpu.lin_gate),
-                lin_from_nn(gpu, &cpu.lin_value),
-                lin_from_nn(gpu, &cpu.lin_down),
-            ],
-        )
     }
 }
 
 impl Block<MLstm> {
     /// Upload a whole CPU mLSTM block (norms, SwiGLU projections and the cell).
-    pub fn from_cpu(gpu: &Gpu, cpu: &crate::nn2::MLstmBlock) -> Self {
+    pub fn from_cpu(gpu: &Gpu, cpu: &crate::cpu::MLstmBlock) -> Self {
         Self::from_cpu_parts(gpu, cpu, MLstm::from_cpu(gpu, &cpu.cell))
-    }
-
-    /// Import an `nn::MLSTMBlock` (from a `HIER` checkpoint) onto the device.
-    pub fn from_nn_block(gpu: &Gpu, cpu: &crate::nn::mlstm_block::MLSTMBlock) -> Self {
-        use super::tensor_from_slice as v;
-        Self::assemble(
-            gpu,
-            cpu.hidden_size,
-            cpu.up_size,
-            RmsNorm::from_parts(gpu, &v(&cpu.pre_norm1.gamma)),
-            MLstm::from_nn_cell(gpu, &cpu.cell),
-            RmsNorm::from_parts(gpu, &v(&cpu.pre_norm2.gamma)),
-            [
-                lin_from_nn(gpu, &cpu.lin_gate),
-                lin_from_nn(gpu, &cpu.lin_value),
-                lin_from_nn(gpu, &cpu.lin_down),
-            ],
-        )
     }
 }
 
@@ -1048,8 +1003,8 @@ mod tests {
     }
     use super::*;
     use crate::gpu::offload::Offload;
-    use crate::nn2::block::{MLstmBlock as CpuMLstmBlock, SLstmBlock as CpuSLstmBlock};
-    use crate::nn2::optim::AdamCfg;
+    use crate::cpu::block::{MLstmBlock as CpuMLstmBlock, SLstmBlock as CpuSLstmBlock};
+    use crate::cpu::optim::AdamCfg;
     use crate::tensor::Tensor;
 
     /// Absolute floor plus `rel * max|want|` — scaled by the whole tensor, **not** per
@@ -1093,7 +1048,7 @@ mod tests {
         }
     }
 
-    /// GPU `Block<SLstm>` must match `nn2::SLstmBlock` for forward → backward →
+    /// GPU `Block<SLstm>` must match `cpu::SLstmBlock` for forward → backward →
     /// AdamW-step from identical parameters.
     #[test]
     fn slstm_block_matches_cpu() {
@@ -1153,7 +1108,7 @@ mod tests {
         );
     }
 
-    /// GPU `Block<MLstm>` (parallel-form cell) must match `nn2::MLstmBlock` (scalar
+    /// GPU `Block<MLstm>` (parallel-form cell) must match `cpu::MLstmBlock` (scalar
     /// recurrence) for forward → backward → AdamW step from identical parameters.
     #[test]
     fn mlstm_block_matches_cpu() {
@@ -1165,7 +1120,7 @@ mod tests {
 
         let mut cpu = CpuMLstmBlock::new_mlstm(h, u, heads, dqk);
         // Non-trivial gate weights so the decay/stabilizer path is exercised
-        // (nn2::MLstm::new zero-inits wi/wf).
+        // (cpu::MLstm::new zero-inits wi/wf).
         cpu.cell.wi = Tensor::random(&[h, heads], 0.3);
         cpu.cell.wf = Tensor::random(&[h, heads], 0.3);
         let mut dev = Block::<MLstm>::from_cpu(&gpu, &cpu);

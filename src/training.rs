@@ -2,49 +2,63 @@ use std::{
     f32::consts::PI,
     fs::File,
     io::{BufWriter, Write},
-    time::{Duration, Instant},
+    time::Instant,
 };
+
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 
 use crate::{
     batches::ChunkedWordDataSet,
+    checkpoint::ModelCfg,
     config::{
-        BATCH_SIZE, CHUNK_BYTES, DECAY_WINDOWS, EPOCHS, LOG_EVERY, LR, MAX_WINDOW_TOKENS, MIN_LR,
-        MIN_WORDS_PER_SEQ, RESUME_WARMUP_WINDOWS, SAVE_EVERY, SEQ_LEN, TRAIN_DATA, VAL_DATA,
-        WARMUP_WINDOWS, WORDS_PER_SEQ,
+        BATCH_SIZE, CHUNK_BYTES, DECAY_WINDOWS, EPOCHS, GRAD_CLIP_NORM, LOG_EVERY, LR,
+        MAX_WINDOW_TOKENS, MIN_LR, MIN_WORDS_PER_SEQ, RESUME_WARMUP_WINDOWS, SAVE_EVERY, SEQ_LEN,
+        SFT_BATCH_SIZE, SFT_DATA, SFT_EPOCHS, SFT_LR, SFT_MAX_TOKENS, SFT_WARMUP_WINDOWS,
+        TRAIN_DATA, VAL_DATA, WARMUP_WINDOWS, WORDS_PER_SEQ,
     },
-    hierarchical::Hierarchical,
-    model::build_hierarchical_model,
-    optimizers::Optimizer,
+    cpu::{hierarchical::Hierarchical, optim::AdamCfg},
+    pretrain_progress, sft, sft_progress,
     tokenizer_utf8::Utf8Tokenizer,
 };
 
+/// Pretraining on the CPU (mode `h`): the loop of `gpu::train::train_hierarchical_gpu`
+/// without the audio stage, and without carrying the backbone state from one window
+/// into the next.
 pub fn train_hierarchical(model_path: &str) {
     let tokenizer = Utf8Tokenizer::new();
-    let vocab = tokenizer.vocab_size();
+    let cfg = ModelCfg::configured(tokenizer.vocab_size(), tokenizer.w_token() as usize);
 
-    let mut model = match Hierarchical::load(model_path, tokenizer) {
+    let (mut model, loaded) = match Hierarchical::load(model_path) {
         Ok(m) => {
-            println!("Loaded HM-RNN from '{model_path}'.");
+            println!("Loaded '{model_path}' (step {}).", m.step_count);
             println!("Trained on so far:");
             print!("{}", m.seen.report());
-            m
+            (m, true)
         }
         Err(e) => {
-            println!("Could not load '{model_path}' ({e}) — creating new HM-RNN.");
-            build_hierarchical_model(vocab, tokenizer)
+            println!("Could not load '{model_path}' ({e}) — creating a new model.");
+            (Hierarchical::new(cfg), false)
         }
     };
+    if model.cfg != cfg {
+        eprintln!(
+            "WARNING: checkpoint architecture {:?} differs from config.rs {:?} — \
+             continuing with the checkpoint's.",
+            model.cfg, cfg
+        );
+    }
+
     // A resumed run already knows which corpus it walks; only a new one asks.
-    // Pointing a resume at a different corpus by accident is exactly the
-    // mistake the sidecar exists to prevent.
-    let corpus_root = match crate::pretrain_progress::load(model_path) {
+    let corpus_root = match pretrain_progress::load(model_path) {
         Some(p) => {
             println!("Found a progress file — continuing on '{}'.", p.corpus);
             p.corpus
         }
-        None => crate::pretrain_progress::ask_corpus(TRAIN_DATA),
+        None => pretrain_progress::ask_corpus(TRAIN_DATA),
     };
-    let corpus = match crate::pretrain_progress::Corpus::open(&corpus_root) {
+    let corpus = match pretrain_progress::Corpus::open(&corpus_root) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Cannot read corpus '{corpus_root}': {e}");
@@ -56,21 +70,18 @@ pub fn train_hierarchical(model_path: &str) {
         corpus.root,
         corpus.len()
     );
-    println!(
-        "Training: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE}, optimizer={:?}, log every {LOG_EVERY} steps",
-        Optimizer {}
-    );
+    println!("Training on CPU: {EPOCHS} epochs, LR={LR}, batch={BATCH_SIZE} windows, log every {LOG_EVERY} steps");
 
-    let mut training_state = TrainingState::from_step(model.step);
-    let extra_cols = ["delta_word", "delta_char1", "word_loss"];
-    training_state.init_log(model_path, &extra_cols);
-    let mut total_time = Duration::ZERO;
-    // Cache is sized to the longest window seen so far and grown on demand.
-    let mut cache_tokens = 0;
+    let mut state = TrainingState::from_step(model.step_count);
+    if loaded {
+        state.schedule = LrSchedule::pretrain_resumed(model.step_count);
+    }
+    state.init_log(model_path, &["word_loss", "grad_norm"]);
+    // The log on disk never gets ahead of the checkpoint: rows flush on save.
+    state.set_defer_log_flush(true);
+    let mut opt = AdamCfg::new(LR, crate::config::BACKBONE_WEIGHT_DECAY);
 
-    // Where the last run stopped, from the sidecar next to the checkpoint. The
-    // step count cannot answer this: it spans every corpus the weights have seen.
-    let start = crate::pretrain_progress::resume_or_fresh(model_path, &corpus, model.step, EPOCHS);
+    let start = pretrain_progress::resume_or_fresh(model_path, &corpus, model.step_count, EPOCHS);
     let mut progress = start.progress;
     let start_epoch = progress.epoch;
     let start_file = start.file;
@@ -82,16 +93,11 @@ pub fn train_hierarchical(model_path: &str) {
     for epoch in start_epoch..=EPOCHS {
         println!("── Epoch {epoch} ───────────────────────────────────────");
         let epoch_start = Instant::now();
-        // Only the resumed epoch resumes mid-corpus; later epochs run whole.
         let first_file = if epoch == start_epoch { start_file } else { 0 };
 
         for file_index in first_file..corpus.len() {
             let path = corpus.path_of(file_index).display().to_string();
-            println!(
-                "── File {}/{}: {path} ─────────────────",
-                file_index + 1,
-                corpus.len()
-            );
+            println!("── File {}/{}: {path} ─────────────────", file_index + 1, corpus.len());
             let mut data = ChunkedWordDataSet::open(
                 tokenizer,
                 &path,
@@ -100,30 +106,26 @@ pub fn train_hierarchical(model_path: &str) {
                 MAX_WINDOW_TOKENS,
                 CHUNK_BYTES,
             );
-            // Only the file the run stopped inside skips; the rest run whole.
             let mut skip = if epoch == start_epoch && file_index == start_file {
                 start_done
             } else {
                 0
             };
-            // Every run must stamp its window count into the sidecar, otherwise the
-            // resume it writes cannot be validated later.
-            let prep_start = Instant::now();
+            // The resume offset is only meaningful against the window count it was
+            // measured with; `windows == 0` is a count that was never taken.
+            let t0 = Instant::now();
             let total = data.count_windows();
-            println!(
-                "  {total} windows (counting pass took {:.1?})",
-                prep_start.elapsed()
-            );
+            println!("  {total} windows (counting pass took {:.1?})", t0.elapsed());
             if skip > 0 && progress.windows != 0 && total != progress.windows {
                 println!(
                     "  file has {total} windows but the progress file recorded {} — \
-                 starting this file from the beginning.",
+                     starting this file from the beginning.",
                     progress.windows
                 );
                 skip = 0;
             }
             if skip > 0 {
-                println!("  Resuming from window {skip} (step {})", model.step);
+                println!("  Resuming from window {skip} (step {})", model.step_count);
             }
             progress.epoch = epoch;
             progress.files_done = file_index;
@@ -131,97 +133,136 @@ pub fn train_hierarchical(model_path: &str) {
             progress.windows = total;
             progress.done = skip;
 
-            let start = Instant::now();
+            let mut tokens_since_print = 0;
+            let mut time = Instant::now();
             data.rewind();
             while let Some(chunk) = data.next_chunk() {
-                // Fast-forward over already-trained windows when resuming.
                 if skip >= chunk.len() {
                     skip -= chunk.len();
                     continue;
                 }
-                if chunk.max_window_tokens() > cache_tokens {
-                    cache_tokens = chunk.max_window_tokens();
-                    model.make_cache(WORDS_PER_SEQ, cache_tokens);
-                }
-                let trained = chunk.len() - skip;
-                model.train(chunk.iter().skip(skip), &mut training_state);
-                // Chunk granularity: `train` consumes the iterator whole, so a stop
-                // mid-chunk resumes from the chunk boundary before it.
-                progress.done += trained;
-                skip = 0;
-            }
-
-            let file_time = start.elapsed();
-            total_time += file_time;
-
-            match model.save(model_path) {
-                Ok(()) => {
-                    println!(
-                        "  ✓ end-of-file save to '{model_path}'  (file {file_time:.0?}, total {total_time:.0?})"
+                for batch in chunk.iter().skip(skip) {
+                    // Counts every window the iterator yields, so `done` stays
+                    // aligned with where `chunk.iter().skip(done)` resumes.
+                    progress.done += 1;
+                    let tokens: Vec<usize> = batch.tokens.iter().map(|&t| t as usize).collect();
+                    let words = &batch.words;
+                    if words.len() < 2 {
+                        continue;
+                    }
+                    model.set_doc_starts(&batch.doc_starts);
+                    let loss = model.forward_backward(&tokens, words);
+                    model.seen.add_pretrain(tokens.len(), words.len());
+                    tokens_since_print += tokens.len();
+                    state.log_tokens(tokens.len());
+                    state.log_metric("word_loss", model.last_word_loss());
+                    state.log_bpb(
+                        loss,
+                        model.last_rows(),
+                        model.last_scored_tokens(),
+                        model.last_scored_words(),
                     );
-                    println!("    trained on: {}", model.seen.save_line());
-                    // The file is finished: the recorded position is the START of
-                    // the next one, so a stop here does not re-read it.
-                    progress.files_done = file_index + 1;
-                    progress.file = corpus.name_of(file_index + 1);
-                    progress.done = 0;
-                    progress.windows = 0;
-                    progress.step = model.step;
-                    if let Err(e) = crate::pretrain_progress::save(model_path, &progress) {
-                        eprintln!("  ✗ progress save failed: {e}");
+
+                    if let Some(lr) = state.step(loss) {
+                        opt.lr = lr;
+                        opt.t += 1;
+                        // The gradient is a sum over BATCH_SIZE windows; the clip and
+                        // the log are on the mean.
+                        let batch = BATCH_SIZE as f32;
+                        let norm = model.clip_grad_norm(GRAD_CLIP_NORM * batch);
+                        state.log_metric("grad_norm", norm / batch);
+                        model.step(&opt);
+                    }
+                    model.step_count = state.step;
+
+                    if state.print() {
+                        let word_loss = state.metric_mean("word_loss");
+                        let loss = state.get_loss();
+                        println!(
+                            "{} | char loss {:.3} | ppl {:.3} | word loss {:.3} | lr {:.1e} | {} bytes | {:.1?}",
+                            state.step,
+                            loss,
+                            loss.exp(),
+                            word_loss,
+                            opt.lr,
+                            tokens_since_print,
+                            time.elapsed(),
+                        );
+                        tokens_since_print = 0;
+                        time = Instant::now();
+                    }
+                    if state.save() {
+                        save_pretrain(&model, &mut state, &mut progress);
                     }
                 }
-                Err(e) => eprintln!("  ✗ end-of-file save failed: {e}"),
+                skip = 0;
             }
-        } // files
+            // The recorded position is the START of the next file.
+            progress.files_done = file_index + 1;
+            progress.file = corpus.name_of(file_index + 1);
+            progress.done = 0;
+            progress.windows = 0;
+            progress.step = state.step;
+            if let Err(e) = pretrain_progress::save(state.save_path(), &progress) {
+                eprintln!("progress save failed: {e}");
+            }
+        }
 
         println!("Epoch {epoch} took {:.1?}", epoch_start.elapsed());
-        // The recorded position is the START of the next epoch, so a stop here
-        // resumes without redoing the epoch just finished.
         progress.epoch = epoch + 1;
         progress.files_done = 0;
         progress.file = corpus.name_of(0);
         progress.done = 0;
-        progress.step = model.step;
-        if let Err(e) = crate::pretrain_progress::save(model_path, &progress) {
-            eprintln!("  ✗ progress save failed: {e}");
+        progress.step = state.step;
+        if let Err(e) = pretrain_progress::save(state.save_path(), &progress) {
+            eprintln!("progress save failed: {e}");
         }
     }
 
-    // The sidecar is left behind saying the corpus is done: it is the record of
-    // which shards these weights have seen, and deleting it is the user's call.
+    save_pretrain(&model, &mut state, &mut progress);
+    // The sidecar stays, saying the corpus is done: it records which shards these
+    // weights have seen, and deleting it is the user's call.
     println!(
         "Run complete — '{}' says the corpus is finished; delete it or point the \
          next run at another corpus.",
-        crate::pretrain_progress::progress_path(model_path).display()
+        pretrain_progress::progress_path(state.save_path()).display()
     );
 }
 
-/// CPU supervised fine-tuning (Q-A / instruction tuning) of a hierarchical
-/// model. The CPU twin of `gpu::train::train_sft_gpu`: loads the (small) SFT set
-/// fully into memory as masked chat windows (`crate::sft`) and fine-tunes with
-/// loss counted only on the response tokens (`Hierarchical::train_sft`).
-///
-/// A model built by this crate already carries the SFT vocabulary; only an older
-/// checkpoint (pretrained before the markers existed) must be run through the
-/// `av` mode first — that mismatch is caught with a hint.
-pub fn train_sft(model_path: &str) {
-    use crate::config::{
-        SFT_BATCH_SIZE, SFT_DATA, SFT_EPOCHS, SFT_LR, SFT_MAX_TOKENS, SFT_WARMUP_WINDOWS,
-    };
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
-    use rand::seq::SliceRandom;
+/// Save the weights, then the log rows and the progress sidecar, so neither runs
+/// ahead of the checkpoint.
+fn save_pretrain(
+    model: &Hierarchical,
+    state: &mut TrainingState,
+    progress: &mut pretrain_progress::PretrainProgress,
+) {
+    match model.save(state.save_path()) {
+        Ok(()) => {
+            state.flush_log();
+            println!("saved -> {}", state.save_path());
+            if let Some((bpb, word)) = state.take_bpb() {
+                println!("  bpb {bpb:.3} | word loss {word:.3}");
+            }
+            println!("  trained on: {}", model.seen.save_line());
+            progress.step = state.step;
+            if let Err(e) = pretrain_progress::save(state.save_path(), progress) {
+                eprintln!("progress save failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("save failed: {e}"),
+    }
+}
 
+/// Q-A / instruction fine-tuning on the CPU (mode `hq`), the twin of
+/// `gpu::train::train_sft_gpu` without heard turns: the whole (small) SFT set in
+/// memory, the loss counted only on the response words.
+pub fn train_sft(model_path: &str) {
     let tokenizer = Utf8Tokenizer::new();
     let vocab = tokenizer.vocab_size();
 
-    let mut model = match Hierarchical::load(model_path, tokenizer) {
+    let mut model = match Hierarchical::load(model_path) {
         Ok(m) => {
-            println!(
-                "Loaded hierarchical model from '{model_path}' (step {}).",
-                m.step
-            );
+            println!("Loaded '{model_path}' (step {}).", m.step_count);
             println!("Trained on so far:");
             print!("{}", m.seen.report());
             m
@@ -234,33 +275,29 @@ pub fn train_sft(model_path: &str) {
             return;
         }
     };
-
-    if model.vocab_size != vocab {
+    if model.cfg.vocab != vocab {
         eprintln!(
             "This is an older checkpoint: its vocab is {} but the tokenizer now has \
              {vocab}: it predates the SFT markers and cannot be fine-tuned.",
-            model.vocab_size
+            model.cfg.vocab
         );
         return;
     }
 
-    let mut examples = match crate::sft::load_jsonl(&tokenizer, SFT_DATA, SFT_MAX_TOKENS) {
+    let data = std::env::var("SFT_DATA").unwrap_or_else(|_| SFT_DATA.to_string());
+    let mut examples = match sft::load_jsonl(&tokenizer, &data, SFT_MAX_TOKENS) {
         Ok(e) if !e.is_empty() => e,
         Ok(_) => {
-            eprintln!("SFT set '{SFT_DATA}' produced no trainable examples.");
+            eprintln!("SFT set '{data}' produced no trainable examples.");
             return;
         }
         Err(e) => {
-            eprintln!("Could not read SFT set '{SFT_DATA}': {e}");
+            eprintln!("Could not read SFT set '{data}': {e}");
             return;
         }
     };
-
-    // Size the caches to the longest example (word count / token span). Both
-    // caps are known up front since the whole set is in memory.
     let max_words = examples.iter().map(|e| e.words.len()).max().unwrap();
     let max_tokens = examples.iter().map(|e| e.tokens.len()).max().unwrap();
-    model.make_cache(max_words, max_tokens);
     println!(
         "SFT (CPU): {} examples, longest {max_words} words / {max_tokens} tokens. \
          {SFT_EPOCHS} epochs, LR={SFT_LR} over {SFT_WARMUP_WINDOWS} warmup windows, \
@@ -268,33 +305,28 @@ pub fn train_sft(model_path: &str) {
         examples.len()
     );
 
-    let mut state = TrainingState::from_step(model.step);
+    let mut state = TrainingState::from_step(model.step_count);
     state.lr = SFT_LR;
     state.batch_size = SFT_BATCH_SIZE;
     state.init_log(&format!("{model_path}_sft"), &["resp_ppl"]);
+    state.set_defer_log_flush(true);
+    let mut opt = AdamCfg::new(SFT_LR, crate::config::BACKBONE_WEIGHT_DECAY);
 
-    // Where a previous, interrupted run stopped (or a fresh start). The shuffle
-    // is seeded from this so resuming replays the same permutation and skipping
-    // `done` examples skips exactly the ones already trained on.
+    // The shuffle is seeded from the sidecar, so a resume replays the same
+    // permutation and skipping `done` examples skips the ones already trained on.
     let mut progress =
-        crate::sft_progress::resume_or_fresh(model_path, examples.len(), model.step, SFT_EPOCHS);
-    // Warmup counts from where this fine-tune began, not from the pretraining
-    // step the checkpoint carries; a resume continues the same ramp.
+        sft_progress::resume_or_fresh(model_path, examples.len(), model.step_count, SFT_EPOCHS);
+    // Warmup counts from where this fine-tune began, not from the checkpoint's step.
     state.schedule = LrSchedule::sft(progress.origin);
     let start_epoch = progress.epoch;
     let start_done = progress.done;
 
-    let mut total_time = Duration::ZERO;
     for epoch in start_epoch..=SFT_EPOCHS {
         println!("── SFT epoch {epoch}/{SFT_EPOCHS} ──");
-        // Per-epoch permutation derived from (seed, epoch), so it depends on the
-        // run identity rather than on how many times the process restarted.
         let mut rng = StdRng::seed_from_u64(
             progress.seed ^ (epoch as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
         );
         examples.shuffle(&mut rng);
-
-        // Only the resumed epoch skips; later epochs run whole.
         let skip = if epoch == start_epoch { start_done } else { 0 };
         if skip > 0 {
             println!("  skipping {skip} examples already trained this epoch");
@@ -302,44 +334,86 @@ pub fn train_sft(model_path: &str) {
         progress.epoch = epoch;
         progress.done = skip;
 
-        let start = Instant::now();
-        model.train_sft(examples.iter().skip(skip), &mut state, &mut progress);
-        let epoch_time = start.elapsed();
-        total_time += epoch_time;
-
-        match model.save(model_path) {
-            Ok(()) => {
-                // The recorded position is the START of the next epoch, so a
-                // stop here resumes without redoing the epoch just finished.
-                progress.epoch = epoch + 1;
-                progress.done = 0;
-                progress.step = state.step;
-                if let Err(e) = crate::sft_progress::save(model_path, &progress) {
-                    eprintln!("  ✗ progress save failed: {e}");
-                }
-                println!(
-                    "  ✓ end-of-epoch save to '{model_path}'  (epoch {epoch_time:.0?}, total {total_time:.0?})"
-                );
-                println!("    trained on: {}", model.seen.save_line());
+        let epoch_start = Instant::now();
+        let mut tokens_since_print = 0;
+        let mut time = Instant::now();
+        for ex in examples.iter().skip(skip) {
+            progress.done += 1;
+            let tokens: Vec<usize> = ex.tokens.iter().map(|&t| t as usize).collect();
+            let words = &ex.words;
+            if words.len() < 2 {
+                continue;
             }
-            Err(e) => eprintln!("  ✗ save failed: {e}"),
-        }
-    }
+            // One flag per DECODED word: word w decodes words[w + 1].
+            let loss = model.forward_backward_masked(&tokens, words, &ex.loss[1..]);
+            let (resp_chars, resp_words) = ex.response_extent();
+            model.seen.add_sft(tokens.len(), words.len(), resp_chars, resp_words);
+            tokens_since_print += tokens.len();
+            state.log_tokens(tokens.len());
+            state.log_metric("resp_ppl", loss.exp());
 
-    // Every epoch done — drop the sidecar so the next invocation starts a new
-    // run rather than resuming a completed one.
-    crate::sft_progress::clear(model_path);
+            if let Some(lr) = state.step(loss) {
+                opt.lr = lr;
+                opt.t += 1;
+                model.step(&opt);
+            }
+            model.step_count = state.step;
+
+            if state.print() {
+                let loss = state.get_loss();
+                println!(
+                    "{} | resp loss {:.3} | ppl {:.3} | lr {:.2e} | {} tok | {:.1?}",
+                    state.step,
+                    loss,
+                    loss.exp(),
+                    opt.lr,
+                    tokens_since_print,
+                    time.elapsed(),
+                );
+                tokens_since_print = 0;
+                time = Instant::now();
+            }
+            if state.save() {
+                save_sft(&model, model_path, &mut state, &mut progress);
+            }
+        }
+        println!("SFT epoch {epoch} took {:.1?}", epoch_start.elapsed());
+        // The recorded position is the START of the next epoch.
+        progress.epoch = epoch + 1;
+        progress.done = 0;
+        save_sft(&model, model_path, &mut state, &mut progress);
+    }
+    // Every epoch done: drop the sidecar so the next run starts fresh.
+    sft_progress::clear(model_path);
 }
 
-/// Forward-only validation: streams the *entire* validation set through the
-/// hierarchical model and reports mean decode char loss and word loss. No
-/// backward, no weight updates. Set via the `hv` mode.
+fn save_sft(
+    model: &Hierarchical,
+    model_path: &str,
+    state: &mut TrainingState,
+    progress: &mut sft_progress::SftProgress,
+) {
+    match model.save(model_path) {
+        Ok(()) => {
+            state.flush_log();
+            progress.step = state.step;
+            if let Err(e) = sft_progress::save(model_path, progress) {
+                eprintln!("progress save failed: {e}");
+            }
+            println!("saved -> {model_path}");
+            println!("  trained on: {}", model.seen.save_line());
+        }
+        Err(e) => eprintln!("save failed: {e}"),
+    }
+}
+
+/// Forward-only validation (mode `hv`): the whole of `VAL_DATA` through the model,
+/// reporting the mean decode char loss and word loss. No backward, no update.
 pub fn validate_hierarchical(model_path: &str) {
     let tokenizer = Utf8Tokenizer::new();
-
-    let mut model = match Hierarchical::load(model_path, tokenizer) {
+    let mut model = match Hierarchical::load(model_path) {
         Ok(m) => {
-            println!("Loaded '{model_path}' (step {}).", m.step);
+            println!("Loaded '{model_path}' (step {}).", m.step_count);
             m
         }
         Err(e) => {
@@ -358,19 +432,18 @@ pub fn validate_hierarchical(model_path: &str) {
     );
 
     let start = Instant::now();
-    let mut cache_tokens = 0;
-    let mut c_total = 0.0;
-    let mut w_total = 0.0;
-    let mut windows = 0;
+    let (mut c_total, mut w_total, mut windows) = (0.0, 0.0, 0usize);
     while let Some(chunk) = data.next_chunk() {
-        if chunk.max_window_tokens() > cache_tokens {
-            cache_tokens = chunk.max_window_tokens();
-            model.make_cache(WORDS_PER_SEQ, cache_tokens);
+        for batch in chunk.iter() {
+            let tokens: Vec<usize> = batch.tokens.iter().map(|&t| t as usize).collect();
+            if batch.words.len() < 2 {
+                continue;
+            }
+            model.set_doc_starts(&batch.doc_starts);
+            c_total += model.eval_loss(&tokens, &batch.words);
+            w_total += model.last_word_loss();
+            windows += 1;
         }
-        let (c, w, n) = model.eval_decode_loss_sums(chunk.iter());
-        c_total += c;
-        w_total += w;
-        windows += n;
         println!(
             "  {windows} windows  char {:.3}  word {:.3}  ({:.0?})",
             c_total / windows.max(1) as f32,
@@ -385,10 +458,7 @@ pub fn validate_hierarchical(model_path: &str) {
     }
     let c_loss = c_total / windows as f32;
     let w_loss = w_total / windows as f32;
-    println!(
-        "\n── validation ({windows} windows, {:.0?}) ──",
-        start.elapsed()
-    );
+    println!("\n── validation ({windows} windows, {:.0?}) ──", start.elapsed());
     println!("  Char loss = {c_loss:.3} nats   ppl = {:.3}", c_loss.exp());
     println!("  Word loss = {w_loss:.3} nats   ppl = {:.3}", w_loss.exp());
 }

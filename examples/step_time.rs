@@ -15,7 +15,7 @@ fn main() {
     use neural_networks::config::{WORD_BLOCKS, WORD_HIDDEN};
     use neural_networks::gpu::Gpu;
     use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
-    use neural_networks::nn2::optim::AdamCfg;
+    use neural_networks::cpu::optim::AdamCfg;
 
     let path = std::env::args().nth(1).unwrap_or("src/gpu/ops.rs".into());
     let steps: usize = std::env::args()

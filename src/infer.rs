@@ -482,7 +482,7 @@ impl Hierarchical {
     }
 
     /// Every word's `e_w` (`[n, hc]`): its chars then `[W]`, read out at `[W]`.
-    fn encode(&self, words: &[&[u16]]) -> Vec<f32> {
+    pub fn encode(&self, words: &[&[u16]]) -> Vec<f32> {
         let hc = self.cfg.hc;
         let w_tok = self.cfg.w_token;
         let mut out = vec![0.0; words.len() * hc];
@@ -777,10 +777,10 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nn2;
+    use crate::cpu;
     use crate::tensor::Tensor;
 
-    fn lin(l: &nn2::Linear) -> Linear {
+    fn lin(l: &cpu::Linear) -> Linear {
         Linear {
             inp: l.w.rows(),
             out: l.w.cols(),
@@ -789,8 +789,8 @@ mod tests {
         }
     }
 
-    /// The nn2 cell's four `[in+H, H]` gate matrices packed the way the GPU stores them.
-    fn slstm(c: &nn2::SLstm, post: &[f32]) -> SLstm {
+    /// The cpu cell's four `[in+H, H]` gate matrices packed the way the GPU stores them.
+    fn slstm(c: &cpu::SLstm, post: &[f32]) -> SLstm {
         let (inp, h) = (c.input_size, c.hidden_size);
         let h4 = 4 * h;
         let mut wx = vec![0.0; inp * h4];
@@ -826,7 +826,7 @@ mod tests {
         out
     }
 
-    fn mlstm(c: &nn2::MLstm) -> MLstm {
+    fn mlstm(c: &cpu::MLstm) -> MLstm {
         let s = 1.0 / (c.dqk as f32).sqrt();
         let scaled = |t: &Tensor| Tensor::new(t.dims(), t.data.iter().map(|v| v * s).collect());
         let (wk, bk) = (scaled(&c.wk), scaled(&c.bk));
@@ -857,7 +857,7 @@ mod tests {
         }
     }
 
-    fn block<C: nn2::block::Cell>(b: &nn2::Block<C>, cell: Cell) -> Block {
+    fn block<C: cpu::block::Cell>(b: &cpu::Block<C>, cell: Cell) -> Block {
         Block {
             norm1: b.pre_norm1.gamma.data.clone(),
             cell,
@@ -873,7 +873,7 @@ mod tests {
         t.data.iter_mut().zip(&r.data).for_each(|(a, b)| *a += b);
     }
 
-    /// Stepping a block one position at a time reproduces nn2's whole-sequence
+    /// Stepping a block one position at a time reproduces cpu's whole-sequence
     /// forward over `[B, T, H]`.
     fn check(mut cpu: impl FnMut(&Tensor) -> Tensor, blk: &Block) {
         let (b, t, h) = (3, 7, blk.hidden());
@@ -895,9 +895,9 @@ mod tests {
     }
 
     #[test]
-    fn slstm_block_steps_like_nn2() {
+    fn slstm_block_steps_like_cpu() {
         let (h, up) = (16, up_of(16));
-        let mut b = nn2::SLstmBlock::new_slstm(h, up);
+        let mut b = cpu::SLstmBlock::new_slstm(h, up);
         for t in [&mut b.cell.wz, &mut b.cell.wi, &mut b.cell.wf, &mut b.cell.wo] {
             randomize(t, 0.3);
         }
@@ -910,9 +910,9 @@ mod tests {
     }
 
     #[test]
-    fn mlstm_block_steps_like_nn2() {
+    fn mlstm_block_steps_like_cpu() {
         let (h, up) = (16, up_of(16));
-        let mut b = nn2::MLstmBlock::new_mlstm(h, up, 4, 4);
+        let mut b = cpu::MLstmBlock::new_mlstm(h, up, 4, 4);
         randomize(&mut b.cell.wi, 0.5);
         randomize(&mut b.cell.wf, 0.5);
         randomize(&mut b.cell.bi, 2.0);

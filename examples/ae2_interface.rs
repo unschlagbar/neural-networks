@@ -2,7 +2,7 @@
 //! text encoder's e_w, fed to the GPU backbone as given embeddings, must score
 //! like the GPU model reading the text itself.
 //!
-//!   cargo run --release --features cuda --example ae2_interface -- s4
+//!   cargo run --release --features cuda --example ae2_interface -- s4.v2
 
 use std::range::Range;
 
@@ -10,10 +10,10 @@ use neural_networks::audio::frontend::LogMel;
 use neural_networks::audio::io::Clip;
 use neural_networks::audio::librispeech::LibriSpeech;
 use neural_networks::audio::segments::WordSegments;
-use neural_networks::config::{AUDIO_DATA, AUDIO_FEATS, AUDIO_SR, MAX_SEQ_LEN};
+use neural_networks::config::{AUDIO_DATA, AUDIO_FEATS, AUDIO_SR};
 use neural_networks::gpu::audio::AudioEncoder;
 use neural_networks::gpu::{GTensor, Gpu, hierarchical::Hierarchical as GpuHier};
-use neural_networks::hierarchical::Hierarchical;
+use neural_networks::infer::Hierarchical;
 use neural_networks::segment::word_ends;
 use neural_networks::tensor::Tensor;
 use neural_networks::tokenizer_utf8::Utf8Tokenizer;
@@ -38,12 +38,15 @@ fn main() {
     g.eval_loss(&gpu, &tokens, &words);
     let teacher = g.last_word_loss();
 
-    let mut c = Hierarchical::load(&path, tok).unwrap();
-    c.make_cache(1, MAX_SEQ_LEN);
-    let mut embeds = Vec::new();
-    for w in &words[..words.len() - 1] {
-        embeds.extend_from_slice(c.encoder.encode_word_sample(&raw[w.start..w.end]));
-    }
+    let c = Hierarchical::load(&path).unwrap();
+    let slices = |words: &[Range<usize>], raw: &[u16]| -> Vec<Vec<u16>> {
+        words.iter().map(|w| raw[w.start..w.end].to_vec()).collect()
+    };
+    let encode = |words: &[Vec<u16>]| {
+        let refs: Vec<&[u16]> = words.iter().map(|w| w.as_slice()).collect();
+        c.encode(&refs)
+    };
+    let embeds = encode(&slices(&words[..words.len() - 1], &raw));
     let hc = embeds.len() / (words.len() - 1);
     let given = GTensor::from_host(&gpu, &Tensor::new(&[words.len() - 1, hc], embeds));
     g.eval_loss_embeds(&gpu, &given, &tokens, &words, None);
@@ -75,10 +78,7 @@ fn main() {
         let audio = out.embeddings.as_ref().unwrap().to_host(&gpu).data;
         enc.discard();
 
-        let mut text_e = Vec::new();
-        for w in &words {
-            text_e.extend_from_slice(c.encoder.encode_word_sample(&raw[w.start..w.end]));
-        }
+        let text_e = encode(&slices(&words, &raw));
         let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
         println!("\n{id}: {text}");
         for (i, w) in words.iter().enumerate() {

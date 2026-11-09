@@ -48,7 +48,7 @@ pub const LOG_EVERY: usize = 100;
 // Per-stack decoupled weight decay (λ): `0.0` is plain Adam, positive is AdamW
 // on the interior projections only (never embeddings, heads, biases, norms).
 pub const ENCODER_WEIGHT_DECAY: f32 = 0.01;
-pub const BACKBONE_WEIGHT_DECAY: f32 = crate::optimizers::WEIGHT_DECAY;
+pub const BACKBONE_WEIGHT_DECAY: f32 = 0.03;
 pub const DECODER_WEIGHT_DECAY: f32 = 0.01;
 
 // Per-stack learning rate, as a multiple of `LR`. Under Adam the update is about
@@ -61,9 +61,6 @@ pub const DECODER_WEIGHT_DECAY: f32 = 0.01;
 // under.
 pub const ENCODER_LR_SCALE: f32 = 2.0;
 pub const DECODER_LR_SCALE: f32 = 2.0;
-
-/// Weight decay for the flat model. `0.0` keeps it plain Adam.
-pub const FLAT_WEIGHT_DECAY: f32 = 0.0;
 
 // Sampling
 

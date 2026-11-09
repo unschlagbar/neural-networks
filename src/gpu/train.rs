@@ -5,9 +5,9 @@
 //! intervals), same gradient accumulation over `BATCH_SIZE` windows — but the
 //! whole model lives on the GPU (`gpu::Hierarchical`).
 //!
-//! Checkpoints use the CPU `HIER` format (see `gpu::hierarchical`), written to
-//! `<model_path>` every `SAVE_EVERY` steps and reloaded on startup, so a run can
-//! be stopped and resumed — and the same file opens in `hp` / `hs`.
+//! Checkpoints are v2 (`src/checkpoint.rs`), written to `<model_path>` every
+//! `SAVE_EVERY` steps and reloaded on startup, so a run can be stopped and resumed —
+//! and the same file opens in `hs`.
 
 use std::time::Instant;
 
@@ -16,17 +16,15 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 
 use crate::batches::ChunkedWordDataSet;
-use crate::checkpoint;
 use crate::config::{
-    AUDIO_STAGE_LR, BATCH_SIZE, CARRY_WINDOW_STATE, CHAR_HIDDEN, CHUNK_BYTES, EPOCHS, GRAD_CLIP_NORM, LOG_EVERY,
-    LOGIT_SOFTCAP, LR, MAX_WINDOW_TOKENS, MIN_WORDS_PER_SEQ, SFT_BATCH_SIZE, SFT_DATA, SFT_EPOCHS,
-    SFT_LR, SFT_MAX_TOKENS, SFT_WARMUP_WINDOWS, TRAIN_DATA, VAL_DATA, WORD_BLOCKS, WORD_HIDDEN,
-    WORDS_PER_SEQ,
+    AUDIO_STAGE_LR, BATCH_SIZE, CARRY_WINDOW_STATE, CHUNK_BYTES, EPOCHS, GRAD_CLIP_NORM, LOG_EVERY,
+    LR, MAX_WINDOW_TOKENS, MIN_WORDS_PER_SEQ, SFT_BATCH_SIZE, SFT_DATA, SFT_EPOCHS, SFT_LR,
+    SFT_MAX_TOKENS, SFT_WARMUP_WINDOWS, TRAIN_DATA, VAL_DATA, WORDS_PER_SEQ,
 };
 use crate::gpu::Gpu;
 use crate::gpu::audio_train::{AudioPretrain, SftAudio};
 use crate::gpu::hierarchical::{Hierarchical, ModelCfg};
-use crate::nn2::optim::AdamCfg;
+use crate::cpu::optim::AdamCfg;
 use crate::pretrain_progress;
 use crate::sft;
 use crate::sft_progress;
@@ -65,19 +63,7 @@ pub fn train_hierarchical_gpu(model_path: &str, audio: bool) {
     let vocab = tokenizer.vocab_size();
     let w_token = tokenizer.w_token() as usize;
 
-    let heads = 8;
-    let cfg = ModelCfg {
-        vocab,
-        hc: CHAR_HIDDEN,
-        wh: WORD_HIDDEN,
-        enc_blocks: 4,
-        bb_blocks: WORD_BLOCKS,
-        dec_blocks: 4,
-        heads,
-        dqk: WORD_HIDDEN / heads,
-        w_token,
-        cap: LOGIT_SOFTCAP,
-    };
+    let cfg = ModelCfg::configured(vocab, w_token);
 
     let (mut model, loaded) = match Hierarchical::load(&gpu, model_path, w_token) {
         Ok(m) => {
@@ -138,7 +124,7 @@ pub fn train_hierarchical_gpu(model_path: &str, audio: bool) {
     // SAVE_EVERY steps), so the on-disk log never gets ahead of the checkpoint.
     state.set_defer_log_flush(true);
 
-    let mut opt = AdamCfg::new(LR, crate::optimizers::WEIGHT_DECAY);
+    let mut opt = AdamCfg::new(LR, crate::config::BACKBONE_WEIGHT_DECAY);
     let mut capture = crate::gpu::profile::Capture::from_env();
     let mut audio = if audio {
         let a = AudioPretrain::open(&gpu, model_path, model.cfg.hc);
@@ -470,86 +456,6 @@ pub fn validate_hierarchical_gpu(model_path: &str) {
     println!("  Word loss = {w_loss:.3} nats   ppl = {:.3}", w_loss.exp());
 }
 
-/// Rewrite an `NNM1` checkpoint as v2 at `<model>.v2`, leaving the original in place.
-///
-/// The written file is read back tensor by tensor and compared bitwise against the
-/// device copy it came from, then loaded as a model.
-pub fn convert_checkpoint(model_path: &str) {
-    let gpu = match Gpu::new() {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("No CUDA GPU available ({e}).");
-            return;
-        }
-    };
-    match checkpoint::is_v2(model_path) {
-        Ok(true) => {
-            println!("'{model_path}' is already a v2 checkpoint.");
-            return;
-        }
-        Ok(false) => {}
-        Err(e) => {
-            eprintln!("Could not open '{model_path}': {e}");
-            std::process::exit(2);
-        }
-    }
-    let w_token = Utf8Tokenizer::new().w_token() as usize;
-    let mut model = match Hierarchical::load(&gpu, model_path, w_token) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Could not load '{model_path}': {e}");
-            std::process::exit(2);
-        }
-    };
-    let out = format!("{model_path}.v2");
-    if let Err(e) = model.save(&gpu, &out) {
-        eprintln!("Could not write '{out}': {e}");
-        std::process::exit(2);
-    }
-
-    let mut verify = || -> std::io::Result<usize> {
-        let mut r = checkpoint::Reader::open(&out)?;
-        let bad = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
-        if r.header.cfg != model.cfg
-            || r.header.step != model.step_count as u64
-            || r.header.seen != model.seen
-        {
-            return Err(bad("header differs from the loaded model".into()));
-        }
-        let mut buf = Vec::new();
-        let mut params = 0;
-        for (i, slot) in model.param_slots().into_iter().enumerate() {
-            let want = slot.param.to_host(&gpu);
-            r.next_into(want.dims(), &mut buf)?;
-            if buf.iter().zip(&want.data).any(|(a, b)| a.to_bits() != b.to_bits()) {
-                return Err(bad(format!("tensor {i} differs")));
-            }
-            params += buf.len();
-        }
-        r.finish()?;
-        Ok(params)
-    };
-    let params = match verify() {
-        Ok(params) => params,
-        Err(e) => {
-            eprintln!("'{out}' does not match the loaded model: {e}");
-            let _ = std::fs::remove_file(&out);
-            std::process::exit(2);
-        }
-    };
-    let (cfg, step) = (model.cfg, model.step_count);
-    drop(model);
-
-    // The v2 loader rebuilds the layers from the config alone, so a checkpoint whose
-    // layer pattern the config does not describe is written fine and cannot be read.
-    if let Err(e) = Hierarchical::load(&gpu, &out, w_token) {
-        eprintln!("'{out}' does not load back ({e}); removed it.");
-        let _ = std::fs::remove_file(&out);
-        std::process::exit(2);
-    }
-    println!("Wrote '{out}': {cfg:?}, step {step}, {params} parameters, verified bit-exact.");
-}
-
 /// GPU supervised fine-tuning (Q-A instruction tuning) of a pretrained
 /// hierarchical model.
 ///
@@ -644,7 +550,7 @@ pub fn train_sft_gpu(model_path: &str) {
     state.init_log(&format!("{model_path}_sft"), &["resp_ppl"]);
     state.set_defer_log_flush(true);
 
-    let mut opt = AdamCfg::new(SFT_LR, crate::optimizers::WEIGHT_DECAY);
+    let mut opt = AdamCfg::new(SFT_LR, crate::config::BACKBONE_WEIGHT_DECAY);
 
     // Where a previous, interrupted run stopped (or a fresh start). The shuffle
     // is seeded from this so resuming replays the exact same permutation and

@@ -1,5 +1,5 @@
 //! Device-resident RMSNorm, the GPU counterpart of
-//! [`nn2::rms_norm::RmsNorm`](crate::nn2::rms_norm::RmsNorm).
+//! [`cpu::rms_norm::RmsNorm`](crate::cpu::rms_norm::RmsNorm).
 //!
 //! Pure normalization (`y = γ ⊙ x / rms(x)`, row-wise) with a learned scale that
 //! trains on undecayed AdamW (norm scales are never weight-decayed). Wraps the
@@ -10,10 +10,10 @@
 use super::arena::{self, ParamKind, ParamSlot, TrainingCache};
 use super::ops::{self, GpuRmsForward};
 use super::{Frame, GTensor, Gpu};
-use crate::nn2::optim::AdamCfg;
+use crate::cpu::optim::AdamCfg;
 use crate::tensor::Tensor;
 
-/// Matches `nn2::rms_norm::EPS` so the two systems normalize identically.
+/// Matches `cpu::rms_norm::EPS` so the two systems normalize identically.
 const EPS: f32 = 1e-6;
 
 pub struct RmsNorm {
@@ -45,7 +45,7 @@ impl RmsNorm {
     }
 
     /// Head-wise variant: `group` is the per-head width (`dhv`); `F` must be a
-    /// multiple of it. Matches `nn2` head-wise RMSNorm (γ is `[F]`, group `grp`
+    /// multiple of it. Matches `cpu` head-wise RMSNorm (γ is `[F]`, group `grp`
     /// uses `γ[grp*group ..]`).
     pub fn from_parts_grouped(gpu: &Gpu, gamma: &Tensor, group: usize) -> Self {
         let size = gamma.len();
@@ -65,7 +65,7 @@ impl RmsNorm {
         }
     }
 
-    /// Fresh RMSNorm with `γ = 1` (matches `nn2::RmsNorm::new`).
+    /// Fresh RMSNorm with `γ = 1` (matches `cpu::RmsNorm::new`).
     pub fn new(gpu: &Gpu, size: usize) -> Self {
         Self::from_parts(gpu, &Tensor::new(&[size], vec![1.0; size]))
     }

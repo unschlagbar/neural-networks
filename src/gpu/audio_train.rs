@@ -45,11 +45,11 @@ use crate::config::{
     AUDIO_HELD_OUT_SPEAKERS, AUDIO_MAX_WORDS, AUDIO_BABBLE_SPLIT, AUDIO_E2_FROM, AUDIO_MAX_TAKE_SECONDS, AUDIO_REALIGN_MAX_CER, AUDIO_PRETRAIN_DISTILL, AUDIO_PRETRAIN_EVAL_EVERY, AUDIO_TAKE_SHARE, AUDIO_PRETRAIN_TTS_P, AUDIO_PRETRAIN_VOICE_P, AUDIO_HOP, AUDIO_LR, AUDIO_NOISE_DIR, AUDIO_PREFIX_P, AUDIO_SPLITS, AUDIO_TRAIN_AFTER_WORDS, AUDIO_TAKE_DIRS, AUDIO_VOICE_DIR, AUDIO_VOICE_DOCS, AUDIO_VOICE_EPOCHS,
     AUDIO_VOICE_LAST, AUDIO_VOICE_VAL_SESSIONS,
     AUDIO_SR, AUDIO_VAL_EVERY, AUDIO_WARMUP_STEPS, BOUNDARY_COUNT_WEIGHT, BOUNDARY_POS_WEIGHT, BOUNDARY_TOLERANCE,
-    CTC_WEIGHT, DISTILL_ALPHA, DISTILL_ALPHA_PLAIN, EMBED_ALIGN_WEIGHT, EMBED_CONTRAST_TEMP, EMBED_CONTRAST_WEIGHT, STATE_DISTILL_BETA, MAX_SEQ_LEN, AUDIO_PRETRAIN_EVERY, AUDIO_PRETRAIN_HEARD,
+    CTC_WEIGHT, DISTILL_ALPHA, DISTILL_ALPHA_PLAIN, EMBED_ALIGN_WEIGHT, EMBED_CONTRAST_TEMP, EMBED_CONTRAST_WEIGHT, STATE_DISTILL_BETA, AUDIO_PRETRAIN_EVERY, AUDIO_PRETRAIN_HEARD,
     AUDIO_PRETRAIN_LR, AUDIO_PRETRAIN_START, AUDIO_PRETRAIN_WORDS, SFT_AUDIO_DISTILL, SFT_AUDIO_LR, SFT_AUDIO_START,
     SFT_SPEECH_DIRS,
 };
-use crate::nn2::optim::AdamCfg;
+use crate::cpu::optim::AdamCfg;
 use crate::segment::word_ends;
 use crate::tensor::Tensor;
 use crate::tokenizer_utf8::Utf8Tokenizer;
@@ -2131,22 +2131,28 @@ impl Corpus {
     /// `SCALE_UTTERANCES` training transcripts: where the backbone is used to
     /// reading its input. On the CPU, so it needs no room on the device.
     fn text_scale(&self, model_path: &str) -> Vec<f32> {
-        let mut text = crate::hierarchical::Hierarchical::load(model_path, Utf8Tokenizer::new())
+        let text = crate::infer::Hierarchical::load(model_path)
             .unwrap_or_else(|e| panic!("{model_path}: {e}"));
-        text.make_cache(1, MAX_SEQ_LEN);
-        let mut sum_sq: Vec<f64> = Vec::new();
-        let mut words = 0;
-        for p in self.train().into_iter().take(SCALE_UTTERANCES) {
-            for w in &p.words {
-                let toks: Vec<u16> = p.tokens[w.start..w.end].iter().map(|&t| t as u16).collect();
-                let e = text.encoder.encode_word_sample(&toks);
-                sum_sq.resize(e.len(), 0.0);
-                for (s, &x) in sum_sq.iter_mut().zip(e) {
-                    *s += (x as f64) * (x as f64);
-                }
-                words += 1;
+        let words: Vec<Vec<u16>> = self
+            .train()
+            .into_iter()
+            .take(SCALE_UTTERANCES)
+            .flat_map(|p| {
+                p.words
+                    .iter()
+                    .map(|w| p.tokens[w.start..w.end].iter().map(|&t| t as u16).collect())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let refs: Vec<&[u16]> = words.iter().map(|w| w.as_slice()).collect();
+        let hc = text.cfg.hc;
+        let mut sum_sq = vec![0.0f64; hc];
+        for e in text.encode(&refs).chunks_exact(hc) {
+            for (s, &x) in sum_sq.iter_mut().zip(e) {
+                *s += (x as f64) * (x as f64);
             }
         }
+        let words = words.len().max(1);
         sum_sq
             .iter()
             .map(|s| (s / words as f64).sqrt() as f32)

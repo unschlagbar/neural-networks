@@ -1,20 +1,20 @@
 //! Device-resident batched sLSTM cell, the GPU counterpart of
-//! [`nn2::slstm::SLstm`](crate::nn2::slstm::SLstm).
+//! [`cpu::slstm::SLstm`](crate::cpu::slstm::SLstm).
 //!
 //! Same equations and the same AdamW convention (gate matrices decay, biases do
 //! not), so a GPU cell built from a CPU cell's weights matches it for
-//! forward → backward → step — which the parity test checks against `nn2::SLstm`.
+//! forward → backward → step — which the parity test checks against `cpu::SLstm`.
 //! The weights are stored fused rather than as the CPU's 4 gates `[rows, H]`; see
 //! the note on the layout below.
 //!
 //! The cell also owns its **post-cell RMSNorm**, applied to the output on the way
-//! out of `forward` and undone first in `backward`. `nn2` and the checkpoint format
+//! out of `forward` and undone first in `backward`. `cpu` and the checkpoint format
 //! still keep that norm on the surrounding block, so its γ crosses the boundary as
 //! an argument (`from_parts`) and a getter (`post_norm_gamma`) — but on the GPU
 //! path the block holds no norm at all, because how a cell normalizes its own
 //! output is the cell's business: this one uses a plain row-wise norm, the mLSTM a
-//! head-wise one. The parity tests therefore compare against `nn2::SLstm` composed
-//! with an `nn2::RmsNorm`, not against the bare cell.
+//! head-wise one. The parity tests therefore compare against `cpu::SLstm` composed
+//! with an `cpu::RmsNorm`, not against the bare cell.
 //!
 //! Time is a serial loop; the batch is the parallel axis. **The whole recurrent
 //! state `(h,c,n,m)` stays resident in `GTensor<f32>`s across the entire T-loop** — no
@@ -53,9 +53,9 @@
 //! The fused operands **are** the parameters of record: `wx [in, 4H]`,
 //! `whr [H, 4H]` and `bcat [4H]` are what the optimizer steps and what the grads
 //! accumulate into, so no per-forward repacking happens at all. The four `[rows, H]`
-//! gate matrices `nn2::SLstm` and the checkpoints use are a *serialization* layout,
-//! converted on the host only in `from_parts` / `to_nn_cell` — once per checkpoint,
-//! never per step. Gate order stays z=0, i=1, f=2, o=3: the column blocks of the
+//! gate matrices `cpu::SLstm` uses are converted on the host only, in `from_parts`
+//! and the test-side `gate_matrices`, never per step. Gate order stays z=0, i=1,
+//! f=2, o=3: the column blocks of the
 //! fused `[·, 4H]`, with the input rows above the recurrent rows in `[rows, H]`.
 
 use super::arena::{self, ParamKind, ParamSlot};
@@ -65,7 +65,7 @@ use super::ops::{self, GpuRmsForward, SlabBuf, SlstmSlabs};
 use super::rms_norm::RmsNorm;
 use super::{Buf, GTensor, Gpu};
 use crate::gpu::arena::TrainingCache;
-use crate::nn2::optim::AdamCfg;
+use crate::cpu::optim::AdamCfg;
 use crate::tensor::Tensor;
 
 /// Below this sequence length the T-loop runs step by step instead of as one
@@ -155,7 +155,7 @@ pub struct SLstm {
     // gates z=0, i=1, f=2, o=3 occupy the four column blocks of the `4H` axis.
     // The optimizer steps these, the grads accumulate into them, and nothing is
     // repacked per forward — the `[rows, H]` gate matrices exist only at the
-    // checkpoint boundary (`from_parts` / `to_nn_cell`).
+    // CPU boundary (`from_parts` / `gate_matrices`).
     pub wx: GTensor<f32>,   // [in, 4H]   input half
     pub whr: GTensor<f32>,  // [H, 4H]    recurrent half
     pub bcat: GTensor<f32>, // [4H]
@@ -377,17 +377,17 @@ impl SLstm {
         }
     }
 
-    /// Freshly-initialised cell, matching `nn2::SLstm::new`'s init exactly
+    /// Freshly-initialised cell, matching `cpu::SLstm::new`'s init exactly
     /// (including the +4.5 forget-gate bias). Post-norm starts at γ=1.
     pub fn new_rand(gpu: &Gpu, input: usize, hidden: usize) -> Self {
-        Self::from_cpu(gpu, &crate::nn2::SLstm::new(input, hidden), None)
+        Self::from_cpu(gpu, &crate::cpu::SLstm::new(input, hidden), None)
     }
 
     /// Upload a CPU cell (weights are copied; grads/moments start at zero).
     ///
-    /// The post-cell norm's γ comes from the surrounding CPU *block* — `nn2` still
+    /// The post-cell norm's γ comes from the surrounding CPU *block* — `cpu` still
     /// keeps it there — so the caller passes it in; `None` starts it at 1.
-    pub fn from_cpu(gpu: &Gpu, cpu: &crate::nn2::SLstm, post_gamma: Option<&Tensor>) -> Self {
+    pub fn from_cpu(gpu: &Gpu, cpu: &crate::cpu::SLstm, post_gamma: Option<&Tensor>) -> Self {
         Self::from_parts(
             gpu,
             cpu.input_size,
@@ -411,30 +411,6 @@ impl SLstm {
     #[inline]
     pub fn hidden_size(&self) -> usize {
         self.hidden
-    }
-
-    /// Export this cell into the CPU `nn::SLSTMLayer` format (weights only; the
-    /// `h_init`/`c_init` the CPU format carries are always zero here). Used to
-    /// write a `HIER` checkpoint from a GPU model.
-    pub fn to_nn_cell(&self, gpu: &Gpu) -> crate::nn::slstm::SLSTMLayer {
-        let (h, inp) = (self.hidden, self.input);
-        let [wz, wi, wf, wo] = self.gate_matrices(gpu);
-        let b = self.bcat.to_host(gpu).data;
-        let bias = |g: usize| b[g * h..(g + 1) * h].to_vec().into_boxed_slice();
-        crate::nn::slstm::SLSTMLayer::from_loaded(
-            inp,
-            h,
-            wz,
-            wi,
-            wf,
-            wo,
-            bias(0),
-            bias(1),
-            bias(2),
-            bias(3),
-            vec![0.0; h].into(),
-            vec![0.0; h].into(),
-        )
     }
 
     /// Gate `g`'s weights as the `[rows, H]` matrix the CPU cell holds, downloaded
@@ -478,8 +454,8 @@ impl SLstm {
     }
 
     /// Unpack the fused `wx`/`whr` back into the four `[rows, H]` gate matrices the
-    /// CPU cells and checkpoints use — the inverse of the pack in
-    /// [`from_parts`](Self::from_parts). Host-side and once per checkpoint.
+    /// CPU cell uses — the inverse of the pack in [`from_parts`](Self::from_parts).
+    #[cfg(test)]
     fn gate_matrices(&self, gpu: &Gpu) -> [iron_oxide::collections::Matrix; 4] {
         let (h, h4, inp) = (self.hidden, 4 * self.hidden, self.input);
         let rows = inp + h;
@@ -494,30 +470,6 @@ impl SLstm {
             }
             iron_oxide::collections::Matrix::from_vec(m, rows, h)
         })
-    }
-
-    /// Rebuild a GPU cell from a CPU `nn::SLSTMLayer` (inverse of `to_nn_cell`).
-    /// `post_gamma` is the enclosing `SLSTMBlock`'s `post_cell_norm.gamma`.
-    pub fn from_nn_cell(
-        gpu: &Gpu,
-        c: &crate::nn::slstm::SLSTMLayer,
-        post_gamma: Option<&Tensor>,
-    ) -> Self {
-        use super::{tensor_from_matrix as m, tensor_from_slice as v};
-        Self::from_parts(
-            gpu,
-            c.input_size,
-            c.hidden_size,
-            &m(&c.wz),
-            &m(&c.wi),
-            &m(&c.wf),
-            &m(&c.wo),
-            &v(&c.bz),
-            &v(&c.bi),
-            &v(&c.bf),
-            &v(&c.bo),
-            post_gamma,
-        )
     }
 
     /// The post-cell norm's scale, for exporting the enclosing block to a CPU
@@ -1370,8 +1322,8 @@ mod tests {
         TrainingCache::new(gpu, 1 << 20, 1 << 16, 1 << 20)
     }
     use super::*;
-    use crate::nn2::optim::AdamCfg;
-    use crate::nn2::slstm::SLstm as CpuSLstm;
+    use crate::cpu::optim::AdamCfg;
+    use crate::cpu::slstm::SLstm as CpuSLstm;
 
     /// GPU-vs-CPU tolerance, scaled for the slab storage dtype in use.
     ///
@@ -1446,7 +1398,7 @@ mod tests {
         )
     }
 
-    /// The CPU reference for a GPU cell: `nn2::SLstm` is the bare recurrence, while
+    /// The CPU reference for a GPU cell: `cpu::SLstm` is the bare recurrence, while
     /// the GPU cell now also owns the post-cell norm, so the comparison composes the
     /// two by hand. γ starts at 1 on both sides (`from_cpu` above passes `None`).
     ///
@@ -1455,17 +1407,17 @@ mod tests {
     /// makes the two sides see the same delta at the recurrence.
     struct CpuRef {
         cell: CpuSLstm,
-        norm: crate::nn2::rms_norm::RmsNorm,
+        norm: crate::cpu::rms_norm::RmsNorm,
     }
 
     impl CpuRef {
         fn new(inp: usize, h: usize) -> Self {
             Self {
                 cell: CpuSLstm::new(inp, h),
-                norm: crate::nn2::rms_norm::RmsNorm::new(h),
+                norm: crate::cpu::rms_norm::RmsNorm::new(h),
             }
         }
-        /// `nn2::RmsNorm` is strictly rank 2 (its GPU twin folds leading axes
+        /// `cpu::RmsNorm` is strictly rank 2 (its GPU twin folds leading axes
         /// itself), so the `[B, T, H]` sequences are flattened around it here.
         fn flat(t: &Tensor) -> Tensor {
             let f = t.shape[t.rank - 1];
@@ -1535,7 +1487,7 @@ mod tests {
         }
     }
 
-    /// GPU sLSTM must match `nn2::SLstm` (cell alone) for a full
+    /// GPU sLSTM must match `cpu::SLstm` (cell alone) for a full
     /// forward → backward → AdamW-step cycle, from identical weights. Tolerance
     /// is loose-ish because the two paths differ in float reduction order (cuBLAS
     /// vs the CPU gemm), but the recurrence math is identical.
@@ -2142,11 +2094,6 @@ mod tests {
         }
     }
 
-    /// The GPU cell (`hg` training) against `nn::slstm` (`hs` inference) — the two
-    /// implementations a checkpoint actually round-trips through. The other parity
-    /// tests compare the GPU to `nn2`, which inference never runs, so this is the
-    /// pair that has to agree. State is reset per word in the encoder/decoder, so
-    /// the sequence start (`n_prev == 0`) is exercised on every call.
     /// A reset row inside one call must split it into two independent sequences: the
     /// outputs, the input gradient and the summed weight gradients of the whole call
     /// equal those of the two halves run on their own, each from zero state — on the
@@ -2215,56 +2162,6 @@ mod tests {
             let db = add(c0.gate_db(gpu, gi), c1.gate_db(gpu, gi));
             assert_close(&whole.gate_dw(gpu, gi), &dw, 1e-3);
             assert_close(&whole.gate_db(gpu, gi), &db, 1e-3);
-        }
-    }
-
-    #[test]
-    fn gpu_matches_nn_slstm_inference_cell() {
-        let Some(gpu) = super::super::test_gpu() else {
-            return;
-        };
-        let tc = test_cache(&gpu);
-        use crate::nn::slstm::SLSTMLayer as InferSLstm;
-        use crate::nn_layer::NnLayer;
-
-        let (t, inp, h) = (64, 4, 6);
-        let mut cpu = InferSLstm::new(inp, h);
-
-        // `from_nn_cell` is the same converter the real GPU stack uses to load an
-        // `nn::slstm` checkpoint, so the weights land exactly as training saw them.
-        let mut dev = SLstm::from_nn_cell(&gpu, &cpu, None);
-        dev.set_carry(true);
-        dev.reset_state(&gpu);
-        cpu.reset_state();
-
-        let x = Tensor::random(&[1, t, inp], 0.5);
-        let y_dev = dev
-            .forward_alloc(&gpu, &GTensor::from_host(&gpu, &x), &tc)
-            .to_host(&gpu)
-            .data;
-
-        // Drive the scalar CPU cell one step at a time over the same input, then
-        // apply the post-cell norm the GPU cell owns internally (γ = 1, since
-        // from_parts got None) so both sides end at the same point.
-        let mut cache = cpu.alloc_cache();
-        let mut norm = crate::nn2::rms_norm::RmsNorm::new(h);
-        let mut y_cpu = Vec::with_capacity(t * h);
-        for step in 0..t {
-            let xt = &x.data[step * inp..(step + 1) * inp];
-            cpu.forward(xt, &mut cache);
-            let mut row = Tensor::zeros(&[1, h]);
-            row.data.copy_from_slice(&cache.h);
-            y_cpu.extend_from_slice(&norm.forward(&row).data);
-        }
-
-        assert_eq!(y_dev.len(), y_cpu.len());
-        for (i, (g, c)) in y_dev.iter().zip(&y_cpu).enumerate() {
-            assert!(
-                (g - c).abs() < tol(&gpu, 8e-3),
-                "step {}/unit {}: gpu {g} vs cpu {c}",
-                i / h,
-                i % h
-            );
         }
     }
 

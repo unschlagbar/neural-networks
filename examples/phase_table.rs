@@ -21,7 +21,7 @@ fn main() {
     use neural_networks::gpu::Gpu;
     use neural_networks::gpu::block::phase::{self, Bucket};
     use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
-    use neural_networks::nn2::optim::AdamCfg;
+    use neural_networks::cpu::optim::AdamCfg;
 
     if !phase::enabled() {
         eprintln!("set GPU_PHASE=1 to enable the per-phase accumulators");

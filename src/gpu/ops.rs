@@ -1,6 +1,6 @@
 //! GPU implementations of the backend op seam, operating on [`GTensor`]s.
 //!
-//! These are the device counterparts of `src/nn2/ops.rs` (+ `tensor::gemm`).
+//! These are the device counterparts of `src/cpu/ops.rs` (+ `tensor::gemm`).
 //! Each is checked against its CPU reference in the tests below, so the finite-
 //! difference tests that already pin the CPU math transitively pin these too.
 //!
@@ -50,7 +50,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use super::{GTensor, Gpu};
-use crate::nn2::optim::AdamCfg;
+use crate::cpu::optim::AdamCfg;
 
 /// Upload host indices (`usize`) as a `u32` device buffer for the gather /
 /// scatter / CE kernels.
@@ -1746,7 +1746,7 @@ pub fn rms_norm_backward_into(
 }
 
 /// Fused softmax + cross-entropy. Returns `(mean_loss, dlogits)` with
-/// `dlogits = (softmax − onehot) / B`, matching `nn2::loss`.
+/// `dlogits = (softmax − onehot) / B`, matching `cpu::loss`.
 pub fn softmax_cross_entropy(
     gpu: &Gpu,
     logits: &GTensor<f32>,
@@ -1791,7 +1791,7 @@ pub fn mlstm_head_major() -> bool {
 }
 
 /// One AdamW step of `param` from `grad`, updating moments `m`/`v` in place.
-/// `decay` toggles the decoupled weight-decay term. Mirrors `nn2::optim`.
+/// `decay` toggles the decoupled weight-decay term. Mirrors `cpu::optim`.
 ///
 /// Per tensor: a whole model steps its `ParamArena` in one launch instead (see
 /// `gpu::arena`), and this is what a standalone layer and the parity tests use.
@@ -1829,7 +1829,7 @@ pub fn adamw(
 }
 
 // sLSTM cell kernels (recurrent core, see gpu/slstm.rs). Each is the device
-// counterpart of an inner step of `nn2::SLstm`; all state stays resident in
+// counterpart of an inner step of `cpu::SLstm`; all state stays resident in
 // `GTensor<f32>`s across the T-loop — the only host transfers are the layer's input
 // and output.
 
@@ -6143,7 +6143,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        use crate::nn2::ops as cpu;
+        use crate::cpu::ops as cpu;
         let cap = 30.0;
         let x = Tensor::random(&[9, 13], 50.0);
         let dy = Tensor::random(&[9, 13], 1.0);
@@ -6162,7 +6162,7 @@ mod tests {
             return;
         };
         let tc = test_cache(&gpu);
-        use crate::nn2::ops as cpu;
+        use crate::cpu::ops as cpu;
         let (b, n) = (7, 5);
         let bias = Tensor::random(&[n], 1.0);
         let dy = Tensor::random(&[b, n], 1.0);
@@ -6189,7 +6189,7 @@ mod tests {
             return;
         };
         let tc = test_cache(&gpu);
-        use crate::nn2::ops as cpu;
+        use crate::cpu::ops as cpu;
         for (rows, n) in [(512, 768), (2048, 768), (1, 768), (333, 257)] {
             let dy = Tensor::random(&[rows, n], 1.0);
             let mut db_cpu = Tensor::random(&[n], 1.0);
@@ -6213,7 +6213,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        use crate::nn2::ops as cpu;
+        use crate::cpu::ops as cpu;
         let (vocab, dim) = (11, 6);
         let table = Tensor::random(&[vocab, dim], 1.0);
         let ids = [3usize, 0, 3, 7, 3]; // repeats -> exercises scatter atomics
@@ -6242,7 +6242,7 @@ mod tests {
             return;
         };
         let tc = test_cache(&gpu);
-        use crate::nn2::ops as cpu;
+        use crate::cpu::ops as cpu;
         let eps = 1e-5;
         // (rows, features, group): ungrouped wide (the block norms), a multi-group
         // wide case, and a width that is not a multiple of the 256 block threads.
@@ -6304,7 +6304,7 @@ mod tests {
             return;
         };
         let tc = test_cache(&gpu);
-        use crate::nn2::ops as cpu;
+        use crate::cpu::ops as cpu;
         let (b, f, group, eps) = (5, 12, 4, 1e-5); // head-wise case: 3 groups/row
         let x = Tensor::random(&[b, f], 1.0);
         let gamma = Tensor::random(&[f], 1.0);
@@ -6344,7 +6344,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        use crate::nn2::loss;
+        use crate::cpu::loss;
         let (b, c) = (6, 9);
         let logits = Tensor::random(&[b, c], 2.0);
         let targets = [0usize, 8, 3, 5, 1, 7];
@@ -6363,7 +6363,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        use crate::nn2::optim::{AdamCfg, AdamState};
+        use crate::cpu::optim::{AdamCfg, AdamState};
         let n = 20;
         let param = Tensor::random(&[n], 1.0);
         let grad = Tensor::random(&[n], 1.0);

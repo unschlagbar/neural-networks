@@ -8,7 +8,7 @@
 //! optimizer-step cycle end to end on the device: buffer threading, transpose
 //! forms, gradient-accumulation order and the multi-layer optimizer convention
 //! all exercised at once. The parity test checks loss and every updated
-//! parameter against the identical stack built from `nn2` CPU layers.
+//! parameter against the identical stack built from `cpu` CPU layers.
 //!
 //! Optimizer convention (same as the rest of the project): the interior `Linear`
 //! decays its weight; the embedding table, the RMSNorm scale and the logit head
@@ -16,10 +16,10 @@
 
 use super::ops::{self, GpuRmsForward};
 use super::{GTensor, Gpu, linear::Linear};
-use crate::nn2::optim::AdamCfg;
+use crate::cpu::optim::AdamCfg;
 use crate::tensor::Tensor;
 
-/// RMSNorm epsilon — matches `nn2::rms_norm::EPS` so the two systems normalize
+/// RMSNorm epsilon — matches `cpu::rms_norm::EPS` so the two systems normalize
 /// identically.
 const EPS: f32 = 1e-6;
 
@@ -181,11 +181,11 @@ impl Flat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nn2::embedding::Embedding as CpuEmb;
-    use crate::nn2::linear::Linear as CpuLinear;
-    use crate::nn2::loss;
-    use crate::nn2::rms_norm::RmsNorm as CpuRms;
-    use crate::nn2::soft_cap::SoftCap as CpuSoftCap;
+    use crate::cpu::embedding::Embedding as CpuEmb;
+    use crate::cpu::linear::Linear as CpuLinear;
+    use crate::cpu::loss;
+    use crate::cpu::rms_norm::RmsNorm as CpuRms;
+    use crate::cpu::soft_cap::SoftCap as CpuSoftCap;
 
     fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
         assert_eq!(got.len(), want.len(), "{what}: length mismatch");
@@ -194,7 +194,7 @@ mod tests {
         }
     }
 
-    /// The whole GPU stack must match an identical CPU `nn2` stack for
+    /// The whole GPU stack must match an identical CPU `cpu` stack for
     /// loss → backward → one AdamW step, from the same initial weights.
     #[test]
     fn flat_stack_matches_cpu() {
@@ -221,7 +221,7 @@ mod tests {
             .map(|v| v % vocab)
             .collect();
 
-        // CPU reference stack (nn2 layers), same init
+        // CPU reference stack (cpu layers), same init
         let mut c_emb = CpuEmb::new(vocab, dim);
         c_emb.table = table.clone();
         let mut c_lin1 = CpuLinear::from_parts(lin1_w.clone(), lin1_b.clone());

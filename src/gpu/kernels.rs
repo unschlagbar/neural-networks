@@ -4,7 +4,7 @@
 //! or clangd can lint and highlight them — and is stitched back into ONE string by
 //! [`SRC`] at Rust compile time. It is compiled once at [`Kernels::load`] and
 //! cached on the [`Gpu`](super::Gpu). Each `extern "C"` kernel is the device
-//! counterpart of a function in `src/nn2/ops.rs` / `loss.rs` / `optim.rs`, and is
+//! counterpart of a function in `src/cpu/ops.rs` / `loss.rs` / `optim.rs`, and is
 //! launched by a thin wrapper in `src/gpu/ops.rs` that owns the grid/block config
 //! and is parity-checked against the CPU reference.
 //!

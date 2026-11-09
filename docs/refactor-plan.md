@@ -47,12 +47,17 @@ build plus the tests named in the step. Tick a step off here when it is done.
   (~32 ms per backbone word, bandwidth-bound). `examples/infer_parity.rs` is the
   check; it goes with the old model in step 5.
 
-- [ ] **4. CPU training on nn2.** `h`, `hq`, `hv` on nn2 + v2 checkpoints, with
+- [x] **4. CPU training on nn2.** `h`, `hq`, `hv` on nn2 + v2 checkpoints, with
   the same masking (SFT loss mask, document borders) as the GPU path.
   Check: the hierarchical mask tests ported to nn2, and a short `h` run lowers
   the loss.
+  Done: `cpu::hierarchical` tests cover the full-mask and per-word-mask gradients,
+  packed document borders, both FD checks of the old model (tied table, injected
+  context), v2 round trip and `infer` loading. The full config does not fit in host
+  RAM, so the short run was the `h` step on a small model (hc 128, wh 256, 256-word
+  windows of `pretrain_v2`): held-out loss 5.86 → 2.08 over 200 windows.
 
-- [ ] **5. Delete the old CPU stack.** `src/nn/`, `src/hierarchical.rs`,
+- [x] **5. Delete the old CPU stack.** `src/nn/`, `src/hierarchical.rs`,
   `sequential.rs`, `nn_layer.rs`, `word_encoder.rs`, `parallel.rs`, `format.rs`
   (HIER), `loading.rs`/`saving.rs`, `gpu/nn_convert.rs`, the optimizers nn2 does
   not use (Muon, SGD, the `GradMatrix` aliases), `tests/parallel_parity.rs`
@@ -61,6 +66,15 @@ build plus the tests named in the step. Tick a step off here when it is done.
   including the GPU side and the `.cu` comments).
   Check: `cargo test --release --features cuda --lib` with a narrow filter per
   module; `harness` builds.
+  Done: `Sequential` stays (smart-light's wake-word detector runs on it), moved to
+  `src/sequential/` with only its general layers (linear, no-bias linear, embedding,
+  SiLU dense, LSTM, sLSTM, RMSNorm, conv1d, dropout, soft cap), one Adam(W) in
+  `optim.rs` instead of the swappable optimizers, and its `NNM1` flat container in
+  `io.rs` (byte-identical: a file saved at `d525d91` loads and re-saves to the same
+  bytes). The mLSTM / block layers, replica and parallel code went with the old
+  model. Byte primitives live in `src/bytes.rs`. `i` reads v2 (or a flat file), the
+  `ae2` text scale and `ae2s` use `infer::Hierarchical`. `models/*` `NNM1`
+  originals are still on disk and no longer readable.
 
 - [ ] **6. Comment and doc pass.** File by file, per CLAUDE.md style: cut
   restating comments, history ("was X"), paragraphs where one line will do,
@@ -93,9 +107,8 @@ Delete (one-off probes and benches whose finding is recorded):
 
 ## Known state
 
-- `tests/parallel_parity.rs` fails on its "training lowers the loss" check. It
-  trains the full 1B config on the CPU (8 min). It goes away in step 5.
-- `hs`, `hqs` and `harness` read v2 only (`models/<name>.v2`). `h`, `hq`, `hv`,
-  `i` and the `ae2` text-scale pass (CPU `Hierarchical::load`) still read `NNM1`
-  only; point them at an untouched `NNM1` file until step 4.
-- `harness` uses `infer::Hierarchical` for chat and `gpu::audio` for the ear. `smart-light` uses `audio` only.
+- Every hierarchical mode reads v2 only (`models/<name>.v2`).
+- The CPU trainer does not fit the full config at 4096-word windows: measured
+  16.9 GB peak at 1024 words (fwd+bwd, before the 8 GB of Adam moments), 67 s per
+  window. It is for small models, SFT and checks.
+- `harness` uses `infer::Hierarchical` for chat and `gpu::audio` for the ear. `smart-light` uses `audio` and `sequential`.

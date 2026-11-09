@@ -1,5 +1,5 @@
 //! Device-resident hierarchical (HAT-style) model — GPU counterpart of
-//! [`nn2::hierarchical::Hierarchical`](crate::nn2::hierarchical::Hierarchical).
+//! [`cpu::hierarchical::Hierarchical`](crate::cpu::hierarchical::Hierarchical).
 //!
 //! Three coupled stages, run phase-by-phase over a window of words:
 //!
@@ -22,10 +22,9 @@
 //! the host and uploaded as id lists; only tensor *data* stays on the device.
 //!
 //! Checkpoints: `save` writes the v2 format (`src/checkpoint.rs`) straight from the
-//! parameter slots; `load` reads v2 or the old `NNM1` container. Weights only; the
+//! parameter slots; `load` reads it back. Weights only; the
 //! AdamW moments are not persisted, so a resumed run restarts them.
 
-use std::ops::Deref;
 use std::range::Range;
 use std::time::{Duration, Instant};
 use std::{io, mem};
@@ -104,16 +103,7 @@ use crate::config::{
 use crate::checkpoint::{self, BlockKind, Layout, Seen};
 use crate::gpu::arena::TrainingCache;
 use crate::gpu::block::BlockLike;
-use crate::gpu::{tensor_from_matrix, tensor_from_slice};
-use crate::nn::embedding::EmbeddingLayer;
-use crate::nn::linear::LinearLayer;
-use crate::nn::linear_nb::LinearNBLayer;
-use crate::nn::mlstm_block::MLSTMBlock;
-use crate::nn::rms_norm::RMSNorm;
-use crate::nn::slstm_block::SLSTMBlock;
-use crate::nn::soft_cap::SoftCapLayer;
-use crate::nn_layer::NnLayer;
-use crate::nn2::optim::AdamCfg;
+use crate::cpu::optim::AdamCfg;
 use crate::tensor::Tensor;
 
 pub use crate::checkpoint::ModelCfg;
@@ -150,7 +140,7 @@ fn new_block(gpu: &Gpu, kind: BlockKind, width: usize, resid: Option<f32>) -> Bo
             MLstm::new_rand(gpu, width, width, heads, dqk),
         )),
         (BlockKind::MLstm { heads, dqk }, Some(scale)) => {
-            let mut cell = crate::nn2::MLstm::new(width, width, heads, dqk);
+            let mut cell = crate::cpu::MLstm::new(width, width, heads, dqk);
             cell.w_out.data.iter_mut().for_each(|w| *w *= scale);
             Box::new(Block::from_cell_scaled(
                 gpu,
@@ -2621,17 +2611,9 @@ impl Hierarchical {
         w.finish()
     }
 
-    /// Load a checkpoint, v2 or the old `NNM1` container. `w_token` comes from the
-    /// tokenizer; a v2 file stores its own and must agree.
+    /// Load a v2 checkpoint. `w_token` comes from the tokenizer and must agree with
+    /// the one the file stores.
     pub fn load(gpu: &Gpu, path: &str, w_token: usize) -> io::Result<Self> {
-        if checkpoint::is_v2(path)? {
-            Self::load_v2(gpu, path, w_token)
-        } else {
-            Self::load_nnm1(gpu, path, w_token)
-        }
-    }
-
-    fn load_v2(gpu: &Gpu, path: &str, w_token: usize) -> io::Result<Self> {
         let err = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("{path}: {m}"));
         let mut r = checkpoint::Reader::open(path)?;
         let checkpoint::Header {
@@ -2668,162 +2650,14 @@ impl Hierarchical {
         model.seen = seen;
         Ok(model)
     }
-
-    /// Load an `NNM1` hierarchical container (written by an older build or a CPU run).
-    /// `w_token` is supplied by the caller because the container does not store it.
-    fn load_nnm1(gpu: &Gpu, path: &str, w_token: usize) -> io::Result<Self> {
-        let stacks = crate::hierarchical::Hierarchical::load_stacks(path)?;
-
-        let err = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-        let to_block = |gpu: &Gpu, l: &dyn NnLayer| -> io::Result<Box<dyn BlockLike>> {
-            if let Some(s) = l.as_any().downcast_ref::<SLSTMBlock>() {
-                Ok(Box::new(Block::<SLstm>::from_nn_block(gpu, s)))
-            } else if let Some(m) = l.as_any().downcast_ref::<MLSTMBlock>() {
-                Ok(Box::new(Block::<MLstm>::from_nn_block(gpu, m)))
-            } else {
-                Err(err("expected an sLSTM/mLSTM block in the checkpoint".into()))
-            }
-        };
-
-        // Encoder: Embedding + blocks
-        let enc = &stacks.encoder_chars.layers;
-        let emb = enc[0]
-            .as_any()
-            .downcast_ref::<EmbeddingLayer>()
-            .ok_or_else(|| err("encoder must start with an Embedding".into()))?;
-        let vocab = emb.input_size();
-        let hc = emb.output_size();
-        let table = GTensor::from_host(gpu, &tensor_from_matrix(&emb.weights));
-        let enc_blocks: Vec<Box<dyn BlockLike>> = enc[1..]
-            .iter()
-            .map(|l| to_block(gpu, l.deref()))
-            .collect::<io::Result<_>>()?;
-
-        // Backbone: Linear + blocks + Linear
-        let wm = &stacks.word_model.layers;
-        let front = wm[0]
-            .as_any()
-            .downcast_ref::<LinearLayer>()
-            .ok_or_else(|| err("backbone must start with a Linear".into()))?;
-        let wh = front.output_size();
-        let bb_front = linear_layer_to_gpu(gpu, front);
-        let back = wm[wm.len() - 1]
-            .as_any()
-            .downcast_ref::<LinearLayer>()
-            .ok_or_else(|| err("backbone must end with a Linear".into()))?;
-        let bb_back = linear_layer_to_gpu(gpu, back);
-        let bb_blocks: Vec<Box<dyn BlockLike>> = wm[1..wm.len() - 1]
-            .iter()
-            .map(|l| to_block(gpu, l.deref()))
-            .collect::<io::Result<_>>()?;
-
-        // heads/dqk read off the first mLSTM block (all mLSTM blocks share them).
-        let (heads, dqk) = wm[1..wm.len() - 1]
-            .iter()
-            .find_map(|l| l.as_any().downcast_ref::<MLSTMBlock>())
-            .map(|m| (m.cell.num_heads, m.cell.dqk))
-            .unwrap_or((8, wh / 8));
-
-        // Decoder: sLSTM blocks + RMSNorm + LinearNoBias + SoftCap
-        let dl = &stacks.char2_model.layers;
-        let norm_idx = dl
-            .iter()
-            .position(|l| l.as_any().downcast_ref::<RMSNorm>().is_some())
-            .ok_or_else(|| err("decoder is missing its RMSNorm".into()))?;
-        let dec_blocks: Vec<Box<dyn BlockLike>> = dl[..norm_idx]
-            .iter()
-            .map(|l| to_block(gpu, l.deref()))
-            .collect::<io::Result<_>>()?;
-        let rms = dl[norm_idx].as_any().downcast_ref::<RMSNorm>().unwrap();
-        let dec_norm = RmsNorm::from_parts(gpu, &tensor_from_slice(&rms.gamma));
-        let head = dl
-            .iter()
-            .find_map(|l| l.as_any().downcast_ref::<LinearNBLayer>())
-            .ok_or_else(|| err("decoder is missing its LinearNoBias head".into()))?;
-        let dec_head = {
-            // fp32, matching the freshly-built model above — a checkpoint must not
-            // load into a different numeric path than it was created with.
-            let mut h = Linear::from_parts(
-                gpu,
-                &tensor_from_matrix(&head.weights),
-                &Tensor::zeros(&[vocab]),
-            );
-            h.set_fp32();
-            head_optimizer_convention(&mut h);
-            h
-        };
-        let cap = dl
-            .iter()
-            .find_map(|l| l.as_any().downcast_ref::<SoftCapLayer>())
-            .map(|s| s.cap)
-            .unwrap_or(crate::config::LOGIT_SOFTCAP);
-
-        let cfg = ModelCfg {
-            vocab,
-            hc,
-            wh,
-            enc_blocks: enc_blocks.len(),
-            bb_blocks: bb_blocks.len(),
-            dec_blocks: dec_blocks.len(),
-            heads,
-            dqk,
-            w_token,
-            cap,
-        };
-        let kind = |l: &Box<dyn NnLayer>| match l.as_any().downcast_ref::<MLSTMBlock>() {
-            Some(m) => BlockKind::MLstm {
-                heads: m.cell.num_heads,
-                dqk: m.cell.dqk,
-            },
-            None => BlockKind::SLstm,
-        };
-        let layout = Layout {
-            encoder: enc[1..].iter().map(kind).collect(),
-            backbone: wm[1..wm.len() - 1].iter().map(kind).collect(),
-            decoder: dl[..norm_idx].iter().map(kind).collect(),
-        };
-        layout.check(&cfg).map_err(err)?;
-
-        let mut model = Hierarchical::unbound(
-            gpu,
-            cfg,
-            layout,
-            Parts {
-                table,
-                enc_blocks,
-                bb_front,
-                bb_blocks,
-                bb_back,
-                dec_blocks,
-                dec_norm,
-                dec_head,
-            },
-        );
-        model.step_count = stacks.step;
-        model.seen = stacks.seen;
-        drop(stacks);
-        super::trim_heap();
-        model.bind_params(gpu);
-        Ok(model)
-    }
 }
 
 /// Put a `Linear` on the logit head's optimizer footing: undecayed (it is a logit
 /// head, not an interior projection) and with the bias frozen at its zero init, so
-/// the layer stays equivalent to `nn::LinearNoBias` and exports to the `HIER` head
-/// faithfully.
+/// it stays a bias-free head.
 fn head_optimizer_convention(head: &mut Linear) {
     head.set_no_decay();
     head.freeze_bias();
-}
-
-/// Upload an `nn::LinearLayer` (weights + bias) to a device `Linear`.
-fn linear_layer_to_gpu(gpu: &Gpu, l: &LinearLayer) -> Linear {
-    Linear::from_parts(
-        gpu,
-        &super::tensor_from_matrix(&l.weights),
-        &super::tensor_from_slice(&l.biases),
-    )
 }
 
 #[cfg(test)]

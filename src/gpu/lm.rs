@@ -20,7 +20,7 @@
 use super::{GTensor, Gpu, linear::Linear, ops, rms_norm::RmsNorm};
 use crate::gpu::arena::TrainingCache;
 use crate::gpu::block::BlockLike;
-use crate::nn2::optim::AdamCfg;
+use crate::cpu::optim::AdamCfg;
 use crate::tensor::Tensor;
 
 pub struct Lm {
@@ -184,8 +184,8 @@ mod tests {
     use super::*;
     use crate::gpu::block::Block;
     use crate::gpu::{mlstm::MLstm, slstm::SLstm};
-    use crate::nn2::loss;
-    use crate::nn2::{
+    use crate::cpu::loss;
+    use crate::cpu::{
         Embedding, Linear as CpuLinear, MLstmBlock, RmsNorm as CpuRms, SLstmBlock, SoftCap,
     };
 
@@ -197,7 +197,7 @@ mod tests {
     }
 
     /// The whole GPU LM — embedding, an sLSTM block **and** an mLSTM block, final
-    /// norm, capped head, fused CE — must match the identical CPU `nn2` stack for
+    /// norm, capped head, fused CE — must match the identical CPU `cpu` stack for
     /// loss → backward → one AdamW step. This is the Phase-D end-to-end check: it
     /// exercises every ported kernel composed in the real architecture.
     #[test]
@@ -220,7 +220,7 @@ mod tests {
         c_emb.table = table.clone();
         let mut c_blk1 = SLstmBlock::new_slstm(hidden, up);
         let mut c_blk2 = MLstmBlock::new_mlstm(hidden, up, heads, dqk);
-        // Non-trivial mLSTM gate weights (nn2::MLstm::new zero-inits wi/wf).
+        // Non-trivial mLSTM gate weights (cpu::MLstm::new zero-inits wi/wf).
         c_blk2.cell.wi = Tensor::random(&[hidden, heads], 0.3);
         c_blk2.cell.wf = Tensor::random(&[hidden, heads], 0.3);
         let mut c_norm = CpuRms::new(hidden);

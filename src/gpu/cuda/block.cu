@@ -1,4 +1,4 @@
-// Residual block / SwiGLU (nn2/block.rs): elementwise add, SwiGLU forward,
+// Residual block / SwiGLU (cpu/block.rs): elementwise add, SwiGLU forward,
 // in-place scale and sigmoid.
 
 // Elementwise add: out = a + b. Used for the two residual adds and the grad
@@ -41,7 +41,7 @@ extern "C" __global__ void swiglu_forward_slab(const float* gate_pre, const floa
     slab_st(mixed, i, ga * value[i]);
 }
 
-// mLSTM projections (nn2/mlstm.rs `project`)
+// mLSTM projections (cpu/mlstm.rs `project`)
 // In-place multiply by a scalar (the k-projection's 1/√dqk scale).
 extern "C" __global__ void scale_inplace(float* x, float s, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -54,4 +54,4 @@ extern "C" __global__ void sigmoid_inplace(float* x, int n) {
     if (i < n) x[i] = stable_sigmoid(x[i]);
 }
 
-// mLSTM parallel/chunkwise core (nn2/mlstm.rs)
+// mLSTM parallel/chunkwise core (cpu/mlstm.rs)

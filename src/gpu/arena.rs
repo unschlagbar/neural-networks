@@ -26,7 +26,7 @@ use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 use super::temp::TempCache;
 use super::{GTensor, Gpu, ops};
-use crate::nn2::optim::AdamCfg;
+use crate::cpu::optim::AdamCfg;
 
 /// How the optimizer treats a parameter.
 ///
@@ -1074,7 +1074,7 @@ mod tests {
         let Some(gpu) = super::super::test_gpu() else {
             return;
         };
-        use crate::nn2::optim::AdamState;
+        use crate::cpu::optim::AdamState;
 
         let n = 512;
         let param: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).sin()).collect();

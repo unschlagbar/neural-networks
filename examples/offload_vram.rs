@@ -22,7 +22,7 @@ fn main() {
     };
     use neural_networks::gpu::Gpu;
     use neural_networks::gpu::hierarchical::{Hierarchical, ModelCfg};
-    use neural_networks::nn2::optim::AdamCfg;
+    use neural_networks::cpu::optim::AdamCfg;
     use neural_networks::tokenizer_utf8::Utf8Tokenizer;
 
     let words: usize = std::env::args()
