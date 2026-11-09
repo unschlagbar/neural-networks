@@ -10,11 +10,13 @@ const EPS: f32 = 1e-8;
 #[derive(Debug)]
 pub struct Adam;
 
-// Adam: 3 Matrizen + step
+/// Gradient and moments are allocated on first use, so a layer that is only built
+/// to be serialized (checkpoint save/load) holds its weights and nothing else.
 pub struct AdamGradMatrix {
-    grads: Matrix,
-    m: Matrix,
-    v: Matrix,
+    rows: usize,
+    cols: usize,
+    grads: Option<Matrix>,
+    moments: Option<(Matrix, Matrix)>,
     step: usize,
 }
 
@@ -28,37 +30,38 @@ pub struct AdamGradVec {
 impl GradMatrixOps for AdamGradMatrix {
     fn zeros(rows: usize, cols: usize) -> Self {
         Self {
-            grads: Matrix::zeros(rows, cols),
-            m: Matrix::zeros(rows, cols),
-            v: Matrix::zeros(rows, cols),
+            rows,
+            cols,
+            grads: None,
+            moments: None,
             step: 0,
         }
     }
 
     fn apply_to(&mut self, weights: &mut Matrix, lr: f32, weight_decay: f32) {
         self.step += 1;
-        debug_assert_eq!(weights.rows(), self.grads.rows());
-        debug_assert_eq!(weights.cols(), self.grads.cols());
-        debug_assert_eq!(self.m.rows(), self.grads.rows());
-        debug_assert_eq!(self.m.cols(), self.grads.cols());
-        debug_assert_eq!(self.v.rows(), self.grads.rows());
-        debug_assert_eq!(self.v.cols(), self.grads.cols());
+        debug_assert_eq!(weights.rows(), self.rows);
+        debug_assert_eq!(weights.cols(), self.cols);
 
         self.clip();
+        let (rows, cols) = (self.rows, self.cols);
+        let g = self.grads.get_or_insert_with(|| Matrix::zeros(rows, cols));
+        let (m, v) = self
+            .moments
+            .get_or_insert_with(|| (Matrix::zeros(rows, cols), Matrix::zeros(rows, cols)));
 
         let t = self.step as f32;
         let beta1_t = 1.0 - BETA1.powf(t);
         let beta2_t = 1.0 - BETA2.powf(t);
 
         // Decoupled weight decay (AdamW): applied directly to the weights, not
-        // through the gradient. `weight_decay == 0.0` recovers plain Adam, so a
-        // stack can be Adam or AdamW purely by what it passes here.
+        // through the gradient. `weight_decay == 0.0` is plain Adam.
         let decay = 1.0 - lr * weight_decay;
 
         for ((w, g), (m_val, v_val)) in weights
             .iter_mut()
-            .zip(self.grads.as_slice())
-            .zip(self.m.iter_mut().zip(self.v.iter_mut()))
+            .zip(g.as_slice())
+            .zip(m.iter_mut().zip(v.iter_mut()))
         {
             *m_val = BETA1 * *m_val + (1.0 - BETA1) * *g;
             *v_val = BETA2 * *v_val + (1.0 - BETA2) * g * g;
@@ -69,15 +72,20 @@ impl GradMatrixOps for AdamGradMatrix {
     }
 
     fn clear(&mut self) {
-        self.grads.clear();
+        if let Some(g) = &mut self.grads {
+            g.clear();
+        }
     }
 
     fn clip(&mut self) {
-        self.grads.clip(-CLIP, CLIP);
+        if let Some(g) = &mut self.grads {
+            g.clip(-CLIP, CLIP);
+        }
     }
 
     fn matrix(&mut self) -> &mut Matrix {
-        &mut self.grads
+        let (rows, cols) = (self.rows, self.cols);
+        self.grads.get_or_insert_with(|| Matrix::zeros(rows, cols))
     }
 }
 

@@ -43,6 +43,20 @@ pub mod temp;
 pub mod train;
 pub mod word_groups;
 
+/// Hand freed heap back to the OS. A checkpoint round-trips the model through the
+/// CPU layers in allocations glibc keeps after they are freed, so without this a
+/// save leaves gigabytes resident (and later in swap) for the rest of the run.
+pub(crate) fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: glibc's malloc_trim has no preconditions.
+        unsafe { malloc_trim(0) };
+    }
+}
+
 pub use arena::{ParamArena, ParamKind, ParamSlot};
 pub use bf16::Slab;
 pub use buf::{Buf, SlabSlot};

@@ -2710,7 +2710,7 @@ impl Hierarchical {
         // exactly what `Hierarchical::new` recomputes and debug-asserts on load.
         let context_size = word_model.output_size;
 
-        Writer::new(
+        let saved = Writer::new(
             ModelKind::Hierarchical,
             Meta {
                 vocab_size: self.cfg.vocab as u32,
@@ -2722,7 +2722,10 @@ impl Hierarchical {
         .section("encoder", &encoder.layers)
         .section("word_model", &word_model.layers)
         .section("char2_model", &char2_model.layers)
-        .save(path)
+        .save(path);
+        drop((encoder, word_model, char2_model));
+        super::trim_heap();
+        saved
     }
 
     /// Load a `HIER` checkpoint (written by this model or a CPU run), rebuilding
@@ -2844,6 +2847,8 @@ impl Hierarchical {
         );
         model.step_count = stacks.step;
         model.seen = stacks.seen;
+        drop(stacks);
+        super::trim_heap();
         model.bind_params(gpu);
         Ok(model)
     }
